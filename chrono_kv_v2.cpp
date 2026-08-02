@@ -28,7 +28,7 @@
 #include <iostream>
 using namespace std;
 using namespace std::chrono;
-constexpr size_t MAX_KEYS = 64;
+const size_t MAX_KEYS = 64;
 #ifdef WIDEN
   #define WIDEN_YIELD() std::this_thread::yield()
 #else

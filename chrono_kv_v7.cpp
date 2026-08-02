@@ -39,8 +39,8 @@
 #include <stdexcept>
 #include <vector>
 using namespace std;
-constexpr size_t MAX_KEYS = 64;
-constexpr size_t RING     = 1024;   // [L12] must exceed max in-flight reservations
+const size_t MAX_KEYS = 64;
+const size_t RING     = 1024;   // [L12] must exceed max in-flight reservations
 static_assert(RING >= 64, "RING must exceed the in-flight window");
 #ifdef WIDEN
   #define WIDEN_YIELD() std::this_thread::yield()

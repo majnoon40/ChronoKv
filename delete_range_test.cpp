@@ -31,7 +31,7 @@ int main(){
   st.put("d","4");
   uint64_t s3=st.clock_-1;        // a=1,b=DELETED,c=3,d=4
 
-  int fails=0; auto chk=[&](const char*n,bool ok){cout<<"  "<<n<<": "<<(ok?"PASS":"FAIL")<<"\n";if(!ok)fails++;};
+  int fails=0; auto chk=[&](const char*n,bool ok){cout<<"  "<<n<<": "<<(ok?"PASS":"FAIL")<<"\n";if(!ok)fails++;};  
   auto r1=st.range(s1,"a","z");
   chk("range[a,z)@s1 -> a,b,c in key order", r1.size()==3&&r1[0].first=="a"&&r1[1].first=="b"&&r1[2].first=="c");
   chk("read b@s2 -> deleted (tombstone)", !st.read_at(s2,"b").has_value());
