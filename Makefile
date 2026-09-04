@@ -24,9 +24,15 @@ HOOKS_ON_DEFS  = -DCHRONOKV_TEST_HOOKS -DCHRONOKV_FAULT_INJECTION \
 HOOKS_OFF_DEFS =
 
 RELEASE_FLAGS = -O2 -g
+# v25.1 M2 close finding (corrected): the container's g++ is 14.2.0 (Debian
+# 14.2.0-19), NOT 12.2.0 as the original M2 closing report claimed. Both
+# native (g++ 15.2.0) and container (g++ 14.2.0) require -static-libasan
+# to avoid "ASan runtime does not come first in initial library list" at
+# process startup. Static linking is a strict superset of dynamic for
+# ASan, so this is safe on all g++ versions.
 ASAN_FLAGS    = -O1 -g -fsanitize=address,undefined \
                 -fno-omit-frame-pointer -fno-sanitize-recover=undefined \
-                -DCKV_UNDER_SANITIZER=1
+                -DCKV_UNDER_SANITIZER=1 -static-libasan
 TSAN_FLAGS    = -O1 -g -fsanitize=thread \
                 -fno-omit-frame-pointer -DCKV_UNDER_SANITIZER=1
 STRESS_FLAGS  = -O2 -g -DCHRONOKV_STRESS -DCKV_UNDER_SANITIZER=1
