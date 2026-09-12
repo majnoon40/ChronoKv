@@ -10,6 +10,18 @@
 # Both modes built across the four-config sanitizer matrix.
 # No separate bench/ directory or extra .cpp files — everything is in
 # chronokv.hpp + main.cpp.
+#
+# Common variables (override on the command line, e.g. `make asan CXX=g++-13`):
+#   CXX           compiler (default g++)
+#   CKV_EXTRA_DEFS extra -D flags appended to every build (see the
+#                 CKV_IOURING_DISABLED note below)
+#   TSAN_BATCH    hooks-on TSan test-batch selector, 0-3 (see main.cpp):
+#                   0 = full suite (default)
+#                   1 = M1.6/M1.5 self-tests only
+#                   2 = early engine tests only (concurrent SSI, phantom, ...)
+#                   3 = standalone tree tests (page pool, btree fuzz, cursor)
+#                 Each batch builds into build/tsan_b<N>/ so switching
+#                 batches always triggers a rebuild.
 
 CXX      ?= g++
 CXXSTD    = -std=c++20
@@ -38,11 +50,13 @@ TSAN_FLAGS    = -O1 -g -fsanitize=thread \
 STRESS_FLAGS  = -O2 -g -DCHRONOKV_STRESS -DCKV_UNDER_SANITIZER=1
 
 BIN_DIR = build
+TSAN_BATCH ?= 0
+TSAN_BIN = $(BIN_DIR)/tsan_b$(TSAN_BATCH)/test
 
 # ---- hooks-on targets ----
 release: $(BIN_DIR)/release/test
 asan:    $(BIN_DIR)/asan/test
-tsan:    $(BIN_DIR)/tsan/test
+tsan:    $(TSAN_BIN)
 stress:  $(BIN_DIR)/stress/test
 
 # ---- hooks-off targets ----
@@ -63,41 +77,42 @@ CKV_EXTRA_DEFS ?=
 
 # ---- hooks-on build rules ----
 $(BIN_DIR)/release/test: main.cpp chronokv.hpp | $(BIN_DIR)/release
-        $(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(RELEASE_FLAGS) \
-            main.cpp -o $@ -lpthread
+	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(RELEASE_FLAGS) \
+	    main.cpp -o $@ -lpthread
 $(BIN_DIR)/asan/test: main.cpp chronokv.hpp | $(BIN_DIR)/asan
-        $(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(ASAN_FLAGS) \
-            main.cpp -o $@ -lpthread
-$(BIN_DIR)/tsan/test: main.cpp chronokv.hpp | $(BIN_DIR)/tsan
-        $(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(TSAN_FLAGS) \
-            main.cpp -o $@ -lpthread
+	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(ASAN_FLAGS) \
+	    main.cpp -o $@ -lpthread
+$(BIN_DIR)/tsan_b$(TSAN_BATCH)/test: main.cpp chronokv.hpp | $(BIN_DIR)/tsan_b$(TSAN_BATCH)
+	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(TSAN_FLAGS) \
+	    -DCHRONOKV_TSAN_BATCH=$(TSAN_BATCH) \
+	    main.cpp -o $@ -lpthread
 $(BIN_DIR)/stress/test: main.cpp chronokv.hpp | $(BIN_DIR)/stress
-        $(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(STRESS_FLAGS) \
-            main.cpp -o $@ -lpthread
+	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(STRESS_FLAGS) \
+	    main.cpp -o $@ -lpthread
 
 # ---- hooks-off build rules ----
 $(BIN_DIR)/smoke_off/release/test: main.cpp chronokv.hpp | $(BIN_DIR)/smoke_off/release
-        $(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) $(RELEASE_FLAGS) \
-            main.cpp -o $@ -lpthread
+	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) $(RELEASE_FLAGS) \
+	    main.cpp -o $@ -lpthread
 $(BIN_DIR)/smoke_off/asan/test: main.cpp chronokv.hpp | $(BIN_DIR)/smoke_off/asan
-        $(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) $(ASAN_FLAGS) \
-            main.cpp -o $@ -lpthread
+	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) $(ASAN_FLAGS) \
+	    main.cpp -o $@ -lpthread
 $(BIN_DIR)/smoke_off/tsan/test: main.cpp chronokv.hpp | $(BIN_DIR)/smoke_off/tsan
-        $(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) $(TSAN_FLAGS) \
-            main.cpp -o $@ -lpthread
+	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) $(TSAN_FLAGS) \
+	    main.cpp -o $@ -lpthread
 $(BIN_DIR)/smoke_off/stress/test: main.cpp chronokv.hpp | $(BIN_DIR)/smoke_off/stress
-        $(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) $(STRESS_FLAGS) \
-            main.cpp -o $@ -lpthread
+	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) $(STRESS_FLAGS) \
+	    main.cpp -o $@ -lpthread
 
 # ---- dirs ----
-$(BIN_DIR)/release $(BIN_DIR)/asan $(BIN_DIR)/tsan $(BIN_DIR)/stress \
+$(BIN_DIR)/release $(BIN_DIR)/asan $(BIN_DIR)/tsan_b$(TSAN_BATCH) $(BIN_DIR)/stress \
 $(BIN_DIR)/smoke_off/release $(BIN_DIR)/smoke_off/asan \
 $(BIN_DIR)/smoke_off/tsan $(BIN_DIR)/smoke_off/stress:
-        mkdir -p $@
+	mkdir -p $@
 
 clean:
-        rm -rf $(BIN_DIR)
+	rm -rf $(BIN_DIR)
 
 .PHONY: release asan tsan stress \
-        smoke_off_release smoke_off_asan smoke_off_tsan smoke_off_stress \
-        all clean
+	smoke_off_release smoke_off_asan smoke_off_tsan smoke_off_stress \
+	all clean
