@@ -1,0 +1,138 @@
+# ChronoKV CI — two-file project (chronokv.hpp + main.cpp), so every job is:
+#   checkout -> make <target> -> run the test binary (exit code 0 = pass).
+#
+# Matrix mirrors the developer's four-config sanitizer validation:
+#   hooks-on:  release / asan (ASan+UBSan) / stress, full internal suite
+#   tsan:      full suite is too slow on small VMs, so it is split into the
+#              three CHRONOKV_TSAN_BATCH subsets (1/2/3), run in parallel
+#   hooks-off: public-API smoke (release + asan) — proves the header works
+#              with no test hooks defined, i.e. how a real user consumes it
+#
+# io_uring: builds use the default (real io_uring attempted). The test
+# binary probes io_uring at runtime and falls back to sync pwrite with a
+# NOTE if the platform blocks it — that path is expected to stay green.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---- hooks-on: full internal test suite --------------------------------
+  engine-tests:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release (g++-13)
+            target: release
+            bin: build/release/test
+            cxx: g++
+          - name: release (g++-14)
+            target: release
+            bin: build/release/test
+            cxx: g++-14
+            install: g++-14
+          - name: asan+ubsan
+            target: asan
+            bin: build/asan/test
+            cxx: g++
+          - name: stress
+            target: stress
+            bin: build/stress/test
+            cxx: g++
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install compiler
+        if: matrix.install != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.install }}
+
+      - name: Build
+        run: make ${{ matrix.target }} CXX=${{ matrix.cxx }}
+
+      - name: Run tests
+        run: |
+          set -o pipefail
+          ./${{ matrix.bin }} 2>&1 | tee test.log
+
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-engine-${{ matrix.target }}-${{ matrix.cxx }}
+          path: test.log
+          if-no-files-found: ignore
+
+  # ---- hooks-on: TSan, split into the three test batches ------------------
+  tsan:
+    name: tsan batch ${{ matrix.batch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        batch: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make tsan TSAN_BATCH=${{ matrix.batch }}
+
+      - name: Run tests
+        run: |
+          set -o pipefail
+          ./build/tsan_b${{ matrix.batch }}/test 2>&1 | tee test.log
+
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-tsan-b${{ matrix.batch }}
+          path: test.log
+          if-no-files-found: ignore
+
+  # ---- hooks-off: public-API smoke, no test hooks -------------------------
+  public-api-smoke:
+    name: smoke (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release
+            target: smoke_off_release
+            bin: build/smoke_off/release/test
+          - name: asan+ubsan
+            target: smoke_off_asan
+            bin: build/smoke_off/asan/test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make ${{ matrix.target }}
+
+      - name: Run tests
+        run: |
+          set -o pipefail
+          ./${{ matrix.bin }} 2>&1 | tee test.log
+
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-smoke-${{ matrix.name }}
+          path: test.log
+          if-no-files-found: ignore
