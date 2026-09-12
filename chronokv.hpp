@@ -1497,6 +1497,8 @@ protected:
     unsigned pending_sentinels_ = 0; // of those, LINK_TIMEOUT sentinels
     CkvTimespec ts_{};               // deadline timespec for the live chain
     std::string description_;
+    int probe_wr_ = -999;            // raw LINK_TIMEOUT probe results, for
+    int probe_sent_ = -999;          // describe() diagnostics
 
     void *sq_mmap_ = nullptr;
     struct io_uring_sqe *sqes_ = nullptr;
@@ -1604,15 +1606,22 @@ private:
     }
 
     // One-shot probe for LINK_TIMEOUT support: write one byte to
-    // /dev/null under a 1 ms hard-linked deadline. Vanilla kernels disarm
-    // the timer when the write completes (sentinel CQE -ECANCELED);
-    // vendor-hardened kernels that reject timeout-class ops return
-    // -EINVAL (sentinel or write CQE) and we stay deadline-less.
+    // /dev/null under a hard-linked 50 ms deadline. Vanilla kernels disarm
+    // the timer when the write completes (sentinel CQE -ECANCELED), or —
+    // under scheduling noise — the timer fires and the cancel lands too
+    // late (write CQE >= 0, sentinel -ETIME): both mean LINK_TIMEOUT works.
+    // Vendor-hardened kernels that reject timeout-class ops return -EINVAL
+    // (sentinel or write CQE) and we stay deadline-less. Raw probe results
+    // are kept for describe() so misclassification is diagnosable from
+    // test logs alone.
     void probe_link_timeout() {
         int probe_fd = ::open("/dev/null", O_WRONLY);
         if (probe_fd < 0) return;            // cannot probe -> deadline-less
         char one = 'x';
-        CkvTimespec ts{0, 1000000};          // 1 ms
+        CkvTimespec ts{0, 50000000};         // 50 ms: generous for io-wq
+                                               // scheduling noise on shared
+                                               // CI runners, instant disarm
+                                               // on a healthy system
         int wr = -999, sent = -999;
         struct io_uring_sqe* w = next_sqe();
         struct io_uring_sqe* t = next_sqe();
@@ -1637,12 +1646,19 @@ private:
                 if (ud == 1) wr = r;
                 else if (ud == SENTINEL_UD) sent = r;
             }
-            // Classify: supported iff the write completed (or was
-            // canceled BY the deadline) with a well-formed timer CQE.
-            if (wr >= 0 && sent == -ECANCELED) link_timeout_ = true;
-            else if (wr == -ECANCELED && (sent == -ETIME || sent == -ECANCELED))
-                link_timeout_ = true;
+            // Classify. Accepted sentinel results (-ECANCELED: timer
+            // disarmed after a timely completion; -ETIME: timer fired,
+            // cancel may or may not have landed in time; -ENOENT: cancel
+            // raced a completed head) all prove the kernel accepted and
+            // executed the LINK_TIMEOUT op. Anything else (-EINVAL from
+            // restricted kernels, -999 never-arrived) means no deadlines.
+            const bool timer_ok =
+                (sent == -ECANCELED || sent == -ETIME || sent == -ENOENT);
+            const bool write_ok = (wr >= 0 || wr == -ECANCELED || wr == -EINTR);
+            if (timer_ok && write_ok) link_timeout_ = true;
         }
+        probe_wr_ = wr;
+        probe_sent_ = sent;
         pending_sqes_ = 0;
         pending_sentinels_ = 0;
         ::close(probe_fd);
@@ -1703,7 +1719,14 @@ private:
             d += std::to_string(deadline_ms_);
             d += "ms";
         } else {
-            d += " deadline=off";
+            // Include the raw probe CQEs so classification issues are
+            // visible from test logs alone (w = write CQE res,
+            // t = LINK_TIMEOUT CQE res).
+            d += " deadline=off(probe w=";
+            d += std::to_string(probe_wr_);
+            d += ",t=";
+            d += std::to_string(probe_sent_);
+            d += ")";
         }
         description_ = d;
     }
