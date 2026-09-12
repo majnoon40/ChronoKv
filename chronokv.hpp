@@ -536,9 +536,21 @@
 
 // Sanitizer detection: fork()+threads crash tests are unreliable under ASan/TSan,
 // and sanitizers model memory/thread errors rather than process crashes.
-#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__) || \
-    (defined(__has_feature) && (__has_feature(address_sanitizer) || __has_feature(thread_sanitizer)))
+// Portability: __has_feature only exists on Clang (and GCC >= 14). GCC 13 and
+// earlier fail with "missing binary operator before token" if __has_feature(...)
+// appears in a #if expression while undefined — the preprocessor does not
+// short-circuit defined() guards in the same line. GCC therefore uses the
+// __SANITIZE_ADDRESS__/__SANITIZE_THREAD__ built-ins (supported on all GCC
+// versions), and __has_feature is only consulted inside a nested guard where
+// it is known to exist.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
 #define CKV_UNDER_SANITIZER 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define CKV_UNDER_SANITIZER 1
+#else
+#define CKV_UNDER_SANITIZER 0
+#endif
 #else
 #define CKV_UNDER_SANITIZER 0
 #endif
