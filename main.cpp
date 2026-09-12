@@ -24,6 +24,7 @@
 #include <cassert>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <sys/wait.h>   // v25.1 M1.5 (C): waitpid for reentrancy fork test
 #include <unistd.h>     // fork, _exit, alarm, mmap, close
@@ -2245,43 +2246,79 @@ return 0;
     // Red test 1: checkpoint time should scale with delta, not database size.
     // After a full checkpoint of N keys, modifying 1 key and re-checkpointing
     // should be at least 4x faster than the full checkpoint.
+    //
+    // Measurement robustness (v25.2 CI fix): on fast CI runners the full
+    // checkpoint completes in ~7ms, where single-shot wall-clock timing is
+    // dominated by scheduler/fsync noise — measured ratios as low as 3.78x
+    // against the 4x bar (GitHub runners, release and stress builds). The
+    // scenario is therefore repeated several times and the BEST (minimum)
+    // full time is compared against the BEST delta time: timing noise only
+    // ever inflates a measurement, so best-vs-best isolates the algorithmic
+    // O(N) vs O(delta) behavior. The 4x acceptance bar is unchanged, and the
+    // red-test semantics are preserved: if incremental checkpointing
+    // regresses to full serialization, the ratio collapses to ~1x and the
+    // test still fails.
     {
-        const std::string wd = "/tmp/v18_incr_ckpt_scaling";
-        const std::string cp = "/tmp/v18_incr_ckpt_scaling.ckpt";
-        std::filesystem::remove_all(wd);
-        unlink(cp.c_str());
+        // N is sized so the full checkpoint's serialization work dominates
+        // the ~2ms of fixed fsync/rename/dirent-fsync I/O every checkpoint
+        // pays: with small N on fast CI storage the fixed cost dominates
+        // BOTH measurements and the true ratio collapses toward the 4x bar
+        // (observed 3.78x at N=5000 on GitHub runners). At N=20000 the
+        // full checkpoint is ~10x serialization vs ~1x fixed cost, so the
+        // O(N) vs O(delta) gap is unambiguous.
+        constexpr int N = 20000;
+        constexpr int REPS = 3;
+        double best_full_ms = std::numeric_limits<double>::max();
+        double best_delta_ms = std::numeric_limits<double>::max();
 
-        ChronoKV kv(wd);  // no GC: timing test measures checkpoint only
+        for (int rep = 0; rep < REPS; ++rep) {
+            const std::string wd = "/tmp/v18_incr_ckpt_scaling_r" + std::to_string(rep);
+            const std::string cp = "/tmp/v18_incr_ckpt_scaling_r" + std::to_string(rep) + ".ckpt";
+            std::filesystem::remove_all(wd);
+            unlink(cp.c_str());
 
-        // Populate with N keys.
-        constexpr int N = 5000;
-        for (int i = 0; i < N; ++i)
-            kv.commit("ik" + std::to_string(i), "v" + std::to_string(i));
+            // 16 MiB page pool (see Options::page_pool_bytes guidance):
+            // 5000 keys use a few hundred KiB of index pages, so a small
+            // pool avoids the 256 MiB default's virtual-memory pressure on
+            // memory-constrained VMs (4 GB / no swap) without changing the
+            // timing semantics — both measurements use the same pool size.
+            ChronoKV kv(wd, 16ULL * 1024 * 1024);  // no GC: timing test measures checkpoint only
 
-        // Full checkpoint: O(N).
-        auto t0 = std::chrono::steady_clock::now();
-        kv.checkpoint(cp);
-        auto t1 = std::chrono::steady_clock::now();
-        double full_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            // Populate with N keys.
+            for (int i = 0; i < N; ++i)
+                kv.commit("ik" + std::to_string(i), "v" + std::to_string(i));
 
-        // Modify exactly 1 key.
-        kv.commit("ik0", "modified");
+            // Full checkpoint: O(N).
+            auto t0 = std::chrono::steady_clock::now();
+            kv.checkpoint(cp);
+            auto t1 = std::chrono::steady_clock::now();
+            double full_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-        // Delta checkpoint: should be O(1), but currently O(N).
-        auto t2 = std::chrono::steady_clock::now();
-        kv.checkpoint(cp);
-        auto t3 = std::chrono::steady_clock::now();
-        double delta_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+            // Modify exactly 1 key.
+            kv.commit("ik0", "modified");
+
+            // Delta checkpoint: should be O(1), but currently O(N).
+            auto t2 = std::chrono::steady_clock::now();
+            kv.checkpoint(cp);
+            auto t3 = std::chrono::steady_clock::now();
+            double delta_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+
+            best_full_ms = std::min(best_full_ms, full_ms);
+            best_delta_ms = std::min(best_delta_ms, delta_ms);
+
+            std::filesystem::remove_all(wd);
+            unlink(cp.c_str());
+        }
 
         // Red assertion: the delta checkpoint should be at least 4x faster
-        // than the full checkpoint. Currently both are O(N), so this fails.
-        bool ok = (delta_ms < full_ms / 4.0);
+        // than the full checkpoint (best-of-REPS measurements).
+        bool ok = (best_delta_ms < best_full_ms / 4.0);
 
         report("v18 checkpoint: incremental checkpoint scales with delta", ok);
         if (!ok)
-            std::cout << "    (full=" << full_ms << "ms delta=" << delta_ms
-                 << "ms ratio=" << (full_ms > 0 ? full_ms / delta_ms : 0)
-                 << "x, expected >=4x)\n";
+            std::cout << "    (best full=" << best_full_ms << "ms best delta=" << best_delta_ms
+                 << "ms ratio=" << (best_full_ms > 0 ? best_full_ms / best_delta_ms : 0)
+                 << "x over " << REPS << " reps, expected >=4x)\n";
     }
 
     // Red test 2: recovery from incremental checkpoint chain produces
