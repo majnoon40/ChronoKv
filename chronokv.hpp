@@ -1368,14 +1368,17 @@ public:
             // Real per-batch deadline, enforced by the kernel: if the write
             // has not completed within deadline_ms_, the LINK_TIMEOUT
             // cancels it (-ECANCELED CQE) and the chain still proceeds to
-            // the fsync (hard link) — the leader sees res < 0 and takes the
-            // offset-pinned sync-pwrite fallback at batch_start.
+            // the fsync (hard link) — the leader sees a short or failed
+            // write and takes the offset-pinned sync-pwrite fallback at
+            // batch_start.
             struct io_uring_sqe* t = next_sqe();
             if (t) {
                 ts_ = CkvTimespec{ (long long)(deadline_ms_ / 1000u),
                                    (long long)((deadline_ms_ % 1000u) * 1000000u) };
                 t->opcode    = CKV_OP_LINK_TIMEOUT;
+                t->fd        = -1;
                 t->addr      = (unsigned long)&ts_;
+                t->len       = lto_len_;   // the layout the kernel accepted
                 t->user_data = SENTINEL_UD;
                 t->flags     = CKV_SQE_HARDLINK;
                 pending_sqes_ += 1;
@@ -1486,6 +1489,7 @@ protected:
     bool fixed_buf_ = false;      // registered bounce buffer active
     bool fixed_files_ = false;    // registered file slot 0 active
     bool link_timeout_ = false;   // LINK_TIMEOUT deadlines active
+    unsigned lto_len_ = 0;        // count-field layout the kernel accepted
     size_t bounce_sz_ = 0;
     void* bounce_ = nullptr;      // page-aligned, registered when fixed_buf_
     int reg_fd_ = -1;             // fd currently occupying file slot 0
@@ -1499,6 +1503,7 @@ protected:
     std::string description_;
     int probe_wr_ = -999;            // raw LINK_TIMEOUT probe results, for
     int probe_sent_ = -999;          // describe() diagnostics
+    int probe_len_ = 0;              // count-field of the last variant tried
 
     void *sq_mmap_ = nullptr;
     struct io_uring_sqe *sqes_ = nullptr;
@@ -1605,63 +1610,80 @@ private:
         return -1;   // plain WRITE for every batch (still correct)
     }
 
-    // One-shot probe for LINK_TIMEOUT support: write one byte to
-    // /dev/null under a hard-linked 50 ms deadline. Vanilla kernels disarm
-    // the timer when the write completes (sentinel CQE -ECANCELED), or —
-    // under scheduling noise — the timer fires and the cancel lands too
-    // late (write CQE >= 0, sentinel -ETIME): both mean LINK_TIMEOUT works.
-    // Vendor-hardened kernels that reject timeout-class ops return -EINVAL
-    // (sentinel or write CQE) and we stay deadline-less. Raw probe results
-    // are kept for describe() so misclassification is diagnosable from
-    // test logs alone.
+    // One-shot probe for LINK_TIMEOUT support. Tries BOTH known SQE
+    // layouts for the timeout's count field:
+    //   variant len=0: the liburing/io_uring-prep canonical layout
+    //   variant len=1: required by kernels that validate count != 0 for
+    //                  timeout-class ops (observed on a vendor 5.10)
+    // Each variant writes one byte to /dev/null under a hard-linked 50 ms
+    // deadline and inspects the CQEs:
+    //   - sentinel -ECANCELED: write completed, timer disarmed     -> works
+    //   - sentinel -ETIME: timer fired (cancel may land late)      -> works
+    //   - sentinel -ENOENT: cancel raced a completed head          -> works
+    //   - sentinel -EINVAL / write canceled by chain failure: kernel
+    //     rejects this layout -> try the next variant
+    //   - anything else: stay deadline-less
+    // Raw probe results are kept for describe() so classification is
+    // diagnosable from test logs alone.
     void probe_link_timeout() {
-        int probe_fd = ::open("/dev/null", O_WRONLY);
-        if (probe_fd < 0) return;            // cannot probe -> deadline-less
-        char one = 'x';
-        CkvTimespec ts{0, 50000000};         // 50 ms: generous for io-wq
-                                               // scheduling noise on shared
-                                               // CI runners, instant disarm
-                                               // on a healthy system
-        int wr = -999, sent = -999;
-        struct io_uring_sqe* w = next_sqe();
-        struct io_uring_sqe* t = next_sqe();
-        if (w && t) {
-            w->opcode = IORING_OP_WRITE; w->fd = probe_fd;
-            w->addr = (unsigned long)&one; w->len = 1; w->off = 0;
-            w->user_data = 1; w->flags = CKV_SQE_HARDLINK;
-            t->opcode = CKV_OP_LINK_TIMEOUT;
-            t->addr = (unsigned long)&ts;
-            t->user_data = SENTINEL_UD;
-            t->flags = 0;                    // end of chain
-            pending_sqes_ = 2; pending_sentinels_ = 1;
-            (void)enter_internal(2, 2, IORING_ENTER_GETEVENTS);
-            for (;;) {
-                unsigned head = *cq_head_;
-                unsigned tail = __atomic_load_n(cq_tail_, __ATOMIC_ACQUIRE);
-                if (head == tail) break;
-                unsigned idx = head & *cq_mask_;
-                unsigned long long ud = cqes_[idx].user_data;
-                int r = cqes_[idx].res;
-                __atomic_store_n(cq_head_, head + 1, __ATOMIC_RELEASE);
-                if (ud == 1) wr = r;
-                else if (ud == SENTINEL_UD) sent = r;
+        const unsigned len_variants[2] = { 0, 1 };
+        for (unsigned v = 0; v < 2 && !link_timeout_; ++v) {
+            int probe_fd = ::open("/dev/null", O_WRONLY);
+            if (probe_fd < 0) return;        // cannot probe -> deadline-less
+            char one = 'x';
+            CkvTimespec ts{0, 50000000};    // 50 ms: generous for io-wq
+                                            // scheduling noise on shared
+                                            // CI runners, instant disarm
+                                            // on a healthy system
+            int wr = -999, sent = -999;
+            struct io_uring_sqe* w = next_sqe();
+            struct io_uring_sqe* t = next_sqe();
+            if (w && t) {
+                w->opcode = IORING_OP_WRITE; w->fd = probe_fd;
+                w->addr = (unsigned long)&one; w->len = 1; w->off = 0;
+                w->user_data = 1; w->flags = CKV_SQE_HARDLINK;
+                t->opcode = CKV_OP_LINK_TIMEOUT;
+                t->fd = -1;
+                t->addr = (unsigned long)&ts;
+                t->len = len_variants[v];
+                t->user_data = SENTINEL_UD;
+                t->flags = 0;                // end of chain
+                pending_sqes_ = 2; pending_sentinels_ = 1;
+                (void)enter_internal(2, 2, IORING_ENTER_GETEVENTS);
+                for (;;) {
+                    unsigned head = *cq_head_;
+                    unsigned tail = __atomic_load_n(cq_tail_, __ATOMIC_ACQUIRE);
+                    if (head == tail) break;
+                    unsigned idx = head & *cq_mask_;
+                    unsigned long long ud = cqes_[idx].user_data;
+                    int r = cqes_[idx].res;
+                    __atomic_store_n(cq_head_, head + 1, __ATOMIC_RELEASE);
+                    if (ud == 1) wr = r;
+                    else if (ud == SENTINEL_UD) sent = r;
+                }
+                // Classify. Accepted sentinel results (-ECANCELED: timer
+                // disarmed after a timely completion; -ETIME: timer fired,
+                // cancel may or may not have landed in time; -ENOENT: cancel
+                // raced a completed head) all prove the kernel accepted and
+                // executed the LINK_TIMEOUT op. Anything else (-EINVAL from
+                // a rejected layout, -999 never-arrived) means this variant
+                // does not work here.
+                const bool timer_ok =
+                    (sent == -ECANCELED || sent == -ETIME || sent == -ENOENT);
+                const bool write_ok =
+                    (wr >= 0 || wr == -ECANCELED || wr == -EINTR);
+                if (timer_ok && write_ok) {
+                    link_timeout_ = true;
+                    lto_len_ = len_variants[v];   // remember what worked
+                }
             }
-            // Classify. Accepted sentinel results (-ECANCELED: timer
-            // disarmed after a timely completion; -ETIME: timer fired,
-            // cancel may or may not have landed in time; -ENOENT: cancel
-            // raced a completed head) all prove the kernel accepted and
-            // executed the LINK_TIMEOUT op. Anything else (-EINVAL from
-            // restricted kernels, -999 never-arrived) means no deadlines.
-            const bool timer_ok =
-                (sent == -ECANCELED || sent == -ETIME || sent == -ENOENT);
-            const bool write_ok = (wr >= 0 || wr == -ECANCELED || wr == -EINTR);
-            if (timer_ok && write_ok) link_timeout_ = true;
+            probe_wr_ = wr;
+            probe_sent_ = sent;
+            probe_len_ = (int)len_variants[v];
+            pending_sqes_ = 0;
+            pending_sentinels_ = 0;
+            ::close(probe_fd);
         }
-        probe_wr_ = wr;
-        probe_sent_ = sent;
-        pending_sqes_ = 0;
-        pending_sentinels_ = 0;
-        ::close(probe_fd);
     }
 
     // Register `fd` into file slot 0 (first use) or swap the slot when
@@ -1721,11 +1743,13 @@ private:
         } else {
             // Include the raw probe CQEs so classification issues are
             // visible from test logs alone (w = write CQE res,
-            // t = LINK_TIMEOUT CQE res).
+            // t = LINK_TIMEOUT CQE res, n = the count-field variant).
             d += " deadline=off(probe w=";
             d += std::to_string(probe_wr_);
             d += ",t=";
             d += std::to_string(probe_sent_);
+            d += ",n=";
+            d += std::to_string(probe_len_);
             d += ")";
         }
         description_ = d;
@@ -1756,7 +1780,9 @@ public:
     enum Mode { MOCK_SUCCESS, MOCK_FAILURE, MOCK_TIMEOUT, MOCK_PARTIAL };
 
     MockIoUring(Mode mode) : IoUring(true), mode_(mode) {
-        mock_write_res_ = (mode == MOCK_SUCCESS) ? 0 : -1;
+        // v25.2: MOCK_SUCCESS reports the full requested length (the real
+        // kernel WRITE CQE does too); the leader now requires it.
+        mock_write_res_ = -1;
         mock_fsync_res_ = (mode == MOCK_SUCCESS) ? 0 : -1;
     }
 
@@ -1779,6 +1805,9 @@ public:
             // if we report failure via CQE — the write may have completed
             // in the kernel before the CQE error was reported).
             pwrite_all_internal(fd, (const uint8_t*)buf, len, offset);
+            // v25.2: success reports the full length (matches the real
+            // kernel's WRITE CQE contract).
+            if (mode_ == MOCK_SUCCESS) mock_write_res_ = (int)len;
         }
         // MOCK_TIMEOUT: don't write at all (simulates io_uring that never completed).
         return user_data;
@@ -2551,7 +2580,15 @@ public:
                             int res1 = -1, res2 = -1, ud1 = 0, ud2 = 0;
                             iouring_->pop_cqe(&res1, &ud1);
                             iouring_->pop_cqe(&res2, &ud2);
-                            if (res1 >= 0 && res2 >= 0) {
+                            // v25.2: require the FULL batch length on the
+                            // write CQE — a deadline-canceled write that
+                            // landed late can complete PARTIALLY with a
+                            // positive res (observed via a blocking FIFO
+                            // write under a 5 ms deadline: res = pipe
+                            // capacity, not the requested length). A short
+                            // write must take the offset-pinned fallback.
+                            if (res1 >= 0 && res2 >= 0 &&
+                                (size_t)(unsigned)res1 >= batch_buf.size()) {
                                 io_ok = true; used_iouring = true;
                                 last_batch_used_iouring_.store(true, std::memory_order_relaxed);
                             } else {
