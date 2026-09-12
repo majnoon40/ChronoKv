@@ -15,13 +15,10 @@
 #   CXX           compiler (default g++)
 #   CKV_EXTRA_DEFS extra -D flags appended to every build (see the
 #                 CKV_IOURING_DISABLED note below)
-#   TSAN_BATCH    hooks-on TSan test-batch selector, 0-3 (see main.cpp):
-#                   0 = full suite (default)
-#                   1 = M1.6/M1.5 self-tests only
-#                   2 = early engine tests only (concurrent SSI, phantom, ...)
-#                   3 = standalone tree tests (page pool, btree fuzz, cursor)
-#                 Each batch builds into build/tsan_b<N>/ so switching
-#                 batches always triggers a rebuild.
+#
+# v25.2: the TSan batch split (TSAN_BATCH / CHRONOKV_TSAN_BATCH) was
+# removed — `make tsan` runs the FULL suite as one step. CI runners
+# complete it comfortably inside one job.
 
 CXX      ?= g++
 CXXSTD    = -std=c++20
@@ -50,8 +47,7 @@ TSAN_FLAGS    = -O1 -g -fsanitize=thread \
 STRESS_FLAGS  = -O2 -g -DCHRONOKV_STRESS -DCKV_UNDER_SANITIZER=1
 
 BIN_DIR = build
-TSAN_BATCH ?= 0
-TSAN_BIN = $(BIN_DIR)/tsan_b$(TSAN_BATCH)/test
+TSAN_BIN = $(BIN_DIR)/tsan/test
 
 # ---- hooks-on targets ----
 release: $(BIN_DIR)/release/test
@@ -82,9 +78,8 @@ $(BIN_DIR)/release/test: main.cpp chronokv.hpp | $(BIN_DIR)/release
 $(BIN_DIR)/asan/test: main.cpp chronokv.hpp | $(BIN_DIR)/asan
 	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(ASAN_FLAGS) \
 	    main.cpp -o $@ -lpthread
-$(BIN_DIR)/tsan_b$(TSAN_BATCH)/test: main.cpp chronokv.hpp | $(BIN_DIR)/tsan_b$(TSAN_BATCH)
+$(BIN_DIR)/tsan/test: main.cpp chronokv.hpp | $(BIN_DIR)/tsan
 	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(TSAN_FLAGS) \
-	    -DCHRONOKV_TSAN_BATCH=$(TSAN_BATCH) \
 	    main.cpp -o $@ -lpthread
 $(BIN_DIR)/stress/test: main.cpp chronokv.hpp | $(BIN_DIR)/stress
 	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(STRESS_FLAGS) \
@@ -105,7 +100,7 @@ $(BIN_DIR)/smoke_off/stress/test: main.cpp chronokv.hpp | $(BIN_DIR)/smoke_off/s
 	    main.cpp -o $@ -lpthread
 
 # ---- dirs ----
-$(BIN_DIR)/release $(BIN_DIR)/asan $(BIN_DIR)/tsan_b$(TSAN_BATCH) $(BIN_DIR)/stress \
+$(BIN_DIR)/release $(BIN_DIR)/asan $(BIN_DIR)/tsan $(BIN_DIR)/stress \
 $(BIN_DIR)/smoke_off/release $(BIN_DIR)/smoke_off/asan \
 $(BIN_DIR)/smoke_off/tsan $(BIN_DIR)/smoke_off/stress:
 	mkdir -p $@

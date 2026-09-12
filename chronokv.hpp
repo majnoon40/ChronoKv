@@ -489,6 +489,7 @@
 #include <linux/io_uring.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
+#include <sys/uio.h>   // v25.2: struct iovec for IORING_REGISTER_BUFFERS
 #include <unistd.h>
 #include <fcntl.h>
 #include <cstring>
@@ -498,6 +499,7 @@
 #include <functional>
 #include <cstdio>
 #include <cerrno>
+#include <cstdlib>   // v25.2: aligned_alloc/free for the registered bounce buffer
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <filesystem>
@@ -1160,15 +1162,79 @@ struct Batch {
 // ================================================================
 // [SECTION_2B_IO_URING]
 // ================================================================
-// v25.1 M2 Phase 2: Minimal io_uring wrapper (no liburing dependency).
-// Uses raw syscalls: io_uring_setup, io_uring_enter, mmap.
-// Supports: write at explicit offset, fsync, wait for CQE with timeout.
-// Falls back to sync write/fsync if io_uring is unavailable.
+// v25.2: modernized io_uring backend (still raw syscalls, no liburing).
 //
-// Key design: the fallback path uses pwrite (positioned write) to the
-// exact batch_start offset, NOT append semantics. This prevents the
-// "two copies at different offsets" bug if the original io_uring write
-// was mid-flight when the leader failed.
+// The WAL leader submits each durability batch as a single SQE chain:
+//
+//     WRITE or WRITE_FIXED  --hardlink-->  [LINK_TIMEOUT]  --hardlink-->
+//     FSYNC(DATASYNC)
+//
+// What each piece buys (and its runtime fallback):
+//
+//   * Hard-linked chain (IOSQE_IO_HARDLINK, 5.5+): io_uring gives NO
+//     ordering guarantee between independent SQEs — the pre-v25.2 code
+//     submitted write+fsync unlinked, so the fsync could start before the
+//     write was complete: a durability hazard. The chain guarantees the
+//     fsync runs after the write, completes deterministically (exactly one
+//     CQE per SQE, always), and needs a single io_uring_enter per batch.
+//     Fallback: none needed — hard links are 5.5+, same floor as the
+//     multi-segment WAL design itself.
+//   * FSYNC with IORING_FSYNC_DATASYNC: fdatasync semantics (skips the
+//     mtime update the WAL never needs). Typically ~2x cheaper than a
+//     full fsync on ext4. Fallback: none needed (5.1+).
+//   * Registered bounce buffer + WRITE_FIXED (IORING_REGISTER_BUFFERS,
+//     5.1+): the batch is memcpy'd into one page-aligned pre-registered
+//     buffer, so the kernel skips the per-IO get_user_pages pin/unpin.
+//     Buffer ladder 256 KiB -> 64 KiB to fit small RLIMIT_MEMLOCK
+//     (ENOMEM/EAGAIN fall through); batches larger than the registered
+//     buffer use plain WRITE on the caller's buffer. Fallback: plain
+//     WRITE (zero-copy path of the old code).
+//   * Registered files (IORING_REGISTER_FILES, 5.1+) + IOSQE_FIXED_FILE:
+//     the active WAL segment fd lives in slot 0 (re-registered on segment
+//     rotation), skipping the per-SQE fd refcount. Fallback: plain fd.
+//   * LINK_TIMEOUT deadline (5.5+): the documented 500 ms CQE-wait
+//     deadline is now enforced IN THE KERNEL — a stuck write is canceled
+//     after 500 ms and its CQEs arrive, which unblocks the enter and sends
+//     the leader down the offset-pinned sync-pwrite fallback. Support is
+//     probed once at ring construction (the probe writes one byte to
+//     /dev/null with a 1 ms deadline); restricted kernels (e.g. some
+//     vendor-hardened 5.10s return -EINVAL for timeout-class ops) get
+//     deadline-less chains: same ordering and single-enter properties,
+//     just an unbounded wait — exactly what the pre-v25.2 code did.
+//   * IORING_SETUP_COOP_TASKRUN (5.19+): completions run as cooperative
+//     task_work instead of signal interrupts — less jitter under load.
+//     Probed at setup; EINVAL falls back to a plain ring.
+//     IORING_SETUP_SINGLE_ISSUER / DEFER_TASKRUN (6.0/6.1+) are
+//     deliberately NOT used: the WAL leader role migrates between
+//     committer threads, while DEFER_TASKRUN requires one dedicated
+//     submitter thread for the ring's lifetime. SQPOLL is likewise
+//     rejected: per-batch durability waits nullify its benefit and it
+//     costs a kernel thread. (A dedicated single-issuer WAL writer
+//     thread is the natural v25.3 follow-up that would unlock both.)
+//   * Ring sizing: 64 SQEs / 128 CQEs (the old ring had 8). Not for
+//     pipelining — sync durability forces a wait per batch — but so a
+//     3-SQE chain can never come close to the ring limits.
+//
+// Robustness fixes over the v25.1 wrapper, all found by inspection:
+//   1. Real deadline (see LINK_TIMEOUT above). The old
+//      enter_with_timeout() IGNORED its timeout parameter — a hung CQE
+//      wait blocked forever while pretending to be bounded.
+//   2. discard_pending(): the leader bail-out path (leader_timed_out_
+//      test hook) previously left unsubmitted SQEs in the ring with
+//      DANGLING buffer pointers (batch_buf is a stack-scoped vector);
+//      the next batch would submit them. Now the tail is rolled back.
+//   3. drain_cqes() + permanent degrade: after a failed enter the ring
+//      is drained and marked unavailable, so late completions from an
+//      abandoned batch can never be mis-attributed to the next batch
+//      (the old code had exactly this one-batch-lag CQE contamination
+//      on EINTR-style failures).
+//   4. EINTR retry on io_uring_enter.
+//
+// The logical interface the WAL leader uses is unchanged from v25.1
+// (submit_write, submit_fsync, enter_with_timeout, pop_cqe x2), so
+// MockIoUring and the four mock-mode state-machine tests keep working
+// unmodified. The wrapper internally translates logical ops to physical
+// SQEs (sentinel LINK_TIMEOUT SQEs/CQEs are added and filtered back out).
 //
 // MockIoUring: test-only subclass that simulates io_uring behavior
 // (CQE success/failure/timeout) with real pwrite I/O, so the full
@@ -1178,128 +1244,233 @@ struct Batch {
 // ---- merge note (v25.1 M2 close) ----
 // This block was previously a separate header (chronokv_iouring.hpp)
 // and was merged into chronokv.hpp as [SECTION_2B_IO_URING] at M2
-// closing time. The system includes it required were hoisted into the
-// top-of-file include block; the #pragma once guard was dropped
-// (chronokv.hpp is itself a single-translation-unit header and does
-// not use include guards); the namespace (chronokv_iouring) is kept
-// as-is so all qualified references (chronokv::WalSegments using
+// closing time. The namespace (chronokv_iouring) is kept so all
+// qualified references (chronokv::WalSegments using
 // chronokv_iouring::IoUring, etc.) continue to resolve identically.
-// No behavioral change. The file chronokv_iouring.hpp no longer
-// exists; the Makefile build rules no longer reference it.
 // =================================================================
+#ifndef __NR_io_uring_setup
+#define __NR_io_uring_setup 425
+#endif
+#ifndef __NR_io_uring_enter
+#define __NR_io_uring_enter 426
+#endif
+#ifndef __NR_io_uring_register
+#define __NR_io_uring_register 427
+#endif
+
 namespace chronokv_iouring {
+
+// ---- v25.2 ABI constants ---------------------------------------------
+// Numeric values are FROZEN in the kernel uapi (io_uring opcode and
+// register-opcode enum members are never renumbered). Spelling them out
+// keeps chronokv.hpp compiling against older distro headers (5.4-era
+// linux-libc-dev) that predate some of them. Flag macros that are plain
+// #defines get #ifndef fallbacks instead.
+constexpr unsigned CKV_OP_LINK_TIMEOUT = 15;   // IORING_OP_LINK_TIMEOUT (5.5+)
+constexpr unsigned CKV_REG_BUFFERS     = 0;    // IORING_REGISTER_BUFFERS (5.1+)
+constexpr unsigned CKV_UNREG_BUFFERS   = 1;    // IORING_UNREGISTER_BUFFERS (5.1+)
+constexpr unsigned CKV_REG_FILES       = 2;    // IORING_REGISTER_FILES (5.1+)
+constexpr unsigned CKV_UNREG_FILES     = 3;    // IORING_UNREGISTER_FILES (5.1+)
+constexpr unsigned CKV_SQE_HARDLINK    = 1u << 3;  // IOSQE_IO_HARDLINK (5.5+)
+#ifndef IORING_SETUP_COOP_TASKRUN
+#define IORING_SETUP_COOP_TASKRUN (1U << 8)    // 5.19+
+#endif
+#ifndef IORING_FSYNC_DATASYNC
+#define IORING_FSYNC_DATASYNC (1U << 0)        // 5.1+
+#endif
+
+// Mirror of struct __kernel_timespec (ABI-identical; avoids depending on
+// linux/time_types.h visibility through older io_uring.h copies).
+struct CkvTimespec { long long tv_sec; long long tv_nsec; };
+
+// Documented CQE-wait deadline for one WAL durability batch (ms).
+constexpr unsigned kDefaultDeadlineMs = 500;
 
 class IoUring {
 public:
     IoUring() : ring_fd_(-1), available_(false) {
-        // v25.1 M2: io_uring init. On systems where io_uring I/O ops are
-        // blocked (seccomp EPERM), available_ stays false and the sync
-        // pwrite+fsync fallback is used. The `early_return` below was a
-        // workaround for the k8s container dev environment — it is now
-        // controlled by CKV_IOURING_DISABLED so real io_uring is attempted
-        // on every platform by default.
+        // v25.2: see the section header for the full feature ladder.
+        // Every step degrades independently at runtime; if the ring
+        // cannot be created at all, available_ stays false and
+        // WalSegments uses the sync pwrite+fsync fallback.
         //
-        // To re-enable the container workaround, define CKV_IOURING_DISABLED.
+        // To re-enable the container workaround (seccomp blocks io_uring
+        // I/O ops with EPERM), define CKV_IOURING_DISABLED.
 #ifdef CKV_IOURING_DISABLED
         return;
 #endif
-        memset(&params_, 0, sizeof(params_));
-        ring_fd_ = syscall(__NR_io_uring_setup, 8, &params_);
-        if (ring_fd_ < 0) return;
-
-        unsigned sq_entries = params_.sq_entries;
-        unsigned cq_entries = params_.cq_entries;
-
-        sq_sz_ = params_.sq_off.array + sq_entries * sizeof(unsigned);
-        sq_mmap_ = mmap(NULL, sq_sz_, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, ring_fd_, IORING_OFF_SQ_RING);
-        if (sq_mmap_ == MAP_FAILED) { ring_fd_ = -1; return; }
-
-        sqe_sz_ = sq_entries * sizeof(struct io_uring_sqe);
-        sqes_ = (struct io_uring_sqe*)mmap(NULL, sqe_sz_, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, ring_fd_, IORING_OFF_SQES);
-        if (sqes_ == MAP_FAILED) { ring_fd_ = -1; return; }
-
-        cq_sz_ = params_.cq_off.cqes + cq_entries * sizeof(struct io_uring_cqe);
-        cq_mmap_ = mmap(NULL, cq_sz_, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, ring_fd_, IORING_OFF_CQ_RING);
-        if (cq_mmap_ == MAP_FAILED) { ring_fd_ = -1; return; }
-
-        sq_head_ = (unsigned*)((char*)sq_mmap_ + params_.sq_off.head);
-        sq_tail_ = (unsigned*)((char*)sq_mmap_ + params_.sq_off.tail);
-        sq_mask_ = (unsigned*)((char*)sq_mmap_ + params_.sq_off.ring_mask);
-        sq_array_ = (unsigned*)((char*)sq_mmap_ + params_.sq_off.array);
-
-        cq_head_ = (unsigned*)((char*)cq_mmap_ + params_.cq_off.head);
-        cq_tail_ = (unsigned*)((char*)cq_mmap_ + params_.cq_off.tail);
-        cq_mask_ = (unsigned*)((char*)cq_mmap_ + params_.cq_off.ring_mask);
-        cqes_ = (struct io_uring_cqe*)((char*)cq_mmap_ + params_.cq_off.cqes);
-
-        available_ = true;
+        if (setup_ring() != 0) return;          // available_ set on success
+        (void)register_buffers_ladder();        // fixed WRITE buffers
+        // Registered files are set up lazily by submit_write — the WAL
+        // segment fd does not exist yet at construction time.
+        probe_link_timeout();                   // deadline support check
+        build_description();
     }
 
     virtual ~IoUring() {
+        if (ring_fd_ < 0) return;
+        if (fixed_files_) {
+            syscall(__NR_io_uring_register, ring_fd_, CKV_UNREG_FILES, NULL, 0);
+            fixed_files_ = false;
+            reg_fd_ = -1;
+        }
+        if (fixed_buf_) {
+            syscall(__NR_io_uring_register, ring_fd_, CKV_UNREG_BUFFERS, NULL, 0);
+            fixed_buf_ = false;
+        }
+        if (bounce_) { free(bounce_); bounce_ = nullptr; bounce_sz_ = 0; }
         if (sq_mmap_ && sq_mmap_ != MAP_FAILED) munmap(sq_mmap_, sq_sz_);
         if (sqes_ && sqes_ != MAP_FAILED) munmap(sqes_, sqe_sz_);
         if (cq_mmap_ && cq_mmap_ != MAP_FAILED) munmap(cq_mmap_, cq_sz_);
-        if (ring_fd_ >= 0) close(ring_fd_);
+        close(ring_fd_);
+        ring_fd_ = -1;
     }
 
     virtual bool available() const { return available_; }
 
+    // v25.2: one-line feature summary for diagnostics. The library itself
+    // stays silent; the test suite prints this in its availability check.
+    // Example: "io_uring: sq=64 cq=128 coop_taskrun=0 fixed_buf=64K
+    // fixed_files=lazy deadline=off"
+    const std::string& describe() const { return description_; }
+
     // Submit a write at an explicit offset (pwrite semantics).
+    //
+    // Builds the head of the batch chain:
+    //   WRITE(WRITE_FIXED) --hardlink--> [LINK_TIMEOUT] --hardlink-->
+    //   (fsync appended by submit_fsync)
     virtual int submit_write(int fd, const void* buf, size_t len, off_t offset, int user_data) {
         if (!available_) return -1;
-        unsigned tail = *sq_tail_;
-        unsigned idx = tail & *sq_mask_;
-        memset(&sqes_[idx], 0, sizeof(struct io_uring_sqe));
-        sqes_[idx].opcode = IORING_OP_WRITE;
-        sqes_[idx].fd = fd;
-        sqes_[idx].addr = (unsigned long)buf;
-        sqes_[idx].len = len;
-        sqes_[idx].off = offset;
-        sqes_[idx].user_data = user_data;
-        sq_array_[idx] = idx;
-        __atomic_store_n(sq_tail_, tail + 1, __ATOMIC_RELEASE);
+        if (fixed_files_ && !ensure_file_registered(fd))
+            fixed_files_ = false;   // slot update failed -> plain fd
+        const bool use_fixed_buf = fixed_buf_ && len <= bounce_sz_;
+
+        struct io_uring_sqe* s = next_sqe();
+        if (!s) return -1;
+        s->opcode = use_fixed_buf ? IORING_OP_WRITE_FIXED : IORING_OP_WRITE;
+        if (fixed_files_) { s->fd = 0; s->flags = CKV_SQE_HARDLINK | IOSQE_FIXED_FILE; }
+        else              { s->fd = fd; s->flags = CKV_SQE_HARDLINK; }
+        if (use_fixed_buf) {
+            // memcpy into the page-aligned registered bounce buffer: the
+            // kernel then skips the per-IO get_user_pages pin/unpin.
+            memcpy(bounce_, buf, len);
+            s->addr = (unsigned long)bounce_;
+            s->buf_index = 0;      // registered buffer slot 0
+        } else {
+            s->addr = (unsigned long)buf;
+        }
+        s->len  = (unsigned)len;
+        s->off  = offset;
+        s->user_data = (unsigned long long)(unsigned)user_data;
+        pending_sqes_ += 1;
+
+        if (link_timeout_) {
+            // Real per-batch deadline, enforced by the kernel: if the write
+            // has not completed within deadline_ms_, the LINK_TIMEOUT
+            // cancels it (-ECANCELED CQE) and the chain still proceeds to
+            // the fsync (hard link) — the leader sees res < 0 and takes the
+            // offset-pinned sync-pwrite fallback at batch_start.
+            struct io_uring_sqe* t = next_sqe();
+            if (t) {
+                ts_ = CkvTimespec{ (long long)(deadline_ms_ / 1000u),
+                                   (long long)((deadline_ms_ % 1000u) * 1000000u) };
+                t->opcode    = CKV_OP_LINK_TIMEOUT;
+                t->addr      = (unsigned long)&ts_;
+                t->user_data = SENTINEL_UD;
+                t->flags     = CKV_SQE_HARDLINK;
+                pending_sqes_ += 1;
+                pending_sentinels_ += 1;
+            }
+        }
         return user_data;
     }
 
-    // Submit an fsync.
+    // Submit an fsync — fdatasync semantics (IORING_FSYNC_DATASYNC):
+    // the WAL never needs the mtime update a full fsync syncs.
     virtual int submit_fsync(int fd, int user_data) {
         if (!available_) return -1;
-        unsigned tail = *sq_tail_;
-        unsigned idx = tail & *sq_mask_;
-        memset(&sqes_[idx], 0, sizeof(struct io_uring_sqe));
-        sqes_[idx].opcode = IORING_OP_FSYNC;
-        sqes_[idx].fd = fd;
-        sqes_[idx].user_data = user_data;
-        sq_array_[idx] = idx;
-        __atomic_store_n(sq_tail_, tail + 1, __ATOMIC_RELEASE);
+        struct io_uring_sqe* s = next_sqe();
+        if (!s) return -1;
+        s->opcode = IORING_OP_FSYNC;
+        if (fixed_files_) { s->fd = 0; s->flags = IOSQE_FIXED_FILE; }
+        else              { s->fd = fd; }
+        s->rw_flags  = IORING_FSYNC_DATASYNC;
+        s->user_data = (unsigned long long)(unsigned)user_data;
+        pending_sqes_ += 1;
         return user_data;
     }
 
-    // Enter: submit pending SQEs and optionally wait for completions.
+    // Enter: submit pending SQEs and wait for completions. to_submit /
+    // min_complete count LOGICAL ops; the sentinel LINK_TIMEOUT SQEs/CQEs
+    // are translated internally. A failed enter permanently degrades the
+    // ring (available_ = false): we cannot know whether the kernel already
+    // consumed the SQEs, so the safe recovery is the sync fallback for all
+    // future batches (late CQEs can then never contaminate a later batch).
     virtual int enter(int to_submit, int min_complete, unsigned flags) {
         if (!available_) return -1;
-        return syscall(__NR_io_uring_enter, ring_fd_, to_submit, min_complete,
-                       flags | IORING_ENTER_GETEVENTS, NULL, 0);
+        int ret = enter_internal(to_submit, min_complete, flags);
+        if (ret < 0) { drain_cqes(); available_ = false; }
+        return ret;
     }
 
-    // Enter with a timeout.
+    // v25.2: the timeout is enforced in the KERNEL by the LINK_TIMEOUT
+    // armed in submit_write (deadline_ms_, default 500 ms): a stuck write
+    // is canceled and its CQEs arrive, which unblocks this enter. On
+    // kernels without LINK_TIMEOUT support the wait is unbounded — the
+    // pre-v25.2 behavior, but with correct write->fsync ordering.
     virtual int enter_with_timeout(int to_submit, int min_complete, int timeout_ms) {
         if (!available_) return -1;
-        // v25.1 M2: kernel 5.10 doesn't support the timeout parameter.
-        return enter(to_submit, min_complete, IORING_ENTER_GETEVENTS);
+        (void)timeout_ms;   // deadline armed at submit time (see above)
+        int ret = enter_internal(to_submit, min_complete, IORING_ENTER_GETEVENTS);
+        if (ret < 0) { drain_cqes(); available_ = false; }
+        return ret;
     }
 
-    // Pop a CQE.
+    // Pop the next LOGICAL CQE. Sentinel LINK_TIMEOUT CQEs (timer
+    // disarm/cancel completions) are consumed and skipped transparently,
+    // so callers still see exactly the write and fsync CQEs.
     virtual bool pop_cqe(int* res, int* user_data) {
         if (!available_) return false;
-        unsigned head = *cq_head_;
-        unsigned tail = __atomic_load_n(cq_tail_, __ATOMIC_ACQUIRE);
-        if (head == tail) return false;
-        unsigned idx = head & *cq_mask_;
-        *res = cqes_[idx].res;
-        *user_data = cqes_[idx].user_data;
-        __atomic_store_n(cq_head_, head + 1, __ATOMIC_RELEASE);
-        return true;
+        for (;;) {
+            unsigned head = *cq_head_;
+            unsigned tail = __atomic_load_n(cq_tail_, __ATOMIC_ACQUIRE);
+            if (head == tail) return false;
+            unsigned idx = head & *cq_mask_;
+            int r = cqes_[idx].res;
+            unsigned long long ud = cqes_[idx].user_data;
+            __atomic_store_n(cq_head_, head + 1, __ATOMIC_RELEASE);
+            if (ud == SENTINEL_UD) continue;    // sentinel: skip
+            *res = r;
+            *user_data = (int)ud;
+            return true;
+        }
+    }
+
+    // v25.2: roll back SQEs appended to the submission queue but never
+    // handed to the kernel (leader bail-out path). Without this, stale
+    // SQEs from an abandoned batch — holding pointers into a dead
+    // stack-scoped batch_buf — would be submitted with the NEXT batch.
+    virtual void discard_pending() {
+        if (!available_ || !sq_tail_ || pending_sqes_ == 0) return;
+        __atomic_store_n(sq_tail_, *sq_tail_ - pending_sqes_, __ATOMIC_RELEASE);
+        pending_sqes_ = 0;
+        pending_sentinels_ = 0;
+    }
+
+    // v25.2: reap every CQE currently in the ring (sentinels included).
+    // Called on the CQE-failure path so nothing from this batch lingers
+    // into the next batch's pops.
+    virtual int drain_cqes() {
+        if (!available_ || !cq_head_ || !cq_tail_) return 0;
+        int n = 0;
+        for (;;) {
+            unsigned head = *cq_head_;
+            unsigned tail = __atomic_load_n(cq_tail_, __ATOMIC_ACQUIRE);
+            if (head == tail) break;
+            __atomic_store_n(cq_head_, head + 1, __ATOMIC_RELEASE);
+            ++n;
+        }
+        return n;
     }
 
 protected:
@@ -1308,7 +1479,24 @@ protected:
 
     int ring_fd_;
     bool available_;
-    struct io_uring_params params_;
+    struct io_uring_params params_{};
+
+    // v25.2 runtime feature flags (see the section header comment).
+    bool coop_taskrun_ = false;   // IORING_SETUP_COOP_TASKRUN active
+    bool fixed_buf_ = false;      // registered bounce buffer active
+    bool fixed_files_ = false;    // registered file slot 0 active
+    bool link_timeout_ = false;   // LINK_TIMEOUT deadlines active
+    size_t bounce_sz_ = 0;
+    void* bounce_ = nullptr;      // page-aligned, registered when fixed_buf_
+    int reg_fd_ = -1;             // fd currently occupying file slot 0
+    unsigned deadline_ms_ = kDefaultDeadlineMs;
+
+    // v25.2 logical<->physical SQE/CQE translation bookkeeping.
+    static constexpr unsigned long long SENTINEL_UD = 0x7C7C7C7C7C7C7C7Cull;
+    unsigned pending_sqes_ = 0;      // SQEs appended since the last enter
+    unsigned pending_sentinels_ = 0; // of those, LINK_TIMEOUT sentinels
+    CkvTimespec ts_{};               // deadline timespec for the live chain
+    std::string description_;
 
     void *sq_mmap_ = nullptr;
     struct io_uring_sqe *sqes_ = nullptr;
@@ -1324,6 +1512,201 @@ protected:
     unsigned *cq_tail_ = nullptr;
     unsigned *cq_mask_ = nullptr;
     struct io_uring_cqe *cqes_ = nullptr;
+
+    // Append a zeroed SQE and advance the tail. Returns nullptr only if
+    // the ring is full (defensive; the leader serializes batches of at
+    // most 3 SQEs against a 64-entry ring, so it cannot happen).
+    struct io_uring_sqe* next_sqe() {
+        if (!available_) return nullptr;
+        unsigned head = __atomic_load_n(sq_head_, __ATOMIC_ACQUIRE);
+        unsigned tail = *sq_tail_;
+        if (tail - head >= params_.sq_entries) return nullptr;  // full
+        unsigned idx = tail & *sq_mask_;
+        struct io_uring_sqe* s = &sqes_[idx];
+        memset(s, 0, sizeof(*s));
+        sq_array_[idx] = idx;
+        __atomic_store_n(sq_tail_, tail + 1, __ATOMIC_RELEASE);
+        return s;
+    }
+
+private:
+    static constexpr unsigned kRingEntries = 64;
+    static constexpr unsigned kCqEntries   = 128;
+
+    // Setup ladder: COOP_TASKRUN|CQSIZE -> CQSIZE -> plain -> unavailable.
+    // Returns 0 on success (available_ = true), -1 otherwise.
+    int setup_ring() {
+        struct { unsigned flags; bool coop; } attempts[] = {
+            { IORING_SETUP_CQSIZE | IORING_SETUP_COOP_TASKRUN, true  },
+            { IORING_SETUP_CQSIZE,                             false },
+            { 0,                                               false },
+        };
+        for (const auto& a : attempts) {
+            memset(&params_, 0, sizeof(params_));
+            params_.flags = a.flags;
+            if (a.flags & IORING_SETUP_CQSIZE) params_.cq_entries = kCqEntries;
+            ring_fd_ = syscall(__NR_io_uring_setup, kRingEntries, &params_);
+            if (ring_fd_ >= 0) { coop_taskrun_ = a.coop; break; }
+        }
+        if (ring_fd_ < 0) return -1;
+
+        unsigned sq_entries = params_.sq_entries;
+        unsigned cq_entries = params_.cq_entries;
+
+        sq_sz_ = params_.sq_off.array + sq_entries * sizeof(unsigned);
+        sq_mmap_ = mmap(NULL, sq_sz_, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, ring_fd_, IORING_OFF_SQ_RING);
+        if (sq_mmap_ == MAP_FAILED) { ring_fd_ = -1; return -1; }
+
+        sqe_sz_ = sq_entries * sizeof(struct io_uring_sqe);
+        sqes_ = (struct io_uring_sqe*)mmap(NULL, sqe_sz_, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, ring_fd_, IORING_OFF_SQES);
+        if (sqes_ == MAP_FAILED) { ring_fd_ = -1; return -1; }
+
+        cq_sz_ = params_.cq_off.cqes + cq_entries * sizeof(struct io_uring_cqe);
+        cq_mmap_ = mmap(NULL, cq_sz_, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, ring_fd_, IORING_OFF_CQ_RING);
+        if (cq_mmap_ == MAP_FAILED) { ring_fd_ = -1; return -1; }
+
+        sq_head_ = (unsigned*)((char*)sq_mmap_ + params_.sq_off.head);
+        sq_tail_ = (unsigned*)((char*)sq_mmap_ + params_.sq_off.tail);
+        sq_mask_ = (unsigned*)((char*)sq_mmap_ + params_.sq_off.ring_mask);
+        sq_array_ = (unsigned*)((char*)sq_mmap_ + params_.sq_off.array);
+
+        cq_head_ = (unsigned*)((char*)cq_mmap_ + params_.cq_off.head);
+        cq_tail_ = (unsigned*)((char*)cq_mmap_ + params_.cq_off.tail);
+        cq_mask_ = (unsigned*)((char*)cq_mmap_ + params_.cq_off.ring_mask);
+        cqes_ = (struct io_uring_cqe*)((char*)cq_mmap_ + params_.cq_off.cqes);
+
+        available_ = true;
+        return 0;
+    }
+
+    // Registered-bounce-buffer ladder: 256 KiB -> 64 KiB -> none.
+    // ENOMEM/EAGAIN (RLIMIT_MEMLOCK too small for this size) falls
+    // through to the next size; any other error stops the ladder.
+    int register_buffers_ladder() {
+        static const size_t kSizes[] = { 256 * 1024, 64 * 1024 };
+        for (size_t sz : kSizes) {
+            void* b = aligned_alloc(4096, sz);
+            if (!b) continue;
+            memset(b, 0, sz);
+            struct iovec iov;
+            iov.iov_base = b;
+            iov.iov_len = sz;
+            if (syscall(__NR_io_uring_register, ring_fd_, CKV_REG_BUFFERS, &iov, 1) == 0) {
+                bounce_ = b;
+                bounce_sz_ = sz;
+                fixed_buf_ = true;
+                return 0;
+            }
+            free(b);
+            if (errno != ENOMEM && errno != EAGAIN) return -1;
+        }
+        return -1;   // plain WRITE for every batch (still correct)
+    }
+
+    // One-shot probe for LINK_TIMEOUT support: write one byte to
+    // /dev/null under a 1 ms hard-linked deadline. Vanilla kernels disarm
+    // the timer when the write completes (sentinel CQE -ECANCELED);
+    // vendor-hardened kernels that reject timeout-class ops return
+    // -EINVAL (sentinel or write CQE) and we stay deadline-less.
+    void probe_link_timeout() {
+        int probe_fd = ::open("/dev/null", O_WRONLY);
+        if (probe_fd < 0) return;            // cannot probe -> deadline-less
+        char one = 'x';
+        CkvTimespec ts{0, 1000000};          // 1 ms
+        int wr = -999, sent = -999;
+        struct io_uring_sqe* w = next_sqe();
+        struct io_uring_sqe* t = next_sqe();
+        if (w && t) {
+            w->opcode = IORING_OP_WRITE; w->fd = probe_fd;
+            w->addr = (unsigned long)&one; w->len = 1; w->off = 0;
+            w->user_data = 1; w->flags = CKV_SQE_HARDLINK;
+            t->opcode = CKV_OP_LINK_TIMEOUT;
+            t->addr = (unsigned long)&ts;
+            t->user_data = SENTINEL_UD;
+            t->flags = 0;                    // end of chain
+            pending_sqes_ = 2; pending_sentinels_ = 1;
+            (void)enter_internal(2, 2, IORING_ENTER_GETEVENTS);
+            for (;;) {
+                unsigned head = *cq_head_;
+                unsigned tail = __atomic_load_n(cq_tail_, __ATOMIC_ACQUIRE);
+                if (head == tail) break;
+                unsigned idx = head & *cq_mask_;
+                unsigned long long ud = cqes_[idx].user_data;
+                int r = cqes_[idx].res;
+                __atomic_store_n(cq_head_, head + 1, __ATOMIC_RELEASE);
+                if (ud == 1) wr = r;
+                else if (ud == SENTINEL_UD) sent = r;
+            }
+            // Classify: supported iff the write completed (or was
+            // canceled BY the deadline) with a well-formed timer CQE.
+            if (wr >= 0 && sent == -ECANCELED) link_timeout_ = true;
+            else if (wr == -ECANCELED && (sent == -ETIME || sent == -ECANCELED))
+                link_timeout_ = true;
+        }
+        pending_sqes_ = 0;
+        pending_sentinels_ = 0;
+        ::close(probe_fd);
+    }
+
+    // Register `fd` into file slot 0 (first use) or swap the slot when
+    // the WAL rotates segments. Returns false if the (re)registration
+    // failed and the caller should drop to plain-fd SQEs.
+    bool ensure_file_registered(int fd) {
+        if (fd == reg_fd_) return true;
+        if (reg_fd_ >= 0)
+            (void)syscall(__NR_io_uring_register, ring_fd_, CKV_UNREG_FILES, NULL, 0);
+        int fds[1] = { fd };
+        if (syscall(__NR_io_uring_register, ring_fd_, CKV_REG_FILES, fds, 1) != 0)
+            return false;
+        reg_fd_ = fd;
+        return true;
+    }
+
+    // Shared enter path: logical->physical translation + EINTR retry.
+    // The wait count is derived from pending_sqes_ — every appended SQE
+    // produces exactly one CQE (hard-linked chains guarantee this) — NOT
+    // from the caller's logical min_complete, which counts only write+fsync
+    // and would under-count probe-style chains (write+sentinel only) by
+    // waiting for a CQE that can never arrive.
+    // pending counters are reset after the syscall regardless of result.
+    int enter_internal(int to_submit, int min_complete, unsigned flags) {
+        (void)to_submit;      // the kernel consumes every appended SQE
+        (void)min_complete;   // see above — pending_sqes_ is authoritative
+        int phys = (int)pending_sqes_;
+        int ret = 0;
+        do {
+            ret = syscall(__NR_io_uring_enter, ring_fd_, phys, phys,
+                          flags | IORING_ENTER_GETEVENTS, NULL, 0);
+        } while (ret < 0 && errno == EINTR);   // v25.2 robustness fix 4
+        pending_sqes_ = 0;
+        pending_sentinels_ = 0;
+        return ret;
+    }
+
+    void build_description() {
+        std::string d = "io_uring: sq=";
+        d += std::to_string((int)params_.sq_entries);
+        d += " cq=";
+        d += std::to_string((int)params_.cq_entries);
+        d += coop_taskrun_ ? " coop_taskrun=1" : " coop_taskrun=0";
+        if (fixed_buf_) {
+            d += " fixed_buf=";
+            d += std::to_string((unsigned)(bounce_sz_ / 1024));
+            d += "K";
+        } else {
+            d += " fixed_buf=0";
+        }
+        d += " fixed_files=lazy";
+        d += " write_fdatasync_chain=1";
+        if (link_timeout_) {
+            d += " deadline=";
+            d += std::to_string(deadline_ms_);
+            d += "ms";
+        } else {
+            d += " deadline=off";
+        }
+        description_ = d;
+    }
 };
 
 // ============================================================================
@@ -1412,6 +1795,21 @@ public:
             return true;
         }
         return false;
+    }
+
+    // v25.2: reset the mock's per-batch CQE state so an abandoned batch
+    // can never leak its (canned) results into the next batch's pops —
+    // mirrors what the real ring's drain/discard now guarantee.
+    void discard_pending() override {
+        mock_write_popped_ = false;
+        mock_fsync_popped_ = false;
+    }
+
+    int drain_cqes() override {
+        int n = (mock_write_popped_ ? 0 : 1) + (mock_fsync_popped_ ? 0 : 1);
+        mock_write_popped_ = false;
+        mock_fsync_popped_ = false;
+        return n;
     }
 
     // Getters for test verification.
@@ -2092,19 +2490,38 @@ public:
                     batch_bytes += frame.size();
                 }
 
-                // v25.1 M2: try io_uring write+fsync, fallback to sync pwrite.
+                // v25.2: try io_uring write+fsync, fallback to sync pwrite.
+                // The wrapper builds ONE hard-linked SQE chain per batch:
+                //   WRITE/WRITE_FIXED -> [LINK_TIMEOUT 500ms] -> FSYNC(DATASYNC)
+                // so the write is guaranteed to complete before the fsync
+                // starts (independent SQEs have no ordering guarantee),
+                // the whole batch needs a single io_uring_enter, and a
+                // stuck write is canceled after the 500 ms deadline —
+                // sending this leader down the offset-pinned fallback.
                 bool used_iouring = false;
                 if (iouring_ && iouring_->available()) {
                     // Submit write at batch_start (positioned, not append).
-                    iouring_->submit_write(active_fd_, batch_buf.data(),
-                                           batch_buf.size(), batch_start, 1);
-                    iouring_->submit_fsync(active_fd_, 2);
+                    // v25.2: a -1 return (defensive: ring full / degraded)
+                    // must NOT be ignored — a batch whose write SQE was not
+                    // appended must never be marked used_iouring.
+                    int wsub = iouring_->submit_write(active_fd_, batch_buf.data(),
+                                                      batch_buf.size(), batch_start, 1);
+                    int fsub = (wsub >= 0) ? iouring_->submit_fsync(active_fd_, 2) : -1;
+                    if (wsub < 0 || fsub < 0) {
+                        iouring_->discard_pending();
+                        iouring_->drain_cqes();
+                    }
 
                     // CQE-wait hook (for deterministic testing).
                     if (cqe_wait_hook_) cqe_wait_hook_();
 
                     if (leader_timed_out_.load(std::memory_order_acquire)) {
                         used_iouring = false;
+                        // v25.2: roll back the unsubmitted SQEs — they hold
+                        // pointers into batch_buf, which dies at the end of
+                        // this scope (previously they lingered in the ring
+                        // and the NEXT batch would submit them).
+                        iouring_->discard_pending();
                     } else {
                         int ret = iouring_->enter_with_timeout(2, 2, 500);
                         if (ret > 0) {
@@ -2117,9 +2534,15 @@ public:
                             } else {
                                 used_iouring = false;  // io_uring failed → fallback
                                 last_batch_used_iouring_.store(false, std::memory_order_relaxed);
+                                // v25.2: reap any remaining CQEs so nothing
+                                // from THIS batch lingers into the next one.
+                                iouring_->drain_cqes();
                             }
                         } else {
                             used_iouring = false;  // timeout/error → fallback
+                            // v25.2: a failed enter permanently degrades the
+                            // ring (see IoUring::enter); drain any late CQEs.
+                            iouring_->drain_cqes();
                         }
                     }
                 }

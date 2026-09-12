@@ -25,9 +25,15 @@ Current version: **0.25.2** (`CHRONOKV_VERSION` in `chronokv.hpp`).
 - **Three durability modes** — `Sync` (fsync per commit), `Group`
   (default; batched fsync, durable against power loss), `Async`
   (durable against process crash only).
-- **io_uring WAL writes** — kernel io_uring with automatic runtime
-  detection and a sync `pwrite` fallback where io_uring is unavailable
-  (e.g. seccomp-restricted containers).
+- **io_uring WAL writes** — modern kernel io_uring backend with a
+  runtime feature ladder: probed `IORING_SETUP_COOP_TASKRUN` rings
+  (5.19+), registered fixed buffers (`WRITE_FIXED`, sized to
+  `RLIMIT_MEMLOCK`), registered fixed file slots, one hard-linked
+  `write -> [LINK_TIMEOUT 500 ms] -> fdatasync` SQE chain per durability
+  batch (guaranteed write-before-fsync ordering, a single
+  `io_uring_enter`, kernel-enforced deadline), plus a sync `pwrite`
+  fallback wherever io_uring is unavailable (e.g. seccomp-restricted
+  containers, `CKV_IOURING_DISABLED` compile-out).
 - **Paged B+ tree index** — 4 KiB pages with a 256 MiB (configurable)
   page pool, per-page shared latches, hazard pointers, and incremental
   range-scan cursors.
@@ -44,7 +50,7 @@ Current version: **0.25.2** (`CHRONOKV_VERSION` in `chronokv.hpp`).
 ## Requirements
 
 - Linux (uses `io_uring`, `flock`, `fork`-based tests)
-- C++20 compiler — tested with g++ 14.2 and g++ 15.2 (CI runs g++ 13+)
+- C++20 compiler — tested with g++ 12/13/14, clang 18, g++ 15.2
 - pthreads
 
 ## Quick start
@@ -148,7 +154,7 @@ flavors:
 ```sh
 make release    # -O2, full test suite
 make asan       # ASan + UBSan, full test suite
-make tsan       # TSan (see batching below)
+make tsan       # TSan, full suite in one run
 make stress     # deterministic stress mode (seeded RNG)
 
 make smoke_off_release   # public-API-only smoke (no test hooks)
@@ -164,31 +170,45 @@ Useful variables:
 ```sh
 make asan CXX=g++-14                 # pick a compiler
 make release CKV_EXTRA_DEFS="-DCKV_IOURING_DISABLED"   # force pwrite fallback
-make tsan TSAN_BATCH=2               # TSan test batch (below)
 ```
 
-**TSan batching** — the full suite under TSan is slow on small VMs, so the
-test binary supports `CHRONOKV_TSAN_BATCH`:
+**TSan** — v25.2 removed the old `CHRONOKV_TSAN_BATCH` split: `make tsan`
+runs the full suite as a single step (`build/tsan/test`), and CI runs it
+as one job. The batch mechanism was a workaround for 2-CPU dev VMs;
+CI runners complete the whole suite comfortably within one job.
 
-| Batch | Contents |
-| --- | --- |
-| `0` (default) | full suite |
-| `1` | M1.6/M1.5 self-tests (async, batch, observer, stream) |
-| `2` | early engine tests (concurrent SSI, phantom, WAL, recovery) |
-| `3` | standalone tree tests (page pool, B+ tree fuzz, cursors) |
+**io_uring backend** — the wrapper self-configures at runtime (no build
+flags needed) and prints its feature summary at the top of the test run:
 
-Each batch builds into `build/tsan_b<N>/` so switching batches always
-triggers a rebuild. CI runs batches 1–3 as parallel jobs.
+```
+io_uring: sq=64 cq=128 coop_taskrun=1 fixed_buf=256K fixed_files=lazy write_fdatasync_chain=1 deadline=500ms
+```
+
+Every feature degrades independently: kernels without `COOP_TASKRUN`
+(< 5.19) get a plain ring; a small `RLIMIT_MEMLOCK` shrinks the
+registered bounce buffer (256 KiB -> 64 KiB -> none); kernels that
+reject `LINK_TIMEOUT` (some vendor-hardened 5.10s) run deadline-less
+chains; and if the ring cannot be created at all (or
+`CKV_IOURING_DISABLED` is defined) every batch uses the sync
+`pwrite`+`fsync` fallback. The test suite includes a real-kernel
+end-to-end assertion (`iouring-real`) that runs wherever io_uring is
+available and skips otherwise.
 
 ## CI
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push
-and pull request:
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push,
+pull request, and manual dispatch:
 
-- **hooks-on matrix**: `release`, `asan`, `stress` — full internal test suite
-- **TSan matrix**: batches 1, 2, 3 in parallel
-- **hooks-off matrix**: public-API smoke under `release` and `asan` —
-  proves the header is usable without any test hooks defined
+- **hooks-on matrix**: `release` (g++-13, g++-14, clang++-18), `asan+ubsan`,
+  `stress`, `release (g++-12)` on ubuntu-22.04 (older 5.15 kernel —
+  exercises the io_uring fallback ladder), and `release` with
+  `CKV_IOURING_DISABLED` (sync-fallback compile-out path)
+- **TSan**: the full suite in a single job
+- **hooks-off matrix**: public-API smoke under `release`, `asan+ubsan`,
+  `tsan`, and `stress` — proves the header is usable without any test
+  hooks defined
+- **`ci-passed` gate**: aggregates every job into one required check for
+  branch protection
 
 ## Architecture
 
@@ -196,7 +216,9 @@ and pull request:
 
 1. **CRC / I/O primitives** — CRC-32, checked I/O helpers, fault injection
 2. **WAL framing** — record encoding/decoding, strict parsers
-3. **io_uring wrapper** — runtime probed; falls back to sync `pwrite`
+3. **io_uring wrapper** — runtime feature ladder (COOP_TASKRUN ring, registered
+   buffers/files, linked write→fdatasync chain with kernel deadline);
+   every step falls back independently, down to sync `pwrite`
 4. **WalSegments** — segmented WAL, group commit, torn-tail recovery
 5. **PublicationTracker / PhantomTracker** — commit visibility watermark;
    SSI phantom detection over scan ranges

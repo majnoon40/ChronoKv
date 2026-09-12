@@ -401,16 +401,9 @@ return 0;
 #endif
 
 #ifdef CHRONOKV_TEST_HOOKS
-    // v25.1 M1.6: batch selection for TSan (the 2-CPU VM can't complete the
-    // full suite under TSan before timeout). CHRONOKV_TSAN_BATCH=N selects
-    // which subset of tests runs. Default (no define) = all tests.
-    //   Batch 0 = all tests (full suite).
-    //   Batch 1 = skip early engine tests, run M1.6/M1.5 self-tests only.
-    //   Batch 2 = early engine tests only (concurrent SSI, phantom, etc.).
-    //   Batch 3 = M0 standalone tree tests (page pool, btree fuzz, cursor, concurrent cursor).
-    #ifndef CHRONOKV_TSAN_BATCH
-    #define CHRONOKV_TSAN_BATCH 0  // 0 = all tests
-    #endif
+    // v25.2: TSan runs the FULL suite as a single step (the former
+    // CHRONOKV_TSAN_BATCH 1/2/3 split was a workaround for tiny dev VMs;
+    // CI runners complete the whole suite comfortably within one job).
     // ----- hooks-on: full internal test suite -----
     crc_init();
 #ifdef CHRONOKV_STRESS
@@ -425,17 +418,28 @@ return 0;
 
 // v25.1 M1.6: early engine tests run in batch 0 (all) or batch 2 (early only).
 // Skipped in batch 1 (self-tests only) and batch 3 (standalone tree only).
-#if CHRONOKV_TSAN_BATCH == 0 || CHRONOKV_TSAN_BATCH == 2
-    std::cout << "v25.1 M2 — io_uring availability check\n";
+#if 1 // v25.2: early engine tests — always on (TSan batch split removed)
+    std::cout << "v25.2 — io_uring availability check\n";
     {
-        // v25.1 M2: runtime io_uring availability check.
-        // Tests io_uring_setup + a real IORING_OP_WRITE (not just NOP —
-        // NOP may succeed even when file I/O is blocked by seccomp).
-        // Respects CKV_IOURING_DISABLED (the container workaround flag).
+        // v25.2: feature summary of the modernized wrapper (setup ladder,
+        // registered buffers/files, linked write->fdatasync chain, kernel
+        // deadline). The wrapper is silent by itself; the test prints it.
+        //
+        // v25.1 M2: runtime io_uring availability check with a real
+        // IORING_OP_WRITE (not just NOP — NOP may succeed even when file
+        // I/O is blocked by seccomp). Respects CKV_IOURING_DISABLED (the
+        // container workaround flag).
 #ifdef CKV_IOURING_DISABLED
         std::cout << "  io_uring: DISABLED via CKV_IOURING_DISABLED (container workaround)\n"
                   << "  Sync pwrite fallback will be used. Mock tests still run.\n";
 #else
+        {
+            chronokv_iouring::IoUring feature_probe;
+            if (feature_probe.available())
+                std::cout << "  " << feature_probe.describe() << "\n";
+            else
+                std::cout << "  io_uring: ring setup failed (sync fallback)\n";
+        }
         struct io_uring_params p;
         memset(&p, 0, sizeof(p));
         int ring_fd = syscall(__NR_io_uring_setup, 4, &p);
@@ -495,9 +499,8 @@ return 0;
                   << "\n";
         if (!io_ok) {
             std::cout << "  NOTE: io_uring I/O ops are blocked on this platform.\n"
-                      << "  The mock-backed state-machine tests still run, but the real\n"
-                      << "  io_uring path is not exercised. End-to-end real-kernel\n"
-                      << "  verification remains outstanding.\n";
+                      << "  The mock-backed state-machine tests still run, and the\n"
+                      << "  real-kernel end-to-end test will SKIP (not fail).\n";
         }
 #endif // CKV_IOURING_DISABLED
     }
@@ -5669,21 +5672,16 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
 }
 
 #endif // CHRONOKV_TEST_HOOKS (inner: v23 Phase A / Phase D / Fix 12 section)
-#endif // CHRONOKV_TSAN_BATCH == 0 || 2 (early engine tests)
+#endif // v25.2 (early engine tests — always on)
 
     // v25.1 M0/M1 self-tests (page pool, B+ tree fuzz, depth test, latency, cursor, concurrent).
-    // M1.6: batch-gated for TSan (CHRONOKV_TSAN_BATCH).
-    // Batch 0 (all) or 3 (standalone tree): page pool, btree fuzz, cursor, concurrent cursor
-    #if CHRONOKV_TSAN_BATCH == 0 || CHRONOKV_TSAN_BATCH == 3
     fails += run_page_pool_selftest();
     fails += run_btree_fuzz();
     fails += run_btree_depth_test();
     fails += run_latency_selftest();
     fails += run_cursor_test();
     fails += run_concurrent_cursor_test();
-    #endif
-    // Batch 0 (all) or 1 (self-tests only): M1.6 Phase 1 + M1.5 async/batch/observer/stream
-    #if CHRONOKV_TSAN_BATCH == 0 || CHRONOKV_TSAN_BATCH == 1
+    // M1.6 Phase 1 + M1.5 async/batch/observer/stream
     fails += run_m16_phase1_test();
     fails += run_m2_phase1_test();
     fails += run_m2_phase2_test();
@@ -5691,11 +5689,8 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     fails += run_async_test();
     fails += run_batch_test();
     fails += run_observer_test();
-    #endif
-    #if CHRONOKV_TSAN_BATCH == 0
-    // Full suite only (not batched): async benchmark (skips under sanitizer anyway)
+    // async benchmark (skips under sanitizer anyway)
     fails += run_async_benchmark();
-    #endif
 
 diag::dump();
     std::cout << (fails == 0 ? "\nV25.1 - ALL TESTS PASSED\n"
@@ -6824,11 +6819,46 @@ static int run_m2_phase2_test() {
         // real test is that recovery succeeds, which it did above).
     }
 
+    // Test 5 (v25.2): REAL kernel io_uring end-to-end — the gap the old
+    // suite called "outstanding". Uses the production WalSegments IoUring
+    // (feature ladder: WRITE_FIXED via registered bounce buffer,
+    // registered file slot, hard-linked write->fdatasync chain, kernel
+    // deadline when supported). Asserts the batch actually USED io_uring
+    // and the data is durable across a reopen. On platforms where
+    // io_uring is unavailable/blocked the test SKIPS (prints SKIP, no
+    // fail) — CI runs it for real on Linux 5.15/6.x runners.
+    {
+        chronokv_iouring::IoUring availability_probe;
+        if (!availability_probe.available()) {
+            std::cout << "   iouring-real: SKIP (io_uring unavailable on this platform)\n";
+        } else {
+            const std::string wd = "/tmp/v25_m2_iouring_real";
+            std::filesystem::remove_all(wd);
+            chronokv::Options opts;
+            opts.wal_dir = wd;
+            opts.auto_start_gc = false;
+            opts.recover_on_open = false;
+            auto db = Database::open(opts);
+            db.put("rk1", "rv1");
+            db.put("rk2", "rv2");
+            const bool used = db.last_batch_used_iouring();
+            db.close();
+            opts.recover_on_open = true;
+            auto db2 = Database::open(opts);
+            const bool recovered = db2.get("rk1").has_value() && *db2.get("rk1") == "rv1"
+                                && db2.get("rk2").has_value() && *db2.get("rk2") == "rv2";
+            check("iouring-real: durability batch used io_uring", used);
+            check("iouring-real: data durable after reopen", recovered);
+            db2.close();
+        }
+    }
+
     // Cleanup
     std::filesystem::remove_all("/tmp/v25_m2_iouring_success");
     std::filesystem::remove_all("/tmp/v25_m2_iouring_fail");
     std::filesystem::remove_all("/tmp/v25_m2_iouring_timeout");
     std::filesystem::remove_all("/tmp/v25_m2_iouring_offset");
+    std::filesystem::remove_all("/tmp/v25_m2_iouring_real");
 
     if (fails == 0) std::cout << "   M2 PHASE 2 TEST PASSED\n";
     return fails;

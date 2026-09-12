@@ -1,16 +1,29 @@
 # ChronoKV CI — two-file project (chronokv.hpp + main.cpp), so every job is:
 #   checkout -> make <target> -> run the test binary (exit code 0 = pass).
 #
-# Matrix mirrors the developer's four-config sanitizer validation:
-#   hooks-on:  release / asan (ASan+UBSan) / stress, full internal suite
-#   tsan:      full suite is too slow on small VMs, so it is split into the
-#              three CHRONOKV_TSAN_BATCH subsets (1/2/3), run in parallel
-#   hooks-off: public-API smoke (release + asan) — proves the header works
-#              with no test hooks defined, i.e. how a real user consumes it
+# v25.2 matrix (expanded):
+#   hooks-on:  release (g++-13 / g++-14 / clang++-18), asan (ASan+UBSan),
+#              stress, and ONE tsan job running the FULL suite (the former
+#              3-batch split was removed — see Makefile/main.cpp).
+#              Plus:
+#                - release (g++-12) on ubuntu-22.04: older kernel (5.15) +
+#                  older compiler — exercises the io_uring feature-ladder
+#                  fallbacks (no COOP_TASKRUN pre-5.19) and g++-12
+#                  portability, the class of bug the g++-13 fix found.
+#                - release with CKV_IOURING_DISABLED: proves the sync
+#                  pwrite+fsync fallback build stays green when a container
+#                  blocks io_uring (the documented compile-out path).
+#   hooks-off: public-API smoke across release / asan / tsan / stress —
+#              proves the header works with no test hooks defined, i.e.
+#              how a real user consumes it.
+#   gate:      ci-passed aggregates every job — a single required check
+#              for branch protection.
 #
-# io_uring: builds use the default (real io_uring attempted). The test
-# binary probes io_uring at runtime and falls back to sync pwrite with a
-# NOTE if the platform blocks it — that path is expected to stay green.
+# io_uring: every default build attempts real io_uring. The test binary
+# probes the ring at runtime, prints the feature summary
+# (coop_taskrun / fixed_buf / fixed_files / deadline), runs the mock-backed
+# state-machine tests, and runs the real-kernel end-to-end test when the
+# ring is available (SKIP otherwise).
 name: CI
 
 on:
@@ -18,6 +31,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -27,29 +41,55 @@ jobs:
   # ---- hooks-on: full internal test suite --------------------------------
   engine-tests:
     name: ${{ matrix.name }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: release (g++-13)
+            os: ubuntu-24.04
             target: release
             bin: build/release/test
             cxx: g++
           - name: release (g++-14)
+            os: ubuntu-24.04
             target: release
             bin: build/release/test
             cxx: g++-14
             install: g++-14
+          - name: release (clang++-18)
+            os: ubuntu-24.04
+            target: release
+            bin: build/release/test
+            cxx: clang++-18
+            install: clang-18
           - name: asan+ubsan
+            os: ubuntu-24.04
             target: asan
             bin: build/asan/test
             cxx: g++
           - name: stress
+            os: ubuntu-24.04
             target: stress
             bin: build/stress/test
             cxx: g++
+          # Older kernel (5.15) + older default compiler: exercises the
+          # io_uring fallback ladder (no COOP_TASKRUN) and g++-12
+          # portability in one job.
+          - name: release (g++-12, ubuntu-22.04)
+            os: ubuntu-22.04
+            target: release
+            bin: build/release/test
+            cxx: g++
+          # Compile-out path for seccomp-confined containers: the sync
+          # pwrite+fsync fallback must stay fully functional.
+          - name: release (io_uring disabled)
+            os: ubuntu-24.04
+            target: release
+            bin: build/release/test
+            cxx: g++
+            extra_defs: -DCKV_IOURING_DISABLED
     steps:
       - uses: actions/checkout@v4
 
@@ -60,7 +100,7 @@ jobs:
           sudo apt-get install -y ${{ matrix.install }}
 
       - name: Build
-        run: make ${{ matrix.target }} CXX=${{ matrix.cxx }}
+        run: make ${{ matrix.target }} CXX=${{ matrix.cxx }} CKV_EXTRA_DEFS='${{ matrix.extra_defs }}'
 
       - name: Run tests
         run: |
@@ -71,35 +111,33 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-log-engine-${{ matrix.target }}-${{ matrix.cxx }}
+          name: test-log-engine-${{ matrix.target }}-${{ matrix.cxx }}-${{ matrix.os }}
           path: test.log
           if-no-files-found: ignore
 
-  # ---- hooks-on: TSan, split into the three test batches ------------------
+  # ---- hooks-on: TSan, the FULL suite as a single job (v25.2) ------------
+  # The former 3-batch split (CHRONOKV_TSAN_BATCH 1/2/3) was removed from
+  # main.cpp and the Makefile; one job now covers everything.
   tsan:
-    name: tsan batch ${{ matrix.batch }}
+    name: tsan (full suite)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        batch: [1, 2, 3]
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
       - name: Build
-        run: make tsan TSAN_BATCH=${{ matrix.batch }}
+        run: make tsan
 
       - name: Run tests
         run: |
           set -o pipefail
-          ./build/tsan_b${{ matrix.batch }}/test 2>&1 | tee test.log
+          ./build/tsan/test 2>&1 | tee test.log
 
       - name: Upload test log
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-log-tsan-b${{ matrix.batch }}
+          name: test-log-tsan-full
           path: test.log
           if-no-files-found: ignore
 
@@ -118,6 +156,12 @@ jobs:
           - name: asan+ubsan
             target: smoke_off_asan
             bin: build/smoke_off/asan/test
+          - name: tsan
+            target: smoke_off_tsan
+            bin: build/smoke_off/tsan/test
+          - name: stress
+            target: smoke_off_stress
+            bin: build/smoke_off/stress/test
     steps:
       - uses: actions/checkout@v4
 
@@ -136,3 +180,24 @@ jobs:
           name: test-log-smoke-${{ matrix.name }}
           path: test.log
           if-no-files-found: ignore
+
+  # ---- gate: single aggregate check for branch protection ----------------
+  ci-passed:
+    name: ci-passed
+    needs: [engine-tests, tsan, public-api-smoke]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: always()
+    steps:
+      - name: Check job results
+        run: |
+          results='${{ toJSON(needs) }}'
+          echo "$results" | python3 -c '
+          import json, sys
+          needs = json.load(sys.stdin)
+          failed = [name for name, j in needs.items() if j["result"] != "success"]
+          if failed:
+              print("FAILED jobs: " + ", ".join(failed))
+              sys.exit(1)
+          print("All jobs passed: " + ", ".join(needs.keys()))
+          '
