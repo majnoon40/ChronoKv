@@ -267,6 +267,19 @@ E1–E16 safety argument and the v24 fix log at the top of the file).
   below that). CI runners are fine; on small containers use
   `make release RELEASE_FLAGS="-O1 -g"`.
 
+## Roadmap
+
+[`docs/ROADMAP.md`](docs/ROADMAP.md) — the v26 → v30 plan: durability hardening
+(adversarial fsync semantics, randomized crash-point fuzzing), deterministic
+simulation testing, the dedicated WAL writer thread, B+ tree page reclamation,
+and API ergonomics. Each item carries its anchor, size, acceptance criteria and
+any new canonical invariant; the document also records where the plan itself
+turned out to be wrong.
+
+Canonical invariants are defined in `chronokv.hpp`'s header comment and
+referenced by ID throughout the roadmap (R1, I2, I3, I6, D1, D2, D3, R-REBASE,
+T1, B1, P1).
+
 ## License
 
 [MIT](LICENSE)
