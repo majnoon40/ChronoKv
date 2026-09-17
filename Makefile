@@ -20,6 +20,10 @@
 # removed — `make tsan` runs the FULL suite as one step. CI runners
 # complete it comfortably inside one job.
 
+# NOTE: the whole project is ONE translation unit (~17k lines). Building it
+# at -O2 needs well over 1 GiB of RSS -- below that, cc1plus is OOM-killed
+# ("g++: fatal error: Killed signal terminated program cc1plus"). On small
+# containers use:  make release RELEASE_FLAGS="-O1 -g"
 CXX      ?= g++
 CXXSTD    = -std=c++20
 WARN      = -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \

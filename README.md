@@ -7,10 +7,10 @@ serializable transactions, written as a single C++20 header
 (`chronokv.hpp`). It pairs a write-ahead log (WAL) with optional
 checkpointing for durability, serializable-snapshot-isolation (SSI)
 transactions with phantom detection, a paged B+ tree index, and
-io_uring-accelerated WAL writes — all in one ~8.6k-line header with no
-external dependencies.
+io_uring-accelerated WAL writes — all in one header with no external
+dependencies.
 
-Current version: **0.25.2** (`CHRONOKV_VERSION` in `chronokv.hpp`).
+Current version: **0.25.3** (`CHRONOKV_VERSION` in `chronokv.hpp`).
 
 ## Highlights
 
@@ -35,10 +35,13 @@ Current version: **0.25.2** (`CHRONOKV_VERSION` in `chronokv.hpp`).
   fallback wherever io_uring is unavailable (e.g. seccomp-restricted
   containers, `CKV_IOURING_DISABLED` compile-out).
 - **Paged B+ tree index** — 4 KiB pages with a 256 MiB (configurable)
-  page pool, per-page shared latches, hazard pointers, and incremental
-  range-scan cursors.
-- **Lock-free reclamation** — epoch-pinned deferred GC of old versions;
-  no GC-vs-scan lock contention on the read path.
+  page pool, per-page shared latches, and incremental range-scan cursors.
+  Hazard-pointer slots are maintained per tree and recycled (bounded by
+  peak cursor concurrency); page *reclamation* is not implemented yet —
+  see Known limitations.
+- **Lock-free reclamation of MVCC versions** — epoch-pinned deferred GC of
+  old *versions*; no GC-vs-scan lock contention on the read path. (This
+  covers version chains only, not B+ tree pages — see Known limitations.)
 - **Rich public API** — sync + async operations, atomic batches,
   prefix observers, streaming range scans, and read-only health/stats
   diagnostics.
@@ -234,6 +237,19 @@ E1–E16 safety argument and the v24 fix log at the top of the file).
 
 ## Known limitations
 
+- **No B+ tree page reclamation**: `PagePool::free()` has no callers and the
+  tree has no merge/rebalance — splits only ever add pages. The page pool is
+  therefore a **monotonic ceiling**: once it is exhausted
+  (`Options::page_pool_bytes`, 256 MiB by default) `alloc()` throws
+  `std::bad_alloc`, and delete-heavy workloads never get space back. Size the
+  pool for the index's *lifetime* high-water mark, not its current size.
+  Implementing leaf merge/rebalance (and wiring the existing hazard-pointer
+  slots into a real reclamation check) is the tracked follow-up.
+- **`~Transaction()` aborts the process** if the transaction is still active
+  and the `Database` is alive. This is deliberate (see Safety properties), but
+  it means an exception propagating out of a scope that holds a `Transaction`
+  will `SIGABRT` during unwinding. Always commit or abort explicitly, and
+  prefer an explicit `try`/`catch` around transactional scopes.
 - **Observer reentrancy**: callbacks run inline under the observer lock;
   re-entering the observer machinery from a callback deadlocks
   (tracked for a future dedicated notification thread).
@@ -242,6 +258,10 @@ E1–E16 safety argument and the v24 fix log at the top of the file).
 - **Single process**: the `flock` guard fails fast on accidental second
   openers; there is no multi-process mode.
 - **Linux only**: no macOS/Windows support.
+- **Compile memory**: the engine plus test suite is one ~17k-line translation
+  unit; building it at `-O2` needs well over 1 GiB of RAM (it is OOM-killed
+  below that). CI runners are fine; on small containers use
+  `make release RELEASE_FLAGS="-O1 -g"`.
 
 ## License
 

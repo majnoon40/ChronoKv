@@ -21,7 +21,10 @@
 // =====================================================================
 
 #include "chronokv.hpp"
+#include <atomic>
+#include <barrier>   // review regression tests (C1)
 #include <cassert>
+#include <chrono>    // review regression tests (watchdog deadlines)
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -60,7 +63,9 @@ static void smoke_check(const char* name, bool ok, const std::string& detail = "
 }
 
 // Returns 0 on success, nonzero on failure.
-static int run_public_api_smoke() {
+// [[maybe_unused]]: only the hooks-off build calls this; the hooks-on build
+// runs the full internal suite instead, which used to warn -Wunused-function.
+[[maybe_unused]] static int run_public_api_smoke() {
     std::cout << "public_api_smoke — minimal hooks-off build test" << std::endl;
     std::cout << "ChronoKV version: " << chronokv::CHRONOKV_VERSION << std::endl;
     std::cout << std::endl;
@@ -394,6 +399,258 @@ static int run_async_benchmark();
 // hooks-off (public-API smoke only) based on CHRONOKV_TEST_HOOKS.
 // =====================================================================
 
+#ifdef CHRONOKV_TEST_HOOKS   // uses Database test hooks; hooks-off has none
+
+// =====================================================================
+// Review regression tests (2026-09 code review of main @ 334fa57).
+//
+// These cover three defects that the pre-existing suite could not see,
+// because all three live in paths that only run when I/O fails or when
+// durability modes mix:
+//
+//   C1  WAL leader throws BEFORE lk.unlock(). The catch(...) cleanup
+//       relied on unique_lock::lock() being idempotent (it throws
+//       EDEADLK) and on a bare `throw;` outside the handler (that is
+//       std::terminate). Result: followers parked on batch_cv_ hung
+//       forever -- 7 of 8 concurrent committers, measured.
+//   H3  Mixed-durability handoff set cur_batch_ = nullptr and orphaned
+//       the in-flight batch; a later leader dereferenced a null
+//       shared_ptr in sort(batch->records...) -> SEGV at chronokv.hpp.
+//   H1  HPRegistry::register_hp() only ever push_back'd into a
+//       process-wide singleton, and BTree::range_scan() builds a Cursor
+//       per call: a measured ~40 byte permanent leak per range_scan.
+// =====================================================================
+static int run_review_regression_tests() {
+    int fails = 0;
+    auto report = [&](const char* n, bool ok, const std::string& fr = {}) {
+        std::cout << "   " << n << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) { fails++; if (!fr.empty()) std::cout << "    (" << fr << ")\n"; }
+    };
+
+    // ---- C1a: leader cleanup invariant (deterministic, no timing) ----
+    //
+    // The leader's contract is that leader_active_ is reset on EVERY exit
+    // path, including the exception path. Before the fix, an exception
+    // thrown while lk was still owned (segment-rotation failure) made the
+    // re-acquiring lk.lock() throw std::system_error(EDEADLK) -- because
+    // unique_lock::lock() is NOT idempotent, contrary to the old comment --
+    // which skipped the whole cleanup block and left leader_active_ true
+    // with every parked follower stranded forever.
+    //
+    // Asserting the invariant directly is timing-independent; the earlier
+    // "N threads race a failing rotation" formulation passed even against
+    // unfixed code, because the followers usually reached group_append after
+    // failed_ was already set and returned early instead of parking.
+    {
+        const std::string wd = "/tmp/ckv_rev_c1a";
+        std::filesystem::remove_all(wd);
+        bool ok = true;
+        std::string fr;
+#ifdef CHRONOKV_FAULT_INJECTION
+        try {
+            chronokv::Options opts;
+            opts.wal_dir = wd;
+            opts.auto_start_gc = false;
+            auto db = chronokv::Database::open(opts);
+
+            db.force_wal_rotation_for_test();
+            fault::arm(fault::Kind::SegOpenFail, 1);
+            chronokv::Status st = chronokv::Status::OK;
+            try { st = db.put("c1a", "v"); }
+            catch (const std::exception& e) { ok = false; fr = std::string("escaped: ") + e.what(); }
+            fault::disarm();
+
+            if (ok && st != chronokv::Status::WalFailure) {
+                ok = false; fr = "expected WalFailure, got " + std::to_string((int)st);
+            }
+            if (ok && !db.wal_failed_for_test()) {
+                ok = false; fr = "WAL did not enter fail-stop after the rotation failure";
+            }
+            if (ok && db.wal_leader_active_for_test()) {
+                ok = false;
+                fr = "leader_active_ still true after a leader exception -- cleanup was "
+                     "skipped, so any follower parked on batch_cv_ is stranded forever";
+            }
+        } catch (const std::exception& e) {
+            fault::disarm();
+            ok = false; fr = std::string("exception: ") + e.what();
+        }
+        report("review C1a: leader exception resets leader_active_ (cleanup not skipped)", ok, fr);
+#else
+        report("review C1a: leader cleanup invariant (needs fault injection)", true);
+#endif
+    }
+
+    // ---- C1b: an exception raised AFTER lk.unlock() must not terminate ----
+    //
+    // The old cleanup ended with a bare `throw;` executed OUTSIDE the
+    // catch(...) block. With no active exception that calls std::terminate.
+    // It was reachable whenever the leader threw while lk was UNOWNED --
+    // e.g. std::bad_alloc from batch_buf/wal_frame, exactly the scenario the
+    // v24 "Fix 2" comment cites. Run in a forked child (same pattern as the
+    // abort-on-drop test) because std::terminate takes the process down.
+    {
+        const std::string wd = "/tmp/ckv_rev_c1b";
+        std::filesystem::remove_all(wd);
+        bool ok = true;
+        std::string fr;
+        // Flush BEFORE forking: fork() duplicates the parent's unflushed
+        // stdout buffer into the child, and the child's flush below would
+        // then re-print everything the suite emitted so far.
+        std::cout.flush();
+        pid_t child = fork();
+        if (child < 0) {
+            ok = false; fr = "fork() failed";
+        } else if (child == 0) {
+            int rc = 3;
+            try {
+                chronokv::Options o;
+                o.wal_dir = wd;
+                o.auto_start_gc = false;
+                auto db = chronokv::Database::open(o);
+                db.set_leader_post_unlock_hook_for_test([] {
+                    throw std::runtime_error("injected post-unlock leader failure");
+                });
+                chronokv::Status st = db.put("c1b", "v");
+                rc = (st == chronokv::Status::WalFailure) ? 0 : 4;
+            } catch (...) {
+                rc = 5;
+            }
+            std::cout.flush();
+            _exit(rc);
+        } else {
+            int wst = 0;
+            if (waitpid(child, &wst, 0) != child) {
+                ok = false; fr = "waitpid failed";
+            } else if (WIFSIGNALED(wst)) {
+                ok = false;
+                fr = std::string("child died on signal ") + std::to_string(WTERMSIG(wst)) +
+                     (WTERMSIG(wst) == SIGABRT
+                        ? " (SIGABRT = std::terminate from `throw;` outside the handler)"
+                        : "");
+            } else if (WEXITSTATUS(wst) != 0) {
+                ok = false;
+                fr = "child exit " + std::to_string(WEXITSTATUS(wst)) +
+                     " (expected 0 = WalFailure returned cleanly)";
+            }
+        }
+        report("review C1b: post-unlock leader exception -> WalFailure, not std::terminate", ok, fr);
+    }
+
+    // NOTE: a third C1 variant ran 8 concurrent committers against a failing
+    // rotation. It was dropped from the suite: against UNFIXED code the wedged
+    // Database hangs in ~Database (after the test's own 30s deadline), so it
+    // would burn the whole CI job timeout instead of reporting FAIL. C1a
+    // already detects the same defect deterministically -- leader_active_
+    // stuck true IS the stranded-follower condition. The concurrent form is
+    // preserved as a standalone reproducer (see review notes).
+
+    // ---- H3: concurrent mixed-durability commits must not crash/hang ----
+    {
+        const std::string wd = "/tmp/ckv_rev_h3";
+        std::filesystem::remove_all(wd);
+        bool ok = true;
+        std::string fr;
+        try {
+            ChronoKV kv(wd);
+            std::atomic<bool> stop{false};
+            std::atomic<long> commits{0};
+
+            std::thread flipper([&] {
+                while (!stop.load(std::memory_order_relaxed)) {
+                    kv.set_durability(DurabilityMode::Async);
+                    kv.set_durability(DurabilityMode::Group);
+                }
+            });
+            std::vector<std::thread> ws;
+            for (int i = 0; i < 4; ++i) ws.emplace_back([&, i] {
+                long n = 0;
+                while (!stop.load(std::memory_order_relaxed)) {
+                    try { kv.commit("h3_" + std::to_string(i) + "_" + std::to_string(n++), "v");
+                          commits.fetch_add(1, std::memory_order_relaxed); }
+                    catch (...) {}
+                }
+            });
+
+            // Pre-fix this segfaulted (null shared_ptr) within ~3s.
+            long last = 0; int stalls = 0;
+            for (int i = 0; i < 10; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                long c = commits.load();
+                if (c == last) { if (++stalls >= 5) break; } else stalls = 0;
+                last = c;
+            }
+            stop = true;
+            flipper.join();
+            for (auto& w : ws) w.join();
+
+            long total = commits.load();
+            if (stalls >= 5) { ok = false; fr = "LIVELOCK: no commit progress for 1s (orphaned batch)"; }
+            else if (total < 100) { ok = false; fr = "only " + std::to_string(total) + " commits completed"; }
+        } catch (const std::exception& e) {
+            ok = false; fr = std::string("exception: ") + e.what();
+        }
+        report("review H3: concurrent mixed-durability commits -> no crash, no livelock", ok, fr);
+    }
+
+    // ---- H1: HP registry occupancy must stay bounded ----
+    {
+        bool ok = true;
+        std::string fr;
+        try {
+            using namespace chronokv_page;
+            using namespace chronokv_btree;
+            PagePool pool(8ULL * 1024 * 1024);
+            BTree tree(pool);
+            for (int i = 0; i < 500; ++i)
+                tree.put("k" + std::to_string(i), "v" + std::to_string(i));
+
+            // 20k sequential scans. Pre-fix this leaked one registry slot
+            // (~40 bytes) per scan, forever.
+            for (int i = 0; i < 20000; ++i) { auto r = tree.range_scan("k0", "k9"); (void)r; }
+            size_t after_serial = tree.hp_slot_count_for_test();
+
+            // Concurrent scans: slots may be checked out simultaneously, so
+            // the registry may hold a few -- but it must not scale with the
+            // number of scans performed.
+            std::vector<std::thread> ts;
+            for (int t = 0; t < 4; ++t) ts.emplace_back([&] {
+                for (int i = 0; i < 5000; ++i) { auto r = tree.range_scan("k0", "k9"); (void)r; }
+            });
+            for (auto& t : ts) t.join();
+            size_t after_conc = tree.hp_slot_count_for_test();
+            size_t in_use = tree.hp_in_use_for_test();
+
+            if (after_serial > 4) {
+                ok = false;
+                fr = "serial: 20000 range_scans left " + std::to_string(after_serial) +
+                     " registry slots (expected <= 4 -- slots must be recycled)";
+            } else if (after_conc > 64) {
+                ok = false;
+                fr = "concurrent: 20000 more range_scans left " + std::to_string(after_conc) +
+                     " slots (registry scaled with op count, not concurrency)";
+            } else if (in_use != 0) {
+                ok = false;
+                fr = std::to_string(in_use) + " slots still checked out after all cursors died";
+            }
+        } catch (const std::exception& e) {
+            ok = false; fr = std::string("exception: ") + e.what();
+        }
+        report("review H1: HP registry bounded by concurrency, not by scan count", ok, fr);
+    }
+
+    std::cout << (fails == 0 ? "   REVIEW REGRESSION TESTS PASSED\n"
+                             : "   REVIEW REGRESSION FAILURES: " + std::to_string(fails) + "\n");
+    return fails;
+}
+
+#endif // CHRONOKV_TEST_HOOKS (review regression tests)
+
+
+#ifdef CHRONOKV_TEST_HOOKS
+static int run_review_regression_tests();   // defined above main()
+#endif
+
 int main() {
 #ifdef CHRONOKV_BENCH
     run_bench();
@@ -401,6 +658,17 @@ return 0;
 #endif
 
 #ifdef CHRONOKV_TEST_HOOKS
+    // First step toward test selection (review M4): the suite is one long
+    // main() with no way to run a subset, which makes triaging a hang or a
+    // single failure slow. CKV_ONLY_REVIEW=1 runs just the review regression
+    // tests -- used to prove those tests actually fail against unfixed code.
+    if (getenv("CKV_ONLY_REVIEW")) {
+        crc_init();
+        int f = run_review_regression_tests();
+        std::cout.flush();
+        return f == 0 ? 0 : 1;
+    }
+
     // v25.2: TSan runs the FULL suite as a single step (the former
     // CHRONOKV_TSAN_BATCH 1/2/3 split was a workaround for tiny dev VMs;
     // CI runners complete the whole suite comfortably within one job).
@@ -5692,9 +5960,18 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     // async benchmark (skips under sanitizer anyway)
     fails += run_async_benchmark();
 
+    // Review regression tests (C1 leader-exception hang, H3 mixed-durability
+    // orphaned batch, H1 hazard-pointer registry leak).
+    fails += run_review_regression_tests();
+
 diag::dump();
-    std::cout << (fails == 0 ? "\nV25.1 - ALL TESTS PASSED\n"
-                        : "\nFAILURES: " + std::to_string(fails) + "\n");
+    // Was a hardcoded "V25.1" banner that drifted from CHRONOKV_VERSION
+    // (0.25.2). Print the real version so CI logs are unambiguous.
+    if (fails == 0)
+        std::cout << "\nChronoKV " << chronokv::CHRONOKV_VERSION
+                  << " - ALL TESTS PASSED\n";
+    else
+        std::cout << "\nFAILURES: " + std::to_string(fails) << "\n";
     return fails == 0 ? 0 : 1;
 
 #else // !CHRONOKV_TEST_HOOKS — hooks-off build: smoke test only.

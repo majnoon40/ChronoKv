@@ -1,4 +1,67 @@
 // chronokv.hpp — ChronoKV engine and public C++ API.
+//
+// v25.3 SHIPPED: correctness release from an external code review. No new
+// architecture; four defects fixed, each with a regression test that was
+// verified to FAIL against the unfixed code (see run_review_regression_tests
+// in main.cpp). All were invisible to the pre-existing suite because they
+// live in paths that only run when I/O fails or when durability modes mix.
+//
+//   C1  WalSegments::group_append leader error path — THREE stacked defects:
+//       (a) truncate_torn_tail() was documented "returns false on I/O error"
+//           but actually threw (std::ifstream underflow on an unreadable
+//           file); it is also called as (void), so the bool was discarded.
+//           Now noexcept, badbit-only exceptions, catch-all returns false.
+//       (b) the catch(...) cleanup re-acquired the lock with a bare
+//           lk.lock() and the comment claimed "unique_lock::lock() is
+//           idempotent if already locked". It is NOT: libstdc++ throws
+//           std::system_error(EDEADLK). An exception raised BEFORE
+//           lk.unlock() (segment-rotation failure) therefore escaped and
+//           skipped the whole v24 "Fix 2" cleanup, leaving leader_active_
+//           true with every follower parked on batch_cv_ forever — measured
+//           7 of 8 concurrent committers hung. Now `if (!lk.owns_lock())`.
+//       (c) `if (leader_threw) throw;` ran OUTSIDE the handler, so with no
+//           active exception it called std::terminate. Reachable today via
+//           any throw AFTER lk.unlock() (bad_alloc from batch_buf/wal_frame
+//           — the exact case Fix 2's comment cites). Now captures
+//           std::current_exception() and rethrows via rethrow_exception().
+//       Fixing (a)+(b) alone EXPOSES (c): the reproducer goes from "hang" to
+//       std::terminate. All three had to land together.
+//   H3  Mixed-durability handoff orphaned the in-flight batch: it set
+//       cur_batch_ = nullptr and built a fresh batch for itself, but the
+//       leader only ever flushed cur_batch_ — never a waiter's own my_batch.
+//       The old batch became unreachable (waiters spun forever) and a waiter
+//       that became leader with cur_batch_ == null dereferenced a null
+//       shared_ptr in sort(batch->records...) — SEGV at chronokv.hpp:2514,
+//       confirmed under ASan. Batches now live in a FIFO (pending_) that the
+//       leader drains front-first, so no batch can be orphaned and cts order
+//       still matches WAL write order.
+//   H4  durability_ was a plain DurabilityMode written by set_durability()
+//       and read by every committer thread — a data race. Now atomic.
+//   H1  HPRegistry was a process-wide singleton whose register_hp() only
+//       ever push_back'd, and BTree::range_scan() builds a Cursor per call:
+//       a measured ~40 byte PERMANENT leak per range_scan (11.6 MiB over
+//       300k scans), i.e. unbounded growth on the read hot path — while
+//       is_hazardous() had zero call sites, so it protected nothing. Slots
+//       are now recycled through a free list (bounded by peak cursor
+//       concurrency) and the registry is per-BTree, which also removes the
+//       cross-instance PageId collisions a global registry would cause.
+//       Measured after the fix: 0 bytes growth over 300k scans.
+//   Also: Cursor's defaulted move left the source owning hp_/leaf_latch_mu_/
+//       owns_latch_, so its destructor would double-release the HP slot and
+//       double-unlock the latch; Transaction::commit() left active_ true if
+//       commit threw, turning an ordinary commit failure into a SIGABRT from
+//       ~Transaction(); open_segment() gained a SegOpenFail fault kind so the
+//       leader exception path is deterministically testable; stale
+//       "B+ tree not yet integrated" comment corrected; test banner prints
+//       CHRONOKV_VERSION instead of a hardcoded "V25.1".
+//
+//   NOT changed (deliberate): ~Transaction() still aborts on a dropped
+//       still-active transaction. That is an explicit documented design
+//       decision asserted by the "abort-on-drop" test and README's Safety
+//       properties; reversing it is a product call, not a bug fix. It is now
+//       called out in README's Known limitations, including the consequence
+//       that an exception unwinding past a live Transaction will SIGABRT.
+//
 // v23 shipped: epoch-pinned deferred reclamation replaced the exclusive
 // gc_scan_mu_ GC/scan lock entirely (see the v23 design section further
 // below for the full E1-E16 safety argument and Phase A-D history).
@@ -468,6 +531,7 @@
 #include <string>
 #include <string_view>
 #include <optional>
+#include <deque>
 #include <vector>
 #include <tuple>
 #include <cstdint>
@@ -565,7 +629,13 @@
 #ifdef CHRONOKV_FAULT_INJECTION
 namespace fault {
     enum class Kind : int { None = 0, FsyncFail, WriteFail, WriteShort,
-                            RenameFail, OpenFail, DirFsyncFail };
+                            RenameFail, OpenFail, DirFsyncFail,
+                            // Review fix C1: fails WalSegments::open_segment()
+                            // so the WAL leader's exception path (segment
+                            // rotation failure) is deterministically testable.
+                            // Kept separate from OpenFail, which the
+                            // checkpoint tests already own.
+                            SegOpenFail };
     inline std::atomic<int> armed{0};
     inline std::atomic<int> remaining{0};
 
@@ -1948,6 +2018,17 @@ class WalSegments {
     std::condition_variable batch_cv_;
     std::atomic<bool> failed_{false};
     std::shared_ptr<Batch> cur_batch_;
+    // H3 fix: FIFO of batches that have records but no leader yet.
+    // cur_batch_ (when non-null) is always pending_.back() -- the batch
+    // still accepting records. Every batch in pending_ has at least one
+    // waiter, and a leader always drains from the FRONT, so:
+    //   * no batch can be orphaned (the old code dropped cur_batch_ on a
+    //     mixed-durability handoff and its waiters could never complete,
+    //     and a later leader could grab a null cur_batch_ and segfault);
+    //   * cts order still matches WAL write order, because cts is reserved
+    //     under batch_mu_ and appended to the tail batch, while flushes
+    //     happen strictly front-to-back.
+    std::deque<std::shared_ptr<Batch>> pending_;
     bool leader_active_ = false;
 
     // v25.1 M2 Phase 1: multi-segment WAL. Fixed-size segments (64 MiB).
@@ -1971,6 +2052,30 @@ class WalSegments {
     }
     // Test-only: check if the last batch used io_uring (skipped sync fsync).
     std::atomic<bool> last_batch_used_iouring_{false};
+#ifdef CHRONOKV_TEST_HOOKS
+    // Review fix C1: make the NEXT leader pass attempt a segment rotation.
+    // Combined with fault::Kind::SegOpenFail this deterministically drives
+    // the leader's exception-before-unlock path, which the suite previously
+    // never exercised.
+    void force_rotation_for_test() { active_segment_bytes_ = SEGMENT_MAX_BYTES; }
+
+    // Review fix C1: the leader's cleanup contract is that leader_active_
+    // is ALWAYS reset before group_append returns, on every path including
+    // the exception path. Exposing it makes that invariant directly
+    // assertable -- a timing-independent detector for the skipped-cleanup
+    // bug (before the fix, an exception thrown while lk was still owned
+    // made the re-acquiring lk.lock() throw EDEADLK, so leader_active_
+    // stayed true and every parked follower was stranded forever).
+    bool leader_active_for_test() {
+        std::lock_guard<std::mutex> lk(batch_mu_);
+        return leader_active_;
+    }
+
+    // Review fix C1: inject a failure AFTER the leader has released
+    // batch_mu_, which is the path where the old bare `throw;` (outside the
+    // handler) called std::terminate. Set to a lambda that throws.
+    std::function<void()> leader_post_unlock_hook_;
+#endif
     // v25.1 M2: stress_point hook for the CQE-wait gap test.
     // When set, the leader calls this BEFORE waiting for the CQE, allowing
     // the test to simulate a leader failure (set leader_timed_out_).
@@ -2199,6 +2304,9 @@ private:
     }
 
     bool open_segment(uint64_t id) {
+#ifdef CHRONOKV_FAULT_INJECTION
+        if (fault::fire(fault::Kind::SegOpenFail)) return false;
+#endif
         std::string p = seg_path(id);
 
         // v24 FIX (Group 1, Fix 3): torn-tail repair before append.
@@ -2245,8 +2353,10 @@ private:
     // last valid frame boundary if a torn tail is found. Returns true if
     // the file was truncated (or was already clean), false on I/O error.
     // Idempotent: a clean file is unchanged.
-    bool truncate_torn_tail(const std::string& path) {
+    bool truncate_torn_tail(const std::string& path) noexcept {
+      try {
         std::ifstream f(path, std::ios::binary);
+        f.exceptions(std::ios::badbit);   // never throw on unreadable input
         if (!f) return true;  // file doesn't exist: nothing to repair
         std::vector<uint8_t> buf(
             (std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -2294,6 +2404,9 @@ private:
             ::close(fd);
         }
         return true;
+      } catch (...) {
+        return false;   // honour the documented bool contract
+      }
     }
 
 public:
@@ -2427,40 +2540,29 @@ public:
     // cur_batch_ (set to nullptr so the next leader iteration creates a
     // fresh one) and start a new batch of the caller's class.
     const bool i_am_async = (mode == DurabilityMode::Async);
-    if (cur_batch_) {
-        const bool batch_is_async = cur_batch_->has_async.load(std::memory_order_relaxed);
-        if (batch_is_async != i_am_async) {
-            // Mixed-mode: hand off the current batch to a leader by
-            // setting it aside. The leader path will pick it up via
-            // cur_batch_ on the next iteration. For OUR record, we
-            // need a fresh batch of our own class. The simplest way:
-            // nullify cur_batch_ so the next line creates a new one.
-            // The previous cur_batch_ is still referenced by any
-            // earlier callers waiting on it (they hold shared_ptr
-            // copies). The leader will pick up the OLD batch when it
-            // sees leader_active_==false and cur_batch_==nullptr --
-            // wait, no: cur_batch_==nullptr means there's nothing to
-            // pick up. The previous batch is still in flight (callers
-            // are waiting). We need to NOT lose it.
-            //
-            // The correct approach: force a leader pass to drain the
-            // current batch BEFORE we add our record. Set cur_batch_
-            // to nullptr so the leader will pick up the existing
-            // shared_ptr (still held by waiting followers), then loop
-            // until the batch is done/written/failed, then create a
-            // fresh batch for our record.
-            //
-            // Implementation: just nullify cur_batch_ here. The next
-            // line `if (!cur_batch_) cur_batch_ = make_shared<Batch>()`
-            // creates a new batch of our class. The OLD batch is still
-            // referenced by other callers' my_batch local copies; they
-            // will wait on its done/written/failed flags as normal.
-            // A leader will emerge from among them (or from us, on a
-            // later iteration) and flush the old batch.
-            cur_batch_ = nullptr;
-        }
+    if (cur_batch_ &&
+        cur_batch_->has_async.load(std::memory_order_relaxed) != i_am_async) {
+        // v24 FIX (Group 1, Fix 4): a batch must contain EITHER async
+        // records XOR sync/group records, never both (see the truncation
+        // logic in the leader path).
+        //
+        // H3 fix: the OLD implementation set cur_batch_ = nullptr here and
+        // built a fresh batch for itself, reasoning that "a leader will
+        // emerge from among them" and drain the old batch. It will not --
+        // the leader only ever flushes cur_batch_, never a waiter's own
+        // my_batch, so the old batch became unreachable: its waiters spun
+        // forever, and a waiter that became leader with cur_batch_ == null
+        // dereferenced a null shared_ptr in sort(batch->records...).
+        //
+        // Now the old batch simply stays in pending_ (it is no longer
+        // cur_batch_, so no new records join it) and a leader drains it
+        // front-first like any other.
+        cur_batch_ = nullptr;
     }
-    if (!cur_batch_) cur_batch_ = std::make_shared<Batch>();
+    if (!cur_batch_) {
+        cur_batch_ = std::make_shared<Batch>();
+        pending_.push_back(cur_batch_);
+    }
     auto my_batch = cur_batch_;
     my_batch->records.push_back({ts, rec});
     if (i_am_async)
@@ -2474,8 +2576,22 @@ public:
             std::this_thread::yield();
             lk.lock();
 
-            auto batch = cur_batch_;
-            cur_batch_ = nullptr;
+            // H3 fix: drain front-first from pending_ instead of grabbing
+            // cur_batch_. A batch may already have been flushed by an
+            // earlier leader pass while this thread was yielding, so
+            // pending_ can legitimately be empty here -- stand down and
+            // let the waiter re-check its own batch.
+            std::shared_ptr<Batch> batch;
+            if (!pending_.empty()) {
+                batch = pending_.front();
+                pending_.pop_front();
+                if (cur_batch_ == batch) cur_batch_ = nullptr;
+            }
+            if (!batch) {
+                leader_active_ = false;
+                batch_cv_.notify_all();
+                continue;
+            }
 
             // v24 FIX (Group 1, Fix 2): wrap the unlocked leader I/O section
             // (sort, frame construction, write, fsync) in try/catch. If ANY
@@ -2505,6 +2621,7 @@ public:
             // requires changing Batch::records; the always-truncate
             // approach is the simpler correct fix the spec requested.
             bool leader_threw = false;
+            std::exception_ptr leader_ep = nullptr;
             off_t batch_start = 0;
             bool io_ok = true;
             size_t batch_bytes = 0;
@@ -2521,6 +2638,12 @@ public:
 
                 lk.unlock();
 
+#ifdef CHRONOKV_TEST_HOOKS
+                // Review fix C1: deterministic injection point for an
+                // exception raised while lk is UNOWNED (the path that used
+                // to reach `throw;` with no active exception).
+                if (leader_post_unlock_hook_) leader_post_unlock_hook_();
+#endif
                 diag::wal_batches.fetch_add(1, std::memory_order_relaxed);
                 i_wal_batches.fetch_add(1, std::memory_order_relaxed);
 
@@ -2712,6 +2835,9 @@ public:
                     std::cerr << "WAL leader exception: unknown\n";
                 }
                 leader_threw = true;
+                // Capture for rethrow OUTSIDE the handler (a bare `throw;`
+                // there has no active exception -> std::terminate).
+                leader_ep = std::current_exception();
                 // Ensure lk is in a known state (locked) before we proceed
                 // to the failure-cleanup section below. If the throw
                 // happened while lk was unlocked, we need to re-acquire.
@@ -2722,8 +2848,14 @@ public:
             }
 
             // Re-acquire batch_mu_ for the final state mutation.
-            // (unique_lock::lock() is idempotent if already locked.)
-            lk.lock();
+            // NOTE: unique_lock::lock() is NOT idempotent -- calling it
+            // while already owning the mutex throws std::system_error
+            // (EDEADLK). An exception thrown BEFORE lk.unlock() (e.g.
+            // from maybe_rotate_segment / truncate_torn_tail) leaves lk
+            // owned, so guard the re-acquire with owns_lock(); otherwise
+            // the throw escapes and skips the cleanup below, stranding
+            // every follower parked on batch_cv_.
+            if (!lk.owns_lock()) lk.lock();
             if (leader_threw || !io_ok) {
                 failed_ = true;
                 batch->failed = true;
@@ -2734,7 +2866,13 @@ public:
             batch_cv_.notify_all();
             // If the leader threw, propagate the exception AFTER cleanup.
             // Callers (commit_txn) catch it via Fix 1b and return WalFailure.
-            if (leader_threw) throw;
+            // A bare `throw;` here would be OUTSIDE the handler (no active
+            // exception) -> std::terminate. Re-throw the captured pointer.
+            if (leader_threw) {
+                auto ep = leader_ep;
+                leader_ep = nullptr;
+                if (ep) std::rethrow_exception(ep);
+            }
         } else {
             batch_cv_.wait(lk);
         }
@@ -3450,7 +3588,9 @@ class ChronoKV {
 
     std::unique_ptr<WalSegments> wal_;
  std::string wal_dir_;  // v18 M5: stored for replication
-    DurabilityMode durability_ = DurabilityMode::Group;  // item 8
+    // H4 fix: was a plain DurabilityMode written by set_durability() and
+    // read by every committer thread inside group_append() -- a data race.
+    std::atomic<DurabilityMode> durability_{DurabilityMode::Group};  // item 8
     double last_ckpt_lock_wait_ms_ = 0;   // path-2: time blocked acquiring checkpoint_mu_
     double last_ckpt_work_ms_ = 0;        // path-2: time doing work under the lock
     mutable FairSharedMutex checkpoint_mu_;   // item 14: writer-preferring
@@ -4124,7 +4264,12 @@ public:
 
     // Item 8: choose durability mode. Async weakens Visible=Durable to
     // Visible>=Durable (bounded-loss window = until next successful group fsync).
-    void set_durability(DurabilityMode m) { durability_ = m; }
+    void set_durability(DurabilityMode m) {
+        durability_.store(m, std::memory_order_relaxed);
+    }
+    DurabilityMode durability() const {
+        return durability_.load(std::memory_order_relaxed);
+    }
 
     // v20 M3: configure rebase thresholds (tests lower these to exercise rebase).
     void set_rebase_threshold(int count, uint64_t bytes) {
@@ -4441,7 +4586,8 @@ public:
          uint64_t ts = 0;
          int status = 0;
          try {
-             auto [s, t] = wal_->group_append(clock_, ws, durability_, on_reserve);
+             auto [s, t] = wal_->group_append(clock_, ws, durability_.load(std::memory_order_relaxed),
+                              on_reserve);
              status = s;
              ts = t;
          } catch (...) {
@@ -5841,7 +5987,7 @@ namespace chronokv {
 // applied and clean under Release / ASan+UBSan / TSan / Stress; the
 // hooks-off public_api_smoke.cpp target (28 checks) passes against the
 // same header.
-static constexpr const char* CHRONOKV_VERSION = "0.25.2";
+static constexpr const char* CHRONOKV_VERSION = "0.25.3";
 static constexpr int CHRONOKV_VERSION_MAJOR = 0;
 static constexpr int CHRONOKV_VERSION_MINOR = 25;
 static constexpr int CHRONOKV_VERSION_PATCH = 2;
@@ -5875,6 +6021,9 @@ public:
 // implemented (e.g., range_scan_stream, which requires M1.6 B+ tree
 // integration for real incremental iteration). This is a deliberate,
 // tracked stub — not a permanent limitation.
+// NOTE: currently declared for API stability but never thrown -- no public
+// method is a stub as of v25.2. Kept so callers that already catch it stay
+// source-compatible; remove it in the next breaking release if still unused.
 class NotYetImplementedError : public Error {
 public:
     using Error::Error;
@@ -6186,6 +6335,25 @@ public:
         check_open();
         return engine_->wal_->last_batch_used_iouring_.load();
     }
+#ifdef CHRONOKV_TEST_HOOKS
+    // Review fix C1: test hooks for the WAL leader exception path.
+    void force_wal_rotation_for_test() {
+        check_open();
+        if (engine_->wal_) engine_->wal_->force_rotation_for_test();
+    }
+    bool wal_failed_for_test() const {
+        check_open();
+        return engine_->wal_ ? engine_->wal_->is_failed() : false;
+    }
+    bool wal_leader_active_for_test() {
+        check_open();
+        return engine_->wal_ ? engine_->wal_->leader_active_for_test() : false;
+    }
+    void set_leader_post_unlock_hook_for_test(std::function<void()> fn) {
+        check_open();
+        if (engine_->wal_) engine_->wal_->leader_post_unlock_hook_ = std::move(fn);
+    }
+#endif
     Health health() const {
         check_open();
         auto hh = engine_->health();
@@ -6549,7 +6717,27 @@ public:
 
     Status commit() {
         check_active();
-        ::TxnResult result = txn_->commit();
+        // Review fix (M1, partial): a throwing commit used to leave
+        // active_ == true, so ~Transaction() saw a "still active" txn with a
+        // live engine and called std::abort() -- i.e. an ordinary commit
+        // failure (bad_alloc building the write set, an engine error) killed
+        // the host process. Roll back instead, then rethrow so the caller
+        // still sees the error. ~ReadWriteTransaction releases the reader
+        // slot and deregisters the phantom reader.
+        //
+        // NOTE: the documented abort-on-drop behaviour for a transaction the
+        // caller simply FORGOT to commit/abort is deliberately unchanged --
+        // that is an explicit design decision asserted by the
+        // "transaction lifecycle (abort-on-drop)" test and README's Safety
+        // properties section.
+        ::TxnResult result;
+        try {
+            result = txn_->commit();
+        } catch (...) {
+            txn_.reset();      // roll back: release slot, deregister phantom
+            active_ = false;
+            throw;
+        }
         active_ = false;
         return Database::map_txn_result(result);
     }
@@ -6582,11 +6770,23 @@ inline Transaction Database::begin() {
 //
 // The following sections (PagePool, BTree, Latency measurement) are
 // the Pillar 1 + M0 measurement-core work. They are in separate namespaces
-// (chronokv_page, chronokv_btree, chronokv_latency) and are not yet
-// integrated into the ChronoKV engine — that integration is M1.4-M1.6.
+// (chronokv_page, chronokv_btree, chronokv_latency).
+//
+// NOTE (corrected 2026-09): an earlier revision of this comment said these
+// components were "not yet integrated into the ChronoKV engine — that
+// integration is M1.4-M1.6". That is STALE. M1.6 shipped: BTree IS the
+// engine's key -> KeyEntry index (see ChronoKV::tree_ / ChronoKV::pool_ and
+// the M1.6 note on the nm_ member), and PagePool backs it. Only
+// chronokv_latency remains measurement-only tooling.
 //
 // They live in this single header so the project stays at two files
 // (chronokv.hpp + main.cpp) rather than sprawling into a header forest.
+//
+// KNOWN LIMITATION (page reclamation): PagePool::free() currently has no
+// callers and BTree has no merge/rebalance -- splits only ever add pages.
+// The pool is therefore a MONOTONIC ceiling: once bump_ reaches capacity_
+// (Options::page_pool_bytes, 256 MiB default) alloc() throws bad_alloc, and
+// delete-heavy workloads never reclaim. See README "Known limitations".
 // =====================================================================
 
 namespace chronokv_page {
@@ -6879,21 +7079,43 @@ struct HazardPointer {
     PageId load() const { return hp.load(std::memory_order_seq_cst); }
 };
 
-// Global HP registry — all reader slots register here.
+// HP registry — one per BTree (NOT a process-wide singleton).
 // A page is safe to free only if no HP in the registry points to it.
+//
+// H1 fix: this used to be a Meyers singleton whose register_hp() only ever
+// push_back'd. BTree::range_scan() builds an internal Cursor per call, and
+// each Cursor registered one HazardPointer that was never removed -- a
+// measured ~40 byte permanent leak per range_scan (11.6 MiB over 300k
+// scans), i.e. unbounded growth on the read hot path. Two further problems:
+//   * PageIds are per-PagePool, so a process-global registry made
+//     is_hazardous() produce cross-instance false positives;
+//   * is_hazardous() scanned every HP ever registered under one global
+//     mutex shared by all BTree instances.
+// Slots are now recycled through a free list, so the registry is bounded by
+// PEAK CURSOR CONCURRENCY rather than by total operations, and it is owned
+// by the BTree whose PageIds it protects.
 class HPRegistry {
 public:
-    static HPRegistry& instance() {
-        static HPRegistry reg;
-        return reg;
-    }
-
-    // Register a new HP slot. Returns a reference to the HP.
-    // The reference is stable for the lifetime of the registry.
+    // Acquire an HP slot (recycled where possible). The caller MUST hand it
+    // back via release_hp() -- Cursor does so in its destructor.
     HazardPointer& register_hp() {
         std::lock_guard<std::mutex> lk(mu_);
+        if (!free_.empty()) {
+            HazardPointer* hp = free_.back();
+            free_.pop_back();
+            hp->clear();
+            return *hp;
+        }
         hps_.push_back(std::make_unique<HazardPointer>());
         return *hps_.back();
+    }
+
+    // Return a slot to the free list. Idempotent for nullptr.
+    void release_hp(HazardPointer* hp) {
+        if (!hp) return;
+        hp->clear();
+        std::lock_guard<std::mutex> lk(mu_);
+        free_.push_back(hp);
     }
 
     // Check if any published HP points to `id`.
@@ -6905,14 +7127,29 @@ public:
         return false;
     }
 
+    // Diagnostics: slots allocated / currently checked out.
+    size_t slot_count() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return hps_.size();
+    }
+    size_t in_use() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return hps_.size() - free_.size();
+    }
+
 private:
     mutable std::mutex mu_;
-    std::vector<std::unique_ptr<HazardPointer>> hps_;
+    std::vector<std::unique_ptr<HazardPointer>> hps_;   // owns every slot
+    std::vector<HazardPointer*> free_;                  // recycled slots
 };
 
 class BTree {
     friend class ::ChronoKV;  // v25.1 M1.6: for fence_recheck_retries_ access
 public:
+    // H1 fix: per-tree HP registry (see HPRegistry). mutable because
+    // Cursor holds a const BTree& and must acquire/release slots.
+    mutable HPRegistry hps_;
+
     explicit BTree(PagePool& pool) : pool_(pool), root_id_(0) {
         // Create an empty leaf as the root.
         root_id_.store(pool_.alloc(), std::memory_order_release);
@@ -7051,6 +7288,12 @@ public:
         return d;
     }
 
+    // Review fix H1: registry occupancy, so a test can assert the HP slot
+    // count is bounded by peak cursor concurrency rather than growing with
+    // the total number of cursors ever created.
+    size_t hp_slot_count_for_test() const { return hps_.slot_count(); }
+    size_t hp_in_use_for_test() const { return hps_.in_use(); }
+
     // v25.1 M1.3/M1.4: generation counter accessor (for Cursor).
     uint64_t generation() const { return generation_.load(std::memory_order_relaxed); }
 
@@ -7092,12 +7335,36 @@ public:
 
         ~Cursor() {
             leave_leaf();
+            // H1 fix: hand the HP slot back so the registry stays bounded
+            // by peak cursor concurrency instead of total cursors created.
+            if (hp_) { tree_.hps_.release_hp(hp_); hp_ = nullptr; }
         }
 
         Cursor(const Cursor&) = delete;
         Cursor& operator=(const Cursor&) = delete;
-        Cursor(Cursor&&) = default;
-        Cursor& operator=(Cursor&&) = default;
+
+        // H1 fix: the defaulted move left the source owning hp_,
+        // leaf_latch_mu_/owns_latch_ and initial_latch_, so its destructor
+        // would release the same HP slot twice and unlock the same latch
+        // twice. Every current use site is covered by C++17 guaranteed
+        // elision, but the type advertised a move that was unsafe.
+        Cursor(Cursor&& o) noexcept
+            : tree_(o.tree_), lo_(std::move(o.lo_)), hi_(std::move(o.hi_)),
+              gen_(o.gen_), leaf_id_(o.leaf_id_), slot_idx_(o.slot_idx_),
+              cur_key_(std::move(o.cur_key_)),
+              cur_value_(std::move(o.cur_value_)),
+              exhausted_(o.exhausted_),
+              key_count_snapshot_(o.key_count_snapshot_),
+              leaf_latch_mu_(o.leaf_latch_mu_), owns_latch_(o.owns_latch_),
+              hp_(o.hp_),
+              initial_latch_(std::move(o.initial_latch_)) {
+            o.leaf_id_ = 0;
+            o.leaf_latch_mu_ = nullptr;
+            o.owns_latch_ = false;
+            o.hp_ = nullptr;          // source must not release our slot
+            o.exhausted_ = true;
+        }
+        Cursor& operator=(Cursor&&) = delete;   // const BTree& member
 
         bool valid() const {
             return !exhausted_;
@@ -7154,7 +7421,7 @@ public:
             // for consistency with leave_leaf.
             leaf_latch_mu_ = tree_.latches_.get_or_create(leaf_id_);
             owns_latch_ = false;  // initial_latch_ owns it, not the manual path
-            if (!hp_) hp_ = &HPRegistry::instance().register_hp();
+            if (!hp_) hp_ = &tree_.hps_.register_hp();
             hp_->publish(leaf_id_);
             const Page* p = tree_.pool_.get(leaf_id_);
             key_count_snapshot_ = tree_.header(p)->key_count;
@@ -7168,7 +7435,7 @@ public:
             owns_latch_ = true;
             // Publish HP (prevents the page from being freed while we
             // read it — important for future merge/rebalance).
-            if (!hp_) hp_ = &HPRegistry::instance().register_hp();
+            if (!hp_) hp_ = &tree_.hps_.register_hp();
             hp_->publish(leaf_id_);
             // Capture snapshot of key_count (per-page snapshot semantic).
             const Page* p = tree_.pool_.get(leaf_id_);

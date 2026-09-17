@@ -33,6 +33,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Least-privilege token: no job in this workflow needs write access.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -94,7 +98,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install compiler
-        if: matrix.install != ''
+        # `matrix.install` is null for entries that don't define it; a truthy
+        # test is unambiguous, whereas `!= ''` relies on GitHub's
+        # null-vs-empty-string coercion.
+        if: ${{ matrix.install }}
         run: |
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.install }}
