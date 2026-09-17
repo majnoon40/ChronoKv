@@ -1,5 +1,43 @@
 // chronokv.hpp — ChronoKV engine and public C++ API.
 //
+// v25.4 SHIPPED (v26 milestone M0): durability defect fix. One confirmed
+// bug, one new canonical invariant, no new public API.
+//
+//   D2 FIX — the WAL rollback truncation was not durable. On a durability
+//       failure the leader ftruncate()d the failed batch out of the active
+//       segment so it could not resurrect on recovery, but nothing fsynced
+//       that truncation. The rollback therefore lived only in the page
+//       cache, and a POWER LOSS immediately after a WalFailure could restore
+//       the batch — precisely the resurrection the truncate exists to
+//       prevent. fdatasync now follows a successful ftruncate; if that fsync
+//       fails the log level is FATAL rather than WARNING (no new fail-stop
+//       path is needed: this block is only reachable when io_ok == false,
+//       and the leader already sets failed_ for !io_ok below).
+//       The pre-existing test "WAL fsync fail -> no resurrection on restart"
+//       could not see this because it restarts the process CLEANLY, and a
+//       clean restart flushes the page cache. Only a crash distinguishes the
+//       two -- and _exit()/kill -9 do not discard the kernel page cache
+//       either, so the new detector proves the MECHANISM (that an fsync is
+//       actually issued after the rollback) rather than simulating power
+//       loss. See the scope note in run_v26_durability_tests().
+//       Also: active_segment_bytes_ is re-synced to the post-truncate file
+//       size. NOTE this is drift correction, NOT inflation prevention -- a
+//       failed batch never inflated the counter, because the increment is
+//       guarded by `if (io_ok)`. It matters only when a partial write grew
+//       the file without io_ok ever being set.
+//
+//   NEW CANONICAL INVARIANT:
+//       D2 — a batch for which any caller observed WalFailure is absent from
+//            the WAL after ANY crash, not merely after a clean restart.
+//
+//   Test hooks added: fault::Kind is unchanged; WalSegments gained
+//       active_segment_bytes_for_test(), surfaced as
+//       Database::wal_active_segment_bytes_for_test(). New tests D2a (the
+//       detector) and D2b (unclean-process-death guard), both verified
+//       against reverted code: D2a FAILS pre-fix with "1 FsyncFail charge
+//       left armed"; D2b passes pre-fix, which is exactly why it is labelled
+//       a guard and not a detector.
+//
 // v25.3 SHIPPED: correctness release from an external code review. No new
 // architecture; four defects fixed, each with a regression test that was
 // verified to FAIL against the unfixed code (see run_review_regression_tests
@@ -2059,6 +2097,13 @@ class WalSegments {
     // never exercised.
     void force_rotation_for_test() { active_segment_bytes_ = SEGMENT_MAX_BYTES; }
 
+    // v26 M0 (invariant D2): the active segment's byte accounting, so a test
+    // can assert a failed batch was rolled back out of the rotation budget.
+    size_t active_segment_bytes_for_test() {
+        std::lock_guard<std::mutex> lk(batch_mu_);
+        return active_segment_bytes_;
+    }
+
     // Review fix C1: the leader's cleanup contract is that leader_active_
     // is ALWAYS reset before group_append returns, on every path including
     // the exception path. Exposing it makes that invariant directly
@@ -2824,6 +2869,52 @@ public:
                             std::cerr << "WARNING: ftruncate failed after WAL durability "
                                          "failure (errno=" << errno << ") — non-durable "
                                          "record may persist in the WAL file\n";
+                        } else {
+                            // v26 M0, invariant D2: ftruncate only updates the
+                            // page cache and the in-core inode. WITHOUT an
+                            // fsync here the ROLLBACK is not durable, so a
+                            // power loss immediately after this WalFailure
+                            // can bring the batch back — exactly the
+                            // resurrection the truncate exists to prevent.
+                            //
+                            // The pre-existing regression test
+                            // ("WAL fsync fail -> no resurrection on restart")
+                            // could not see this: it restarts the process
+                            // cleanly, and a clean restart flushes the page
+                            // cache. Only a crash distinguishes the two.
+                            //
+                            // fdatasync suffices — file size is metadata
+                            // needed to retrieve the data, so it is
+                            // transferred; we never needed the mtime sync.
+                            //
+                            // Note this does NOT add a new fail-stop path:
+                            // we only reach this block when io_ok == false,
+                            // and the leader already sets failed_ for !io_ok
+                            // in the state-mutation section below. So the
+                            // instance is going to fail-stop either way; all
+                            // we add is an honest log level and the counter.
+                            if (!checked_fsync(active_fd_)) {
+                                diag::wal_truncate_fails.fetch_add(1, std::memory_order_relaxed);
+                                i_wal_truncate_fails.fetch_add(1, std::memory_order_relaxed);
+                                std::cerr << "FATAL: could not make the WAL rollback "
+                                             "truncation durable (errno=" << errno
+                                          << ") — the failed batch may resurrect "
+                                             "after a crash; instance is failing "
+                                             "stop\n";
+                            }
+                            // v26 M0: re-sync the rotation budget with the
+                            // file's actual post-truncate size. NOTE: a
+                            // failed batch never inflated this counter in
+                            // the first place -- `active_segment_bytes_ +=
+                            // batch_bytes` is guarded by `if (io_ok)`. So
+                            // this is DRIFT CORRECTION, not inflation
+                            // prevention: it matters when a partial write
+                            // grew the file without io_ok ever being set,
+                            // leaving the tracked size below the real one.
+                            // batch_start is where the batch began, i.e.
+                            // exactly the size the file now has.
+                            if (batch_start >= 0)
+                                active_segment_bytes_ = (size_t)batch_start;
                         }
                     }
                 }
@@ -5987,7 +6078,7 @@ namespace chronokv {
 // applied and clean under Release / ASan+UBSan / TSan / Stress; the
 // hooks-off public_api_smoke.cpp target (28 checks) passes against the
 // same header.
-static constexpr const char* CHRONOKV_VERSION = "0.25.3";
+static constexpr const char* CHRONOKV_VERSION = "0.25.4";
 static constexpr int CHRONOKV_VERSION_MAJOR = 0;
 static constexpr int CHRONOKV_VERSION_MINOR = 25;
 static constexpr int CHRONOKV_VERSION_PATCH = 2;
@@ -6352,6 +6443,12 @@ public:
     void set_leader_post_unlock_hook_for_test(std::function<void()> fn) {
         check_open();
         if (engine_->wal_) engine_->wal_->leader_post_unlock_hook_ = std::move(fn);
+    }
+    // v26 M0 (invariant D2): active-segment byte accounting, so a test can
+    // assert a WalFailure'd batch was rolled back out of the rotation budget.
+    size_t wal_active_segment_bytes_for_test() {
+        check_open();
+        return engine_->wal_ ? engine_->wal_->active_segment_bytes_for_test() : 0;
     }
 #endif
     Health health() const {

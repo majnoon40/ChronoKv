@@ -10,7 +10,7 @@ transactions with phantom detection, a paged B+ tree index, and
 io_uring-accelerated WAL writes — all in one header with no external
 dependencies.
 
-Current version: **0.25.3** (`CHRONOKV_VERSION` in `chronokv.hpp`).
+Current version: **0.25.4** (`CHRONOKV_VERSION` in `chronokv.hpp`).
 
 ## Highlights
 
@@ -143,6 +143,10 @@ inactive transaction), `Error` (engine failures), `NotYetImplementedError`.
   inter-process guard).
 - Recovery verifies CRCs, truncates torn WAL tails, rejects LSN
   gaps/duplicates, and validates the checkpoint chain.
+- Invariant **D2**: a batch for which any caller observed `WalFailure` is
+  absent from the WAL after *any* crash, not merely after a clean restart —
+  the rollback truncation is itself fsynced, so it cannot be undone by a
+  power loss.
 - A `Transaction` destroyed while still active calls `std::abort()` —
   commit or abort explicitly. Concurrent `Database::close()` with live
   transactions requires external synchronization.

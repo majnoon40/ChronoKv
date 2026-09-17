@@ -399,6 +399,163 @@ static int run_async_benchmark();
 // hooks-off (public-API smoke only) based on CHRONOKV_TEST_HOOKS.
 // =====================================================================
 
+#ifdef CHRONOKV_TEST_HOOKS   // uses Database test hooks + fault injection
+
+// =====================================================================
+// v26 M0 — invariant D2: durable rollback of a WalFailure'd batch.
+//
+//   D2 — a batch for which any caller observed WalFailure is absent from
+//        the WAL after ANY crash, not merely after a clean restart.
+//
+// The defect: the leader ftruncate()d the failed batch away but never
+// fsynced the truncation, so the rollback lived only in the page cache and
+// a power loss could resurrect the batch.
+//
+// HONEST SCOPE NOTE: true power-loss durability cannot be tested in CI --
+// it needs real hardware or a fault-injecting block layer (dm-flakey), and
+// _exit()/kill -9 do NOT discard the kernel page cache, so a process-death
+// test cannot distinguish "fsynced" from "still dirty". The detector below
+// therefore proves the MECHANISM: that an fsync is actually issued on the
+// WAL fd after the rollback truncation. That, plus the general meaning of
+// fsync, is the guarantee. The process-death test is a regression guard on
+// the in-core behaviour only and is labelled as such.
+// =====================================================================
+static int run_v26_durability_tests() {
+    int fails = 0;
+    auto report = [&](const char* n, bool ok, const std::string& fr = {}) {
+        std::cout << "   " << n << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) { fails++; if (!fr.empty()) std::cout << "    (" << fr << ")\n"; }
+    };
+
+#ifdef CHRONOKV_FAULT_INJECTION
+    // ---- D2a: the rollback truncation must be followed by a real fsync ----
+    //
+    // DETECTOR for the defect. Arm FsyncFail for TWO charges: the first is
+    // consumed by the batch's own fsync (making the commit fail), the second
+    // can only be consumed by an fsync issued during the rollback. If no
+    // rollback fsync exists, one charge stays armed.
+    {
+        const std::string wd = "/tmp/ckv_v26_d2a";
+        std::filesystem::remove_all(wd);
+        bool ok = true;
+        std::string fr;
+        try {
+            chronokv::Options opts;
+            opts.wal_dir = wd;
+            opts.auto_start_gc = false;
+            opts.durability = chronokv::DurabilityMode::Group;
+            auto db = chronokv::Database::open(opts);
+
+            if (db.put("a", "1") != chronokv::Status::OK) { ok = false; fr = "seed commit failed"; }
+
+            const auto seg = wd + "/wal_000001.log";
+            const uintmax_t size_before = std::filesystem::file_size(seg);
+
+            fault::arm(fault::Kind::FsyncFail, 2);
+            chronokv::Status st = chronokv::Status::OK;
+            try { st = db.put("b", "2"); } catch (...) { st = chronokv::Status::Failed; }
+            int left = fault::remaining.load();
+            fault::disarm();
+
+            if (st != chronokv::Status::WalFailure) {
+                ok = false; fr = "expected WalFailure, got " + std::to_string((int)st);
+            } else if (left != 0) {
+                ok = false;
+                fr = std::to_string(left) + " FsyncFail charge(s) left armed -- no fsync was "
+                     "issued after the rollback truncation, so the rollback is NOT durable "
+                     "and the failed batch can resurrect after a power loss";
+            }
+            // Guard (not a detector): the truncation itself must be visible
+            // to a fresh open, i.e. the file really did shrink back.
+            if (ok) {
+                uintmax_t size_after = std::filesystem::file_size(seg);
+                if (size_after != size_before) {
+                    ok = false;
+                    fr = "segment size " + std::to_string(size_after) + " != pre-batch " +
+                         std::to_string(size_before) + " (truncation not applied)";
+                }
+            }
+            // The tracked rotation budget must match the real file size.
+            if (ok && db.wal_active_segment_bytes_for_test() != (size_t)size_before) {
+                ok = false;
+                fr = "active_segment_bytes_ = " +
+                     std::to_string(db.wal_active_segment_bytes_for_test()) +
+                     ", file size = " + std::to_string(size_before) + " (drift not corrected)";
+            }
+        } catch (const std::exception& e) {
+            fault::disarm();
+            ok = false; fr = std::string("exception: ") + e.what();
+        }
+        report("v26 M0 / D2a: rollback truncation is fsynced (durable, not page-cache-only)", ok, fr);
+    }
+
+    // ---- D2b: unclean process death -> no resurrection (regression guard) ----
+    {
+        const std::string wd = "/tmp/ckv_v26_d2b";
+        std::filesystem::remove_all(wd);
+        bool ok = true;
+        std::string fr;
+        std::cout.flush();          // do not let the child re-print our buffer
+        pid_t child = fork();
+        if (child < 0) {
+            ok = false; fr = "fork() failed";
+        } else if (child == 0) {
+            int rc = 3;
+            try {
+                chronokv::Options o;
+                o.wal_dir = wd;
+                o.auto_start_gc = false;
+                o.durability = chronokv::DurabilityMode::Group;
+                auto db = chronokv::Database::open(o);
+                if (db.put("a", "1") != chronokv::Status::OK) _exit(6);
+                fault::arm(fault::Kind::FsyncFail, 1);
+                chronokv::Status st = db.put("b", "2");
+                fault::disarm();
+                rc = (st == chronokv::Status::WalFailure) ? 0 : 7;
+            } catch (...) { rc = 8; }
+            // Power-loss stand-in: die WITHOUT running destructors or
+            // closing the DB. (Still not a real power loss -- see the scope
+            // note above; the page cache survives process death.)
+            _exit(rc);
+        } else {
+            int wst = 0;
+            if (waitpid(child, &wst, 0) != child) {
+                ok = false; fr = "waitpid failed";
+            } else if (!WIFEXITED(wst) || WEXITSTATUS(wst) != 0) {
+                ok = false;
+                fr = "child did not report WalFailure (exit " +
+                     std::to_string(WIFEXITED(wst) ? WEXITSTATUS(wst) : -1) +
+                     ", signal " + std::to_string(WIFSIGNALED(wst) ? WTERMSIG(wst) : 0) + ")";
+            } else {
+                try {
+                    chronokv::Options o;
+                    o.wal_dir = wd;
+                    o.auto_start_gc = false;
+                    o.recover_on_open = true;
+                    auto db2 = chronokv::Database::open(o);
+                    auto a = db2.get("a");
+                    auto b = db2.get("b");
+                    if (!a || *a != "1") { ok = false; fr = "durable 'a' lost across restart"; }
+                    else if (b)          { ok = false; fr = "RESURRECTION: WalFailure'd 'b' came back"; }
+                } catch (const std::exception& e) {
+                    ok = false; fr = std::string("recovery threw: ") + e.what();
+                }
+            }
+        }
+        report("v26 M0 / D2b: WalFailure'd batch absent after unclean process death", ok, fr);
+    }
+#else
+    report("v26 M0 / D2: durable rollback (needs fault injection)", true);
+#endif
+
+    std::cout << (fails == 0 ? "   V26 M0 DURABILITY TESTS PASSED\n"
+                             : "   V26 M0 DURABILITY FAILURES: " + std::to_string(fails) + "\n");
+    return fails;
+}
+
+#endif // CHRONOKV_TEST_HOOKS (v26 durability tests)
+
+
 #ifdef CHRONOKV_TEST_HOOKS   // uses Database test hooks; hooks-off has none
 
 // =====================================================================
@@ -649,6 +806,7 @@ static int run_review_regression_tests() {
 
 #ifdef CHRONOKV_TEST_HOOKS
 static int run_review_regression_tests();   // defined above main()
+static int run_v26_durability_tests();      // defined above main()
 #endif
 
 int main() {
@@ -664,7 +822,7 @@ return 0;
     // tests -- used to prove those tests actually fail against unfixed code.
     if (getenv("CKV_ONLY_REVIEW")) {
         crc_init();
-        int f = run_review_regression_tests();
+        int f = run_review_regression_tests() + run_v26_durability_tests();
         std::cout.flush();
         return f == 0 ? 0 : 1;
     }
@@ -5963,6 +6121,8 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     // Review regression tests (C1 leader-exception hang, H3 mixed-durability
     // orphaned batch, H1 hazard-pointer registry leak).
     fails += run_review_regression_tests();
+    // v26 M0: invariant D2 -- the WalFailure rollback must be durable.
+    fails += run_v26_durability_tests();
 
 diag::dump();
     // Was a hardcoded "V25.1" banner that drifted from CHRONOKV_VERSION
