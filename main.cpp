@@ -544,12 +544,197 @@ static int run_v26_durability_tests() {
         }
         report("v26 M0 / D2b: WalFailure'd batch absent after unclean process death", ok, fr);
     }
+
+    // ---- D3: every durability result on the rotation path must fail-stop ----
+    //
+    // DETECTORS. maybe_rotate_segment() discarded four durability results
+    // (old-segment fsync, new-segment fsync, write_manifest(), fsync_dir()),
+    // so a size-based rotation could "succeed" and leave an on-disk state
+    // that recover_all() then rejects loudly -- "orphan WAL segment" or
+    // "missing WAL segment" -- stranding writes already acknowledged durable.
+    // Each case below forces a rotation and fails one distinct step.
+    {
+        struct RotCase {
+            const char* name;
+            fault::Kind kind;
+            const char* what;
+        };
+        const RotCase cases[] = {
+            { "D3a", fault::Kind::FsyncFail,    "fsync of the OLD segment before close" },
+            { "D3b", fault::Kind::RenameFail,   "MANIFEST atomic rename" },
+            { "D3c", fault::Kind::DirFsyncFail, "MANIFEST directory fsync" },
+        };
+        for (const auto& c : cases) {
+            const std::string wd = std::string("/tmp/ckv_v26_") + c.name;
+            std::filesystem::remove_all(wd);
+            bool ok = true;
+            std::string fr;
+            try {
+                chronokv::Options opts;
+                opts.wal_dir = wd;
+                opts.auto_start_gc = false;
+                opts.durability = chronokv::DurabilityMode::Group;
+                auto db = chronokv::Database::open(opts);
+                if (db.put("seed", "1") != chronokv::Status::OK) { ok = false; fr = "seed commit failed"; }
+
+                if (ok) {
+                    db.force_wal_rotation_for_test();   // next leader pass must rotate
+                    fault::arm(c.kind, 1);
+                    chronokv::Status st = chronokv::Status::OK;
+                    try { st = db.put("after_rotate", "2"); } catch (...) { st = chronokv::Status::Failed; }
+                    fault::disarm();
+
+                    if (st != chronokv::Status::WalFailure) {
+                        ok = false;
+                        fr = std::string("rotation survived a failure of ") + c.what +
+                             " (commit returned " + std::to_string((int)st) +
+                             ", expected WalFailure) -- the result is being discarded";
+                    } else if (!db.wal_failed_for_test()) {
+                        ok = false;
+                        fr = std::string("commit failed but the instance did not fail-stop after ") + c.what;
+                    }
+                }
+            } catch (const std::exception& e) {
+                fault::disarm();
+                ok = false; fr = std::string("exception: ") + e.what();
+            }
+            report((std::string("v26 M1 / ") + c.name + ": rotation fail-stops on " + c.what).c_str(), ok, fr);
+        }
+    }
+
+    // ---- D3d: the fail-stop latch must not be fooled by a later success ----
+    //
+    // GUARD, not a detector (this already held before M1: failed_ latches and
+    // is never cleared). It exists because it is the property that makes the
+    // fsyncgate family safe -- once an fsync has errored, no LATER successful
+    // fsync may be read as evidence that the earlier data is durable. Worth
+    // pinning down explicitly so a future "retry the fsync" change cannot
+    // silently reintroduce the hazard.
+    {
+        const std::string wd = "/tmp/ckv_v26_d3d";
+        std::filesystem::remove_all(wd);
+        bool ok = true;
+        std::string fr;
+        try {
+            chronokv::Options opts;
+            opts.wal_dir = wd;
+            opts.auto_start_gc = false;
+            opts.durability = chronokv::DurabilityMode::Group;
+            auto db = chronokv::Database::open(opts);
+            if (db.put("a", "1") != chronokv::Status::OK) { ok = false; fr = "seed commit failed"; }
+
+            fault::arm(fault::Kind::FsyncFail, 1);
+            chronokv::Status st = chronokv::Status::OK;
+            try { st = db.put("b", "2"); } catch (...) { st = chronokv::Status::Failed; }
+            fault::disarm();                       // fsync works again from here on
+
+            if (st != chronokv::Status::WalFailure) {
+                ok = false; fr = "expected WalFailure from the failed fsync";
+            } else {
+                // fsync is healthy again, yet every later write must still be
+                // refused: the instance cannot un-learn that it lost data.
+                //
+                // NOTE the expected status is Failed, not WalFailure: once
+                // wal_->is_failed(), commit_txn short-circuits to
+                // TxnResult::DatabaseFailed, which maps to Status::Failed.
+                // That distinction is deliberate and worth preserving --
+                // WalFailure means "this write failed", Failed means "this
+                // instance is done, stop trying". An earlier draft of this
+                // test asserted WalFailure and was simply wrong.
+                for (int i = 0; i < 3 && ok; ++i) {
+                    chronokv::Status s2 = chronokv::Status::OK;
+                    try { s2 = db.put("c" + std::to_string(i), "v"); } catch (...) { s2 = chronokv::Status::Failed; }
+                    if (s2 != chronokv::Status::Failed) {
+                        ok = false;
+                        fr = "write #" + std::to_string(i) + " after the fsync error returned " +
+                             std::to_string((int)s2) + " (expected Failed/DatabaseFailed) -- the "
+                             "latch was cleared or bypassed, so a later successful fsync could "
+                             "mask the earlier loss";
+                    }
+                }
+                if (ok && !db.wal_failed_for_test()) { ok = false; fr = "instance did not stay failed"; }
+                // The latch must also be OBSERVABLE, not merely inferable from
+                // repeated write failures: health() must report fail-stop.
+                if (ok) {
+                    auto h = db.health();
+                    bool reported = (h.level == 2);
+                    for (auto& r : h.reasons)
+                        if (r.find("fail-stop") != std::string::npos) reported = reported && true;
+                    if (!reported) { ok = false; fr = "health() did not report fail-stop (level " +
+                                     std::to_string(h.level) + ")"; }
+                }
+                // Reads of already-durable data must still work: fail-stop
+                // costs write availability, not read availability.
+                if (ok) {
+                    auto a = db.get("a");
+                    if (!a || *a != "1") { ok = false; fr = "reads broke after fail-stop"; }
+                }
+            }
+        } catch (const std::exception& e) {
+            fault::disarm();
+            ok = false; fr = std::string("exception: ") + e.what();
+        }
+        report("v26 M1 / D3d: fail-stop latches; later fsync success cannot mask earlier loss", ok, fr);
+    }
+
+    // ---- D3e: a FALSE fsync failure must still not leave the record behind ----
+    //
+    // New capability, so there is no pre-fix behaviour to detect. Models the
+    // other half of fsyncgate: the bytes reached stable storage but the call
+    // returned EIO. The caller is told WalFailure, so the record must not be
+    // recoverable -- otherwise the engine has created exactly the
+    // "told-failure-but-actually-durable" contract violation that the
+    // rollback truncation exists to prevent.
+    {
+        const std::string wd = "/tmp/ckv_v26_d3e";
+        std::filesystem::remove_all(wd);
+        bool ok = true;
+        std::string fr;
+        try {
+            {
+                chronokv::Options opts;
+                opts.wal_dir = wd;
+                opts.auto_start_gc = false;
+                opts.durability = chronokv::DurabilityMode::Group;
+                auto db = chronokv::Database::open(opts);
+                if (db.put("a", "1") != chronokv::Status::OK) { ok = false; fr = "seed commit failed"; }
+                if (ok) {
+                    fault::arm(fault::Kind::FsyncFailAfterPersist, 1);
+                    chronokv::Status st = chronokv::Status::OK;
+                    try { st = db.put("b", "2"); } catch (...) { st = chronokv::Status::Failed; }
+                    fault::disarm();
+                    if (st != chronokv::Status::WalFailure) {
+                        ok = false; fr = "expected WalFailure, got " + std::to_string((int)st);
+                    }
+                }
+            }   // close cleanly; the interesting question is what is ON DISK
+            if (ok) {
+                chronokv::Options o;
+                o.wal_dir = wd;
+                o.auto_start_gc = false;
+                o.recover_on_open = true;
+                auto db2 = chronokv::Database::open(o);
+                auto a = db2.get("a"), b = db2.get("b");
+                if (!a || *a != "1") { ok = false; fr = "durable 'a' lost"; }
+                else if (b) {
+                    ok = false;
+                    fr = "'b' was recovered although its caller saw WalFailure -- the fsync "
+                         "reported failure after persisting, and the rollback did not remove it";
+                }
+            }
+        } catch (const std::exception& e) {
+            fault::disarm();
+            ok = false; fr = std::string("exception: ") + e.what();
+        }
+        report("v26 M1 / D3e: false fsync failure (data persisted) still rolls back", ok, fr);
+    }
+
 #else
     report("v26 M0 / D2: durable rollback (needs fault injection)", true);
 #endif
 
-    std::cout << (fails == 0 ? "   V26 M0 DURABILITY TESTS PASSED\n"
-                             : "   V26 M0 DURABILITY FAILURES: " + std::to_string(fails) + "\n");
+    std::cout << (fails == 0 ? "   V26 M0+M1 DURABILITY TESTS PASSED\n"
+                             : "   V26 DURABILITY FAILURES: " + std::to_string(fails) + "\n");
     return fails;
 }
 

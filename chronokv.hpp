@@ -1,5 +1,64 @@
 // chronokv.hpp — ChronoKV engine and public C++ API.
 //
+// v25.5 SHIPPED (v26 milestone M1): adversarial fsync semantics. Two defects
+// found by auditing every fsync call site, one new fault kind, five new
+// tests. No public API change.
+//
+//   D3 FIX — maybe_rotate_segment() discarded FOUR durability results: the
+//       old segment's pre-close fsync, the new segment's fsync,
+//       write_manifest()'s return, and fsync_dir(). rotate_after_checkpoint()
+//       has always checked all four; the size-based rotation path (the one
+//       that runs every 64 MiB) simply did not follow the same pattern.
+//       The consequence was NOT silent corruption — recover_all() rejects the
+//       resulting state loudly: a non-durable MANIFEST still names segment N
+//       while N+1 exists -> "orphan WAL segment"; a non-durable directory
+//       entry leaves the MANIFEST naming N+1 with no file -> "missing WAL
+//       segment". Either way the database will not open, and the only
+//       practical remedy is deleting the offending segment, which discards
+//       writes already acknowledged durable. Now fail-stops at the moment of
+//       failure, while the on-disk state is still self-consistent.
+//
+//   FAULT-INJECTION FIX — the io_uring fsync branch honoured ONLY
+//       fault::Kind::FsyncFail. When used_iouring is true the chain runs
+//       IORING_OP_FSYNC itself, so checked_fsync() — where every other fault
+//       kind is injected — is never called. Any other fsync fault was
+//       therefore silently inert on every modern kernel, which is exactly the
+//       trap that makes a test pass vacuously. No existing test was affected
+//       (they all use FsyncFail), but both paths now honour every kind.
+//
+//   NEW FAULT KIND — FsyncFailAfterPersist: the bytes reached stable storage
+//       but the call returned EIO. This is the other half of the fsyncgate
+//       family, and the case that tests whether the rollback truncation
+//       (invariant D2) prevents a "told-failure-but-actually-durable"
+//       contract violation. Distinct from FsyncFail, which skips the real
+//       fsync so nothing was persisted.
+//
+//   NOT IMPLEMENTED, deliberately:
+//     - FsyncSilentLoss (fsync returns 0, data never persisted) is untestable
+//       in-process for the same reason M0's power loss is — nothing in a user
+//       process can discard the kernel page cache. Adding the kind would
+//       create a knob that tests nothing and invites false confidence.
+//       Coverage gap; needs dm-flakey or real hardware.
+//     - PartialWrite is redundant: write_all() already loops on short writes,
+//       Kind::WriteShort already exercises that, torn-tail recovery already
+//       handles a lost remainder, and v25.2 requires the full write length on
+//       the io_uring CQE.
+//
+//   NOTE ON D3: the milestone plan described this as "make fsync errors fatal,
+//       needs sign-off". The audit showed that policy ALREADY existed — failed_
+//       latches and is never cleared, commit_txn short-circuits to
+//       TxnResult::DatabaseFailed, and health() reports level 2 "wal fail-stop
+//       mode active". So M1 extended an existing policy to the one path that
+//       violated it; it did not change behaviour for callers. The
+//       DatabaseFailed/WalFailure distinction is deliberate: WalFailure means
+//       "this write failed", Failed means "this instance is done".
+//
+//   Tests D3a-D3e. D3a/D3b/D3c are detectors and were verified to FAIL with
+//       the rotation fix reverted. D3d (latch cannot be fooled by a later
+//       successful fsync) and D3e (false fsync failure still rolls back) pass
+//       either way and are labelled a guard and a new-capability test rather
+//       than passed off as detectors.
+//
 // v25.4 SHIPPED (v26 milestone M0): durability defect fix. One confirmed
 // bug, one new canonical invariant, no new public API.
 //
@@ -673,7 +732,13 @@ namespace fault {
                             // rotation failure) is deterministically testable.
                             // Kept separate from OpenFail, which the
                             // checkpoint tests already own.
-                            SegOpenFail };
+                            SegOpenFail,
+                            // v26 M1: adversarial fsync semantics. Models the
+                            // "false failure" half of the fsyncgate family --
+                            // the data IS durable but the kernel reported an
+                            // error. Distinct from FsyncFail (which skips the
+                            // real fsync, so nothing was persisted).
+                            FsyncFailAfterPersist };
     inline std::atomic<int> armed{0};
     inline std::atomic<int> remaining{0};
 
@@ -943,6 +1008,15 @@ static bool checked_fsync(int fd) {
     if (fault::fire(fault::Kind::FsyncFail)) { errno = EIO; return false; }
 #endif
     while (::fsync(fd) != 0) { if (errno == EINTR) continue; return false; }
+#ifdef CHRONOKV_FAULT_INJECTION
+    // v26 M1: the bytes ARE on stable storage but the call reported an
+    // error. This is the case that makes fsync errors dangerous in the
+    // other direction -- the caller must not conclude "not durable" and
+    // leave the record where recovery will replay it after telling the
+    // client WalFailure. The rollback truncation (invariant D2) is what
+    // closes that, and this fault kind is how it gets tested.
+    if (fault::fire(fault::Kind::FsyncFailAfterPersist)) { errno = EIO; return false; }
+#endif
     return true;
 }
 
@@ -974,7 +1048,8 @@ static bool checked_rename(const std::string& from, const std::string& to) {
     return ::rename(from.c_str(), to.c_str()) == 0;
 }
 
-static void write_file(const std::string& path, const std::vector<uint8_t>& data) {
+// [[maybe_unused]]: only called from the hooks-on test suite.
+[[maybe_unused]] static void write_file(const std::string& path, const std::vector<uint8_t>& data) {
     int fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd < 0) return;
     write_all(fd, data.data(), data.size());
@@ -1060,7 +1135,8 @@ static std::vector<uint8_t> wal_prepend_lsn(uint64_t lsn, const std::vector<uint
     return full;
 }
 // Full framed record, used by tests that hand-build WAL bytes.
-static std::vector<uint8_t> wal_make_record(uint64_t lsn, uint64_t cts, const WriteSet& ws) {
+// [[maybe_unused]]: only called from the hooks-on test suite.
+[[maybe_unused]] static std::vector<uint8_t> wal_make_record(uint64_t lsn, uint64_t cts, const WriteSet& ws) {
     return wal_frame(wal_prepend_lsn(lsn, wal_ser(cts, ws)));
 }
 
@@ -1243,7 +1319,8 @@ enum class TxnState : uint8_t { Active, Committed, Aborted };
 //                    data, or you have an external recovery mechanism).
 enum class DurabilityMode : uint8_t { Sync, Group, Async };
 
-static const char* to_string(TxnResult r) {
+// [[maybe_unused]]: only called under CHRONOKV_RECORD_HISTORY.
+[[maybe_unused]] static const char* to_string(TxnResult r) {
     switch (r) {
         case TxnResult::Committed:          return "Committed";
         case TxnResult::Conflict:           return "Conflict";
@@ -2376,9 +2453,28 @@ private:
     void maybe_rotate_segment() {
         if (active_segment_bytes_ < SEGMENT_MAX_BYTES) return;
         // Active segment is full — rotate.
+        // v26 M1 (invariant D3): every durability result on this path is now
+        // checked and fail-stops the instance, matching what
+        // rotate_after_checkpoint() has always done.
+        //
+        // Previously FOUR results were discarded here: the fsync of the old
+        // segment before closing it, the fsync of the new segment,
+        // write_manifest()'s return, and fsync_dir(). The consequence was not
+        // silent corruption but something nearly as bad -- an inconsistent
+        // on-disk state that recovery rejects LOUDLY:
+        //   * MANIFEST not durable -> it still names segment N while N+1
+        //     exists -> recover_all() throws "orphan WAL segment".
+        //   * new segment's directory entry not durable -> MANIFEST names N+1
+        //     but the file is gone -> recover_all() throws "missing WAL
+        //     segment".
+        // Either way the database will not open, and the only practical
+        // remedy is deleting the offending segment -- which discards writes
+        // that were already acknowledged durable. Fail-stop at the moment of
+        // the failure instead: the instance stops accepting writes while the
+        // on-disk state is still self-consistent and recoverable.
         if (active_fd_ >= 0) {
-            checked_fsync(active_fd_);
-            checked_close(active_fd_);
+            if (!checked_fsync(active_fd_)) { failed_ = true; return; }
+            if (!checked_close(active_fd_)) { active_fd_ = -1; failed_ = true; return; }
             active_fd_ = -1;
         }
         uint64_t new_id = active_id_ + 1;
@@ -2386,12 +2482,12 @@ private:
             failed_ = true;
             return;
         }
-        checked_fsync(active_fd_);
+        if (!checked_fsync(active_fd_)) { failed_ = true; return; }
         // Write MANIFEST with the new active_id. ckpt_ts is 0 (no checkpoint
         // triggered this rotation — it's size-based). The checkpoint mechanism
         // (M3) will update ckpt_ts when it runs.
-        write_manifest(new_id, 0);
-        fsync_dir(dir_);
+        if (!write_manifest(new_id, 0)) { failed_ = true; return; }
+        if (!fsync_dir(dir_)) { failed_ = true; return; }
     }
 
     // v24 FIX (Group 1, Fix 3): scan a segment file and ftruncate to the
@@ -2799,8 +2895,19 @@ public:
                 // If fault injection fires, treat as fsync failure (truncation).
                 if (io_ok && used_iouring) {
                     // Check fault injection without calling real fsync.
+                    //
+                    // v26 M1: this branch must honour EVERY fsync fault kind,
+                    // not just FsyncFail. The io_uring chain runs
+                    // IORING_OP_FSYNC itself, so checked_fsync() -- where the
+                    // other kinds are injected -- is never called on this
+                    // path. Before this fix any non-FsyncFail fsync fault was
+                    // silently inert whenever io_uring was active (i.e. on
+                    // every modern kernel), which would make such tests pass
+                    // VACUOUSLY. FsyncFail is checked first and || short-
+                    // circuits, so only one charge is ever consumed.
 #ifdef CHRONOKV_FAULT_INJECTION
-                    if (fault::fire(fault::Kind::FsyncFail)) {
+                    if (fault::fire(fault::Kind::FsyncFail) ||
+                        fault::fire(fault::Kind::FsyncFailAfterPersist)) {
                         io_ok = false;
                         diag::wal_fsync_fails.fetch_add(1, std::memory_order_relaxed);
                         i_wal_fsync_fails.fetch_add(1, std::memory_order_relaxed);
@@ -3055,9 +3162,11 @@ bool rotate_after_checkpoint(uint64_t ckpt_ts) {
 
         if (!manifest_exists) {
             // No MANIFEST. This is the normal state of a non-checkpointed
-            // database: segments exist but MANIFEST is only written by
-            // rotate_after_checkpoint(). Infer active_id from the highest
-            // segment number found.
+            // database: segments exist but no rotation has completed yet.
+            // (v26 M1 correction: MANIFEST is written by BOTH
+            // rotate_after_checkpoint() and maybe_rotate_segment() -- the
+            // previous wording named only the former.) Infer active_id from
+            // the highest segment number found.
             uint64_t max_seg_id = 0;
             if (std::filesystem::exists(dir) && std::filesystem::is_directory(dir)) {
                 for (auto& entry : std::filesystem::directory_iterator(dir)) {
@@ -6078,7 +6187,7 @@ namespace chronokv {
 // applied and clean under Release / ASan+UBSan / TSan / Stress; the
 // hooks-off public_api_smoke.cpp target (28 checks) passes against the
 // same header.
-static constexpr const char* CHRONOKV_VERSION = "0.25.4";
+static constexpr const char* CHRONOKV_VERSION = "0.25.5";
 static constexpr int CHRONOKV_VERSION_MAJOR = 0;
 static constexpr int CHRONOKV_VERSION_MINOR = 25;
 static constexpr int CHRONOKV_VERSION_PATCH = 2;

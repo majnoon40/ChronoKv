@@ -9,7 +9,8 @@ Progress:
 | --- | --- | --- |
 | v25.3 — review defect fixes (C1, H1, H3, H4) | **DONE** | `3929d25`, `0.25.3` |
 | v26 M0 — durable rollback truncation (D2) | **DONE** | `3509586`, `0.25.4` |
-| v26 M1–M4, v27–v30 | not started | — |
+| v26 M1 — adversarial fsync semantics (D3) | **DONE** | see below |
+| v26 M2–M4, v27–v30 | not started | — |
 
 ## How to read this
 
@@ -121,7 +122,73 @@ What shipped instead:
   **Passes pre-fix**, which is exactly why it is labelled a guard and not a detector —
   it documents the limit above rather than pretending to close it.
 
-## M1 — Adversarial fsync semantics  **[M] [HIGHEST VALUE]**
+## M1 — Adversarial fsync semantics  **[M] [HIGHEST VALUE] — DONE**
+
+> ### What the audit changed about this milestone
+>
+> The plan below was written before the fsync call sites were audited. Three of its
+> premises were wrong, and the audit found two defects the plan did not anticipate.
+> Recorded here rather than quietly rewritten, because the corrections are more
+> useful than the original plan.
+>
+> **1. The "policy change needing sign-off" does not exist.** The plan called for making
+> fsync errors fatal to the WAL instance and flagged it as a behaviour change requiring
+> approval. It already works that way: `failed_` latches and is never cleared anywhere;
+> `commit_txn` short-circuits to `TxnResult::DatabaseFailed` (→ `Status::Failed`) once
+> `wal_->is_failed()`; and `health()` reports level 2 with reason `"wal fail-stop mode
+> active"`. Reads keep working, writes are refused, and the state is observable through
+> the public API. So M1 needed *consistency*, not a policy change. Asking for sign-off
+> was a mistake born from planning before reading.
+>
+> The `DatabaseFailed` vs `WalFailure` distinction is deliberate and worth preserving:
+> `WalFailure` means "this write failed", `Failed` means "this instance is done, stop
+> trying". The first draft of test D3d asserted `WalFailure` for post-latch writes and
+> was simply wrong; the comment in the test now says so, to stop someone "fixing" it back.
+>
+> **2. New defect found — `maybe_rotate_segment()` discarded four durability results.**
+> Not in the plan. The size-based rotation path (the one that runs every 64 MiB) ignored
+> the old segment's pre-close fsync, the new segment's fsync, `write_manifest()`'s return
+> and `fsync_dir()`. `rotate_after_checkpoint()` checks all four correctly, so the right
+> pattern already existed in the same file — this path just didn't follow it.
+>
+> The consequence is *not* silent corruption: `recover_all()` rejects the resulting state
+> loudly. A non-durable MANIFEST leaves it naming segment N while N+1 exists → `"orphan
+> WAL segment"`; a non-durable directory entry leaves the MANIFEST naming N+1 with no
+> file → `"missing WAL segment"`. Either way the database will not open, and the only
+> practical remedy is deleting the offending segment — which discards writes already
+> acknowledged durable. Now fail-stops at the moment of failure, while the on-disk state
+> is still self-consistent.
+>
+> **3. New defect found — fsync fault injection was inert on the io_uring path.** When
+> `used_iouring` is true the chain runs `IORING_OP_FSYNC` itself, so `checked_fsync()` —
+> where fault kinds are injected — is never called. That branch checked `FsyncFail` only,
+> so **any other fsync fault kind silently did nothing on every modern kernel**. No
+> existing test was affected (they all use `FsyncFail`), but it is exactly the trap that
+> makes a test suite pass vacuously. Now every fsync fault kind is honoured on both paths.
+>
+> **4. Two planned fault kinds were NOT implemented.**
+> - `FsyncSilentLoss` (fsync returns 0, data never persisted) is **untestable in-process**
+>   for the same reason M0's power loss is: nothing in a user process can discard the
+>   kernel page cache. Adding the kind would create a knob that tests nothing and invites
+>   false confidence. Recorded as a coverage gap requiring `dm-flakey` or real hardware.
+> - `PartialWrite` was dropped as redundant: `write_all()` already loops on short writes,
+>   `Kind::WriteShort` already exercises that, torn-tail recovery already handles a lost
+>   remainder, and v25.2 requires the full write length on the io_uring CQE.
+>
+> **What actually shipped:** the `maybe_rotate_segment` fail-stop fix; the io_uring
+> fault-injection fix; `Kind::FsyncFailAfterPersist` (the data IS durable but the call
+> reported an error — the other half of fsyncgate, and the case that tests whether the
+> rollback truncation prevents "told-failure-but-actually-durable"); tests D3a–D3e; and a
+> correction to a stale `recover_all()` comment claiming MANIFEST is written only by
+> `rotate_after_checkpoint()`.
+>
+> **Verified against reverted code:** D3a, D3b and D3c all FAIL when the rotation fix is
+> reverted. D3d and D3e pass either way, and are labelled a guard and a new-capability
+> test respectively rather than being passed off as detectors.
+>
+> ---
+>
+> *Original plan, preserved for the record:*
 
 **Anchor.** `checked_fsync()` retries on `EINTR` and returns `false` otherwise; the
 leader then truncates, returns `WalFailure`, and *keeps running*. That policy is unsafe
@@ -156,6 +223,9 @@ what Jepsen hunts.
 **New invariant.**
 > **D3** — once any fsync on the WAL or checkpoint path returns an error, the instance
 > makes no further durability promise and accepts no further writes.
+>
+> *Status: already held on the main WAL path before M1 (see correction 1). M1 extended it
+> to the size-based rotation path, which was the one place that violated it.*
 
 **Acceptance.** A matrix of {fault kind} × {crash point} × {Sync, Group, Async} asserting
 jointly: no resurrection (D2), no silent loss of an acknowledged-durable record, no LSN

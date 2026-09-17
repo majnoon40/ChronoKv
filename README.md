@@ -10,7 +10,7 @@ transactions with phantom detection, a paged B+ tree index, and
 io_uring-accelerated WAL writes — all in one header with no external
 dependencies.
 
-Current version: **0.25.4** (`CHRONOKV_VERSION` in `chronokv.hpp`).
+Current version: **0.25.5** (`CHRONOKV_VERSION` in `chronokv.hpp`).
 
 ## Highlights
 
@@ -147,6 +147,14 @@ inactive transaction), `Error` (engine failures), `NotYetImplementedError`.
   absent from the WAL after *any* crash, not merely after a clean restart —
   the rollback truncation is itself fsynced, so it cannot be undone by a
   power loss.
+- Invariant **D3**: once any fsync on the WAL path returns an error the
+  instance fail-stops — `failed_` latches permanently, writes return
+  `Status::Failed` (`TxnResult::DatabaseFailed`), reads of already-durable
+  data keep working, and `health()` reports level 2 with reason
+  `"wal fail-stop mode active"`. A later *successful* fsync can therefore
+  never be mistaken for evidence that earlier data survived; this is the
+  property that makes the Linux fsync-error semantics (the "fsyncgate"
+  family) safe here. Every fsync on both rotation paths is checked.
 - A `Transaction` destroyed while still active calls `std::abort()` —
   commit or abort explicitly. Concurrent `Database::close()` with live
   transactions requires external synchronization.
