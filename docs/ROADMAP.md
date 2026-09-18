@@ -9,8 +9,9 @@ Progress:
 | --- | --- | --- |
 | v25.3 — review defect fixes (C1, H1, H3, H4) | **DONE** | `3929d25`, `0.25.3` |
 | v26 M0 — durable rollback truncation (D2) | **DONE** | `3509586`, `0.25.4` |
-| v26 M1 — adversarial fsync semantics (D3) | **DONE** | see below |
-| v26 M2–M4, v27–v30 | not started | — |
+| v26 M1 — adversarial fsync semantics (D3) | **DONE** | `f73d7f6`, `0.25.5` |
+| v26 M2 — randomized crash-point fuzzing | **DONE** | see below, `0.25.6` |
+| v26 M3–M4, v27–v30 | not started | — |
 
 ## How to read this
 
@@ -232,7 +233,65 @@ jointly: no resurrection (D2), no silent loss of an acknowledged-durable record,
 gap or duplicate, and `verify_wal_dir()` clean after recovery. Every cell must be
 exercised — publish the matrix as coverage, not just as a pass count.
 
-## M2 — Randomized crash-point fuzzing  **[M]**
+## M2 — Randomized crash-point fuzzing  **[M] — DONE, shipped as 0.25.6**
+
+> ### It found a bug on the first run
+>
+> **An interrupted segment rotation left the database permanently unopenable.**
+> `maybe_rotate_segment()` creates the new segment *before* it can make the MANIFEST
+> durable, so a crash in that window leaves MANIFEST naming `N` while `N+1` exists.
+> `recover_all()` rejected any segment above `active_id` as an "orphan" and threw — so a
+> **routine** crash during a size-based rotation (one happens every 64 MiB) bricked the
+> database until someone manually deleted the file.
+>
+> Found by killing at `man_after_tmp_write`. Scene preserved by the fuzzer:
+> `MANIFEST active_id=2`, `wal_000001.log` 287 bytes, `wal_000002.log` 0 bytes,
+> `wal_000003.log` 0 bytes, plus a stale `MANIFEST.tmp`. All 7 ledgered writes were safe
+> in segment 1 — so no data loss, purely an availability defect, but a total one.
+>
+> Fix: tolerate an orphan that is **empty and at exactly `active_id+1`**. Provably safe —
+> rotation completes before any batch is written to the new segment, so a segment the
+> MANIFEST does not yet name cannot hold acknowledged data. It is *ignored*, not adopted:
+> `active_id` stays authoritative. The tolerance is deliberately narrow — a **non-empty**
+> orphan still throws (a MANIFEST rename that landed without its directory fsync can
+> revert while the newer segment holds acknowledged writes), and a **non-contiguous**
+> orphan still throws (no single interrupted rotation can produce one).
+>
+> Verified: reverting the tolerance gives 2 violations and a FAIL; with it, 0 violations
+> across all 20 points.
+>
+> ### The anti-vacuity check paid for itself twice
+>
+> The fuzzer asserts that *every* instrumented point is actually reached, because an
+> unreached point contributes nothing and looks identical to a pass — the same trap as the
+> io_uring fault-injection gap found in M1. That assertion failed on the first two runs and
+> caught two bugs **in the fuzzer itself**:
+>
+> 1. Occurrence index was fully random, so a point executing once per run was missed ~2/3
+>    of the time. Round 0 now always uses occurrence 0; later rounds randomise it.
+> 2. Workload plans were fully random, so rotation-only and checkpoint-only points were
+>    skipped whenever the seeded plan did not rotate or checkpoint. Plans are now forced
+>    to the regimes the target point needs.
+>
+> First run reported 6 of 20 points never hit. After both fixes: 20 of 20, every run.
+> Without the coverage assertion this would have shipped as a fuzzer silently testing 70%
+> of what it claimed.
+>
+> ### Deviations from the plan
+>
+> - The plan said "extend `stress_point()` into kill points". **Not possible** — it compiles
+>   to a no-op unless `CHRONOKV_STRESS` is defined, so it is inert in the release/asan/tsan
+>   builds. A separate `crashpt` mechanism gated on `CHRONOKV_FAULT_INJECTION` was added.
+> - The plan targeted 10k crash points per CI run. The in-suite default is 240 (12 rounds ×
+>   20 points, ~10 s) to keep the always-run suite fast; `CKV_CRASHFUZZ_ROUNDS=500` gives
+>   the 10k figure (~7 min at -O0 on 2 CPUs) for nightly. Round 0 alone guarantees full
+>   boundary coverage, so the default is not merely a sample.
+> - The fuzzer drives the **public `chronokv::Database` API**, not the engine directly, so
+>   it also covers the wrapper paths a real embedder uses.
+>
+> ---
+>
+> *Original plan, preserved for the record:*
 
 **Anchor.** Your own v20 M3 note: *"The 6-boundary crash matrix from the original plan
 was NOT built."* Twelve versions later it still isn't. Hand-picked crash boundaries

@@ -10,7 +10,7 @@ transactions with phantom detection, a paged B+ tree index, and
 io_uring-accelerated WAL writes — all in one header with no external
 dependencies.
 
-Current version: **0.25.5** (`CHRONOKV_VERSION` in `chronokv.hpp`).
+Current version: **0.25.6** (`CHRONOKV_VERSION` in `chronokv.hpp`).
 
 ## Highlights
 
@@ -46,9 +46,17 @@ Current version: **0.25.5** (`CHRONOKV_VERSION` in `chronokv.hpp`).
   prefix observers, streaming range scans, and read-only health/stats
   diagnostics.
 - **Heavy-duty validation** — engine tests, B+ tree fuzzing, fault
-  injection, deterministic stress mode, and a linearizability history
-  recorder, all run under a four-config sanitizer matrix
-  (Release / ASan+UBSan / TSan / Stress).
+  injection, deterministic stress mode, randomized crash-point fuzzing, and a
+  linearizability history recorder, all run under a four-config sanitizer
+  matrix (Release / ASan+UBSan / TSan / Stress).
+- **Crash-consistent recovery** — 20 instrumented crash points cover the whole
+  durability state machine (WAL leader, segment rotation, MANIFEST
+  write/rename, checkpoint, rebase). The fuzzer forks a child, kills it at a
+  seeded point, then reopens and asserts the database is recoverable with no
+  lost acknowledged write and no resurrected rejected one. It also asserts
+  *every* crash point is actually reached, so coverage cannot silently rot.
+  Note this exercises the recovery state machine, not power loss — `_exit()`
+  does not discard the kernel page cache (see Known limitations).
 
 ## Requirements
 
@@ -270,6 +278,13 @@ E1–E16 safety argument and the v24 fix log at the top of the file).
 - **Single process**: the `flock` guard fails fast on accidental second
   openers; there is no multi-process mode.
 - **Linux only**: no macOS/Windows support.
+- **Crash testing is not power-loss testing**: the crash fuzzer kills the
+  process with `_exit()`, which leaves the kernel page cache intact. It
+  therefore validates the *recovery state machine* — torn tails, half-written
+  MANIFESTs, orphaned `.tmp` files, rotation and checkpoint boundaries — but
+  cannot distinguish "fsynced" from "still dirty". True power-loss validation
+  needs a fault-injecting block layer (`dm-flakey`) or real hardware, and is an
+  open coverage gap.
 - **Compile memory**: the engine plus test suite is one ~17k-line translation
   unit; building it at `-O2` needs well over 1 GiB of RAM (it is OOM-killed
   below that). CI runners are fine; on small containers use

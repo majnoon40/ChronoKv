@@ -26,6 +26,8 @@
 #include <cassert>
 #include <chrono>    // review regression tests (watchdog deadlines)
 #include <filesystem>
+#include <fstream>   // v26 M2 crash fuzz: ledger parsing
+#include <random>    // v26 M2 crash fuzz: seeded plans
 #include <iostream>
 #include <limits>
 #include <string>
@@ -741,6 +743,363 @@ static int run_v26_durability_tests() {
 #endif // CHRONOKV_TEST_HOOKS (v26 durability tests)
 
 
+#ifdef CHRONOKV_TEST_HOOKS
+#ifdef CHRONOKV_FAULT_INJECTION
+
+// =====================================================================
+// v26 M2 — randomized crash-point fuzzing.
+//
+// This is the "6-boundary crash matrix" the v20 M3 plan called for and never
+// built, generalised: instead of six hand-picked boundaries, every instrumented
+// point in the durability state machine (crashpt::kAll) is targeted in turn,
+// with a seeded workload and a seeded occurrence index.
+//
+// SCOPE, stated plainly so a green run is not over-trusted: crash points use
+// _exit(), which does NOT discard the kernel page cache. Writes that were never
+// fsynced therefore remain visible after the "crash". What this exercises is the
+// RECOVERY STATE MACHINE -- torn tails, half-written MANIFESTs, orphaned .tmp
+// files, checkpoint/rebase interleavings, rotation boundaries, LSN contiguity.
+// Power-loss semantics are a separate gap (dm-flakey / real hardware), recorded
+// under v26 M1.
+//
+// The ledger is what makes "no loss" assertable: every commit that returned OK
+// under Sync durability is appended to a sidecar file OUTSIDE the database
+// directory, with a write+fsync per entry, before the next operation. After the
+// crash the parent reopens and requires every ledgered key to be present. A
+// sidecar is necessary because the database itself is the thing under test.
+// =====================================================================
+namespace crashfuzz {
+
+struct Ledger {
+    int fd = -1;
+    void open(const std::string& path) {
+        fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_APPEND | O_TRUNC, 0644);
+    }
+    // Raw write + fsync: no stdio buffering, so the entry survives _exit().
+    void record(const std::string& key, const std::string& val) {
+        if (fd < 0) return;
+        std::string line = key + "\t" + val + "\n";
+        ssize_t w = ::write(fd, line.data(), line.size());
+        (void)w;
+        ::fsync(fd);
+    }
+    void close() { if (fd >= 0) { ::fsync(fd); ::close(fd); fd = -1; } }
+};
+
+static std::vector<std::pair<std::string,std::string>> read_ledger(const std::string& path) {
+    std::vector<std::pair<std::string,std::string>> out;
+    std::ifstream f(path);
+    std::string line;
+    while (std::getline(f, line)) {
+        auto t = line.find('\t');
+        if (t == std::string::npos) continue;
+        out.emplace_back(line.substr(0, t), line.substr(t + 1));
+    }
+    return out;
+}
+
+// Seeded plan. Deliberately covers the four regimes needed to reach every
+// crash point: plain commits (wal_*), forced segment rotation (rot_*, man_*),
+// checkpoint (ckpt_*), and checkpoint-driven rotation (rotc_*).
+struct Plan {
+    int puts_before;
+    bool rotate;
+    int puts_after_rotate;
+    bool checkpoint;
+    int puts_after_ckpt;
+    bool second_checkpoint;
+    int occurrence;      // which hit of the target point dies
+};
+
+static Plan make_plan(uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    Plan p;
+    p.puts_before        = 1 + (int)(rng() % 8);
+    p.rotate             = (rng() % 2) == 0;
+    p.puts_after_rotate  = (int)(rng() % 5);
+    p.checkpoint         = (rng() % 2) == 0;
+    p.puts_after_ckpt    = (int)(rng() % 5);
+    p.second_checkpoint  = p.checkpoint && (rng() % 3) == 0;
+    // occurrence is filled in by the caller: round 0 must always use 0, so a
+    // point that executes only once per run is guaranteed to be reached. A
+    // purely random occurrence would leave single-execution points unhitted
+    // ~2/3 of the time -- which is exactly what the first run of this fuzzer
+    // did, reporting 6 of 20 points never hit. Randomising the occurrence is
+    // still valuable (it targets the 2nd/3rd batch or rotation), just not on
+    // the round that carries the coverage guarantee.
+    p.occurrence         = 0;
+    return p;
+}
+
+// Runs in the forked child. Returns a process exit code.
+//
+// Drives the PUBLIC chronokv::Database API rather than the engine directly:
+// the crash points sit in engine code, but exercising them through the public
+// surface means the fuzzer also covers the wrapper paths a real embedder uses.
+static int child_body(const std::string& base, const Plan& plan,
+                      const char* point, bool use_ckpt) {
+    const std::string wd = base + "/wal";
+    Ledger acked, rejected;
+    acked.open(base + "/ledger");
+    rejected.open(base + "/ledger_rejected");
+    if (acked.fd < 0) return 20;
+
+    try {
+        chronokv::Options opts;
+        opts.wal_dir         = wd;
+        opts.checkpoint_path = use_ckpt ? (base + "/ckpt") : std::string();
+        opts.durability      = chronokv::DurabilityMode::Sync;  // every OK commit is fsynced
+        opts.auto_start_gc   = false;
+        opts.recover_on_open = false;
+        auto db = chronokv::Database::open(opts);
+
+        // Arm AFTER open: killing during open would not test recovery of a
+        // written database, and would make every iteration trivially identical.
+        crashpt::arm(point, plan.occurrence);
+
+        auto do_put = [&](const std::string& k) {
+            std::string v = "v_" + k;
+            chronokv::Status st = chronokv::Status::Failed;
+            try { st = db.put(k, v); } catch (...) { st = chronokv::Status::Failed; }
+            if (st == chronokv::Status::OK) acked.record(k, v);
+            else                            rejected.record(k, "");
+        };
+
+        for (int i = 0; i < plan.puts_before; ++i)
+            do_put("a" + std::to_string(i));
+
+        if (plan.rotate) {
+            db.force_wal_rotation_for_test();
+            for (int i = 0; i < std::max(1, plan.puts_after_rotate); ++i)
+                do_put("b" + std::to_string(i));
+        }
+        if (use_ckpt) {
+            try { db.checkpoint(); } catch (...) { /* may legitimately fail */ }
+            for (int i = 0; i < plan.puts_after_ckpt; ++i)
+                do_put("c" + std::to_string(i));
+            if (plan.second_checkpoint) {
+                try { db.checkpoint(); } catch (...) {}
+            }
+        }
+        crashpt::disarm();
+    } catch (...) {
+        acked.close(); rejected.close();
+        return 21;
+    }
+    // Flush ledgers BEFORE a clean exit so the parent can distinguish
+    // "plan completed" from "died at the armed point".
+    acked.close();
+    rejected.close();
+    return 0;
+}
+
+} // namespace crashfuzz
+
+static int run_crash_fuzz() {
+    int fails = 0;
+    auto report = [&](const char* n, bool ok, const std::string& fr = {}) {
+        std::cout << "   " << n << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) { fails++; if (!fr.empty()) std::cout << "    (" << fr << ")\n"; }
+    };
+
+    // Rounds per crash point. Total iterations = rounds * kAllCount (20).
+    // The default keeps the always-run suite fast (~10s); round 0 of every
+    // point uses occurrence 0, so full coverage of all 20 boundaries is
+    // guaranteed even at rounds=1. Raise CKV_CRASHFUZZ_ROUNDS for a long
+    // nightly run -- 40 gives 800 iterations, 500 gives 10k (the figure the
+    // v26 plan targeted for CI) at roughly 7 minutes on a 2-CPU box at -O0.
+    int rounds = 12;
+    if (const char* e = getenv("CKV_CRASHFUZZ_ROUNDS")) {
+        int v = atoi(e);
+        if (v > 0) rounds = v;
+    }
+
+    const size_t npts = crashpt::kAllCount;
+    std::vector<int> hits(npts, 0);          // coverage: did the point ever fire?
+    std::vector<int> clean_runs(npts, 0);    // plan completed without hitting it
+    std::vector<std::string> first_failure;
+    int violations = 0;
+
+    uint64_t seed_base = 0xC0FFEEULL;
+    if (const char* e = getenv("CKV_CRASHFUZZ_SEED")) seed_base = strtoull(e, nullptr, 10);
+
+    for (size_t pi = 0; pi < npts; ++pi) {
+        const char* point = crashpt::kAll[pi];
+        for (int r = 0; r < rounds; ++r) {
+            uint64_t seed = seed_base + pi * 1000003ULL + (uint64_t)r * 7919ULL;
+            crashfuzz::Plan plan = crashfuzz::make_plan(seed);
+            // Reachability: force the plan regimes the TARGET point needs, so
+            // coverage does not depend on the seeded plan happening to rotate
+            // or checkpoint. Without this the first run reported 6 of 20 points
+            // never hit -- not because they were unreachable, but because the
+            // random plan skipped the code path they sit on.
+            {
+                std::string pn(point);
+                if (pn.rfind("rot_", 0) == 0 || pn.rfind("man_", 0) == 0) {
+                    plan.rotate = true;
+                    plan.puts_after_rotate = std::max(1, plan.puts_after_rotate);
+                }
+                if (pn.rfind("rotc_", 0) == 0 || pn.rfind("ckpt_", 0) == 0) {
+                    plan.checkpoint = true;
+                    // rotc_* needs rotate_after_checkpoint, which only runs when
+                    // a checkpoint is taken on a WAL that has segments to rotate.
+                    plan.rotate = true;
+                    plan.puts_after_ckpt = std::max(1, plan.puts_after_ckpt);
+                }
+            }
+            if (r > 0) {
+                std::mt19937_64 orng(seed ^ 0x5DEECE66DULL);
+                plan.occurrence = (int)(orng() % 3);   // 2nd/3rd hit, if it recurs
+            }
+            const std::string base = "/tmp/ckv_cf_" + std::to_string(getpid()) +
+                                     "_" + std::to_string(pi) + "_" + std::to_string(r);
+            std::filesystem::remove_all(base);
+            std::filesystem::create_directories(base + "/wal");
+            // Only some iterations configure a checkpoint path, so ckpt_* and
+            // rotc_* points are reached in a realistic mix rather than every time.
+
+            std::cout.flush();
+            pid_t child = fork();
+            if (child < 0) { first_failure.push_back(std::string(point) + ": fork failed"); break; }
+            if (child == 0) {
+                _exit(crashfuzz::child_body(base, plan, point, plan.checkpoint));
+            }
+            int wst = 0;
+            if (waitpid(child, &wst, 0) != child) {
+                first_failure.push_back(std::string(point) + ": waitpid failed");
+                continue;
+            }
+
+            // A signal death is a real bug (segfault/abort), not a crash point.
+            if (WIFSIGNALED(wst)) {
+                violations++;
+                first_failure.push_back(std::string(point) + " seed=" + std::to_string(seed) +
+                                        ": child died on signal " + std::to_string(WTERMSIG(wst)));
+                std::filesystem::remove_all(base);
+                continue;
+            }
+            int rc = WIFEXITED(wst) ? WEXITSTATUS(wst) : -1;
+            if (rc == crashpt::kExitCode)      hits[pi]++;
+            else if (rc == 0)                  clean_runs[pi]++;
+            else {
+                violations++;
+                first_failure.push_back(std::string(point) + " seed=" + std::to_string(seed) +
+                                        ": child exit " + std::to_string(rc));
+                std::filesystem::remove_all(base);
+                continue;
+            }
+
+            // ---- verify the on-disk state recovers cleanly ----
+            std::string reason;
+            const std::string wd = base + "/wal";
+            const std::string cp = base + "/ckpt";
+            std::string err;
+
+            if (!ChronoKV::verify_wal_dir(wd, &reason)) {
+                err = "verify_wal_dir: " + reason;
+            } else if (plan.checkpoint && std::filesystem::exists(cp) &&
+                       !ChronoKV::verify_checkpoint_chain(cp, &reason)) {
+                err = "verify_checkpoint_chain: " + reason;
+            }
+
+            auto acked    = crashfuzz::read_ledger(base + "/ledger");
+            auto rejected = crashfuzz::read_ledger(base + "/ledger_rejected");
+
+            if (err.empty()) {
+                try {
+                    ChronoKV kv2(wd);
+                    if (plan.checkpoint && std::filesystem::exists(cp))
+                        kv2.recover_with_checkpoint(wd, cp);
+                    else
+                        kv2.recover(wd);
+
+                    // NO LOSS: everything acknowledged durable must be present.
+                    for (auto& [k, v] : acked) {
+                        auto got = kv2.read(k);
+                        if (!got || *got != v) {
+                            err = "LOSS: acknowledged key '" + k + "' missing/wrong after recovery";
+                            break;
+                        }
+                    }
+                    // NO RESURRECTION (D2): a write the caller was NOT told
+                    // succeeded must not be present. Keys are unique per
+                    // attempt, so a rejected key can never be re-acknowledged.
+                    if (err.empty()) {
+                        for (auto& [k, v] : rejected) {
+                            (void)v;
+                            if (kv2.read(k).has_value()) {
+                                err = "RESURRECTION: rejected key '" + k + "' present after recovery";
+                                break;
+                            }
+                        }
+                    }
+                    if (err.empty() && !kv2.verify_publication(&reason))
+                        err = "verify_publication: " + reason;
+                    if (err.empty() && !kv2.verify_version_chains(&reason))
+                        err = "verify_version_chains: " + reason;
+                } catch (const std::exception& e) {
+                    // An unopenable database is the worst outcome: it strands
+                    // every acknowledged write behind a manual repair step.
+                    err = std::string("recovery THREW: ") + e.what();
+                }
+            }
+
+            if (!err.empty()) {
+                violations++;
+                if (first_failure.size() < 12)
+                    first_failure.push_back(std::string(point) + " seed=" + std::to_string(seed) +
+                                            " occurrence=" + std::to_string(plan.occurrence) +
+                                            ": " + err);
+                // Preserve the scene for the first few failures only.
+                if (violations > 3) std::filesystem::remove_all(base);
+            } else {
+                std::filesystem::remove_all(base);
+            }
+        }
+    }
+
+    const int total_iters = (int)(npts * (size_t)rounds);
+    int total_hits = 0;
+    std::vector<std::string> never_hit;
+    for (size_t i = 0; i < npts; ++i) {
+        total_hits += hits[i];
+        if (hits[i] == 0) never_hit.push_back(crashpt::kAll[i]);
+    }
+
+    std::cout << "    (" << total_iters << " iterations, " << total_hits
+              << " reached an armed crash point, " << violations << " violations)\n";
+
+    // ANTI-VACUITY: a crash point that is never reached contributes nothing,
+    // and a fuzzer that silently skips points looks identical to one that
+    // passes. This is the same class of trap as the io_uring fault-injection
+    // gap found in v26 M1, so it is asserted rather than assumed.
+    report("v26 M2: every instrumented crash point is reachable",
+           never_hit.empty(),
+           never_hit.empty() ? std::string()
+                             : "never hit: " + [&]{ std::string j;
+                                 for (size_t i=0;i<never_hit.size();++i) { if(i) j+=", "; j+=never_hit[i]; }
+                                 return j; }());
+
+    report("v26 M2: no crash leaves the database unrecoverable, lossy, or resurrected",
+           violations == 0,
+           first_failure.empty() ? std::string() : first_failure[0]);
+
+    if (first_failure.size() > 1) {
+        std::cout << "    (further failures: ";
+        for (size_t i = 1; i < first_failure.size(); ++i)
+            std::cout << (i>1?"; ":"") << first_failure[i];
+        std::cout << ")\n";
+    }
+
+    std::cout << (fails == 0 ? "   V26 M2 CRASH FUZZ PASSED\n"
+                             : "   V26 M2 CRASH FUZZ FAILURES: " + std::to_string(fails) + "\n");
+    return fails;
+}
+
+#endif // CHRONOKV_FAULT_INJECTION
+#endif // CHRONOKV_TEST_HOOKS
+
+
 #ifdef CHRONOKV_TEST_HOOKS   // uses Database test hooks; hooks-off has none
 
 // =====================================================================
@@ -992,6 +1351,9 @@ static int run_review_regression_tests() {
 #ifdef CHRONOKV_TEST_HOOKS
 static int run_review_regression_tests();   // defined above main()
 static int run_v26_durability_tests();      // defined above main()
+#ifdef CHRONOKV_FAULT_INJECTION
+static int run_crash_fuzz();                // defined above main()
+#endif
 #endif
 
 int main() {
@@ -1008,6 +1370,9 @@ return 0;
     if (getenv("CKV_ONLY_REVIEW")) {
         crc_init();
         int f = run_review_regression_tests() + run_v26_durability_tests();
+#ifdef CHRONOKV_FAULT_INJECTION
+        f += run_crash_fuzz();
+#endif
         std::cout.flush();
         return f == 0 ? 0 : 1;
     }
@@ -6308,6 +6673,10 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     fails += run_review_regression_tests();
     // v26 M0: invariant D2 -- the WalFailure rollback must be durable.
     fails += run_v26_durability_tests();
+#ifdef CHRONOKV_FAULT_INJECTION
+    // v26 M2: randomized crash-point fuzzing over the recovery state machine.
+    fails += run_crash_fuzz();
+#endif
 
 diag::dump();
     // Was a hardcoded "V25.1" banner that drifted from CHRONOKV_VERSION

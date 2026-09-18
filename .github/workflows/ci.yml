@@ -56,6 +56,10 @@ jobs:
             target: release
             bin: build/release/test
             cxx: g++
+            # v26 M2: this job carries the heavy crash-fuzz run (800 iterations
+            # vs the in-suite default of 240). Kept to one job so the sanitizer
+            # and TSan jobs -- where fork+recovery costs far more -- stay fast.
+            crashfuzz_rounds: 40
           - name: release (g++-14)
             os: ubuntu-24.04
             target: release
@@ -110,6 +114,10 @@ jobs:
         run: make ${{ matrix.target }} CXX=${{ matrix.cxx }} CKV_EXTRA_DEFS='${{ matrix.extra_defs }}'
 
       - name: Run tests
+        env:
+          # Empty for matrix entries that don't set it; the test binary treats
+          # an unset-or-zero value as "use the built-in default".
+          CKV_CRASHFUZZ_ROUNDS: ${{ matrix.crashfuzz_rounds }}
         run: |
           set -o pipefail
           ./${{ matrix.bin }} 2>&1 | tee test.log

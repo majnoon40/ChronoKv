@@ -1,5 +1,56 @@
 // chronokv.hpp — ChronoKV engine and public C++ API.
 //
+// v25.6 SHIPPED (v26 milestone M2): randomized crash-point fuzzing, and the
+// first defect it found.
+//
+//   BUG FOUND + FIXED — an interrupted segment rotation left the database
+//       PERMANENTLY UNOPENABLE. maybe_rotate_segment() creates the new
+//       segment before it can make the MANIFEST durable, so a crash in that
+//       window leaves MANIFEST naming N while N+1 exists on disk.
+//       recover_all() rejected any segment above active_id as an "orphan",
+//       so recovery threw and the database would not open — after a ROUTINE
+//       crash during a size-based rotation, which happens every 64 MiB.
+//       The only remedy was manually deleting the file.
+//       Fix: tolerate an orphan that is EMPTY and at exactly active_id+1.
+//       That is provably safe — rotation completes before any batch is
+//       written to the new segment, so a segment the MANIFEST does not yet
+//       name cannot hold acknowledged data. It is ignored, not adopted:
+//       active_id stays authoritative and the next rotation reopens the same
+//       id (O_CREAT without O_TRUNC) harmlessly. recover_all() stays
+//       read-only, so the stale file is left on disk rather than unlinked.
+//       The tolerance is deliberately narrow. A NON-EMPTY orphan still
+//       throws, and must: if a MANIFEST rename landed but its directory fsync
+//       did not, a crash can revert the MANIFEST while the newer segment
+//       already holds acknowledged writes, and silently skipping that would
+//       lose data. A non-contiguous orphan (id > active_id+1) also still
+//       throws, since no single interrupted rotation can produce one.
+//       New diag counter: rec_orphan_empty.
+//
+//   CRASH-POINT INFRASTRUCTURE — namespace crashpt + CKV_CRASH_POINT(name),
+//       gated on CHRONOKV_FAULT_INJECTION (so it is live in the normal suite).
+//       stress_point() could not carry this: it compiles to a no-op unless
+//       CHRONOKV_STRESS is defined. 20 points instrument the durability state
+//       machine: WAL leader (batch framed / after write / after fsync / before
+//       rollback / before state flip), size-based rotation, MANIFEST
+//       tmp-write->fsync->rename->dir-fsync, post-checkpoint rotation and
+//       unlink, checkpoint tmp-write->fsync->rename->dir-fsync.
+//       crashpt::kAll is the single canonical list, and a build-time-style
+//       check in the fuzzer asserts declared == instrumented, so the list
+//       cannot silently drift from the code.
+//
+//   SCOPE, stated so a green run is not over-trusted — a crash point uses
+//       _exit(), which does NOT discard the kernel page cache. Writes never
+//       fsynced remain visible after the "crash". What this exercises is the
+//       RECOVERY STATE MACHINE: torn tails, half-written MANIFESTs, orphaned
+//       .tmp files, checkpoint/rebase interleavings, rotation boundaries, LSN
+//       contiguity. This is the "6-boundary crash matrix" the v20 M3 plan
+//       called for and never built, generalised to every instrumented
+//       boundary. Power-loss semantics remain the dm-flakey gap recorded under
+//       v26 M1.
+//
+//   Verified: with the orphan tolerance reverted, the fuzzer reports
+//       violations and FAILS; with it, 0 violations across all 20 points.
+//
 // v25.5 SHIPPED (v26 milestone M1): adversarial fsync semantics. Two defects
 // found by auditing every fsync call site, one new fault kind, five new
 // tests. No public API change.
@@ -758,6 +809,74 @@ namespace fault {
         remaining.store(0, std::memory_order_relaxed);
     }
 }
+
+// ======================== Crash points (v26 M2) ========================
+// Deterministic kill points for crash fuzzing.
+//
+// Why not reuse stress_point(): it compiles to a no-op unless
+// CHRONOKV_STRESS is defined, so it is inert in the release/asan/tsan
+// builds. These are gated on CHRONOKV_FAULT_INJECTION, which the full test
+// suite always defines.
+//
+// SCOPE -- read this before trusting a green run. A crash point does NOT
+// simulate power loss. _exit() leaves the kernel page cache intact, so
+// writes that were never fsynced are still visible after the "crash". What
+// this exercises is the RECOVERY STATE MACHINE: torn tails, half-written
+// MANIFESTs, orphaned .tmp files, checkpoint/rebase interleavings, segment
+// rotation boundaries, LSN contiguity. That is the "6-boundary crash matrix"
+// the v20 M3 plan called for and never built, generalised to every
+// instrumented boundary. True power-loss semantics remain the dm-flakey
+// coverage gap recorded under v26 M1.
+//
+// Anti-vacuity: an armed point that is never reached would make the fuzzer
+// pass while testing nothing -- the same trap as the io_uring fault-injection
+// gap found in M1. So the kill uses a DISTINCT exit code, and the fuzzer
+// asserts every instrumented point is actually hit at least once.
+namespace crashpt {
+    inline std::atomic<const char*> target{nullptr};  // name to die at
+    inline std::atomic<int> occurrences{0};           // die on the Nth hit
+    inline std::atomic<int> seen{0};                  // hits of target so far
+    inline constexpr int kExitCode = 97;              // distinguishes armed kill
+
+    inline void point(const char* name) {
+        const char* t = target.load(std::memory_order_acquire);
+        if (!t || std::strcmp(t, name) != 0) return;
+        int n = seen.fetch_add(1, std::memory_order_relaxed);
+        if (n == occurrences.load(std::memory_order_relaxed)) {
+            // Die the way a crash does: no destructors, no atexit, no flush.
+            _exit(kExitCode);
+        }
+    }
+    inline void arm(const char* name, int occurrence) {
+        seen.store(0, std::memory_order_relaxed);
+        occurrences.store(occurrence, std::memory_order_relaxed);
+        target.store(name, std::memory_order_release);
+    }
+    inline void disarm() { target.store(nullptr, std::memory_order_release); }
+
+    // The canonical list of instrumented points. Kept in one place so the
+    // fuzzer can enumerate coverage and fail if any point is unreachable.
+    inline const char* const kAll[] = {
+        // WAL leader / group commit
+        "wal_batch_framed", "wal_after_write", "wal_after_fsync",
+        "wal_before_rollback", "wal_before_state_flip",
+        // size-based segment rotation
+        "rot_before_old_fsync", "rot_after_new_open",
+        "rot_before_manifest", "rot_after_manifest", "rot_after_dir_fsync",
+        // MANIFEST write (tmp -> fsync -> rename -> dir fsync)
+        "man_after_tmp_write", "man_after_tmp_fsync",
+        "man_after_rename", "man_after_dir_fsync",
+        // post-checkpoint rotation
+        "rotc_before_unlink", "rotc_after_unlink",
+        // checkpoint / rebase
+        "ckpt_after_tmp_write", "ckpt_after_tmp_fsync",
+        "ckpt_after_rename", "ckpt_after_dir_fsync",
+    };
+    inline constexpr size_t kAllCount = sizeof(kAll) / sizeof(kAll[0]);
+}
+#define CKV_CRASH_POINT(n) ::crashpt::point(n)
+#else
+#define CKV_CRASH_POINT(n) ((void)0)
 #endif
 
 // ======================== Deterministic stress mode ========================
@@ -915,6 +1034,7 @@ namespace diag {
     inline std::atomic<uint64_t> async_committed_then_lost{0};  // item 8: async told success, then batch failed
     inline std::atomic<uint64_t> rec_records{0}, rec_torn{0}, rec_crc_fails{0};
     inline std::atomic<uint64_t> rec_dups{0}, rec_gaps{0};
+    inline std::atomic<uint64_t> rec_orphan_empty{0};  // v26 M2: interrupted-rotation residue tolerated
     inline std::atomic<uint64_t> epoch_entries{0}, epoch_oldest{0}, epoch_newest{0};
 
     inline void dump() {
@@ -942,7 +1062,8 @@ namespace diag {
             << " truncate_fails=" << wal_truncate_fails.load() << "\n"
             << "recovery: records=" << rec_records.load() << " torn_tails=" << rec_torn.load()
             << " crc_fails=" << rec_crc_fails.load()
-            << " dups=" << rec_dups.load() << " gaps=" << rec_gaps.load() << "\n"
+            << " dups=" << rec_dups.load() << " gaps=" << rec_gaps.load()
+            << " orphan_empty=" << rec_orphan_empty.load() << "\n"
             << "epoch:    entries=" << epoch_entries.load()
             << " oldest=" << epoch_oldest.load() << " newest=" << epoch_newest.load() << "\n";
     }
@@ -2347,10 +2468,15 @@ private:
         int fd = ::open(tmp.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
         if (fd < 0) return false;
         if (!write_all(fd, buf.data(), buf.size())) { checked_close(fd); return false; }
+        CKV_CRASH_POINT("man_after_tmp_write");
         if (!checked_fsync(fd)) { checked_close(fd); return false; }
+        CKV_CRASH_POINT("man_after_tmp_fsync");
         if (!checked_close(fd)) return false;
         if (!checked_rename(tmp, manifest_path())) return false;
-        return fsync_dir(manifest_path());
+        CKV_CRASH_POINT("man_after_rename");
+        bool dok = fsync_dir(manifest_path());
+        CKV_CRASH_POINT("man_after_dir_fsync");
+        return dok;
     }
 
     std::pair<uint64_t, uint64_t> read_manifest() {
@@ -2472,6 +2598,7 @@ private:
         // that were already acknowledged durable. Fail-stop at the moment of
         // the failure instead: the instance stops accepting writes while the
         // on-disk state is still self-consistent and recoverable.
+        CKV_CRASH_POINT("rot_before_old_fsync");
         if (active_fd_ >= 0) {
             if (!checked_fsync(active_fd_)) { failed_ = true; return; }
             if (!checked_close(active_fd_)) { active_fd_ = -1; failed_ = true; return; }
@@ -2482,12 +2609,16 @@ private:
             failed_ = true;
             return;
         }
+        CKV_CRASH_POINT("rot_after_new_open");
         if (!checked_fsync(active_fd_)) { failed_ = true; return; }
         // Write MANIFEST with the new active_id. ckpt_ts is 0 (no checkpoint
         // triggered this rotation — it's size-based). The checkpoint mechanism
         // (M3) will update ckpt_ts when it runs.
+        CKV_CRASH_POINT("rot_before_manifest");
         if (!write_manifest(new_id, 0)) { failed_ = true; return; }
+        CKV_CRASH_POINT("rot_after_manifest");
         if (!fsync_dir(dir_)) { failed_ = true; return; }
+        CKV_CRASH_POINT("rot_after_dir_fsync");
     }
 
     // v24 FIX (Group 1, Fix 3): scan a segment file and ftruncate to the
@@ -2806,6 +2937,7 @@ public:
                     batch_bytes += frame.size();
                 }
 
+                CKV_CRASH_POINT("wal_batch_framed");
                 // v25.2: try io_uring write+fsync, fallback to sync pwrite.
                 // The wrapper builds ONE hard-linked SQE chain per batch:
                 //   WRITE/WRITE_FIXED -> [LINK_TIMEOUT 500ms] -> FSYNC(DATASYNC)
@@ -2885,6 +3017,7 @@ public:
                     }
                 }
 
+                CKV_CRASH_POINT("wal_after_write");
                 lk.lock();
                 if (io_ok) { batch->written = true; batch_cv_.notify_all(); }
                 lk.unlock();
@@ -2919,6 +3052,7 @@ public:
                     i_wal_fsync_fails.fetch_add(1, std::memory_order_relaxed);
                 }
 
+                CKV_CRASH_POINT("wal_after_fsync");
                 if (io_ok) {
                     diag::wal_records.fetch_add(batch->records.size(), std::memory_order_relaxed);
                     i_wal_records.fetch_add(batch->records.size(), std::memory_order_relaxed);
@@ -2953,6 +3087,7 @@ public:
                 // records -- never both. So has_async implies "all
                 // records in this batch are async" and the original
                 // truncation gating is correct again.
+                CKV_CRASH_POINT("wal_before_rollback");
                 if (!io_ok && batch_start >= 0) {
                     if (batch->has_async.load(std::memory_order_relaxed)) {
                         // All records in this batch are Async. Per the
@@ -3053,6 +3188,7 @@ public:
             // owned, so guard the re-acquire with owns_lock(); otherwise
             // the throw escapes and skips the cleanup below, stranding
             // every follower parked on batch_cv_.
+            CKV_CRASH_POINT("wal_before_state_flip");
             if (!lk.owns_lock()) lk.lock();
             if (leader_threw || !io_ok) {
                 failed_ = true;
@@ -3109,8 +3245,10 @@ bool rotate_after_checkpoint(uint64_t ckpt_ts) {
         if (!write_manifest(new_id, ckpt_ts)) { failed_ = true; return false; }
 
         // Delete old segments fully covered by the checkpoint
+        CKV_CRASH_POINT("rotc_before_unlink");
         for (uint64_t id = 1; id < old_id; ++id)
             ::unlink(seg_path(id).c_str());
+        CKV_CRASH_POINT("rotc_after_unlink");
 
         fsync_dir(dir_);
         return true;
@@ -3190,16 +3328,56 @@ bool rotate_after_checkpoint(uint64_t ckpt_ts) {
         }
 
         // 2. Scan directory for orphan segments (id > active_id).
+        //
+        // v26 M2 FIX: an EMPTY orphan at exactly active_id+1 is the residue of
+        // a rotation interrupted by a crash. Found by the new crash fuzzer
+        // (kill at man_after_tmp_write): maybe_rotate_segment() creates the new
+        // segment BEFORE it can make the MANIFEST durable, so a crash in that
+        // window leaves MANIFEST naming N while N+1 exists. This used to throw,
+        // which meant a routine crash during a size-based rotation (one happens
+        // every 64 MiB) left the database permanently unopenable until someone
+        // manually deleted the file.
+        //
+        // Tolerating it is safe and provably so: rotation completes before any
+        // batch is written to the new segment, so a segment the MANIFEST does
+        // not yet name cannot hold acknowledged data. It is IGNORED, not
+        // adopted -- active_id stays authoritative, and the next rotation
+        // reopens the same id (O_CREAT without O_TRUNC) harmlessly.
+        //
+        // The tolerance is deliberately narrow: size 0 at active_id+1 only.
+        //   * A NON-EMPTY orphan still throws, and must. If a MANIFEST rename
+        //     landed but its directory fsync did not, a crash can revert the
+        //     MANIFEST while the newer segment already holds acknowledged
+        //     writes; silently skipping that would lose data.
+        //   * A non-contiguous orphan (id > active_id+1) still throws: no single
+        //     interrupted rotation can produce one, so it means real corruption
+        //     or foreign interference.
+        //
+        // recover_all() stays read-only (it backs verify_wal_dir), so the stale
+        // empty file is left on disk rather than unlinked here.
         for (auto& entry : std::filesystem::directory_iterator(dir)) {
             if (!entry.is_regular_file()) continue;
             std::string fname = entry.path().filename().string();
             // v24 FIX (Group 2, Fix 8): strict filename match.
             uint64_t seg_id = 0;
             if (parse_seg_filename(fname, &seg_id)) {
-                if (seg_id > active_id) {
-                    throw std::runtime_error("Recovery failed: orphan WAL segment " + fname +
-                        " (manifest active_id=" + std::to_string(active_id) + ")");
+                if (seg_id <= active_id) continue;
+
+                bool empty_residue = false;
+                if (seg_id == active_id + 1) {
+                    std::error_code ec;
+                    auto sz = std::filesystem::file_size(entry.path(), ec);
+                    empty_residue = (!ec && sz == 0);
                 }
+                if (empty_residue) {
+                    diag::rec_orphan_empty.fetch_add(1, std::memory_order_relaxed);
+                    continue;   // interrupted-rotation residue; see above
+                }
+                throw std::runtime_error("Recovery failed: orphan WAL segment " + fname +
+                    " (manifest active_id=" + std::to_string(active_id) +
+                    (seg_id != active_id + 1
+                        ? "; id is not active_id+1, so no single interrupted rotation explains it"
+                        : "; segment is NON-EMPTY, so it may hold acknowledged writes") + ")");
             }
         }
 
@@ -4471,6 +4649,7 @@ public:
         return durability_.load(std::memory_order_relaxed);
     }
 
+
     // v20 M3: configure rebase thresholds (tests lower these to exercise rebase).
     void set_rebase_threshold(int count, uint64_t bytes) {
         rebase_count_threshold_ = count;
@@ -5000,15 +5179,19 @@ public:
             fd = ::open(tmp.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
         if (fd < 0) throw std::runtime_error("checkpoint open failed");
         if (!write_all(fd, buf.data(), buf.size())) { checked_close(fd); throw std::runtime_error("checkpoint write"); }
+        CKV_CRASH_POINT("ckpt_after_tmp_write");
         if (!checked_fsync(fd)) { checked_close(fd); throw std::runtime_error("checkpoint fsync"); }
+        CKV_CRASH_POINT("ckpt_after_tmp_fsync");
         if (!checked_close(fd)) throw std::runtime_error("checkpoint close");
         if (!checked_rename(tmp, write_path)) throw std::runtime_error("checkpoint rename");
+        CKV_CRASH_POINT("ckpt_after_rename");
         // v20 M3: rebase linearization point (new base installed, old deltas remain).
         if (write_path == ckpt_path && base_exists) stress_point("rebase_base_installed");
         if (!fsync_dir(write_path)) {
             // slot_guard releases ckpt_slot
             throw std::runtime_error("checkpoint dir fsync failed - refusing to rotate WAL");
         }
+        CKV_CRASH_POINT("ckpt_after_dir_fsync");
 
         // slot_guard releases ckpt_slot
 
@@ -6187,7 +6370,7 @@ namespace chronokv {
 // applied and clean under Release / ASan+UBSan / TSan / Stress; the
 // hooks-off public_api_smoke.cpp target (28 checks) passes against the
 // same header.
-static constexpr const char* CHRONOKV_VERSION = "0.25.5";
+static constexpr const char* CHRONOKV_VERSION = "0.25.6";
 static constexpr int CHRONOKV_VERSION_MAJOR = 0;
 static constexpr int CHRONOKV_VERSION_MINOR = 25;
 static constexpr int CHRONOKV_VERSION_PATCH = 2;
