@@ -462,6 +462,81 @@ static void smoke_check(const char* name, bool ok, const std::string& detail = "
         db.close();
     }
 
+    // ---------- Test 19: point-in-time restore (v26 M4) ----------
+    {
+        const std::string pr = "/tmp/public_api_smoke_pitr";
+        std::filesystem::remove_all(pr);
+        std::filesystem::create_directories(pr);
+        chronokv::Options o;
+        o.wal_dir = pr + "/wal";
+        o.checkpoint_path = pr + "/ckpt";
+        o.durability = chronokv::DurabilityMode::Sync;
+        o.auto_start_gc = false;
+        o.page_pool_bytes = 16ULL * 1024 * 1024;
+        uint64_t w_mid = 0;
+        {
+            auto db = chronokv::Database::open(o);
+            db.put("p1", "v1");
+            db.checkpoint();
+            db.put("p2", "v2");
+            w_mid = db.published_watermark();
+            db.put("p3", "v3");
+            db.close();
+        }
+        chronokv::Options po = o;
+        po.pitr_as_of_cts = w_mid;
+        auto pdb = chronokv::Database::open(po);
+        smoke_check("pitr: as-of open sees p2 but not p3",
+                    pdb.get("p2").value_or("") == "v2" && !pdb.get("p3").has_value());
+        smoke_check("pitr: as-of open refuses writes",
+                    pdb.put("p4", "v4") == chronokv::Status::Failed);
+        pdb.close();
+        auto rdb = chronokv::Database::restore_pitr(o.wal_dir, o.checkpoint_path,
+                                                    pr + "/restored", w_mid);
+        smoke_check("pitr: restore_pitr state correct and writable",
+                    rdb.get("p2").value_or("") == "v2" && !rdb.get("p3").has_value() &&
+                    rdb.put("p5", "v5") == chronokv::Status::OK);
+        rdb.close();
+        std::filesystem::remove_all(pr);
+    }
+
+    // ---------- Test 20: close() racing the API (v25.8 rank-1; TSan detector) ----------
+    {
+        for (int iter = 0; iter < 10; ++iter) {
+            chronokv::Options o;
+            o.page_pool_bytes = 4ULL * 1024 * 1024;
+            o.auto_start_gc = false;
+            auto db = std::make_unique<chronokv::Database>(chronokv::Database::open(o));
+            db->put("k", "v");
+            std::atomic<bool> go{false}, stop{false};
+            std::atomic<int> bad{0};
+            auto hammer = [&](int mode) {
+                while (!go.load(std::memory_order_acquire)) {}
+                while (!stop.load(std::memory_order_relaxed)) {
+                    try {
+                        if (mode == 0) (void)db->put("k", "v");
+                        else if (mode == 1) (void)db->get("k");
+                        else { chronokv::Database::RangeScanStream s(*db, "a", "z"); (void)s.has_next(); }
+                    } catch (const chronokv::LifecycleError&) {
+                    } catch (const chronokv::Error&) {
+                    } catch (...) { bad.fetch_add(1, std::memory_order_relaxed); }
+                }
+            };
+            std::thread t0(hammer, 0), t1(hammer, 1), t2(hammer, 2);
+            go.store(true, std::memory_order_release);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            db->close();
+            stop.store(true, std::memory_order_relaxed);
+            t0.join(); t1.join(); t2.join();
+            if (bad.load() != 0) {
+                smoke_check("lifecycle: close-race produced unexpected exception types", false);
+                break;
+            }
+            db.reset();
+        }
+        smoke_check("lifecycle: close() racing put/get/stream — no crash, clean failures only", true);
+    }
+
     // ---------- Cleanup ----------
     std::filesystem::remove_all("/tmp/public_api_smoke_wd");
     std::filesystem::remove_all("/tmp/public_api_smoke_cp");
@@ -492,6 +567,7 @@ static int run_observer_test();
 static int run_gc_idle_test();        // v25.7 review H2 detector
 static int run_lifecycle_test();      // v25.7 review M2 detectors
 static int run_backup_test();         // v26 M3 online backup
+static int run_pitr_test();           // v26 M4 point-in-time restore
 static int run_m16_phase1_test();
 static int run_m2_phase1_test();
 static int run_m2_phase2_test();
@@ -919,6 +995,23 @@ struct Plan {
     // "missing". With this flag the parent-side verification (reopen +
     // ledger diff) covers that regime on ~half of all checkpoint plans.
     bool rotate_after_ckpt;
+    // v25.8 (adversarial review rank 2): an online backup AFTER the
+    // checkpoint regime, so the six bk_* crash points are reachable by the
+    // fuzzer's plan grammar and join kAll's anti-vacuity coverage. On a
+    // CLEAN run the child leaves a bk_ok sentinel and the parent asserts
+    // verify_backup() accepts (B1 machine-check on the fuzz path).
+    bool backup;
+    // v25.8 (adversarial review rank 3): compound plans — a seeded fault
+    // kind (fault::Kind 1..8) armed for 1-2 charges, ORTHOGONAL to the
+    // crash point. This begins the {fault kind} x {crash point} matrix the
+    // v26 M1 acceptance criteria called for: the child must still honour
+    // D2/D3 under the fault (rejected puts go to the rejected ledger, the
+    // instance fail-stops), and the parent's recovery assertions must hold
+    // for the COMBINATION. Exhaustive-matrix publication (every cell
+    // exercised by name) remains an open ROADMAP item; this is seeded
+    // sampling of the space on every fuzz run.
+    int fault_kind;      // 0 = none, else fault::Kind value
+    int fault_charges;
     int occurrence;      // which hit of the target point dies
 };
 
@@ -932,6 +1025,13 @@ static Plan make_plan(uint64_t seed) {
     p.puts_after_ckpt    = (int)(rng() % 5);
     p.second_checkpoint  = p.checkpoint && (rng() % 3) == 0;
     p.rotate_after_ckpt  = p.checkpoint && (rng() % 2) == 0;
+    p.backup             = p.checkpoint && (rng() % 2) == 0;
+    p.fault_kind         = 0;
+    p.fault_charges      = 0;
+    if ((rng() % 4) == 0) {
+        p.fault_kind    = 1 + (int)(rng() % 8);   // fault::Kind 1..8
+        p.fault_charges = 1 + (int)(rng() % 2);
+    }
     // occurrence is filled in by the caller: round 0 must always use 0, so a
     // point that executes only once per run is guaranteed to be reached. A
     // purely random occurrence would leave single-execution points unhitted
@@ -968,6 +1068,12 @@ static int child_body(const std::string& base, const Plan& plan,
         // Arm AFTER open: killing during open would not test recovery of a
         // written database, and would make every iteration trivially identical.
         crashpt::arm(point, plan.occurrence);
+        // v25.8 (rank 3): compound fault x crash-point plans. Armed after
+        // open so Database::open/recovery never sees a fault; every failure
+        // mode below is already contract-tested in isolation (D2/D3 series)
+        // — here it composes with a kill at the target point.
+        if (plan.fault_kind != 0)
+            fault::arm(static_cast<fault::Kind>(plan.fault_kind), plan.fault_charges);
 
         auto do_put = [&](const std::string& k) {
             std::string v = "v_" + k;
@@ -999,7 +1105,23 @@ static int child_body(const std::string& base, const Plan& plan,
                 db.force_wal_rotation_for_test();
                 do_put("d0");
             }
+            // v25.8 (rank 2): backup regime. A crash at any bk_* point
+            // leaves an incomplete copy — source recoverability is asserted
+            // by the parent as usual; per-copy rejection is
+            // run_backup_test's deterministic job. On a CLEAN run the
+            // backup must VERIFY, signalled by the bk_ok sentinel (a backup
+            // that legitimately THREW — e.g. under an armed fault — leaves
+            // no sentinel and asserts nothing).
+            if (plan.backup) {
+                try {
+                    db.backup(base + "/bk");
+                    int sfd = ::open((base + "/bk_ok").c_str(),
+                                     O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                    if (sfd >= 0) ::close(sfd);
+                } catch (...) { /* legitimate under fault injection */ }
+            }
         }
+        fault::disarm();
         crashpt::disarm();
     } catch (...) {
         acked.close(); rejected.close();
@@ -1036,6 +1158,7 @@ static int run_crash_fuzz() {
     const size_t npts = crashpt::kAllCount;
     std::vector<int> hits(npts, 0);          // coverage: did the point ever fire?
     std::vector<int> clean_runs(npts, 0);    // plan completed without hitting it
+    std::vector<int> fault_kind_plans(9, 0); // v25.8 (rank 3): per-kind plan coverage
     std::vector<std::string> first_failure;
     int violations = 0;
 
@@ -1065,11 +1188,31 @@ static int run_crash_fuzz() {
                     plan.rotate = true;
                     plan.puts_after_ckpt = std::max(1, plan.puts_after_ckpt);
                 }
+                if (pn.rfind("bk_", 0) == 0) {
+                    // v25.8 (rank 2): backup points need a checkpoint path
+                    // (use_ckpt) and the backup regime.
+                    plan.checkpoint = true;
+                    plan.backup = true;
+                    plan.puts_after_ckpt = std::max(1, plan.puts_after_ckpt);
+                }
             }
             if (r > 0) {
                 std::mt19937_64 orng(seed ^ 0x5DEECE66DULL);
                 plan.occurrence = (int)(orng() % 3);   // 2nd/3rd hit, if it recurs
+            } else {
+                // v25.8: round 0 carries the coverage guarantee (occurrence
+                // 0 for every point), so it must run CLEAN: a compound
+                // fault can legitimately break the path to a single-fire
+                // point (e.g. an armed OpenFail makes backup()'s internal
+                // checkpoint throw before bk_after_ckptfiles is reached),
+                // which cost that point its guaranteed hit on the first
+                // run of the fault matrix. Compound plans remain fully
+                // random for rounds > 0.
+                plan.fault_kind = 0;
+                plan.fault_charges = 0;
             }
+            if (plan.fault_kind >= 1 && plan.fault_kind <= 8)
+                fault_kind_plans[plan.fault_kind]++;
             const std::string base = "/tmp/ckv_cf_" + std::to_string(getpid()) +
                                      "_" + std::to_string(pi) + "_" + std::to_string(r);
             std::filesystem::remove_all(base);
@@ -1123,6 +1266,18 @@ static int run_crash_fuzz() {
 
             auto acked    = crashfuzz::read_ledger(base + "/ledger");
             auto rejected = crashfuzz::read_ledger(base + "/ledger_rejected");
+
+            // v25.8 (rank 2): a CLEAN run whose backup COMPLETED (bk_ok
+            // sentinel) must produce a copy that verifies — B1 machine-check
+            // on the fuzz path. Backups that legitimately threw (armed
+            // faults) leave no sentinel and assert nothing; copies killed
+            // mid-backup are covered deterministically by run_backup_test.
+            if (err.empty() && rc == 0 && plan.backup &&
+                std::filesystem::exists(base + "/bk_ok")) {
+                std::string breason;
+                if (!ChronoKV::verify_backup(base + "/bk", &breason))
+                    err = "verify_backup after clean run: " + breason;
+            }
 
             if (err.empty()) {
                 try {
@@ -1183,6 +1338,28 @@ static int run_crash_fuzz() {
     for (size_t i = 0; i < npts; ++i) {
         total_hits += hits[i];
         if (hits[i] == 0) never_hit.push_back(crashpt::kAll[i]);
+    }
+
+    // v25.8 (rank 3): report the compound fault-kind plan distribution, and
+    // at default-or-larger run sizes assert every kind actually appears in
+    // the plan space (same anti-vacuity discipline as kAll coverage; small
+    // custom CKV_CRASHFUZZ_ROUNDS runs downgrade to informational because a
+    // short seeded plan stream cannot guarantee all eight kinds).
+    {
+        int armed_plans = 0, kinds_seen = 0;
+        std::string dist;
+        for (int k = 1; k <= 8; ++k) {
+            armed_plans += fault_kind_plans[k];
+            if (fault_kind_plans[k]) ++kinds_seen;
+            dist += " k" + std::to_string(k) + "=" + std::to_string(fault_kind_plans[k]);
+        }
+        std::cout << "    (compound fault plans: " << armed_plans << " of "
+                  << total_iters << ";" << dist << " )\n";
+        if (total_iters >= 200)
+            report("v25.8: every fault kind appears in the fuzz plan space",
+                   kinds_seen == 8,
+                   kinds_seen == 8 ? std::string()
+                                   : "only " + std::to_string(kinds_seen) + " of 8 kinds planned");
     }
 
     std::cout << "    (" << total_iters << " iterations, " << total_hits
@@ -6789,6 +6966,8 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     fails += run_lifecycle_test();
     // v26 M3: online backup + verify_backup (invariant B1).
     fails += run_backup_test();
+    // v26 M4: point-in-time restore.
+    fails += run_pitr_test();
     // async benchmark (skips under sanitizer anyway)
     fails += run_async_benchmark();
 
@@ -8659,6 +8838,68 @@ static int run_lifecycle_test() {
         }
         std::filesystem::remove_all(wd);
     }
+    // 5. v25.8 (adversarial review rank-1 DETECTOR): concurrent close() vs
+    //    every public API surface. Pre-fix, closed_ was a plain bool and the
+    //    engine_ handoff unsynchronized: TSan reported 59 races on the
+    //    standalone positive control, and the engine could be destroyed
+    //    under an in-flight call (UAF cascade in ~ChronoKV/free_all).
+    //    Post-fix every call either completes against a keepalive-held
+    //    engine or fails cleanly with LifecycleError. Under the CI tsan/asan
+    //    jobs this block is the in-suite detector; under other configs it
+    //    asserts the observable contract: no crash, no unexpected exception
+    //    types, and a sane mix of successes/clean-failures.
+    {
+        int bad_throws_total = 0, ok_total = 0, clean_total = 0;
+        for (int iter = 0; iter < 40; ++iter) {
+            Options o;
+            o.page_pool_bytes = 4ULL * 1024 * 1024;
+            o.auto_start_gc = false;
+            auto db = std::make_unique<Database>(Database::open(o));
+            db->put("k", "v");
+            std::atomic<bool> go{false}, stop{false};
+            std::atomic<int> ok_ops{0}, lc_throws{0}, bad_throws{0};
+            auto hammer = [&](int mode) {
+                while (!go.load(std::memory_order_acquire)) {}
+                while (!stop.load(std::memory_order_relaxed)) {
+                    try {
+                        switch (mode) {
+                            case 0: (void)db->put("k", "v"); break;
+                            case 1: (void)db->get("k"); break;
+                            case 2: { Database::RangeScanStream s(*db, "a", "z");
+                                      (void)s.has_next(); } break;
+                            case 3: { auto f = db->get_async("k"); (void)f.get(); } break;
+                            case 4: { auto t = db->begin(); t.put("k", "v"); t.abort(); } break;
+                        }
+                        ok_ops.fetch_add(1, std::memory_order_relaxed);
+                    } catch (const LifecycleError&) {
+                        lc_throws.fetch_add(1, std::memory_order_relaxed);
+                    } catch (const Error&) {
+                        lc_throws.fetch_add(1, std::memory_order_relaxed);
+                    } catch (...) {
+                        bad_throws.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            };
+            std::thread t0(hammer, 0), t1(hammer, 1), t2(hammer, 2),
+                      t3(hammer, 3), t4(hammer, 4);
+            go.store(true, std::memory_order_release);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            db->close();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            stop.store(true, std::memory_order_relaxed);
+            t0.join(); t1.join(); t2.join(); t3.join(); t4.join();
+            bad_throws_total += bad_throws.load();
+            ok_total += ok_ops.load();
+            clean_total += lc_throws.load();
+            db.reset();
+        }
+        if (bad_throws_total != 0)
+            std::cout << "      (unexpected exception types: " << bad_throws_total << ")\n";
+        check("lifecycle: close() racing put/get/stream/async/txn: no crash, no unexpected throws (rank-1)",
+              bad_throws_total == 0 && (ok_total + clean_total) > 0);
+        check("lifecycle: post-close operations all failed cleanly (LifecycleError)",
+              clean_total > 0);
+    }
     if (fails == 0) std::cout << "   LIFECYCLE TEST PASSED\n";
     return fails;
 }
@@ -8973,6 +9214,236 @@ static int run_backup_test() {
 
     std::filesystem::remove_all(root);
     if (fails == 0) std::cout << "   BACKUP TEST PASSED\n";
+    return fails;
+}
+
+// ---- v26 M4: point-in-time restore tests ----
+// Covers: WAL-mid cut (records after as_of invisible, writes refused,
+// health/checkpoint advertise the read-only mode), delta-chain cut (a
+// future delta is SKIPPED AND LEFT ON DISK — a later normal open still
+// sees the full state), as_of below the base fails loud, as_of >= max
+// equals normal recovery, restore_pitr materializes a WRITABLE as-of
+// database in a fresh directory, and the backup-copy boundary semantics
+// (backup_cts == marker cts; restore at that cts = full state; below it =
+// rejected — PITR inside a backup() copy is vacuous BY CONSTRUCTION, the
+// documented deviation).
+static int run_pitr_test() {
+    using namespace chronokv;
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) {
+            ++fails;
+            if (!detail.empty()) std::cout << "      (" << detail << ")\n";
+        }
+    };
+    const std::string root = "/tmp/ckv_pitr_test";
+    std::filesystem::remove_all(root);
+    std::error_code mec;
+    std::filesystem::create_directories(root, mec);
+    const std::string wd = root + "/wal";
+    const std::string cp = root + "/ckpt";
+
+    Options o;
+    o.wal_dir = wd;
+    o.checkpoint_path = cp;
+    o.durability = DurabilityMode::Sync;
+    o.auto_start_gc = false;
+    o.page_pool_bytes = 16ULL * 1024 * 1024;
+
+    // Build the source timeline:
+    //   a,b,c -> checkpoint (base @ W3) -> d -> e -> checkpoint (delta.1 @ W5)
+    //   -> f -> g -> h   (WAL beyond the last checkpoint)
+    uint64_t W3 = 0, W4 = 0, W5 = 0, W7 = 0, W8 = 0;
+    {
+        auto db = Database::open(o);
+        db.put("a", "1"); db.put("b", "2"); db.put("c", "3");
+        W3 = db.published_watermark();
+        db.checkpoint();                       // full base @ W3
+        db.put("d", "4");
+        W4 = db.published_watermark();
+        db.put("e", "5");
+        W5 = db.published_watermark();
+        db.checkpoint();                       // delta.1 @ W5
+        db.put("f", "6");
+        db.put("g", "7");
+        W7 = db.published_watermark();
+        db.put("h", "8");
+        W8 = db.published_watermark();
+        db.close();
+    }
+
+    // (1) WAL-mid cut: as_of = W7 → a..g visible, h absent; read-only.
+    {
+        Options po = o;
+        po.pitr_as_of_cts = W7;
+        bool open_ok = false, reads_ok = false, h_absent = false,
+             writes_refused = false, ckpt_refused = false, health_ok = false;
+        std::string detail;
+        try {
+            auto db = Database::open(po);
+            open_ok = true;
+            reads_ok = db.get("a").value_or("") == "1" && db.get("d").value_or("") == "4" &&
+                       db.get("e").value_or("") == "5" && db.get("g").value_or("") == "7";
+            h_absent = !db.get("h").has_value();
+            writes_refused = db.put("new", "x") == Status::Failed;
+            auto txn = db.begin();
+            txn.put("txn_new", "y");
+            writes_refused = writes_refused && (txn.commit() == Status::Failed);
+            try { db.checkpoint(); } catch (const Error&) { ckpt_refused = true; }
+            auto hh = db.health();
+            health_ok = hh.level >= 1;
+            bool reason_ok = false;
+            for (auto& r : hh.reasons)
+                if (r.find("point-in-time") != std::string::npos) reason_ok = true;
+            health_ok = health_ok && reason_ok;
+            db.close();
+        } catch (const std::exception& e) { detail = e.what(); }
+        check("pitr: as_of mid-WAL opens and reads the prefix state",
+              open_ok && reads_ok && h_absent, detail);
+        check("pitr: writes refused (Status::Failed) on a PITR open", writes_refused);
+        check("pitr: checkpoint() refused on a PITR open", ckpt_refused);
+        check("pitr: health() reports the read-only mode", health_ok);
+    }
+
+    // (2) Delta-chain cut: as_of = W4 → delta.1 (cts W5) is SKIPPED but
+    //     LEFT ON DISK; state = base + WAL prefix = a,b,c,d (no e).
+    {
+        Options po = o;
+        po.pitr_as_of_cts = W4;
+        bool ok = false, e_absent = false;
+        try {
+            auto db = Database::open(po);
+            ok = db.get("a").value_or("") == "1" && db.get("d").value_or("") == "4";
+            e_absent = !db.get("e").has_value();
+            db.close();
+        } catch (...) {}
+        check("pitr: as_of between base and delta skips the future delta", ok && e_absent);
+        bool delta_intact = std::filesystem::exists(cp + ".delta.1");
+        check("pitr: skipped delta LEFT ON DISK (read-only open is non-destructive)", delta_intact);
+        // ... and a subsequent NORMAL open still sees the full timeline.
+        bool full = false;
+        try {
+            auto db = Database::open(o);
+            full = db.get("e").value_or("") == "5" && db.get("h").value_or("") == "8";
+            db.close();
+        } catch (...) {}
+        check("pitr: normal open after PITR open recovers the FULL state", full);
+    }
+
+    // (3) as_of below the checkpoint base → fail loud, not silent.
+    {
+        Options po = o;
+        po.pitr_as_of_cts = W3 - 1;
+        bool threw = false;
+        std::string what;
+        try {
+            auto db = Database::open(po);
+            db.close();
+        } catch (const std::exception& e) {
+            threw = true;
+            what = e.what();
+        }
+        check("pitr: as_of preceding the base checkpoint fails loud",
+              threw && what.find("precedes checkpoint base") != std::string::npos, what);
+    }
+
+    // (4) as_of >= max → identical to normal recovery.
+    {
+        Options po = o;
+        po.pitr_as_of_cts = W8 + 100;
+        bool ok = false;
+        try {
+            auto db = Database::open(po);
+            ok = db.get("h").value_or("") == "8";
+            db.close();
+        } catch (...) {}
+        check("pitr: as_of beyond the tail equals normal recovery", ok);
+    }
+
+    // (5) restore_pitr: materialize a WRITABLE as-of database (dest dir).
+    {
+        bool ok = false, writable = false, h_absent = false, persists = false;
+        std::string detail;
+        try {
+            auto rdb = Database::restore_pitr(wd, cp, root + "/restored", W7);
+            ok = rdb.get("a").value_or("") == "1" && rdb.get("g").value_or("") == "7";
+            h_absent = !rdb.get("h").has_value();
+            writable = rdb.put("post", "restore") == Status::OK;   // WRITABLE
+            rdb.checkpoint();
+            rdb.close();
+            // Reopen the restored directory normally: state persists.
+            Options ro;
+            ro.wal_dir = root + "/restored/wal";
+            ro.checkpoint_path = root + "/restored/ckpt";
+            ro.auto_start_gc = false;
+            ro.page_pool_bytes = 16ULL * 1024 * 1024;
+            auto db2 = Database::open(ro);
+            persists = db2.get("g").value_or("") == "7" &&
+                       db2.get("post").value_or("") == "restore" &&
+                       !db2.get("h").has_value();
+            db2.close();
+        } catch (const std::exception& e) { detail = e.what(); }
+        check("pitr: restore_pitr materializes the as-of state", ok && h_absent, detail);
+        check("pitr: restored database is WRITABLE", writable);
+        check("pitr: restored database persists across reopen", persists);
+        // The SOURCE is untouched and still recovers to the full timeline.
+        bool src_full = false;
+        try {
+            auto db = Database::open(o);
+            src_full = db.get("h").value_or("") == "8";
+            db.close();
+        } catch (...) {}
+        check("pitr: source directory untouched by restore_pitr", src_full);
+    }
+
+    // (6) Backup-copy boundary semantics (documented deviation): a
+    //     backup()'s own cts is the exact restore point; PITR *below* it
+    //     is rejected because the backup's base superseded older state.
+    {
+        std::string breason;
+        bool backed = true;
+        try {
+            auto db = Database::open(o);
+            db.backup(root + "/bak");
+            db.close();
+        } catch (const std::exception& e) { backed = false; breason = e.what(); }
+        check("pitr: backup for boundary test succeeded", backed, breason);
+        uint64_t bcts = Database::backup_cts(root + "/bak");
+        check("pitr: backup_cts reads the marker boundary", bcts >= W8, 
+              "backup_cts=" + std::to_string(bcts));
+        bool at_ok = false, below_rejected = false;
+        try {
+            auto db = Database::restore_pitr(root + "/bak/wal", root + "/bak/ckpt",
+                                             root + "/r_at", bcts);
+            at_ok = db.get("h").value_or("") == "8";
+            db.close();
+        } catch (const std::exception& e) { breason = e.what(); }
+        check("pitr: restore at backup_cts yields the full backup state", at_ok, breason);
+        try {
+            auto db = Database::restore_pitr(root + "/bak/wal", root + "/bak/ckpt",
+                                             root + "/r_below", bcts - 1);
+            db.close();
+        } catch (const std::exception&) { below_rejected = true; }
+        check("pitr: restore BELOW backup_cts is rejected (vacuous range, documented)",
+              below_rejected);
+    }
+
+    // (7) Argument validation.
+    {
+        bool threw = false;
+        try {
+            Options po = o;
+            po.pitr_as_of_cts = W7;
+            po.recover_on_open = false;
+            auto db = Database::open(po);
+            db.close();
+        } catch (const LifecycleError&) { threw = true; } catch (...) {}
+        check("pitr: pitr_as_of_cts without recover_on_open is rejected", threw);
+    }
+
+    std::filesystem::remove_all(root);
+    if (fails == 0) std::cout << "   PITR TEST PASSED\n";
     return fails;
 }
 

@@ -13,7 +13,9 @@ Progress:
 | v26 M2 — randomized crash-point fuzzing | **DONE** | see below, `0.25.6` |
 | v25.7 — 2026-09-18 external-review defect fixes: **H1** MANIFEST ckpt_ts zeroed by size rotation (DB unopenable after checkpoint+rotation), **H2** GC busy-spin above 256 keys (one core burned idle), **M1** observer data race (TSan-confirmed); plus lifecycle hardening (streams/handles/async vs close), transaction commits now notify observers | **DONE** | see below, `0.25.7` |
 | v26 M3 — online backup API (invariant B1) | **DONE** | see below, `0.25.7` |
-| v26 M4, v27–v30 | not started | — |
+| v25.8 — adversarial-review response: **rank-1** close()-race (plain-bool `closed_` + engine TOCTOU; v25.7's close-safety claim was false for concurrent *creation*), **rank-2** bk_* points folded into crashpt::kAll + fuzz plan grammar, **rank-3** compound fault×crash-point plans; plus a PRE-EXISTING checkpoint re-emission defect the matrix found on its first run | **DONE** | see below, `0.25.8` |
+| v26 M4 — point-in-time restore | **DONE** | see below, `0.25.8` |
+| v27–v30 | not started | — |
 
 > **v25.7 note (the load-bearing constraint, re-confirmed).** H1 and H2 were
 > found by an outside reviewer *reading code and writing three-line repros* —
@@ -422,11 +424,54 @@ filesystem can see). Restore is *already implemented*: point `Options` at the co
 DB with deltas; backup concurrent with active writers; restore into a fresh instance and
 diff against the source.
 
-## M4 (stretch) — Point-in-time restore  **[S]**
+## M4 (stretch) — Point-in-time restore  **[S]** — DONE, shipped in `0.25.8`
 
-`restore(backup, as_of_cts)` — replay WAL and stop at a cts boundary. Cheap because
-recovery already walks records in cts order. Only worth doing if someone needs PITR;
-otherwise the M3 semantics are sufficient.
+> ### What actually shipped
+>
+> `Options::pitr_as_of_cts` (read-only as-of open) +
+> `Database::restore_pitr(src_wal_dir, src_ckpt_path, dest_dir, as_of_cts,
+> dest_opts)` (writable materialization into a fresh directory) +
+> `Database::backup_cts(dir)` (marker boundary reader). Recovery replays the
+> chain and WAL up to the boundary: future deltas are skipped via a new
+> `peek_ckpt_cts()` header read and LEFT ON DISK, future WAL records break
+> replay and stay untouched — a PITR open is non-destructive by construction
+> (asserted: a normal reopen after a PITR open still recovers the full
+> timeline). `as_of` below the base's cts fails loud. The PITR instance is
+> read-only (writes `Status::Failed`, `checkpoint()` throws, `health()`
+> level 1 names the mode); `restore_pitr` exports the state via
+> `export_checkpoint_no_rotate()` — the source WAL/MANIFEST are never
+> rewritten — and returns the fresh directory open and writable.
+>
+> **The plan was wrong about one thing (recorded per house rules).** The
+> sketch said `restore(backup, as_of_cts)`. But `backup()` ALWAYS checkpoints
+> first, so every artifact in a backup sits at its boundary cts: PITR
+> *inside* a `backup()` copy is vacuous by construction (`as_of >= cts` =
+> normal restore; `as_of < cts` = rejected, since the base superseded older
+> state). The real PITR window is a LIVE/CRASHED database directory (or an
+> external file-level copy of one), where the WAL extends past the last
+> checkpoint — which is what shipped. `backup_cts()` documents the boundary
+> a copy restores to.
+>
+> **Why materialize-fresh instead of write-in-place:** appending to a WAL
+> that still holds records newer than the boundary would collide on cts at
+> the next recovery (duplicate commit_ts). Exporting to a fresh directory is
+> the only option that keeps both the source and the restored instance
+> honest. Consequence: PITR does not rewind the source; it forks it.
+>
+> **Tests:** WAL-mid cut; delta-chain cut + delta-left-on-disk + full-state
+> normal reopen; below-base loud failure; beyond-tail equivalence;
+> restore_pitr writability + persistence + source-untouched; backup-boundary
+> semantics (at-cts full state, below-cts rejected); argument validation;
+> public-API subset in hooks-off smoke (Test 19).
+>
+> **Bonus defect found while building it** (via the v25.8 rank-3 compound
+> fault matrix, first run): the checkpoint re-emission brick — a checkpoint
+> failing after its delta rename left `dirty_since_ckpt_` uncleaned, the next
+> checkpoint re-emitted identical (key, commit_ts) entries into a second
+> delta, and recovery's strictly-increasing guard rejected the database
+> forever. Pre-existing since v18-style delta chains; fixed by treating
+> equal (key, cts) as the idempotent re-emission it is (skip; strictly
+> decreasing still throws). Fuzzer-preserved scene confirmed byte-exact.
 
 ---
 

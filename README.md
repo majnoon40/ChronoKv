@@ -10,7 +10,7 @@ transactions with phantom detection, a paged B+ tree index, and
 io_uring-accelerated WAL writes — all in one header with no external
 dependencies.
 
-Current version: **0.25.7** (`CHRONOKV_VERSION` in `chronokv.hpp`).
+Current version: **0.25.8** (`CHRONOKV_VERSION` in `chronokv.hpp`).
 
 ## Highlights
 
@@ -50,7 +50,13 @@ Current version: **0.25.7** (`CHRONOKV_VERSION` in `chronokv.hpp`).
   stays online, with a self-verifying `BACKUP_COMPLETE` marker
   (per-file size + CRC32) written last; `Database::verify_backup(dir)`
   validates a copy without opening it. Restore = point `Options` at the
-  copy. Invariant **B1**; not point-in-time (M4).
+  copy. Invariant **B1**.
+- **Point-in-time restore** (v26 M4) — `Options::pitr_as_of_cts` recovers
+  a database directory to an exact cts boundary (read-only open), and
+  `Database::restore_pitr(...)` materializes a **writable** as-of database
+  into a fresh directory. The as-of window of a live/crashed directory is
+  the WAL beyond its last checkpoint; a `backup()` copy restores to
+  exactly its marker cts (`Database::backup_cts`).
 - **Heavy-duty validation** — engine tests, B+ tree fuzzing, fault
   injection, deterministic stress mode, randomized crash-point fuzzing, and a
   linearizability history recorder, all run under a four-config sanitizer
@@ -133,6 +139,27 @@ ro.checkpoint_path = "/mnt/nas/ckv-bak/ckpt";   // basename of your checkpoint_p
 auto restored = chronokv::Database::open(ro);
 ```
 
+Point-in-time restore (v26 M4) — undo durable-but-wrong writes by
+recovering a database directory to an exact commit timestamp:
+
+```cpp
+chronokv::Options po = opts;
+po.pitr_as_of_cts = good_cts;          // from published_watermark()/diagnostics
+auto view = chronokv::Database::open(po);   // READ-ONLY as-of view
+auto v = view.get("counter");               // writes return Status::Failed
+view.close();
+
+// Materialize a WRITABLE as-of database in a fresh directory:
+auto db = chronokv::Database::restore_pitr(
+    opts.wal_dir, opts.checkpoint_path, "/tmp/restored", good_cts);
+db.put("counter", *v);                      // writable again
+```
+
+The boundary must not precede the checkpoint base's cts (older state was
+superseded — `open` fails loud). For a `backup()` copy the only valid
+boundary is its marker cts (`Database::backup_cts(dir)`): backups
+checkpoint before copying, so they hold exactly one point in time.
+
 Compile:
 
 ```sh
@@ -149,7 +176,8 @@ g++ -std=c++20 -O2 -I. my_app.cpp -o my_app -lpthread
 | Async | `put_async/get_async/erase_async` | `std::future`-based; errors via `Result<T>` / `Status` |
 | Streams | `RangeScanStream::has_next/next` | incremental B+ tree cursor; per-page snapshot consistency |
 | Observers | `observe(prefix, callback)` | inline callbacks on the committing thread; fired by `put/erase/Batch::commit` **and `Transaction::commit`** (v25.7); `old_val` is always `nullopt` |
-| Backup | `backup(dest_dir)` / `verify_backup(dest_dir, reason*)` | v26 M3; requires `checkpoint_path`; restore by opening `Options` against the copy |
+| Backup | `backup(dest_dir)` / `verify_backup(dest_dir, reason*)` / `backup_cts(dest_dir)` | v26 M3; requires `checkpoint_path`; restore by opening `Options` against the copy |
+| PITR | `Options::pitr_as_of_cts` / `restore_pitr(src_wal, src_ckpt, dest, as_of)` | v26 M4; PITR opens are read-only; `restore_pitr` materializes a writable as-of DB in a fresh directory |
 | Diagnostics | `wal_stats/gc_stats/epoch_stats/health/published_watermark` | read-only snapshots of engine counters |
 
 **Status codes** (`chronokv::Status`): `OK`, `Conflict`, `TooLarge`
@@ -189,16 +217,22 @@ inactive transaction), `Error` (engine failures), `NotYetImplementedError`.
 - A `Transaction` destroyed while still active calls `std::abort()` —
   commit or abort explicitly. Concurrent `Database::close()` with live
   transactions requires external synchronization.
-- **Lifecycle of auxiliary handles (v25.7)**: `RangeScanStream`,
-  `ObserverHandle`, and in-flight async futures are safe against
-  `Database::close()` — streams throw `LifecycleError` on iteration and
-  destroy cleanly (the engine is kept alive until the last stream dies,
-  so `close()` **defers engine teardown and the WAL flock release** until
-  then); observer handles may even outlive the `Database` object; async
-  ops racing `close()` resolve to `Status::Failed` or complete against
-  the keepalive-held engine. Destroying the `Database` *object itself*
-  while transactions are active or futures are in flight still requires
-  external synchronization.
+- **Lifecycle of auxiliary handles (v25.7, race-free since v25.8)**:
+  every public API call is safe to race against `Database::close()` —
+  `close()` and all engine access are serialized by an internal mutex,
+  and each call either completes against a keepalive-held engine or
+  fails cleanly (`LifecycleError` / `Status::Failed`). `RangeScanStream`
+  iteration after close throws and destroys cleanly; `ObserverHandle`s
+  may outlive the `Database` object; transactions pin the engine for
+  their lifetime. Because streams/transactions hold engine keepalives,
+  `close()` **defers engine teardown and the WAL flock release** until
+  the last such handle dies. Destroying the `Database` *object itself*
+  while calls are in flight still requires external synchronization.
+- **PITR opens are read-only (v26 M4)**: with `pitr_as_of_cts` set,
+  writes return `Status::Failed`, `checkpoint()` throws, and `health()`
+  reports level 1 with the mode — the WAL still holds records newer than
+  the boundary, and appending after them would collide on cts. Use
+  `restore_pitr()` to obtain a writable as-of database.
 - **Backup semantics (v26 M3)**: a backup is *at least* as new as the
   checkpoint taken inside `backup()` and *at most* as new as copy
   completion — not a point-in-time snapshot. `verify_backup()` succeeds
