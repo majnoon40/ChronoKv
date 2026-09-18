@@ -10,7 +10,7 @@ transactions with phantom detection, a paged B+ tree index, and
 io_uring-accelerated WAL writes — all in one header with no external
 dependencies.
 
-Current version: **0.25.6** (`CHRONOKV_VERSION` in `chronokv.hpp`).
+Current version: **0.25.7** (`CHRONOKV_VERSION` in `chronokv.hpp`).
 
 ## Highlights
 
@@ -45,6 +45,12 @@ Current version: **0.25.6** (`CHRONOKV_VERSION` in `chronokv.hpp`).
 - **Rich public API** — sync + async operations, atomic batches,
   prefix observers, streaming range scans, and read-only health/stats
   diagnostics.
+- **Online backup** (v26 M3) — `Database::backup(dest_dir)` copies a
+  consistent snapshot (checkpoint + WAL artifacts) while the database
+  stays online, with a self-verifying `BACKUP_COMPLETE` marker
+  (per-file size + CRC32) written last; `Database::verify_backup(dir)`
+  validates a copy without opening it. Restore = point `Options` at the
+  copy. Invariant **B1**; not point-in-time (M4).
 - **Heavy-duty validation** — engine tests, B+ tree fuzzing, fault
   injection, deterministic stress mode, randomized crash-point fuzzing, and a
   linearizability history recorder, all run under a four-config sanitizer
@@ -111,6 +117,22 @@ int main() {
 }
 ```
 
+Online backup (v26 M3):
+
+```cpp
+db.backup("/mnt/nas/ckv-bak");           // consistent copy, DB stays online
+
+std::string reason;
+if (!chronokv::Database::verify_backup("/mnt/nas/ckv-bak", &reason))
+    std::cerr << "backup invalid: " << reason << "\n";
+
+// Restore = open a fresh instance against the copy:
+chronokv::Options ro;
+ro.wal_dir         = "/mnt/nas/ckv-bak/wal";
+ro.checkpoint_path = "/mnt/nas/ckv-bak/ckpt";   // basename of your checkpoint_path
+auto restored = chronokv::Database::open(ro);
+```
+
 Compile:
 
 ```sh
@@ -126,7 +148,8 @@ g++ -std=c++20 -O2 -I. my_app.cpp -o my_app -lpthread
 | Batch | `create_batch()` → `put/erase/commit` | atomic write-set commit, cheaper than a transaction |
 | Async | `put_async/get_async/erase_async` | `std::future`-based; errors via `Result<T>` / `Status` |
 | Streams | `RangeScanStream::has_next/next` | incremental B+ tree cursor; per-page snapshot consistency |
-| Observers | `observe(prefix, callback)` | inline callbacks on the committing thread |
+| Observers | `observe(prefix, callback)` | inline callbacks on the committing thread; fired by `put/erase/Batch::commit` **and `Transaction::commit`** (v25.7); `old_val` is always `nullopt` |
+| Backup | `backup(dest_dir)` / `verify_backup(dest_dir, reason*)` | v26 M3; requires `checkpoint_path`; restore by opening `Options` against the copy |
 | Diagnostics | `wal_stats/gc_stats/epoch_stats/health/published_watermark` | read-only snapshots of engine counters |
 
 **Status codes** (`chronokv::Status`): `OK`, `Conflict`, `TooLarge`
@@ -166,6 +189,23 @@ inactive transaction), `Error` (engine failures), `NotYetImplementedError`.
 - A `Transaction` destroyed while still active calls `std::abort()` —
   commit or abort explicitly. Concurrent `Database::close()` with live
   transactions requires external synchronization.
+- **Lifecycle of auxiliary handles (v25.7)**: `RangeScanStream`,
+  `ObserverHandle`, and in-flight async futures are safe against
+  `Database::close()` — streams throw `LifecycleError` on iteration and
+  destroy cleanly (the engine is kept alive until the last stream dies,
+  so `close()` **defers engine teardown and the WAL flock release** until
+  then); observer handles may even outlive the `Database` object; async
+  ops racing `close()` resolve to `Status::Failed` or complete against
+  the keepalive-held engine. Destroying the `Database` *object itself*
+  while transactions are active or futures are in flight still requires
+  external synchronization.
+- **Backup semantics (v26 M3)**: a backup is *at least* as new as the
+  checkpoint taken inside `backup()` and *at most* as new as copy
+  completion — not a point-in-time snapshot. `verify_backup()` succeeds
+  only if every copied file matches its recorded size and CRC32, the
+  checkpoint chain is structurally valid, and the copied WAL fully
+  parses (invariant B1); an interrupted copy has no complete
+  `BACKUP_COMPLETE` marker and is therefore rejected.
 
 ## Build and test
 
@@ -287,8 +327,17 @@ E1–E16 safety argument and the v24 fix log at the top of the file).
   open coverage gap.
 - **Compile memory**: the engine plus test suite is one ~17k-line translation
   unit; building it at `-O2` needs well over 1 GiB of RAM (it is OOM-killed
-  below that). CI runners are fine; on small containers use
-  `make release RELEASE_FLAGS="-O1 -g"`.
+  below that). CI runners are fine; on small containers even
+  `make release RELEASE_FLAGS="-O1 -g"` can be OOM-killed around ~1 GiB —
+  use `RELEASE_FLAGS="-O0"` there (verified on a 1 GiB container: `-O2` and
+  `-O1 -g` killed, `-O0` builds in seconds). Sanitizer builds need
+  proportionally more; this is the strongest argument for the v30 M5
+  source-split/amalgamation plan.
+- **GC sweep cost**: each GC pass re-scans the whole key tree to collect
+  entries before processing its 256-key budget, so a full sweep is
+  O(N²/256) scan work at large N (the v25.7 idle-spin fix stopped the
+  pathological back-to-back sweeping, but the per-pass rescan remains).
+  A persistent tree cursor for GC is a tracked follow-up.
 
 ## Roadmap
 

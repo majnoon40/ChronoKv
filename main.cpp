@@ -362,6 +362,106 @@ static void smoke_check(const char* name, bool ok, const std::string& detail = "
         smoke_check("batch+obs: b:pre erased", !db.get("b:pre").has_value());
     }
 
+    // ---------- Test 16: online backup + verify + restore (v26 M3) ----------
+    {
+        const std::string bk_root = "/tmp/public_api_smoke_backup";
+        std::filesystem::remove_all(bk_root);
+        std::filesystem::create_directories(bk_root);
+        chronokv::Options o;
+        o.wal_dir = bk_root + "/wal";
+        o.checkpoint_path = bk_root + "/ckpt";
+        o.durability = chronokv::DurabilityMode::Sync;
+        o.auto_start_gc = false;
+        o.page_pool_bytes = 16ULL * 1024 * 1024;
+        {
+            auto db = chronokv::Database::open(o);
+            db.put("bk1", "v1");
+            db.put("bk2", "v2");
+            db.checkpoint();
+            db.put("bk3", "v3");
+            db.backup(bk_root + "/bak");
+            db.put("bk_after", "x");   // must NOT be in the copy
+            db.close();
+        }
+        std::string reason;
+        smoke_check("backup: verify_backup accepts",
+                    chronokv::Database::verify_backup(bk_root + "/bak", &reason), reason);
+        chronokv::Options ro;
+        ro.wal_dir = bk_root + "/bak/wal";
+        ro.checkpoint_path = bk_root + "/bak/ckpt";
+        ro.auto_start_gc = false;
+        ro.page_pool_bytes = 16ULL * 1024 * 1024;
+        auto rdb = chronokv::Database::open(ro);
+        smoke_check("backup: restore round-trips all pre-backup keys",
+                    rdb.get("bk1").value_or("") == "v1" &&
+                    rdb.get("bk2").value_or("") == "v2" &&
+                    rdb.get("bk3").value_or("") == "v3");
+        smoke_check("backup: post-backup write absent from restore",
+                    !rdb.get("bk_after").has_value());
+        rdb.close();
+        // A missing marker must be rejected.
+        std::filesystem::remove(bk_root + "/bak/BACKUP_COMPLETE");
+        smoke_check("backup: missing marker rejected",
+                    !chronokv::Database::verify_backup(bk_root + "/bak", &reason));
+        std::filesystem::remove_all(bk_root);
+    }
+
+    // ---------- Test 17: stream/handle lifecycle vs close() (v25.7 M2) ----------
+    {
+        auto db = chronokv::Database::open(chronokv::Options{});
+        db.put("lc1", "1");
+        db.put("lc2", "2");
+        auto stream = std::make_unique<chronokv::Database::RangeScanStream>(db, "a", "z");
+        smoke_check("lifecycle: stream yields before close", stream->has_next());
+        db.close();
+        bool threw = false;
+        try { (void)stream->has_next(); }
+        catch (const chronokv::LifecycleError&) { threw = true; }
+        catch (...) {}
+        smoke_check("lifecycle: stream after close throws LifecycleError", threw);
+        stream.reset();   // must be safe (engine keepalive)
+        smoke_check("lifecycle: stream destroyed after close is safe", true);
+
+        chronokv::Options o2;
+        o2.page_pool_bytes = 16ULL * 1024 * 1024;
+        std::optional<chronokv::Database::ObserverHandle> h;
+        {
+            auto db2 = chronokv::Database::open(o2);
+            h = db2.observe("z:", [](const std::string&,
+                                      const std::optional<std::string>&,
+                                      const std::optional<std::string>&) {});
+        }   // db2 destroyed with h alive
+        h.reset();        // must be safe (weak-liveness guard)
+        smoke_check("lifecycle: observer handle outliving Database is safe", true);
+    }
+
+    // ---------- Test 18: concurrent observers + commits (v25.7 M1; TSan detector) ----------
+    {
+        auto db = chronokv::Database::open(chronokv::Options{});
+        std::atomic<bool> stop{false};
+        std::atomic<int> put_fails{0};
+        std::thread registrant([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                auto h = db.observe("smoke:", [](const std::string&,
+                                                  const std::optional<std::string>&,
+                                                  const std::optional<std::string>&) {});
+            }
+        });
+        std::thread committer([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                if (db.put("smoke:k", "v") != chronokv::Status::OK)
+                    put_fails.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        stop.store(true);
+        registrant.join();
+        committer.join();
+        smoke_check("lifecycle: concurrent observe()+commit: no crash, all puts OK",
+                    put_fails.load() == 0);
+        db.close();
+    }
+
     // ---------- Cleanup ----------
     std::filesystem::remove_all("/tmp/public_api_smoke_wd");
     std::filesystem::remove_all("/tmp/public_api_smoke_cp");
@@ -389,6 +489,9 @@ static int run_concurrent_cursor_test();
 static int run_async_test();
 static int run_batch_test();
 static int run_observer_test();
+static int run_gc_idle_test();        // v25.7 review H2 detector
+static int run_lifecycle_test();      // v25.7 review M2 detectors
+static int run_backup_test();         // v26 M3 online backup
 static int run_m16_phase1_test();
 static int run_m2_phase1_test();
 static int run_m2_phase2_test();
@@ -808,6 +911,14 @@ struct Plan {
     bool checkpoint;
     int puts_after_ckpt;
     bool second_checkpoint;
+    // v25.7 (review H1): a SIZE-based rotation AFTER the checkpoint(s).
+    // The pre-fix plan grammar only ever rotated BEFORE checkpointing, so
+    // the fuzzer could not reach the state that bricked the database:
+    // checkpoint deletes segments -> size rotation zeroes the MANIFEST
+    // ckpt_ts -> recovery rejects the legitimately-deleted segments as
+    // "missing". With this flag the parent-side verification (reopen +
+    // ledger diff) covers that regime on ~half of all checkpoint plans.
+    bool rotate_after_ckpt;
     int occurrence;      // which hit of the target point dies
 };
 
@@ -820,6 +931,7 @@ static Plan make_plan(uint64_t seed) {
     p.checkpoint         = (rng() % 2) == 0;
     p.puts_after_ckpt    = (int)(rng() % 5);
     p.second_checkpoint  = p.checkpoint && (rng() % 3) == 0;
+    p.rotate_after_ckpt  = p.checkpoint && (rng() % 2) == 0;
     // occurrence is filled in by the caller: round 0 must always use 0, so a
     // point that executes only once per run is guaranteed to be reached. A
     // purely random occurrence would leave single-execution points unhitted
@@ -879,6 +991,13 @@ static int child_body(const std::string& base, const Plan& plan,
                 do_put("c" + std::to_string(i));
             if (plan.second_checkpoint) {
                 try { db.checkpoint(); } catch (...) {}
+            }
+            // v25.7 (review H1): size-based rotation AFTER the checkpoint(s)
+            // — the regime whose combination with segment deletion bricked
+            // the pre-fix database at the next open.
+            if (plan.rotate_after_ckpt) {
+                db.force_wal_rotation_for_test();
+                do_put("d0");
             }
         }
         crashpt::disarm();
@@ -6665,6 +6784,11 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     fails += run_async_test();
     fails += run_batch_test();
     fails += run_observer_test();
+    // v25.7 review detectors: GC busy-spin (H2), API lifecycle (M2).
+    fails += run_gc_idle_test();
+    fails += run_lifecycle_test();
+    // v26 M3: online backup + verify_backup (invariant B1).
+    fails += run_backup_test();
     // async benchmark (skips under sanitizer anyway)
     fails += run_async_benchmark();
 
@@ -8153,6 +8277,51 @@ static int run_m2_phase3_test() {
         db.close();
     }
 
+    // ====================================================================
+    // Step 6 (v25.7, review H1 DETECTOR): a size-based rotation AFTER a
+    // segment-deleting checkpoint must PRESERVE the MANIFEST's ckpt_ts.
+    // Pre-fix, maybe_rotate_segment() wrote ckpt_ts=0, which disabled
+    // recover_all()'s missing-segment tolerance for the segments the
+    // checkpoint legitimately deleted — the next open (clean or after a
+    // crash) threw "missing WAL segment 1" and the database was
+    // permanently unopenable. Verified against the unfixed header: the
+    // reopen below FAILS with exactly that error; with the fix, ckpt_ts is
+    // preserved and recovery skips the deleted ids.
+    // ====================================================================
+    {
+        chronokv::Options opts2 = opts;
+        opts2.recover_on_open = true;
+        auto db = Database::open(opts2);
+        db.force_wal_rotation_for_test();   // next leader pass performs a size rotation
+        check("m2p3-h1: put across forced size rotation returns OK",
+              db.put("k3_h1", "x") == Status::OK);
+        db.close();
+    }
+    {
+        auto [aid6, cts6] = WalSegments::read_manifest_for_test(wal_dir);
+        (void)aid6;
+        check("m2p3-h1: MANIFEST preserves ckpt_ts > 0 across size-based rotation",
+              cts6 > 0);
+        bool reopened = false;
+        std::string err;
+        try {
+            chronokv::Options opts2 = opts;
+            opts2.recover_on_open = true;
+            auto db = Database::open(opts2);
+            reopened = db.is_open() &&
+                       db.get("k1_00000").has_value() &&
+                       db.get("k2_0049").has_value() &&
+                       db.get("k3_h1").has_value();
+            db.close();
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        if (!reopened && !err.empty())
+            std::cout << "      (reopen threw: " << err << ")\n";
+        check("m2p3-h1: database reopens after checkpoint-deletion + size rotation",
+              reopened);
+    }
+
     // Cleanup
     std::filesystem::remove_all(wd);
 
@@ -8250,7 +8419,560 @@ static int run_observer_test() {
         check("obs: reentrant callback deadlocks (known M1.5 limitation, M6 fix)",
               deadlocked);
     }
+    // v25.7 (review M3 DETECTOR): a committed Transaction must fire prefix
+    // observers exactly like put/erase/Batch::commit. Pre-fix, transactional
+    // writes were the ONE path observers could not see — verified: with the
+    // Transaction::commit notification reverted, the "fired on transaction
+    // commit" check below FAILS.
+    {
+        auto db = Database::open(Options{});
+        bool txn_observed = false;
+        std::string txn_key;
+        auto handle = db.observe("txn:", [&](const std::string& key,
+                                              const std::optional<std::string>&,
+                                              const std::optional<std::string>&) {
+            txn_observed = true;
+            txn_key = key;
+        });
+        auto txn = db.begin();
+        txn.put("txn:a", "1");
+        check("obs: txn commit returns OK", txn.commit() == Status::OK);
+        check("obs: fired on transaction commit (review M3)",
+              txn_observed && txn_key == "txn:a");
+        txn_observed = false;
+        auto t2 = db.begin();
+        t2.put("txn:b", "2");
+        t2.abort();
+        check("obs: does NOT fire on aborted transaction", !txn_observed);
+    }
+    // v25.7 (review M1 DETECTOR): TSan detector for the unlocked
+    // observers_.empty() fast path that used to run in notify_observers().
+    // Pre-fix this was a data race (UB) against observe()'s push_back —
+    // reproduced with a standalone TSan program before the fix. Under the
+    // CI tsan job this block is the in-suite detector (ThreadSanitizer
+    // reports the race and fails the binary); under other configs it
+    // exercises concurrent registration + notification for crashes and
+    // failed puts.
+    {
+        auto db = Database::open(Options{});
+        std::atomic<bool> stop{false};
+        std::atomic<int> put_fails{0};
+        std::thread registrant([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                auto h = db.observe("race:", [](const std::string&,
+                                                 const std::optional<std::string>&,
+                                                 const std::optional<std::string>&) {});
+                // h destroyed each iteration: exercises the unregister path
+                // (which also takes observer_mu_) concurrently with commits.
+            }
+        });
+        std::thread committer([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                if (db.put("race:k", "v") != Status::OK)
+                    put_fails.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        stop.store(true);
+        registrant.join();
+        committer.join();
+        check("obs: concurrent observe()/handle-drop + commits: no crash, all puts OK (review M1)",
+              put_fails.load() == 0);
+        db.close();
+    }
     if (fails == 0) std::cout << "   OBSERVER TEST PASSED\n";
+    return fails;
+}
+
+// ---- v25.7 review H2 DETECTOR: GC must idle when there is no work ----
+// gc_once() used to return `keys_done < total`, which is true on EVERY pass
+// once the database has more than GC_KEYS_PER_PASS (256) keys — so the GC
+// thread's do/while never reached its condition-variable wait. Any
+// GC-enabled database with >256 keys burned a full core on endless
+// full-tree scans even while completely idle (measured pre-fix: ~1100
+// passes/s, one core pinned, zero versions reclaimed; each pass also held
+// gc_active_mu_, stalling checkpoints behind O(keyspace) scans).
+// Verified against the unfixed header: the idle-window delta below is in
+// the hundreds; post-fix it is 0.
+static int run_gc_idle_test() {
+    using namespace chronokv;
+    int fails = 0;
+    auto check = [&](const char* name, bool ok) {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) ++fails;
+    };
+    {
+        Options o;                       // in-memory: isolate GC behaviour
+        o.auto_start_gc = true;
+        o.page_pool_bytes = 32ULL * 1024 * 1024;
+        auto db = Database::open(o);
+        const int N = 600;               // > GC_KEYS_PER_PASS (256)
+        for (int i = 0; i < N; ++i)
+            db.put("k" + std::to_string(i), "v");
+        // Quiesce: wait until the pass counter stops moving (two equal
+        // samples 200 ms apart), max ~10 s. Polling instead of a fixed
+        // sleep keeps the detector valid under TSan/stress, where sweeps
+        // are an order of magnitude slower.
+        uint64_t prev = db.gc_stats().passes;
+        for (int i = 0; i < 50; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            uint64_t cur = db.gc_stats().passes;
+            if (cur == prev) break;
+            prev = cur;
+        }
+        auto s0 = db.gc_stats();
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        auto s1 = db.gc_stats();
+        uint64_t delta = s1.passes - s0.passes;
+        if (delta != 0)
+            std::cout << "      (idle-window passes delta = " << delta << ")\n";
+        // Post-fix: nothing wakes the GC while idle → delta == 0 (the
+        // quiesce loop above already absorbed any straggler sweeps).
+        // Threshold 10 is slack for pathological CI scheduling; pre-fix the
+        // delta is in the hundreds within this window even under TSan.
+        check("gc-idle: no GC passes on an idle >256-key database (review H2)",
+              delta <= 10);
+        // The wake path must still WORK after idling: update every key and
+        // expect the old versions to be reclaimed (poll, TSan-safe).
+        for (int i = 0; i < N; ++i)
+            db.put("k" + std::to_string(i), "v2");
+        bool reclaimed_grew = false;
+        for (int i = 0; i < 50; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            if (db.gc_stats().reclaimed > s1.reclaimed) { reclaimed_grew = true; break; }
+        }
+        check("gc-idle: GC still reclaims after an idle period (wake path intact)",
+              reclaimed_grew);
+        db.close();
+    }
+    if (fails == 0) std::cout << "   GC IDLE TEST PASSED\n";
+    return fails;
+}
+
+// ---- v25.7 review M2 DETECTORS: API lifecycle hardening ----
+// Pre-fix, each block below was a use-after-free / UB path (ASan-visible):
+//   * RangeScanStream outliving Database::close() — its pImpl (SnapshotGuard
+//     + BTree::Cursor) ran destructors against the freed engine, and
+//     has_next() read freed memory. Now the cursor state holds a shared_ptr
+//     keepalive to the engine and iteration after close throws
+//     LifecycleError.
+//   * ObserverHandle outliving Database destruction — its unregister lambda
+//     locked a destroyed mutex. Now guarded by the same weak_ptr liveness
+//     pattern Transaction uses.
+//   * Async ops racing close() — the std::async lambda dereferenced the
+//     reset engine_ member. Now it captures a shared_ptr to the engine plus
+//     the weak liveness flag.
+static int run_lifecycle_test() {
+    using namespace chronokv;
+    int fails = 0;
+    auto check = [&](const char* name, bool ok) {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) ++fails;
+    };
+
+    // 1. Stream outliving close(): iteration throws; destruction is safe.
+    {
+        Options o;
+        o.page_pool_bytes = 16ULL * 1024 * 1024;
+        auto db = Database::open(o);
+        db.put("a", "1");
+        db.put("b", "2");
+        auto stream = std::make_unique<Database::RangeScanStream>(db, "a", "z");
+        check("lifecycle: stream yields entries before close", stream->has_next());
+        db.close();
+        bool threw = false;
+        try {
+            (void)stream->has_next();
+        } catch (const LifecycleError&) {
+            threw = true;
+        } catch (...) {}
+        check("lifecycle: stream has_next() after close throws LifecycleError", threw);
+        stream.reset();   // pre-fix: UAF in ~Cursor/~SnapshotGuard (ASan detector)
+        check("lifecycle: stream destroyed after close is safe (M2 keepalive)", true);
+    }
+    // 2. Observer handle outliving close() AND Database destruction.
+    {
+        Options o;
+        o.page_pool_bytes = 16ULL * 1024 * 1024;
+        {
+            auto db = Database::open(o);
+            auto h1 = db.observe("x:", [](const std::string&,
+                                           const std::optional<std::string>&,
+                                           const std::optional<std::string>&) {});
+            db.close();
+            // h1 destroyed here, after close() but before Database destruction.
+        }
+        {
+            std::optional<Database::ObserverHandle> h2;
+            {
+                auto db = Database::open(o);
+                h2 = db.observe("y:", [](const std::string&,
+                                          const std::optional<std::string>&,
+                                          const std::optional<std::string>&) {});
+                // db destroyed here with h2 alive — pre-fix: the unregister
+                // lambda ran against a destroyed mutex (ASan detector).
+            }
+            h2.reset();
+            check("lifecycle: observer handle outliving its Database is safe (M2 guard)", true);
+        }
+    }
+    // 3. Async ops racing close(): futures resolve, no UAF.
+    {
+        Options o;
+        o.page_pool_bytes = 16ULL * 1024 * 1024;
+        auto db = Database::open(o);
+        std::vector<std::future<Status>> futs;
+        for (int i = 0; i < 8; ++i)
+            futs.push_back(db.put_async("ar" + std::to_string(i), "v"));
+        db.close();     // races the in-flight ops
+        bool all_resolved = true;
+        for (auto& f : futs) {
+            try {
+                Status s = f.get();
+                if (s != Status::OK && s != Status::Failed) all_resolved = false;
+            } catch (...) {
+                all_resolved = false;
+            }
+        }
+        check("lifecycle: put_async racing close() resolves OK-or-Failed, no UAF (M2)", all_resolved);
+    }
+    // 4. Close-then-reopen the same wal_dir after a stream dies: the engine
+    //    keepalive must release the flock when the last stream handle goes.
+    {
+        const std::string wd = "/tmp/ckv_lifecycle_wal";
+        std::filesystem::remove_all(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.page_pool_bytes = 16ULL * 1024 * 1024;
+        o.auto_start_gc = false;
+        {
+            auto db = Database::open(o);
+            db.put("k", "v");
+            {
+                Database::RangeScanStream s(db, "a", "z");
+                db.close();      // engine teardown deferred while s lives
+            }                    // s destroyed → engine released, flock freed
+            auto db2 = Database::open(o);
+            check("lifecycle: reopen same wal_dir after stream-outlived-close",
+                  db2.is_open() && db2.get("k").has_value());
+            db2.close();
+        }
+        std::filesystem::remove_all(wd);
+    }
+    if (fails == 0) std::cout << "   LIFECYCLE TEST PASSED\n";
+    return fails;
+}
+
+// ---- v26 M3: online backup tests ----
+// Acceptance per docs/ROADMAP.md v26 M3, invariant B1:
+//   verify_backup(dir) succeeds iff dir restores to a state containing
+//   every record acknowledged durable before backup() returned.
+// Coverage: round-trip differential (multi-segment + delta chain) against a
+// sequential oracle, no-over-copy assertion, corruption/truncation/missing-
+// marker rejection, interrupted backup at EVERY bk_* crash point
+// (fork + kill, anti-vacuity asserted via the exit code), backup concurrent
+// with active writers, and an in-memory (no-WAL) backup.
+//
+// DEVIATION (recorded in the roadmap): the round-trip differential uses a
+// std::map oracle rather than SerialOracle — the workload here is
+// sequential and deterministic, for which the two are equivalent; the
+// concurrent-writer sub-case asserts the pre-backup acknowledged prefix,
+// which is the property B1 actually promises.
+static int run_backup_test() {
+    using namespace chronokv;
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) {
+            ++fails;
+            if (!detail.empty()) std::cout << "      (" << detail << ")\n";
+        }
+    };
+    const std::string root = "/tmp/ckv_backup_test";
+    std::filesystem::remove_all(root);
+    std::error_code mec;
+    std::filesystem::create_directories(root, mec);
+
+    Options src_opts;
+    src_opts.wal_dir = root + "/wal";
+    src_opts.checkpoint_path = root + "/ckpt";
+    src_opts.durability = DurabilityMode::Sync;   // every OK put is acked durable
+    src_opts.auto_start_gc = false;
+    src_opts.page_pool_bytes = 16ULL * 1024 * 1024;
+
+    // ==================================================================
+    // (a) Round-trip: base + delta chain, two WAL segments (forced size
+    //     rotation), differential restore vs oracle, B1 both directions.
+    // ==================================================================
+    std::map<std::string, std::string> oracle;
+    {
+        auto db = Database::open(src_opts);
+        for (int i = 0; i < 200; ++i) {
+            std::string k = "a" + std::to_string(i), v = "va" + std::to_string(i);
+            db.put(k, v);
+            oracle[k] = v;
+        }
+        db.checkpoint();                                  // full base
+        for (int i = 0; i < 100; ++i) {
+            std::string k = "b" + std::to_string(i), v = "vb" + std::to_string(i);
+            db.put(k, v);
+            oracle[k] = v;
+        }
+        db.checkpoint();                                  // delta.1
+        db.force_wal_rotation_for_test();                 // span >= 2 segments
+        db.put("rot", "1");
+        oracle["rot"] = "1";
+        for (int i = 0; i < 50; ++i) {
+            std::string k = "c" + std::to_string(i), v = "vc" + std::to_string(i);
+            db.put(k, v);
+            oracle[k] = v;
+        }
+        db.backup(root + "/bak");
+        // A write AFTER backup() returned: must NOT be required in (nor
+        // appear in) the copy — "at most as new as copy completion".
+        db.put("after_backup", "x");
+        db.close();
+    }
+    std::string reason;
+    check("backup: verify_backup accepts a fresh backup",
+          Database::verify_backup(root + "/bak", &reason), reason);
+    {
+        Options ro;
+        ro.wal_dir = root + "/bak/wal";
+        ro.checkpoint_path = root + "/bak/ckpt";
+        ro.recover_on_open = true;
+        ro.auto_start_gc = false;
+        ro.page_pool_bytes = 16ULL * 1024 * 1024;
+        bool restore_ok = false;
+        std::string detail;
+        try {
+            auto rdb = Database::open(ro);
+            restore_ok = true;
+            size_t n = 0;
+            for (auto& [k, v] : oracle) {
+                auto got = rdb.get(k);
+                if (!got || *got != v) {
+                    restore_ok = false;
+                    detail = "first mismatch: " + k;
+                    break;
+                }
+                ++n;
+            }
+            if (restore_ok && n != oracle.size()) { restore_ok = false; detail = "count"; }
+            // No over-copy: the post-backup write committed after the WAL
+            // freeze, so it cannot be in the copy.
+            if (restore_ok && rdb.get("after_backup").has_value()) {
+                restore_ok = false;
+                detail = "post-backup write present in restore (over-copy)";
+            }
+            rdb.close();
+        } catch (const std::exception& e) {
+            restore_ok = false;
+            detail = std::string("restore threw: ") + e.what();
+        }
+        check("backup: restore == every write acked before backup() returned (B1)",
+              restore_ok, detail);
+        check("backup: post-backup write is NOT in the restore (no over-copy)",
+              restore_ok && detail.find("over-copy") == std::string::npos);
+    }
+
+    // ==================================================================
+    // (b) Rejection: corrupted file, truncated marker, missing marker.
+    // ==================================================================
+    {
+        // Fresh backup to corrupt (keeps (a)'s directory pristine).
+        auto db = Database::open(src_opts);
+        db.backup(root + "/bak2");
+        db.close();
+        check("backup: verify_backup accepts second backup",
+              Database::verify_backup(root + "/bak2", &reason), reason);
+
+        // Corrupt one byte of the checkpoint base in the copy.
+        {
+            std::fstream f(root + "/bak2/ckpt",
+                           std::ios::in | std::ios::out | std::ios::binary);
+            if (f) {
+                f.seekp(20);
+                char c = 0;
+                f.read(&c, 1);
+                f.seekp(20);
+                c = (char)(c ^ 0xFF);
+                f.write(&c, 1);
+                f.close();
+            }
+            bool rejected = !Database::verify_backup(root + "/bak2", &reason);
+            check("backup: corrupted file rejected", rejected, reason);
+        }
+        // Truncate the marker.
+        {
+            std::error_code tec;
+            std::filesystem::resize_file(root + "/bak2/BACKUP_COMPLETE", 10, tec);
+            bool rejected = !tec && !Database::verify_backup(root + "/bak2", &reason);
+            check("backup: truncated marker rejected", rejected, reason);
+        }
+        // Remove the marker entirely.
+        {
+            std::error_code tec;
+            std::filesystem::remove(root + "/bak2/BACKUP_COMPLETE", tec);
+            bool rejected = !tec && !Database::verify_backup(root + "/bak2", &reason);
+            check("backup: missing marker rejected (incomplete backup)", rejected, reason);
+        }
+    }
+
+#ifdef CHRONOKV_FAULT_INJECTION
+    // ==================================================================
+    // (c) Interrupted backup: fork a child, kill it at EACH bk_* crash
+    //     point, assert the parent-side verify_backup() rejects — and that
+    //     every point actually fired (exit code 97; anti-vacuity, same
+    //     discipline as the v26 M2 fuzzer).
+    //
+    //     bk_marker_after_rename is the one point where the backup IS
+    //     complete: the marker renamed into place, only its directory
+    //     fsync is outstanding. _exit() does not discard the page cache,
+    //     so a PROCESS crash there leaves a valid backup (only a power
+    //     loss could revert the rename — the exact semantics the engine's
+    //     MANIFEST rename relies on everywhere else). Expected: accepted.
+    // ==================================================================
+    {
+        const char* bk_points[] = {
+            "bk_after_ckpt", "bk_mid_wal", "bk_after_wal",
+            "bk_after_ckptfiles", "bk_marker_after_tmp", "bk_marker_after_rename",
+        };
+        for (const char* point : bk_points) {
+            const std::string dest = root + "/bak_" + std::string(point);
+            std::filesystem::remove_all(dest);
+            std::cout.flush();
+            pid_t child = fork();
+            if (child < 0) {
+                check("backup-interrupt: fork failed", false);
+                continue;
+            }
+            if (child == 0) {
+                // Child: reopen the source (parent holds no flock), arm the
+                // point, back up. crashpt kills us with kExitCode at the point.
+                int rc = 1;   // point NOT reached => vacuous run => fail
+                try {
+                    auto db = Database::open(src_opts);   // recover_on_open default true
+                    crashpt::arm(point, 0);
+                    db.backup(dest);
+                    crashpt::disarm();
+                    rc = 0;
+                    db.close();
+                } catch (...) {
+                    rc = 2;
+                }
+                _exit(rc);
+            }
+            int wst = 0;
+            waitpid(child, &wst, 0);
+            bool fired = WIFEXITED(wst) && WEXITSTATUS(wst) == crashpt::kExitCode;
+            check((std::string("backup-interrupt: point fired: ") + point).c_str(), fired);
+            bool valid = Database::verify_backup(dest, &reason);
+            const bool expect_valid = (std::string(point) == "bk_marker_after_rename");
+            check((std::string("backup-interrupt: verify_backup ") +
+                   (expect_valid ? "ACCEPTS complete-at-rename (" : "REJECTS interrupted (") +
+                   point + ")").c_str(),
+                  valid == expect_valid,
+                  "verify=" + std::to_string(valid) + " reason=" + reason);
+            std::filesystem::remove_all(dest);
+        }
+    }
+#endif // CHRONOKV_FAULT_INJECTION
+
+    // ==================================================================
+    // (d) Backup concurrent with active writers: backup() succeeds while
+    //     writers are live; the restore contains every key acknowledged
+    //     BEFORE the backup call (B1); writers' later keys are optional.
+    // ==================================================================
+    {
+        auto db = Database::open(src_opts);
+        std::mutex ledger_mu;
+        std::vector<std::pair<std::string, std::string>> acked;
+        std::atomic<bool> stop{false};
+        std::thread writer([&] {
+            int i = 0;
+            while (!stop.load(std::memory_order_relaxed)) {
+                std::string k = "w" + std::to_string(i++);
+                if (db.put(k, "wv") == Status::OK) {
+                    std::lock_guard<std::mutex> lk(ledger_mu);
+                    acked.push_back({k, "wv"});
+                }
+            }
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        std::vector<std::pair<std::string, std::string>> pre_backup;
+        {
+            std::lock_guard<std::mutex> lk(ledger_mu);
+            pre_backup = acked;    // everything here is acked-durable (Sync)
+        }
+        bool backup_ok = true;
+        std::string berr;
+        try {
+            db.backup(root + "/bak_concurrent");
+        } catch (const std::exception& e) {
+            backup_ok = false;
+            berr = e.what();
+        }
+        stop.store(true);
+        writer.join();
+        db.close();
+        check("backup-concurrent: backup() succeeds while writers are active", backup_ok, berr);
+        check("backup-concurrent: verify_backup accepts",
+              Database::verify_backup(root + "/bak_concurrent", &reason), reason);
+        Options ro;
+        ro.wal_dir = root + "/bak_concurrent/wal";
+        ro.checkpoint_path = root + "/bak_concurrent/ckpt";
+        ro.recover_on_open = true;
+        ro.auto_start_gc = false;
+        ro.page_pool_bytes = 16ULL * 1024 * 1024;
+        bool all_present = !pre_backup.empty();
+        try {
+            auto rdb = Database::open(ro);
+            for (auto& [k, v] : pre_backup) {
+                auto got = rdb.get(k);
+                if (!got || *got != v) { all_present = false; break; }
+            }
+            rdb.close();
+        } catch (const std::exception& e) {
+            all_present = false;
+            berr = e.what();
+        }
+        check("backup-concurrent: every pre-backup acked key present in restore (B1)",
+              all_present, berr);
+    }
+
+    // ==================================================================
+    // (e) In-memory source (no WAL): backup = checkpoint files + marker.
+    // ==================================================================
+    {
+        Options o;
+        o.checkpoint_path = root + "/mem.ckpt";
+        o.page_pool_bytes = 16ULL * 1024 * 1024;
+        o.auto_start_gc = false;
+        {
+            auto db = Database::open(o);
+            db.put("m1", "v1");
+            db.put("m2", "v2");
+            db.backup(root + "/bak_mem");
+            db.close();
+        }
+        check("backup-mem: verify_backup accepts a no-WAL backup",
+              Database::verify_backup(root + "/bak_mem", &reason), reason);
+        Options ro;
+        ro.checkpoint_path = root + "/bak_mem/mem.ckpt";
+        ro.recover_on_open = true;
+        ro.page_pool_bytes = 16ULL * 1024 * 1024;
+        bool ok = false;
+        try {
+            auto rdb = Database::open(ro);
+            ok = rdb.get("m1").value_or("") == "v1" && rdb.get("m2").value_or("") == "v2";
+            rdb.close();
+        } catch (...) { ok = false; }
+        check("backup-mem: restore of a no-WAL backup round-trips", ok);
+    }
+
+    std::filesystem::remove_all(root);
+    if (fails == 0) std::cout << "   BACKUP TEST PASSED\n";
     return fails;
 }
 

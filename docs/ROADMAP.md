@@ -7,11 +7,26 @@ Progress:
 
 | Milestone | Status | Shipped as |
 | --- | --- | --- |
-| v25.3 — review defect fixes (C1, H1, H3, H4) | **DONE** | `3929d25`, `0.25.3` |
+| v25.3 — review defect fixes (C1, H1, H3, H4 of the 2026-09-12 review) | **DONE** | `3929d25`, `0.25.3` |
 | v26 M0 — durable rollback truncation (D2) | **DONE** | `3509586`, `0.25.4` |
 | v26 M1 — adversarial fsync semantics (D3) | **DONE** | `f73d7f6`, `0.25.5` |
 | v26 M2 — randomized crash-point fuzzing | **DONE** | see below, `0.25.6` |
-| v26 M3–M4, v27–v30 | not started | — |
+| v25.7 — 2026-09-18 external-review defect fixes: **H1** MANIFEST ckpt_ts zeroed by size rotation (DB unopenable after checkpoint+rotation), **H2** GC busy-spin above 256 keys (one core burned idle), **M1** observer data race (TSan-confirmed); plus lifecycle hardening (streams/handles/async vs close), transaction commits now notify observers | **DONE** | see below, `0.25.7` |
+| v26 M3 — online backup API (invariant B1) | **DONE** | see below, `0.25.7` |
+| v26 M4, v27–v30 | not started | — |
+
+> **v25.7 note (the load-bearing constraint, re-confirmed).** H1 and H2 were
+> found by an outside reviewer *reading code and writing three-line repros* —
+> again. The suite executes checkpoints, rotations and GC sweeps thousands of
+> times, but its plan grammar never *composed* them (rotate always preceded
+> checkpoint in the crash-fuzz `Plan`; the m2_phase3 test explicitly avoids a
+> post-checkpoint rotation), and nothing asserts "an idle database consumes
+> no CPU". Both detectors now ship in-suite, the crash-fuzz `Plan` gained
+> `rotate_after_ckpt` (reverting the H1 fix makes the fuzzer itself fail), and
+> the GC-idle test polls for quiescence instead of sleeping a fixed time so it
+> stays valid under TSan/stress. This is the same signal that gates v28/v29
+> on v27 — widening the *composition* of existing regimes is cheaper than the
+> full DST harness and should not wait for it.
 
 ## How to read this
 
@@ -66,7 +81,7 @@ v30 ergonomics (any time) ┘                        └─> v29 page reclamatio
 
 # v26 — Durability correctness + online backup
 
-**Status:** M0 **DONE** (`3509586`, shipped as `0.25.4`). M1–M4 not started.
+**Status:** M0 **DONE** (`3509586`, `0.25.4`) · M1 **DONE** (`f73d7f6`, `0.25.5`) · M2 **DONE** (`b793486`, `0.25.6`) · M3 **DONE** (`0.25.7`, see below). M4 (stretch, PITR) not started.
 
 Theme: the durability path has a confirmed live defect, and the backup API is cheap
 because both hard primitives already exist. Small, coherent, ships fast.
@@ -318,7 +333,63 @@ violations. Then: **deliberately reintroduce the M0 defect on a branch and confi
 fuzzer finds it within N seeds.** That is the only honest proof the fuzzer works — the
 same standard applied to the v25.3 tests.
 
-## M3 — Online backup API  **[M]**
+## M3 — Online backup API  **[M]** — DONE, shipped in `0.25.7`
+
+> ### What actually shipped
+>
+> `Database::backup(dest_dir)` and static `Database::verify_backup(dest_dir,
+> reason*)`, implemented as planned: exclusive `checkpoint_mu_` hold →
+> checkpoint (→ rotation) → copy MANIFEST-referenced segments (id ≤
+> active_id) + MANIFEST + checkpoint base/deltas → fsync every file and both
+> directories → `BACKUP_COMPLETE` written LAST (magic `BKM1`, CRC32 over the
+> payload; payload = cts, active_id, checkpoint basename, and
+> {name, size, crc32} per copied file). `verify_backup` re-checksums every
+> file, runs `verify_checkpoint_chain`, and does a full read-only
+> `recover_all()` parse of the copied WAL — no Database instance, so it can
+> never collide with the flock guard. Restore is the existing recovery path
+> pointed at the copy. Works for WAL-less (checkpoint-only) databases too.
+>
+> **Dependency discovered during implementation:** backup *requires* the
+> v25.7 H1 fix. A backup taken after any size-based rotation copies a
+> MANIFEST whose `ckpt_ts` must have survived the rotation; with the old
+> `ckpt_ts=0` behaviour, `verify_backup`'s own `recover_all()` would reject
+> every legitimate backup of a checkpointed database ("missing WAL segment").
+>
+> **Tests (all shipping, all green in the four-config matrix):** round-trip
+> differential over a multi-segment + delta-chain source (oracle diff over
+> every write acknowledged before `backup()` returned — B1's "contains"
+> half — plus a no-over-copy assertion for a write committed after);
+> corrupted-file / truncated-marker / missing-marker rejection; interrupted
+> backup via fork + kill at EACH of six `bk_*` crash points with
+> per-point reachability assertions (exit code 97) — `bk_marker_after_rename`
+> is asserted to be ACCEPTED, since after the marker rename the copy is
+> complete for process-crash purposes (only power loss could revert it —
+> the same semantics the MANIFEST rename relies on everywhere else);
+> backup concurrent with active writers (pre-backup acknowledged prefix
+> present in the restore); no-WAL backup round-trip. A public-API subset
+> runs in the hooks-off smoke build.
+>
+> **Deviations from the plan (recorded, not hidden):**
+> 1. `bk_*` crash points are deliberately NOT added to `crashpt::kAll`: the
+>    fuzzer's plan grammar has no backup regime, and the dedicated
+>    interrupted-backup test arms every point exactly once with an
+>    anti-vacuity assertion — a stronger per-point guarantee than seeded
+>    sampling. Folding a backup regime into the fuzzer is a legitimate
+>    follow-up if backup grows more state machine.
+> 2. The round-trip differential uses a `std::map` oracle rather than
+>    `SerialOracle`: the workload is sequential and deterministic, for which
+>    the two are equivalent. The concurrent-writer case asserts the property
+>    B1 actually promises (the acknowledged prefix), not full equivalence.
+> 3. Because commits are blocked for the whole copy, the documented window
+>    "at least as new as the checkpoint, at most as new as copy completion"
+>    collapses in practice to exactly the checkpoint cts. Documented as such
+>    in the header; still NOT PITR (M4).
+>
+> **B1 status:** the "only-if" half is mechanically enforced (marker absent
+> or any mismatch → reject; verified by the corruption/interruption tests).
+> The "if" half rests on the exclusive-lock freeze + checkpoint-before-copy
+> ordering, and is asserted by the ledger-style round-trip and
+> concurrent-writer tests.
 
 **Anchor.** "Online" = while running. No server, no network: it copies a consistent
 snapshot to another directory (local path, external drive, NAS mount — anything the

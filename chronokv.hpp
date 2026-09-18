@@ -1,5 +1,115 @@
 // chronokv.hpp — ChronoKV engine and public C++ API.
 //
+// v25.7 SHIPPED (external-review defect fixes + v26 milestone M3 start):
+// three reproduced defects fixed, API lifecycle hardened, transaction
+// commits made visible to observers, and the online-backup API (roadmap
+// v26 M3, invariant B1) implemented.
+//
+//   H1 FIX (HIGH, availability) — size-based rotation BRICKED the database
+//       after any earlier segment-deleting checkpoint. maybe_rotate_segment()
+//       wrote MANIFEST(active_id+1, ckpt_ts=0); recover_all()'s missing-
+//       segment tolerance for segments legitimately deleted by
+//       rotate_after_checkpoint() is gated on ckpt_ts > 0. So: checkpoint ->
+//       checkpoint (deletes segment 1) -> 64 MiB of writes (size rotation)
+//       -> ANY reopen, crash or clean, threw "missing WAL segment 1"
+//       permanently. Reproduced pre-fix through the public API alone
+//       (hooks-off build). Fix: WalSegments tracks last_ckpt_ts_ (seeded
+//       from the MANIFEST at construction, updated by
+//       rotate_after_checkpoint) and preserves it across size rotations.
+//       Detector: m2p3-h1 (verified FAILING pre-fix); the crash-fuzz Plan
+//       grammar gained rotate_after_ckpt, and the fuzzer ALSO fails pre-fix
+//       with the fix reverted — the regime combination that hid the bug is
+//       now in the plan space.
+//
+//   H2 FIX (HIGH, resource) — the GC thread busy-spun forever on any idle
+//       database with > GC_KEYS_PER_PASS (256) keys. gc_once() returned
+//       `keys_done < total` (true on EVERY pass above 256 keys), so the
+//       do/while never reached the cv wait; each pass is a full O(keyspace)
+//       tree scan under gc_active_mu_ (checkpoints queue behind it).
+//       Measured pre-fix: ~1100 passes/s and one full core burned on a
+//       completely idle 1000-key database, 0 versions reclaimed. Fix:
+//       gc_once() now returns "sweep incomplete" (cursor did not wrap), and
+//       the gc loop distinguishes dirty_ wakes (full sweep) from
+//       retired_pending_-only wakes (cheap reclaim retry + 5 ms backoff,
+//       so pinned retirements cannot hot-spin either). Detector: gc-idle
+//       (quiesce-poll based; TSan-safe thresholds). The per-pass full
+//       rescan remains (a persistent-cursor sweep is the follow-up); it is
+//       now paid once per sweep, not 1100x/s.
+//
+//   M1 FIX (UB, data race) — notify_observers() read observers_.empty()
+//       OUTSIDE observer_mu_ while observe() push_backs under it (vector
+//       reallocation under an unsynchronized read). Reproduced pre-fix
+//       under TSan (standalone repro + the new in-suite concurrent
+//       observe/commit block, which makes the CI tsan job the detector).
+//       Fix: take the lock unconditionally — noise next to a WAL commit.
+//
+//   M2 (API lifecycle hardening) — RangeScanStream, ObserverHandle and the
+//       async futures used raw references into Database/engine and became
+//       use-after-free when close()/destruction raced them, while
+//       Transaction already had the weak-liveness treatment. Now:
+//         * engine_ is a shared_ptr; the stream's cursor state holds a
+//           keepalive, so engine teardown DEFERS until the last stream dies
+//           (flock included — documented on close()). Iterating a stream
+//           after close throws LifecycleError; destroying it is safe.
+//         * ObserverHandle's unregister lambda checks a weak liveness flag
+//           — a handle may now outlive close() AND the Database itself.
+//         * Async lambdas capture an engine shared_ptr + the liveness flag:
+//           close() racing an in-flight op yields Status::Failed or a
+//           commit against the keepalive-held engine — never a null/freed
+//           engine_. For this contract the alive_ flag became
+//           std::atomic<bool> (plain bool + cross-thread reads was itself
+//           a TSan-visible race).
+//       Detector: lifecycle tests + standalone repro verified under ASan
+//       (pre-fix: heap-use-after-free in HazardPointer::clear; post-fix:
+//       clean under ASan AND TSan). Destroying the Database OBJECT itself
+//       with in-flight futures/live transactions still requires external
+//       synchronization (README: Safety properties).
+//
+//   M3-txn (API gap) — Transaction::commit() now fires prefix observers,
+//       exactly like put/erase/Batch::commit. Transactional writes were the
+//       one path observers could not see, making observe() a silently
+//       incomplete change feed. Detector: "obs: fired on transaction
+//       commit" (fails pre-fix — no notify call site existed).
+//
+//   v26 M3 (ONLINE BACKUP, invariant B1) — Database::backup(dest_dir) +
+//       static Database::verify_backup(dest_dir, reason*). Checkpoints
+//       under the exclusive checkpoint lock (WAL frozen), then copies the
+//       MANIFEST-referenced segments + MANIFEST + checkpoint base/deltas,
+//       fsyncing every file and directory, and writes BACKUP_COMPLETE LAST
+//       (marker carries cts, active_id, and {name,size,crc32} per file —
+//       an interrupted or corrupted copy is DETECTABLE across filesystems,
+//       where directory-rename atomicity does not reach). Restore = point
+//       Options at the copy. verify_backup needs no Database instance (no
+//       flock collision): marker parse + per-file re-checksum + checkpoint-
+//       chain verify + full read-only recover_all() parse. Semantics: at
+//       least as new as the internal checkpoint, at most as new as copy
+//       completion — NOT PITR (that is M4). Depends on the H1 fix: a backup
+//       taken after a size rotation copies a MANIFEST whose ckpt_ts must
+//       survive, or verify_backup's recover_all would reject the copy.
+//       Tests: round-trip differential (multi-segment + delta chain, oracle
+//       diff, no-over-copy), corruption/truncation/missing-marker
+//       rejection, fork+kill at EACH of six bk_* crash points with
+//       per-point reachability assertions, backup concurrent with active
+//       writers (B1 prefix), no-WAL backup. bk_* points are deliberately
+//       NOT in crashpt::kAll — the dedicated interrupted-backup test arms
+//       every point exactly once, a stronger per-point guarantee than
+//       seeded sampling (deviation recorded in docs/ROADMAP.md).
+//
+//   HYGIENE — stale contradictory v24-Fix-4 comment removed from the WAL
+//       leader; active_segment_bytes_ mutations moved under batch_mu_
+//       (they were lock-free, benign only by leader-serialization
+//       accident); BTree OLC retries now reload root_id_ per descent
+//       (stale-root hardening; key_in_leaf_fence documented as
+//       deliberately NOT a validity gate — new-max inserts legitimately
+//       fall outside the rightmost fence); CHRONOKV_VERSION_PATCH was
+//       stale (said 2 for version 0.25.6) and is now kept in lockstep.
+//
+//   Local validation (2-CPU, ~1 GiB container, kernel 5.10, io_uring
+//   active): release(-O0) 343/343, stress(-O0) 344/344, hooks-off smoke
+//   green, CKV_ONLY_REVIEW + crash fuzz (240 iters, 0 violations) green;
+//   ASan/TSan full-suite builds exceed this container's memory (see README
+//   build note) — sanitizer validation via standalone repros + CI matrix.
+//
 // v25.6 SHIPPED (v26 milestone M2): randomized crash-point fuzzing, and the
 // first defect it found.
 //
@@ -2249,6 +2359,17 @@ class WalSegments {
     int active_fd_ = -1;
     FdGuard lock_fd_;  // v22.1 M4: inter-process guard (flock), v24: RAII
     uint64_t active_id_ = 1;
+    // v25.7 FIX (review H1): the ckpt_ts of the most recent checkpoint, as
+    // recorded in the MANIFEST. maybe_rotate_segment() MUST preserve it when
+    // rewriting the MANIFEST: recover_all()'s missing-segment tolerance for
+    // segments legitimately deleted by rotate_after_checkpoint() is gated on
+    // ckpt_ts > 0. The old code wrote a hardcoded 0 here, so the FIRST
+    // size-based rotation after any segment-deleting checkpoint made every
+    // deleted segment look "missing" — the database refused to open
+    // ("missing WAL segment 1") after a perfectly clean shutdown.
+    // Guarded by batch_mu_ (written by both rotation paths, read at
+    // construction before any concurrency).
+    uint64_t last_ckpt_ts_ = 0;
     std::atomic<uint64_t> lsn_{0};  // physical write-order sequence (item 6)
     std::mutex batch_mu_;
     std::condition_variable batch_cv_;
@@ -2293,7 +2414,12 @@ class WalSegments {
     // Combined with fault::Kind::SegOpenFail this deterministically drives
     // the leader's exception-before-unlock path, which the suite previously
     // never exercised.
-    void force_rotation_for_test() { active_segment_bytes_ = SEGMENT_MAX_BYTES; }
+    // v25.7: takes batch_mu_ — every other access to active_segment_bytes_
+    // is under it (the leader's own updates moved under the lock too).
+    void force_rotation_for_test() {
+        std::lock_guard<std::mutex> lk(batch_mu_);
+        active_segment_bytes_ = SEGMENT_MAX_BYTES;
+    }
 
     // v26 M0 (invariant D2): the active segment's byte accounting, so a test
     // can assert a failed batch was rolled back out of the rotation budget.
@@ -2376,6 +2502,12 @@ public:
     // Both are deliberately stateless (no instance needed) so the test can
     // call them after the engine has been destroyed (post-close inspection).
     static std::vector<uint64_t> list_segment_ids_for_test(const std::string& dir) {
+        return list_segment_ids(dir);
+    }
+    // v26 M3 (online backup): production-named directory inspectors. The
+    // _for_test wrappers delegate here so backup_to()/verify_backup() don't
+    // call "*_for_test" from production code paths.
+    static std::vector<uint64_t> list_segment_ids(const std::string& dir) {
         std::vector<uint64_t> ids;
         std::error_code ec;
         if (!std::filesystem::exists(dir, ec) || !std::filesystem::is_directory(dir, ec)) {
@@ -2393,6 +2525,9 @@ public:
         return ids;
     }
     static std::pair<uint64_t, uint64_t> read_manifest_for_test(const std::string& dir) {
+        return read_manifest_dir(dir);
+    }
+    static std::pair<uint64_t, uint64_t> read_manifest_dir(const std::string& dir) {
         std::string mp = dir + "/MANIFEST";
         std::ifstream f(mp, std::ios::binary);
         if (!f) return {0, 0};  // no manifest
@@ -2611,11 +2746,18 @@ private:
         }
         CKV_CRASH_POINT("rot_after_new_open");
         if (!checked_fsync(active_fd_)) { failed_ = true; return; }
-        // Write MANIFEST with the new active_id. ckpt_ts is 0 (no checkpoint
-        // triggered this rotation — it's size-based). The checkpoint mechanism
-        // (M3) will update ckpt_ts when it runs.
+        // Write MANIFEST with the new active_id. v25.7 FIX (review H1):
+        // PRESERVE the last checkpoint's ckpt_ts instead of writing 0. This
+        // rotation is size-based (no checkpoint triggered it), but the
+        // MANIFEST's ckpt_ts is load-bearing for recovery: it enables the
+        // missing-segment tolerance for segments that an EARLIER
+        // rotate_after_checkpoint() legitimately deleted. Zeroing it made
+        // the next reopen throw "missing WAL segment" whenever a size
+        // rotation followed a segment-deleting checkpoint — a clean-shutdown
+        // path, no crash required. (Reproduced pre-fix: checkpoint x2 ->
+        // 64 MiB of writes -> close -> open -> "missing WAL segment 1".)
         CKV_CRASH_POINT("rot_before_manifest");
-        if (!write_manifest(new_id, 0)) { failed_ = true; return; }
+        if (!write_manifest(new_id, last_ckpt_ts_)) { failed_ = true; return; }
         CKV_CRASH_POINT("rot_after_manifest");
         if (!fsync_dir(dir_)) { failed_ = true; return; }
         CKV_CRASH_POINT("rot_after_dir_fsync");
@@ -2706,6 +2848,7 @@ public:
         }
         auto [act, ckpt] = read_manifest();
         active_id_ = act;
+        last_ckpt_ts_ = ckpt;   // v25.7 FIX (review H1): preserve across size rotations
         // v20.1 BLOCKER #1: never silently recreate a missing active segment
         // for an EXISTING database. If the manifest or any segment is present,
         // the active segment must exist; a missing segment means durable data
@@ -2898,6 +3041,7 @@ public:
             bool io_ok = true;
             size_t batch_bytes = 0;
             uint64_t base_lsn = 0;
+            bool seg_bytes_rollback = false;  // v25.7: applied under batch_mu_ at the state flip
 
             try {
                 sort(batch->records.begin(), batch->records.end(),
@@ -3061,32 +3205,21 @@ public:
                     diag::wal_fsyncs.fetch_add(1, std::memory_order_relaxed);
                     i_wal_fsyncs.fetch_add(1, std::memory_order_relaxed);
                     // v25.1 M2: track segment size for size-based rotation.
-                    active_segment_bytes_ += batch_bytes;
+                    // v25.7 (review note 2): the += moved DOWN into the
+                    // state-flip section under batch_mu_ — every other access
+                    // to active_segment_bytes_ (maybe_rotate_segment,
+                    // open_segment, rotate_after_checkpoint, the test
+                    // accessor) is under that mutex; mutating it here
+                    // lock-free was benign only by leader-serialization
+                    // accident and one future caller away from a TSan report.
                 }
 
-                // Group 1, Fix 4: mixed-durability batch truncation.
-                // The previous code skipped the ftruncate if the batch
-                // contained ANY async record (has_async). That meant
-                // Sync/Group records in the same batch survived the
-                // failed fsync and would be replayed on recovery -- a
-                // durability-contract violation (caller saw WalFailure
-                // but data was silently durable).
-                //
-                // The cleaner correct fix the spec requested: do NOT
-                // let Async and Sync/Group share a batch. Then Sync/Group
-                // batches can be safely truncated on fsync failure (no
-                // async records to lose), and Async batches are never
-                // truncated (preserving the documented "stays present
-                // after restart" contract for async commits that
-                // already returned Committed).
-                //
-                // The batch separation is enforced BELOW in the
-                // reservation path (see "Group 1, Fix 4: batch
-                // separation" comment). By the time we reach here,
-                // a batch contains EITHER async records XOR sync/group
-                // records -- never both. So has_async implies "all
-                // records in this batch are async" and the original
-                // truncation gating is correct again.
+                // v25.7: the stale duplicated "Group 1, Fix 4" commentary
+                // that used to sit here described an ABANDONED design
+                // ("always truncate; has_async no longer gates truncation")
+                // and contradicted both the code and the accurate comment at
+                // the truncation site below. Removed; the truncation policy
+                // is documented where it is implemented.
                 CKV_CRASH_POINT("wal_before_rollback");
                 if (!io_ok && batch_start >= 0) {
                     if (batch->has_async.load(std::memory_order_relaxed)) {
@@ -3147,16 +3280,20 @@ public:
                             // v26 M0: re-sync the rotation budget with the
                             // file's actual post-truncate size. NOTE: a
                             // failed batch never inflated this counter in
-                            // the first place -- `active_segment_bytes_ +=
-                            // batch_bytes` is guarded by `if (io_ok)`. So
-                            // this is DRIFT CORRECTION, not inflation
-                            // prevention: it matters when a partial write
-                            // grew the file without io_ok ever being set,
-                            // leaving the tracked size below the real one.
-                            // batch_start is where the batch began, i.e.
-                            // exactly the size the file now has.
+                            // the first place -- the `+= batch_bytes` is
+                            // gated on io_ok. So this is DRIFT CORRECTION,
+                            // not inflation prevention: it matters when a
+                            // partial write grew the file without io_ok
+                            // ever being set, leaving the tracked size
+                            // below the real one. batch_start is where the
+                            // batch began, i.e. exactly the size the file
+                            // now has.
+                            // v25.7 (review note 2): flag it here, apply it
+                            // under batch_mu_ in the state-flip section —
+                            // active_segment_bytes_ is a batch_mu_-guarded
+                            // member everywhere else.
                             if (batch_start >= 0)
-                                active_segment_bytes_ = (size_t)batch_start;
+                                seg_bytes_rollback = true;
                         }
                     }
                 }
@@ -3193,8 +3330,17 @@ public:
             if (leader_threw || !io_ok) {
                 failed_ = true;
                 batch->failed = true;
+                // v25.7 (review note 2): post-truncation drift correction,
+                // applied under batch_mu_ (was a lock-free store pre-fix).
+                if (seg_bytes_rollback && batch_start >= 0)
+                    active_segment_bytes_ = (size_t)batch_start;
             } else {
                 batch->done = true;
+                // v25.1 M2: track segment size for size-based rotation.
+                // v25.7 (review note 2): moved here from the unlocked
+                // diagnostics block so EVERY active_segment_bytes_ mutation
+                // is under batch_mu_, matching every reader.
+                active_segment_bytes_ += batch_bytes;
             }
             leader_active_ = false;
             batch_cv_.notify_all();
@@ -3243,6 +3389,9 @@ bool rotate_after_checkpoint(uint64_t ckpt_ts) {
         if (!checked_fsync(active_fd_)) { failed_ = true; return false; }
 
         if (!write_manifest(new_id, ckpt_ts)) { failed_ = true; return false; }
+        // v25.7 FIX (review H1): remember the new checkpoint boundary so the
+        // next SIZE-based rotation preserves it in the MANIFEST.
+        last_ckpt_ts_ = ckpt_ts;
 
         // Delete old segments fully covered by the checkpoint
         CKV_CRASH_POINT("rotc_before_unlink");
@@ -4100,12 +4249,22 @@ class ChronoKV {
 
      size_t idx = gc_cursor_;
      size_t keys_budget = std::min(GC_KEYS_PER_PASS, total);
+     // v25.7 FIX (review H2): `wrapped` marks "the cursor completed a full
+     // sweep of the keyspace during THIS pass". The old return value
+     // (`keys_done < total`) was true on EVERY pass once total > 256, so
+     // the gc thread's do/while never exited: any database with more than
+     // GC_KEYS_PER_PASS keys kept the GC thread hot-spinning full tree
+     // scans forever, even completely idle (measured pre-fix: 1100 passes/s,
+     // one full core burned, 0 versions reclaimed). The loop must be able
+     // to reach the condition-variable wait; wake_gc() re-arms it on the
+     // next commit.
+     bool wrapped = false;
 
      for (size_t k = 0; k < keys_budget; ++k) {
          if (steps_done >= GC_STEPS_PER_PASS) break;  // v18.1: step budget
          if (idx >= all_entries.size()) break;
          KeyEntry* ent = all_entries[idx];
-         if (!ent) { ++idx; if (idx >= total) idx = 0; continue; }
+         if (!ent) { ++idx; if (idx >= total) { idx = 0; wrapped = true; } continue; }
 
          Version* cur = ent->head.load(std::memory_order_acquire);
          bool anchor = false;
@@ -4127,7 +4286,7 @@ class ChronoKV {
 
          ++keys_done;
          ++idx;
-         if (idx >= total) idx = 0;
+         if (idx >= total) { idx = 0; wrapped = true; }
      }
 
      gc_cursor_ = idx;
@@ -4157,7 +4316,11 @@ class ChronoKV {
      i_gc_last_pass_ns.store(ns, std::memory_order_relaxed);
      diag::store_max(i_gc_max_pass_ns, ns);
 
-     return keys_done < total;
+     // v25.7 FIX (review H2): true = "this sweep is incomplete, run another
+     // pass" (cursor advanced without wrapping, e.g. step-budget break or
+     // more keys remain). false = "sweep complete OR nothing to do" — the
+     // gc thread then returns to its cv wait instead of spinning.
+     return !wrapped;
  }
 
     void free_all() {
@@ -4725,13 +4888,41 @@ public:
                            retired_pending_.load(std::memory_order_relaxed) != 0;
                 });
                 if (!running_.load(std::memory_order_acquire)) break;
+                // v25.7 FIX (review H2): distinguish the two wake reasons.
+                // dirty_ => new commits retired versions => run the sweep
+                // loop (gc_once now returns false when the sweep wraps, so
+                // this terminates). retired_pending_ alone => previously
+                // retired nodes may have become reclaimable (a reader left);
+                // retry ONLY the cheap reclamation, and back off 5 ms while
+                // nodes stay pinned. Running a full O(keyspace) sweep per
+                // pinned-retry wake was the second half of the spin: with a
+                // long-lived reader pinning anything, the old loop re-swept
+                // back-to-back forever even after the H2 gc_once fix.
+                const bool do_sweep = dirty_.load(std::memory_order_acquire);
                 dirty_.store(false, std::memory_order_release);
                 lk.unlock();
-                bool more;
-             do {
-                 { std::lock_guard<std::mutex> gc_act(gc_active_mu_); more = gc_once(); }
-                 if (more) std::this_thread::yield();
-             } while (more && running_.load(std::memory_order_acquire));
+                if (do_sweep) {
+                    bool more;
+                 do {
+                     { std::lock_guard<std::mutex> gc_act(gc_active_mu_); more = gc_once(); }
+                     if (more) std::this_thread::yield();
+                 } while (more && running_.load(std::memory_order_acquire));
+                } else {
+                    size_t freed = 0;
+                    {
+                        std::lock_guard<std::mutex> gc_act(gc_active_mu_);
+                        freed = reclaim_retired();
+                    }
+                    if (freed == 0 &&
+                        retired_pending_.load(std::memory_order_relaxed) != 0 &&
+                        running_.load(std::memory_order_acquire)) {
+                        // Still pinned by a live reader: bounded backoff
+                        // instead of a hot retry loop.
+                        lk.lock();
+                        gc_cv_.wait_for(lk, std::chrono::milliseconds(5));
+                        continue;
+                    }
+                }
                 // v17: PhantomTracker.prune() is called from gc_once() under
              // gc_active_mu_. It prunes transitions with commit_ts <= the
              // minimum active reader snapshot. This is safe because
@@ -5046,15 +5237,24 @@ public:
     }
 
     void checkpoint(const std::string& ckpt_path) {
+        auto ckpt_t_enter = std::chrono::steady_clock::now();
+        std::unique_lock ckpt_lk(checkpoint_mu_);
+        last_ckpt_lock_wait_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ckpt_t_enter).count();
+        checkpoint_locked(ckpt_path);
+    }
+
+    // v26 M3 (online backup): the body of checkpoint(), split out so
+    // backup_to() can run a checkpoint while ALREADY holding checkpoint_mu_
+    // exclusively (a second unique_lock here would self-deadlock; the mutex
+    // is not recursive). Callers MUST hold checkpoint_mu_ exclusively.
+    // Returns the checkpoint's cts (v26 M3: the backup marker records it).
+    uint64_t checkpoint_locked(const std::string& ckpt_path) {
         struct WorkTimer {
             std::chrono::steady_clock::time_point start;
             double& out;
             WorkTimer(double& o) : start(std::chrono::steady_clock::now()), out(o) {}
             ~WorkTimer() { out = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(); }
         };
-        auto ckpt_t_enter = std::chrono::steady_clock::now();
-        std::unique_lock ckpt_lk(checkpoint_mu_);
-        last_ckpt_lock_wait_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ckpt_t_enter).count();
         WorkTimer ckpt_work(last_ckpt_work_ms_);
 
         // Wait for any in-progress GC to finish, then register a reader
@@ -5231,6 +5431,315 @@ public:
      }
         if (wal_ && !wal_->rotate_after_checkpoint(cts))
          throw std::runtime_error("WAL rotation failed after checkpoint");
+        return cts;
+    }
+
+    // =====================================================================
+    // v26 M3: ONLINE BACKUP (roadmap invariant B1).
+    //
+    // backup_to(dest_dir, ckpt_path) copies a consistent snapshot of the
+    // database to dest_dir while the database stays online:
+    //
+    //   1. Take checkpoint_mu_ EXCLUSIVELY — commits hold it shared, so the
+    //      WAL is frozen for the duration (no concurrent checkpoint/rebase
+    //      can swap the base file mid-copy either).
+    //   2. checkpoint_locked(): snapshot at cts T, write base-or-delta,
+    //      rotate the WAL (MANIFEST now names a fresh empty active segment
+    //      and ckpt_ts = T; segments fully covered by older checkpoints are
+    //      already deleted).
+    //   3. Copy the MANIFEST-referenced WAL segments (id <= active_id), the
+    //      MANIFEST, the checkpoint base and its whole delta chain into
+    //      dest_dir (wal/ subdir mirrors the source layout), fsyncing every
+    //      copied file and both destination directories.
+    //   4. Write BACKUP_COMPLETE LAST (tmp -> fsync -> rename -> dir fsync).
+    //      The marker carries T, active_id, and {name, size, crc32} for
+    //      every copied file, so an interrupted or corrupted copy is
+    //      DETECTABLE rather than silently plausible — rename atomicity
+    //      only holds within one filesystem, and backups typically cross
+    //      filesystems, which is why the marker (not a directory rename) is
+    //      the completion mechanism.
+    //
+    // Restore is the pre-existing recovery path: point Options at the copy
+    // (wal_dir = dest/wal, checkpoint_path = dest/<ckpt_name>,
+    // recover_on_open = true).
+    //
+    // SEMANTICS (documented precisely, per the roadmap): the restored state
+    // is AT LEAST as new as the checkpoint taken inside backup(), and AT
+    // MOST as new as copy completion. Because commits are blocked for the
+    // whole operation, "at most" == "exactly the checkpoint cts T" in
+    // practice. This is NOT point-in-time restore (that is M4).
+    //
+    // B1: verify_backup(dir) succeeds iff dir restores to a state
+    // containing every record acknowledged durable before backup()
+    // returned. The "only if" direction is enforced by the marker's
+    // per-file checksums + a full read-only recover_all() parse; the "if"
+    // direction by the exclusive-lock freeze (nothing acknowledged durable
+    // pre-return can be missing from the copied artifacts).
+    //
+    // Crash points bk_* instrument every step boundary; the interrupted-
+    // backup test forks, kills at EACH point, and asserts verify_backup()
+    // rejects. They are deliberately NOT in crashpt::kAll: the fuzzer's
+    // plan grammar has no backup regime, and the dedicated test arms every
+    // bk_* point exactly once with a reachability assertion — a stronger
+    // per-point guarantee than seeded sampling. (Recorded as a deviation
+    // in docs/ROADMAP.md.)
+    // =====================================================================
+
+    // Copy one file to dst, fsync it, and return {size, crc32-of-contents}.
+    // Throws on any I/O failure — a backup that cannot make a copy durable
+    // must fail loud, never leave a plausible-but-partial artifact behind
+    // (the marker is written last, so a throw here leaves the copy
+    // verifiably incomplete).
+    static std::pair<uint64_t, uint32_t> backup_copy_file(const std::string& src,
+                                                          const std::string& dst) {
+        std::ifstream in(src, std::ios::binary);
+        if (!in) throw std::runtime_error("backup: cannot read " + src);
+        std::vector<uint8_t> data(
+            (std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        in.close();
+        int fd = ::open(dst.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd < 0)
+            throw std::runtime_error("backup: cannot create " + dst +
+                                     " (errno=" + std::to_string(errno) + ")");
+        bool wok = write_all(fd, data.data(), data.size());
+        bool fok = wok && checked_fsync(fd);
+        checked_close(fd);
+        if (!wok) throw std::runtime_error("backup: write failed for " + dst);
+        if (!fok) throw std::runtime_error("backup: fsync failed for " + dst);
+        return {data.size(), crc32(data.data(), data.size())};
+    }
+
+    struct BackupManifest {
+        uint64_t cts = 0;
+        uint64_t active_id = 0;
+        std::string ckpt_name;   // "" when the source had no checkpoint file
+        std::vector<std::tuple<std::string, uint64_t, uint32_t>> files;  // rel, size, crc
+    };
+
+    static void backup_write_marker(const std::string& dest_dir, const BackupManifest& m) {
+        std::vector<uint8_t> pl;
+        auto u64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) pl.push_back((v >> (8*i)) & 0xFF); };
+        auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) pl.push_back((v >> (8*i)) & 0xFF); };
+        auto u16 = [&](uint16_t v) { for (int i = 0; i < 2; ++i) pl.push_back((v >> (8*i)) & 0xFF); };
+        auto astr = [&](const std::string& s) { u16((uint16_t)s.size()); for (char c : s) pl.push_back((uint8_t)c); };
+        u64(m.cts);
+        u64(m.active_id);
+        astr(m.ckpt_name);
+        u32(static_cast<uint32_t>(m.files.size()));
+        for (auto& [name, size, crc] : m.files) { astr(name); u64(size); u32(crc); }
+        uint32_t crc = crc32(pl.data(), pl.size());
+        std::vector<uint8_t> buf;
+        auto p32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) buf.push_back((v >> (8*i)) & 0xFF); };
+        p32(0x314D4B42);   // "BKM1" (LE bytes 42 4B 4D 31)
+        p32(crc);
+        buf.insert(buf.end(), pl.begin(), pl.end());
+        const std::string final_path = dest_dir + "/BACKUP_COMPLETE";
+        const std::string tmp = final_path + ".tmp";
+        int fd = ::open(tmp.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd < 0) throw std::runtime_error("backup: cannot create marker tmp");
+        if (!write_all(fd, buf.data(), buf.size())) {
+            checked_close(fd);
+            throw std::runtime_error("backup: marker write failed");
+        }
+        if (!checked_fsync(fd)) {
+            checked_close(fd);
+            throw std::runtime_error("backup: marker fsync failed");
+        }
+        if (!checked_close(fd)) throw std::runtime_error("backup: marker close failed");
+        CKV_CRASH_POINT("bk_marker_after_tmp");
+        if (!checked_rename(tmp, final_path))
+            throw std::runtime_error("backup: marker rename failed");
+        CKV_CRASH_POINT("bk_marker_after_rename");
+        if (!fsync_dir(final_path))
+            throw std::runtime_error("backup: marker dir fsync failed");
+    }
+
+    // Parse BACKUP_COMPLETE. Returns false (with reason) on missing /
+    // truncated / bad-magic / bad-CRC / malformed marker.
+    static bool backup_read_marker(const std::string& dest_dir, BackupManifest& out,
+                                   std::string* reason) {
+        auto fail = [&](const std::string& r) { if (reason) *reason = r; return false; };
+        std::ifstream f(dest_dir + "/BACKUP_COMPLETE", std::ios::binary);
+        if (!f) return fail("BACKUP_COMPLETE missing — backup never completed");
+        std::vector<uint8_t> buf(
+            (std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        f.close();
+        if (buf.size() < 8) return fail("BACKUP_COMPLETE truncated (header)");
+        uint32_t magic = 0, crc = 0;
+        for (int i = 0; i < 4; ++i) magic |= static_cast<uint32_t>(buf[i]) << (8*i);
+        for (int i = 0; i < 4; ++i) crc   |= static_cast<uint32_t>(buf[4+i]) << (8*i);
+        if (magic != 0x314D4B42) return fail("BACKUP_COMPLETE bad magic");
+        if (crc32(&buf[8], buf.size() - 8) != crc) return fail("BACKUP_COMPLETE CRC mismatch");
+        size_t q = 8;
+        auto need = [&](size_t n) { return q <= buf.size() && n <= buf.size() - q; };
+        auto pu64 = [&]() { uint64_t v = 0; for (int i = 0; i < 8; ++i) v |= (uint64_t(buf[q++]) << (8*i)); return v; };
+        auto pu32 = [&]() { uint32_t v = 0; for (int i = 0; i < 4; ++i) v |= (uint32_t(buf[q++]) << (8*i)); return v; };
+        auto pu16 = [&]() { uint16_t v = 0; for (int i = 0; i < 2; ++i) v |= (uint16_t(buf[q++]) << (8*i)); return v; };
+        auto pstr = [&]() -> std::string {
+            if (!need(2)) throw std::runtime_error("marker truncated (strlen)");
+            uint16_t n = pu16();
+            if (!need(n)) throw std::runtime_error("marker truncated (string)");
+            std::string s(reinterpret_cast<const char*>(&buf[q]), n);
+            q += n;
+            return s;
+        };
+        try {
+            if (!need(8)) return fail("BACKUP_COMPLETE truncated (cts)");
+            out.cts = pu64();
+            if (!need(8)) return fail("BACKUP_COMPLETE truncated (active_id)");
+            out.active_id = pu64();
+            out.ckpt_name = pstr();
+            if (!need(4)) return fail("BACKUP_COMPLETE truncated (nfiles)");
+            uint32_t nfiles = pu32();
+            for (uint32_t i = 0; i < nfiles; ++i) {
+                std::string name = pstr();
+                if (!need(8)) return fail("BACKUP_COMPLETE truncated (file size)");
+                uint64_t size = pu64();
+                if (!need(4)) return fail("BACKUP_COMPLETE truncated (file crc)");
+                uint32_t fcrc = pu32();
+                out.files.push_back({name, size, fcrc});
+            }
+        } catch (const std::exception& e) {
+            return fail(std::string("BACKUP_COMPLETE malformed: ") + e.what());
+        }
+        return true;
+    }
+
+    void backup_to(const std::string& dest_dir, const std::string& ckpt_path) {
+        namespace bfs = std::filesystem;
+        if (dest_dir.empty())
+            throw std::runtime_error("backup: empty dest_dir");
+
+        std::unique_lock ckpt_lk(checkpoint_mu_);   // exclusive: commits hold shared
+        // 1. Checkpoint + WAL rotation under the same exclusive hold. After
+        //    this, the WAL is frozen and MANIFEST names a fresh active segment.
+        const uint64_t cts = checkpoint_locked(ckpt_path);
+        CKV_CRASH_POINT("bk_after_ckpt");
+
+        std::error_code ec;
+        bfs::create_directories(dest_dir, ec);
+        if (!ec && wal_ && !wal_dir_.empty()) bfs::create_directories(dest_dir + "/wal", ec);
+        if (ec) throw std::runtime_error("backup: cannot create dest dirs: " + ec.message());
+
+        BackupManifest m;
+        m.cts = cts;
+
+        // 2. WAL artifacts referenced by the post-rotation MANIFEST.
+        if (wal_ && !wal_dir_.empty()) {
+            auto [aid, manifest_ckpt_ts] = WalSegments::read_manifest_dir(wal_dir_);
+            (void)manifest_ckpt_ts;   // == cts; recorded in the marker via m.cts
+            m.active_id = aid;
+            bool first_seg = true;
+            for (uint64_t id : WalSegments::list_segment_ids(wal_dir_)) {
+                if (id > aid) continue;   // unreferenced orphan residue: do not copy
+                char fname[64];
+                snprintf(fname, sizeof(fname), "wal_%06llu.log", (unsigned long long)id);
+                auto [sz, crc] = backup_copy_file(wal_dir_ + "/" + fname,
+                                                  dest_dir + "/wal/" + fname);
+                m.files.push_back({std::string("wal/") + fname, sz, crc});
+                if (first_seg) { CKV_CRASH_POINT("bk_mid_wal"); first_seg = false; }
+            }
+            auto [msz, mcrc] = backup_copy_file(wal_dir_ + "/MANIFEST",
+                                                dest_dir + "/wal/MANIFEST");
+            m.files.push_back({"wal/MANIFEST", msz, mcrc});
+            CKV_CRASH_POINT("bk_after_wal");
+        }
+
+        // 3. Checkpoint base + delta chain.
+        if (!ckpt_path.empty()) {
+            m.ckpt_name = bfs::path(ckpt_path).filename().string();
+            if (bfs::exists(ckpt_path)) {
+                auto [sz, crc] = backup_copy_file(ckpt_path, dest_dir + "/" + m.ckpt_name);
+                m.files.push_back({m.ckpt_name, sz, crc});
+                bfs::path parent_p = bfs::path(ckpt_path).parent_path();
+                if (parent_p.empty()) parent_p = ".";
+                std::string prefix = m.ckpt_name + ".delta.";
+                std::vector<std::pair<uint64_t, std::string>> deltas;
+                for (auto& entry : bfs::directory_iterator(parent_p, ec)) {
+                    if (ec) break;
+                    if (!entry.is_regular_file(ec)) continue;
+                    std::string fn = entry.path().filename().string();
+                    if (fn.size() <= prefix.size() || fn.compare(0, prefix.size(), prefix) != 0)
+                        continue;
+                    std::string digits = fn.substr(prefix.size());
+                    uint64_t n = 0;
+                    bool ok = !digits.empty();
+                    for (char c : digits) {
+                        if (c < '0' || c > '9') { ok = false; break; }
+                        n = n * 10 + static_cast<uint64_t>(c - '0');
+                    }
+                    if (ok) deltas.push_back({n, fn});
+                }
+                std::sort(deltas.begin(), deltas.end());
+                for (auto& [n, fn] : deltas) {
+                    auto [sz, crc] = backup_copy_file(
+                        (parent_p / fn).string(), dest_dir + "/" + fn);
+                    m.files.push_back({fn, sz, crc});
+                }
+            } else {
+                m.ckpt_name.clear();   // no base on disk: nothing to copy
+            }
+        }
+        CKV_CRASH_POINT("bk_after_ckptfiles");
+
+        // 4. fsync both destination directories so the copies survive power loss.
+        auto fsync_one_dir = [&](const std::string& d) {
+            int dfd = ::open(d.c_str(), O_RDONLY | O_DIRECTORY);
+            if (dfd < 0)
+                throw std::runtime_error("backup: cannot open dest dir " + d);
+            bool ok = checked_fsync(dfd);
+            checked_close(dfd);
+            if (!ok) throw std::runtime_error("backup: dest dir fsync failed: " + d);
+        };
+        if (wal_ && !wal_dir_.empty()) fsync_one_dir(dest_dir + "/wal");
+        fsync_one_dir(dest_dir);
+
+        // 5. Marker LAST: until it exists (and re-checksums), nothing above
+        //    is claimed complete.
+        backup_write_marker(dest_dir, m);
+    }
+
+    // v26 M3: validate a backup directory WITHOUT opening a Database (no
+    // flock, so it can never collide with a live instance). Checks, in
+    // order: marker presence/parse; every listed file present with the
+    // recorded size and CRC; the checkpoint chain structurally valid; the
+    // copied WAL fully parseable via the same read-only recover_all() that
+    // a restore would run. Returns false with *reason set on the first
+    // rejection.
+    static bool verify_backup(const std::string& dest_dir, std::string* reason = nullptr) {
+        auto fail = [&](const std::string& r) { if (reason) *reason = r; return false; };
+        BackupManifest m;
+        if (!backup_read_marker(dest_dir, m, reason)) return false;
+        for (auto& [name, size, crc] : m.files) {
+            const std::string p = dest_dir + "/" + name;
+            std::ifstream f(p, std::ios::binary);
+            if (!f) return fail("backup file missing: " + name);
+            std::vector<uint8_t> data(
+                (std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            f.close();
+            if (data.size() != size)
+                return fail("backup file size mismatch: " + name + " (marker=" +
+                            std::to_string(size) + " actual=" + std::to_string(data.size()) + ")");
+            if (crc32(data.data(), data.size()) != crc)
+                return fail("backup file CRC mismatch: " + name);
+        }
+        if (!m.ckpt_name.empty()) {
+            std::string sub;
+            if (!verify_checkpoint_chain(dest_dir + "/" + m.ckpt_name, &sub))
+                return fail("checkpoint chain invalid: " + sub);
+        }
+        if (m.active_id > 0) {
+            uint64_t ckpt_ts = 0;
+            try {
+                auto [status, records] =
+                    WalSegments::recover_all(dest_dir + "/wal", ckpt_ts);
+                if (status == WalStatus::CORRUPT)
+                    return fail("backup WAL corruption detected");
+            } catch (const std::exception& e) {
+                return fail(std::string("backup WAL does not recover: ") + e.what());
+            }
+        }
+        return true;
     }
 
     void recover_with_checkpoint(const std::string& wal_dir, const std::string& ckpt_path) {
@@ -5512,7 +6021,8 @@ public:
     // iterate. Consistency guarantee: per-page snapshot via Cursor's shared
     // latch (M1.4). No cross-page consistency guarantee.
     std::unique_ptr<ChronoKVRangeScanCursorState>
-    open_range_scan_stream(const std::string& lo, const std::string& hi);
+    open_range_scan_stream(const std::shared_ptr<ChronoKV>& self,
+                           const std::string& lo, const std::string& hi);
     static bool stream_has_next(ChronoKVRangeScanCursorState& s);
     static std::pair<std::string, std::string>
     stream_next(ChronoKVRangeScanCursorState& s);
@@ -6159,7 +6669,7 @@ class ReadWriteTransaction {
     // true.  The destructor skips kv_ cleanup if the Database was
     // closed or destroyed.  When created directly (internal engine
     // tests), guarded_ is false and cleanup always runs.
-    std::weak_ptr<bool> db_alive_;
+    std::weak_ptr<std::atomic<bool>> db_alive_;
     bool guarded_ = false;
 
     // Returns true if the owning Database is still open and the engine
@@ -6186,7 +6696,7 @@ public:
     // active_snapshots_) and erased phantom-tracker transitions this
     // reader needs. See acquire_slot_with_phantom() for the lock
     // ordering argument.
-    ReadWriteTransaction(ChronoKV& kv, std::weak_ptr<bool> db_alive)
+    ReadWriteTransaction(ChronoKV& kv, std::weak_ptr<std::atomic<bool>> db_alive)
         : kv_(kv), db_alive_(std::move(db_alive)), guarded_(true) {
         slot_ = kv_.acquire_slot_with_phantom(read_ts_);
     }
@@ -6213,6 +6723,14 @@ public:
     ReadWriteTransaction& operator=(const ReadWriteTransaction&) = delete;
 
     TxnState state() const { return state_; }
+
+    // v25.7 (review M3): read-only view of the buffered write set, so
+    // chronokv::Transaction::commit() can notify the Database's prefix
+    // observers after a successful commit. Transaction commits were
+    // previously the ONLY write path observers could not see.
+    const std::map<std::string, std::pair<std::string, bool>>& write_set() const {
+        return ws_;
+    }
 
     std::optional<std::string> read(const std::string& k) {
         if (state_ != TxnState::Active) return std::nullopt;
@@ -6370,10 +6888,12 @@ namespace chronokv {
 // applied and clean under Release / ASan+UBSan / TSan / Stress; the
 // hooks-off public_api_smoke.cpp target (28 checks) passes against the
 // same header.
-static constexpr const char* CHRONOKV_VERSION = "0.25.6";
+static constexpr const char* CHRONOKV_VERSION = "0.25.7";
 static constexpr int CHRONOKV_VERSION_MAJOR = 0;
 static constexpr int CHRONOKV_VERSION_MINOR = 25;
-static constexpr int CHRONOKV_VERSION_PATCH = 2;
+// v25.7: PATCH was stale (said 2 while the string said 0.25.6). Kept in
+// lockstep with CHRONOKV_VERSION from here on.
+static constexpr int CHRONOKV_VERSION_PATCH = 7;
 
 // ---- Error hierarchy --------------------------------------------------
 class Error : public std::runtime_error {
@@ -6503,7 +7023,14 @@ struct Health {
 };
 // ---- Database ---------------------------------------------------------
 class Database {
-    std::unique_ptr<ChronoKV> engine_;
+    // v25.7 (review M2): shared_ptr, not unique_ptr. RangeScanStream's
+    // pImpl state holds a copy, which keeps the engine (and its page pool,
+    // latch table, and reader slots) alive while any stream handle is
+    // alive. Consequence, documented in close(): after close(), engine
+    // teardown is DEFERRED until the last stream handle dies — including
+    // the WAL flock release. A stream that outlives close() is safe to
+    // destroy but its has_next()/next() throw LifecycleError.
+    std::shared_ptr<ChronoKV> engine_;
     std::string checkpoint_path_;
     bool closed_ = false;
     // v24 fix (was Kimi review 1.4 partial mitigation, now complete):
@@ -6514,21 +7041,21 @@ class Database {
     // destructor cleanup path (release_slot / deregister_phantom_reader)
     // check this flag via a weak_ptr held by ReadWriteTransaction.
     //
-    // Concurrency note: this is a plain bool, not std::atomic<bool>.
-    // Concurrent Database::close() (which writes *alive_ = false) with
-    // Transaction method calls on another thread is NOT a supported
-    // concurrency pattern.  Making the bool atomic would prevent a
-    // theoretical data race on the flag itself, but would not make
-    // close() thread-safe: there would still be a TOCTOU window
-    // between Transaction::check_active() passing and the subsequent
-    // engine_->... call seeing a destructed engine.  Callers that
-    // need concurrent shutdown must provide their own external
-    // synchronisation (e.g. join all transaction-holding threads
-    // before calling close()).
-    std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
+    // Concurrency note (updated v25.7, review M2): the flag is now
+    // std::atomic<bool>. The async API's contract — close() may race an
+    // in-flight put_async/get_async/erase_async, which then completes
+    // against a keepalive-held engine or returns Status::Failed — requires
+    // reading this flag from another thread while close() writes it; with a
+    // plain bool that was a data race (UB), reproduced under TSan. What
+    // atomicity does NOT fix: the TOCTOU between Transaction::check_active()
+    // passing and the subsequent engine call. Transactions therefore still
+    // require external synchronization against a concurrent close()
+    // (join all transaction-holding threads first); streams and async ops
+    // are close()-safe by construction (engine keepalive + this flag).
+    std::shared_ptr<std::atomic<bool>> alive_ = std::make_shared<std::atomic<bool>>(true);
 
     // Private constructor (used by open factory)
-    Database(std::unique_ptr<ChronoKV> eng, std::string cp)
+    Database(std::shared_ptr<ChronoKV> eng, std::string cp)
         : engine_(std::move(eng)), checkpoint_path_(std::move(cp)) {}
 
     void check_open() const {
@@ -6538,9 +7065,9 @@ class Database {
 public:
     // Factory: constructs engine, recovers (if configured), starts GC
     static Database open(const Options& opts) {
-        std::unique_ptr<ChronoKV> engine;
+        std::shared_ptr<ChronoKV> engine;
         try {
-            engine = std::make_unique<ChronoKV>(opts.wal_dir, opts.page_pool_bytes);
+            engine = std::make_shared<ChronoKV>(opts.wal_dir, opts.page_pool_bytes);
         } catch (const std::exception& e) {
             throw LifecycleError(std::string("cannot open database: ") + e.what());
         }
@@ -6669,6 +7196,40 @@ public:
         }
     }
 
+    // ======================== v26 M3: Online backup ========================
+    //
+    // backup(dest_dir) copies a consistent snapshot to dest_dir while the
+    // database stays online (commits block only for the duration of the
+    // copy). Requires a configured checkpoint_path (the backup is
+    // checkpoint + WAL artifacts + a self-verifying BACKUP_COMPLETE marker
+    // written LAST). Restoring = opening a fresh Database with
+    // Options{wal_dir = dest_dir + "/wal", checkpoint_path = dest_dir + "/"
+    // + <ckpt basename>, recover_on_open = true}.
+    //
+    // SEMANTICS: the restored state is at least as new as the checkpoint
+    // taken inside backup() and at most as new as copy completion — NOT a
+    // point-in-time snapshot (PITR is roadmap M4). An interrupted or
+    // corrupted copy is DETECTABLE: verify_backup() rejects it.
+    void backup(const std::string& dest_dir) {
+        check_open();
+        if (checkpoint_path_.empty())
+            throw LifecycleError("backup() called but no checkpoint_path was configured");
+        try {
+            engine_->backup_to(dest_dir, checkpoint_path_);
+        } catch (const std::exception& e) {
+            throw Error(std::string("backup failed: ") + e.what());
+        }
+    }
+
+    // Validate a backup directory WITHOUT opening it as a Database (no
+    // flock, no recovery side effects): marker present and parseable, every
+    // listed file present with matching size + CRC32, checkpoint chain
+    // structurally valid, copied WAL fully parseable. Invariant B1's
+    // "only-if" half; see ChronoKV::verify_backup.
+    static bool verify_backup(const std::string& dest_dir, std::string* reason = nullptr) {
+        return ChronoKV::verify_backup(dest_dir, reason);
+    }
+
     void close() {
         if (!closed_) {
             closed_ = true;
@@ -6752,15 +7313,30 @@ public:
     // ======================== M1.5: Async API ========================
 
     // Async put: returns a future that resolves to the commit Status.
+    // v25.7 (review M2): the lambda captures a shared_ptr to the engine and
+    // a weak_ptr to the liveness flag instead of raw `this`-relative member
+    // access. A close() (or Database destruction) racing an in-flight async
+    // op can no longer dereference a reset engine_ member: the op either
+    // sees the flag down (returns Failed without committing) or holds the
+    // engine alive until it finishes. Observer notification is skipped when
+    // the Database is closed/destroyed. NOTE: as with every async surface
+    // here, destroying the Database object ITSELF while futures are in
+    // flight still requires external synchronization (README: Safety
+    // properties) — the guard makes close()-races safe, not &db deletion.
     std::future<Status> put_async(std::string key, std::string value) {
         check_open();
-        return std::async(std::launch::async, [this, key = std::move(key), value = std::move(value)]() {
+        auto eng = engine_;
+        std::weak_ptr<std::atomic<bool>> w = alive_;
+        Database* self = this;
+        return std::async(std::launch::async, [eng, w, self,
+                          key = std::move(key), value = std::move(value)]() {
+            if (auto sp = w.lock(); !sp || !*sp) return Status::Failed;
             WriteSet ws = {{key, value, false}};
             uint64_t cts = 0;
-            auto r = engine_->commit_txn(UINT64_MAX, ws, {}, {}, &cts);
-            auto status = map_txn_result(r);
+            auto r = eng->commit_txn(UINT64_MAX, ws, {}, {}, &cts);
+            auto status = Database::map_txn_result(r);
             if (status == Status::OK) {
-                notify_observers(ws);
+                if (auto sp2 = w.lock(); sp2 && *sp2) self->notify_observers(ws);
             }
             return status;
         });
@@ -6769,9 +7345,14 @@ public:
     // Async get: returns a future that resolves to Result<std::optional<std::string>>.
     std::future<Result<std::optional<std::string>>> get_async(std::string key) {
         check_open();
-        return std::async(std::launch::async, [this, key = std::move(key)]() -> Result<std::optional<std::string>> {
+        auto eng = engine_;
+        std::weak_ptr<std::atomic<bool>> w = alive_;
+        return std::async(std::launch::async, [eng, w, key = std::move(key)]()
+                              -> Result<std::optional<std::string>> {
+            if (auto sp = w.lock(); !sp || !*sp)
+                return Result<std::optional<std::string>>::failure(Status::Failed);
             try {
-                return Result<std::optional<std::string>>::success(engine_->read(key));
+                return Result<std::optional<std::string>>::success(eng->read(key));
             } catch (...) {
                 return Result<std::optional<std::string>>::failure(Status::Failed);
             }
@@ -6781,13 +7362,17 @@ public:
     // Async erase: returns a future that resolves to the commit Status.
     std::future<Status> erase_async(std::string key) {
         check_open();
-        return std::async(std::launch::async, [this, key = std::move(key)]() {
+        auto eng = engine_;
+        std::weak_ptr<std::atomic<bool>> w = alive_;
+        Database* self = this;
+        return std::async(std::launch::async, [eng, w, self, key = std::move(key)]() {
+            if (auto sp = w.lock(); !sp || !*sp) return Status::Failed;
             WriteSet ws = {{key, "", true}};
             uint64_t cts = 0;
-            auto r = engine_->commit_txn(UINT64_MAX, ws, {}, {}, &cts);
-            auto status = map_txn_result(r);
+            auto r = eng->commit_txn(UINT64_MAX, ws, {}, {}, &cts);
+            auto status = Database::map_txn_result(r);
             if (status == Status::OK) {
-                notify_observers(ws);
+                if (auto sp2 = w.lock(); sp2 && *sp2) self->notify_observers(ws);
             }
             return status;
         });
@@ -6904,10 +7489,22 @@ public:
         std::lock_guard<std::mutex> lk(observer_mu_);
         size_t idx = observers_.size();
         observers_.push_back({std::move(prefix), std::move(callback)});
-        return ObserverHandle([this, idx]() {
-            std::lock_guard<std::mutex> lk(observer_mu_);
-            if (idx < observers_.size()) {
-                observers_[idx].callback = nullptr;  // mark as removed
+        // v25.7 (review M2): the unregister lambda used to capture raw
+        // `this`; a handle outliving its Database ran the lambda against a
+        // destroyed mutex. Same weak_ptr-liveness pattern Transaction uses:
+        // if the Database is closed (flag false) or destroyed (weak
+        // expired), there is nothing to unregister — the observers_ vector
+        // dies with the Database anyway. NOTE: entries are tombstoned
+        // (callback = nullptr), never erased, so captured indices stay
+        // valid; observers_ therefore grows with TOTAL observe() calls
+        // over the Database's lifetime (~56 bytes per tombstone).
+        std::weak_ptr<std::atomic<bool>> w = alive_;
+        Database* self = this;
+        return ObserverHandle([self, idx, w]() {
+            if (auto sp = w.lock(); !sp || !*sp) return;
+            std::lock_guard<std::mutex> lk(self->observer_mu_);
+            if (idx < self->observers_.size()) {
+                self->observers_[idx].callback = nullptr;  // mark as removed
             }
         });
     }
@@ -6936,7 +7533,12 @@ public:
         bool has_next();
         std::pair<std::string, std::string> next();
     private:
+        // v25.7 (review M2): liveness guard, mirroring Transaction's.
+        // has_next()/next() after Database::close() throw LifecycleError
+        // instead of touching a closed engine; destruction is always safe
+        // because state_ holds its own engine reference (keepalive_).
         Database& db_;
+        std::weak_ptr<std::atomic<bool>> alive_;
         std::unique_ptr<ChronoKVRangeScanCursorState> state_;
     };
 
@@ -6951,9 +7553,16 @@ private:
 
     // v25.1 M1.5: called from commit path to notify observers.
     // Walks the write-set, checks prefixes, enqueues notifications.
+    // v25.7 FIX (review M1): the `observers_.empty()` fast path used to run
+    // OUTSIDE observer_mu_ — a data race (UB) against observe()'s
+    // push_back, which can reallocate the vector under the unlocked read.
+    // Reproduced pre-fix under TSan (repro_observer_race.cpp: race between
+    // vector::empty() here and vector::push_back in observe()). The lock is
+    // now taken unconditionally; relative to the WAL I/O a commit performs,
+    // one uncontended mutex is noise.
     void notify_observers(const WriteSet& ws) {
-        if (observers_.empty()) return;
         std::lock_guard<std::mutex> lk(observer_mu_);
+        if (observers_.empty()) return;
         for (auto& [key, value, deleted] : ws) {
             for (auto& obs : observers_) {
                 if (obs.callback && key.compare(0, obs.prefix.size(), obs.prefix) == 0) {
@@ -6985,17 +7594,23 @@ private:
 
 // ---- Transaction ------------------------------------------------------
 class Transaction {
+    // v25.7 (review M3): pointer to the owning Database, so commit() can
+    // fire prefix observers (notify_observers is private; Transaction is a
+    // Database friend). A pointer, not a reference, because move-assignment
+    // must be able to rebind it.
+    Database* db_;
     std::unique_ptr<ReadWriteTransaction> txn_;
     bool active_ = true;
     // v24 fix: weak_ptr into the owning Database's liveness flag.
     // Locks the weak_ptr and inspects the boolean value — this catches
     // both Database destruction (weak_ptr expires) AND Database::close()
     // (boolean set to false before engine is reset).
-    std::weak_ptr<bool> db_alive_;
+    std::weak_ptr<std::atomic<bool>> db_alive_;
 
     // Private constructor (used by Database::begin)
-    Transaction(ChronoKV& engine, std::weak_ptr<bool> db_alive)
-        : txn_(std::make_unique<ReadWriteTransaction>(engine, db_alive)),
+    Transaction(Database& db, ChronoKV& engine, std::weak_ptr<std::atomic<bool>> db_alive)
+        : db_(&db),
+          txn_(std::make_unique<ReadWriteTransaction>(engine, db_alive)),
           db_alive_(std::move(db_alive)) {}
 
     void check_active() const {
@@ -7028,7 +7643,8 @@ public:
 
     // Move-only — explicit because active_ must be cleared on the source.
     Transaction(Transaction&& o) noexcept
-        : txn_(std::move(o.txn_))
+        : db_(o.db_)
+          , txn_(std::move(o.txn_))
           , active_(o.active_)
           , db_alive_(std::move(o.db_alive_)) {
         o.active_ = false;
@@ -7076,6 +7692,7 @@ public:
             txn_ = std::move(o.txn_);
             active_ = o.active_;
             db_alive_ = std::move(o.db_alive_);
+            db_ = o.db_;   // v25.7 (review M3): observer target follows the txn
             o.active_ = false;
         }
         return *this;
@@ -7120,6 +7737,13 @@ public:
         // "transaction lifecycle (abort-on-drop)" test and README's Safety
         // properties section.
         ::TxnResult result;
+        WriteSet obs_ws;   // v25.7 (review M3): built BEFORE txn_ is touched
+        if (txn_) {
+            // Snapshot the write set while the RWT is alive; only used if
+            // the commit succeeds.
+            for (auto& [k, vd] : txn_->write_set())
+                obs_ws.push_back({k, vd.first, vd.second});
+        }
         try {
             result = txn_->commit();
         } catch (...) {
@@ -7128,6 +7752,14 @@ public:
             throw;
         }
         active_ = false;
+        // v25.7 FIX (review M3): a committed Transaction now fires prefix
+        // observers exactly like put/erase/Batch::commit. Previously
+        // transactional writes were the one path observers could not see,
+        // which made the "change feed" semantics of observe() silently
+        // incomplete. old_val remains nullopt (same as every other path —
+        // the commit side never reads previous values).
+        if (result == ::TxnResult::Committed && !obs_ws.empty())
+            db_->notify_observers(obs_ws);
         return Database::map_txn_result(result);
     }
 
@@ -7149,7 +7781,7 @@ public:
 // Database::begin implementation (must be after Transaction is defined)
 inline Transaction Database::begin() {
     check_open();
-    return Transaction(*engine_, alive_);
+    return Transaction(*this, *engine_, alive_);
 }
 
 } // namespace chronokv
@@ -8545,10 +9177,24 @@ private:
         // we never hold an exclusive latch while re-descending with shared
         // latches (no hold-and-wait cycle). The retry is a fresh shared-descent
         // from the root, same as the working read path.
+        //
+        // v25.7 (review note 3): the (re)descent now RELOADS root_id_ every
+        // iteration instead of reusing the caller's snapshot. With concurrent
+        // writers (standalone-BTree use; the engine serializes writers under
+        // nm_ so this is belt-and-braces there), a root split during descent
+        // could leave us inserting into the wrong subtree, and the fence
+        // re-check alone cannot detect that: it only notices changes to the
+        // leaf we landed in. Reloading the root makes every retry descent
+        // start from the current tree. (A key-containment check against the
+        // leaf fence — key_in_leaf_fence — is deliberately NOT used as a
+        // validity gate: inserting a new maximum key legitimately lands
+        // outside the rightmost leaf's fence, so gating on it would livelock.)
+        (void)page_id;
         while (true) {
+            const PageId cur_root = root_id_.load(std::memory_order_acquire);
             std::shared_lock<std::shared_mutex> leaf_shared;
             LeafFence desc_fence;
-            PageId leaf = find_leaf_crabbing_with_fence(page_id, key, leaf_shared, desc_fence);
+            PageId leaf = find_leaf_crabbing_with_fence(cur_root, key, leaf_shared, desc_fence);
             leaf_shared.unlock();
 
             auto leaf_excl = latches_.lock_exclusive(leaf);
@@ -8567,7 +9213,7 @@ private:
             if (r.split) {
                 leaf_excl.unlock();
                 InsertResult pr = insert_into_parent_optimistic(
-                    page_id, r.split_key, r.new_child, leaf);
+                    cur_root, r.split_key, r.new_child, leaf);
                 if (pr.split) return pr;  // root split — handled by put()
                 return {r.inserted, false, "", 0};
             }
@@ -8577,6 +9223,13 @@ private:
 
     // v25.1 M1.6: Check if key falls within the leaf's [min_key, max_key] fence.
     // Empty fence (empty leaf) means the key belongs here.
+    // v25.7 (review note 3): deliberately NOT wired into put/erase as a
+    // retry gate. Inserting a new maximum key legitimately lands in a leaf
+    // whose fence does not contain it (the fence is updated BY the insert),
+    // and erasing an absent key can descend to a leaf that never contained
+    // it — gating on containment would livelock both. The stale-root hazard
+    // this predicate was written for is handled soundly by reloading root_id_
+    // on every (re)descent instead. Kept as a debug predicate for tests.
     bool key_in_leaf_fence(const Page* p, const PageHeader* h, const std::string& key) const {
         if (h->min_key_len == 0) return true;  // empty leaf
         std::string min_k(reinterpret_cast<const char*>(p) + h->min_key_off, h->min_key_len);
@@ -8595,12 +9248,15 @@ private:
         // crabbing, tracking the parent. At the parent, release shared,
         // acquire exclusive, re-check that `child` is still a child of this
         // parent, then insert.
+        // v25.7 (review note 3): reload root_id_ per iteration (see
+        // put_recursive) — the `root` parameter is only the initial hint.
         while (true) {
+            const PageId cur_root = root_id_.load(std::memory_order_acquire);
             // Descend to find the leaf for split_key (the split key defines
             // which leaf the new child pointer goes into). The parent is the
             // interior page that points to `child`.
             std::shared_lock<std::shared_mutex> parent_shared;
-            PageId parent = find_parent_crabbing(root, split_key, child, parent_shared);
+            PageId parent = find_parent_crabbing(cur_root, split_key, child, parent_shared);
             if (parent == 0) {
                 // `child` is the root — root split needed.
                 return {false, true, split_key, new_child};
@@ -9332,10 +9988,14 @@ private:
     // fence failure. Erase doesn't cause splits, so no split propagation.
     bool erase_recursive(PageId page_id, const std::string& key) {
         // v25.1 M1.6: Optimistic crabbing with fence re-check (same as put).
+        // v25.7 (review note 3): reload root_id_ per iteration — see the
+        // long comment in put_recursive for the stale-root argument.
+        (void)page_id;
         while (true) {
+            const PageId cur_root = root_id_.load(std::memory_order_acquire);
             std::shared_lock<std::shared_mutex> leaf_shared;
             LeafFence desc_fence;
-            PageId leaf = find_leaf_crabbing_with_fence(page_id, key, leaf_shared, desc_fence);
+            PageId leaf = find_leaf_crabbing_with_fence(cur_root, key, leaf_shared, desc_fence);
             leaf_shared.unlock();
 
             auto leaf_excl = latches_.lock_exclusive(leaf);
@@ -9456,6 +10116,12 @@ inline uint64_t Database::ensure_index_loser_deletes() const {
 // the cached current (key, value) pair. Defined here (after BTree) because
 // it uses BTree::Cursor (incomplete at ChronoKV's class body).
 struct ChronoKVRangeScanCursorState {
+    // v25.7 (review M2): declared FIRST so it is destroyed LAST — the
+    // engine (page pool, latch table, HP registry, reader slots) stays
+    // alive for the whole lifetime of this state, even if the owning
+    // Database was closed meanwhile. Without it, ~Cursor and ~SnapshotGuard
+    // ran against a freed engine (use-after-free on close-with-live-stream).
+    std::shared_ptr<ChronoKV> keepalive_;
     SnapshotGuard guard;
     uint64_t effective_ts;
     // v25.1 M1.6: no nm_ — Cursor uses shared latch crabbing internally.
@@ -9465,9 +10131,12 @@ struct ChronoKVRangeScanCursorState {
     std::optional<std::string> cached_val;
     ChronoKV& kv;
 
-    ChronoKVRangeScanCursorState(ChronoKV& k, const std::string& lo, const std::string& hi)
-        : guard(k), effective_ts(std::min(guard.read_ts(), k.pub_.published())),
-          cursor(k.tree_->open_cursor(lo, hi)), cached_valid(false), kv(k) {
+    ChronoKVRangeScanCursorState(std::shared_ptr<ChronoKV> self,
+                                 const std::string& lo, const std::string& hi)
+        : keepalive_(std::move(self)), guard(*keepalive_),
+          effective_ts(std::min(guard.read_ts(), keepalive_->pub_.published())),
+          cursor(keepalive_->tree_->open_cursor(lo, hi)), cached_valid(false),
+          kv(*keepalive_) {
         advance();
     }
 
@@ -9485,8 +10154,9 @@ struct ChronoKVRangeScanCursorState {
 };
 
 inline std::unique_ptr<ChronoKVRangeScanCursorState>
-ChronoKV::open_range_scan_stream(const std::string& lo, const std::string& hi) {
-    return std::make_unique<ChronoKVRangeScanCursorState>(*this, lo, hi);
+ChronoKV::open_range_scan_stream(const std::shared_ptr<ChronoKV>& self,
+                                 const std::string& lo, const std::string& hi) {
+    return std::make_unique<ChronoKVRangeScanCursorState>(self, lo, hi);
 }
 
 inline bool ChronoKV::stream_has_next(ChronoKVRangeScanCursorState& s) {
@@ -9508,17 +10178,29 @@ namespace chronokv {
 inline Database::RangeScanStream::RangeScanStream(Database& db, std::string lo, std::string hi)
     : db_(db) {
     db_.check_open();
-    state_ = db_.engine_->open_range_scan_stream(lo, hi);
+    alive_ = db_.alive_;
+    // v25.7 (review M2): pass the engine's shared_ptr so the cursor state
+    // keeps the engine alive for the stream's lifetime (see keepalive_).
+    state_ = db_.engine_->open_range_scan_stream(db_.engine_, lo, hi);
 }
 
 inline Database::RangeScanStream::~RangeScanStream() = default;
 inline Database::RangeScanStream::RangeScanStream(RangeScanStream&&) noexcept = default;
 
 inline bool Database::RangeScanStream::has_next() {
+    // v25.7 (review M2): liveness check — post-close iteration throws
+    // instead of reading through a stale state (LifecycleError, same
+    // contract as Transaction::check_active).
+    if (auto sp = alive_.lock(); !sp || !*sp)
+        throw LifecycleError("range_scan_stream: Database was closed or "
+                             "destroyed while the stream was still alive");
     return ChronoKV::stream_has_next(*state_);
 }
 
 inline std::pair<std::string, std::string> Database::RangeScanStream::next() {
+    if (auto sp = alive_.lock(); !sp || !*sp)
+        throw LifecycleError("range_scan_stream: Database was closed or "
+                             "destroyed while the stream was still alive");
     return ChronoKV::stream_next(*state_);
 }
 
