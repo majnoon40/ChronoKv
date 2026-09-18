@@ -1,5 +1,104 @@
 // chronokv.hpp — ChronoKV engine and public C++ API.
 //
+// v26.1 SHIPPED (adversarial-review response for 929cb00 + v27 M1 start):
+// the HIGH PITR correctness defect — mid-window as_of silently losing
+// acknowledged commits after later checkpoints rotate the covering WAL
+// segments — fixed with in-suite detectors; the v27 M1 history ->
+// strict-serializability checker lands in main.cpp (txnrec:: below).
+//
+//   RANK-1 FIX (correctness — wrong PITR snapshot) — the review showed a
+//       pitr_as_of_cts falling BETWEEN two checkpoint boundaries can lose
+//       acknowledged commits silently. Mechanism: a delta stores only each
+//       dirty key's newest version <= its snapshot cts, and
+//       rotate_after_checkpoint() unlinks segments id < old_id, so after a
+//       further checkpoint the WAL covering (prev_delta, as_of] is gone —
+//       and recovery SKIPPED WHOLE delta files whose header cts exceeded
+//       as_of, including their entries with hc <= as_of, which were the
+//       only surviving copy of the mid-window state. Reviewer's repro
+//       (base@W3; d@W4, e@W5; delta.1@W5; f@W6; delta.2@W6 — whose
+//       rotation deletes the segment holding W4/W5; as_of=W4) returned
+//       d=<none> instead of d=4. Fix (the review's direction 1): the FIRST
+//       delta beyond the boundary is parsed with PER-ENTRY filtering —
+//       entries with hc <= as_of are applied, hc > as_of skipped (counted
+//       in rec_pitr_filtered). Deltas after it remain skipped whole,
+//       provably: their entries' commit_ts lie in (prev_header, header],
+//       already > as_of. Supporting changes: (a) WAL replay under PITR
+//       dedupes per key against the filtered delta (head >= ts -> skip,
+//       rec_pitr_wal_skipped) — a surviving segment can hold the same
+//       version the delta supplied, or an older one the delta's entry
+//       supersedes; (b) the published watermark now covers delta-only
+//       versions (max(contiguous, filtered max hc)) or reads would clamp
+//       below them and hide the recovered state; (c) an interior WAL gap
+//       under PITR fails loud with the real cause and remedies (rotated
+//       window) instead of the misleading "WAL corruption detected" —
+//       this is the review's direction 2 for the genuinely unrecoverable
+//       composition (surviving record inside a partially-rotated window);
+//       (d) PITR opens no longer delete R-REBASE stale deltas — the
+//       read-only promise on the source directory now holds literally.
+//       DOCUMENTED RESIDUAL LIMIT (README "Point-in-time restore"): when
+//       the WAL covering (prev_delta, as_of] is gone, a key rewritten
+//       AGAIN between as_of and the next checkpoint boundary keeps only
+//       its post-as_of version in that delta; its as_of version is
+//       unrecoverable and the key reads as absent-or-older at as_of. This
+//       is indistinguishable on disk from "first write after as_of" (both
+//       worlds produce byte-identical artifacts), so no recovery policy
+//       can do better without retaining the WAL; the in-suite detector
+//       pins the recoverable composition. Detectors: run_pitr_test blocks
+//       6-8 (multi-checkpoint gap = the reviewer's scenario, verified
+//       FAIL pre-fix; delta+WAL dedupe; partial-rotation loud failure).
+//
+//   v27 M1 START (history -> strict-serializability checker) — txnrec::
+//       (below, compiled under CHRONOKV_TEST_HOOKS, armed at RUNTIME so
+//       disarmed cost is one relaxed atomic load): structured per-op
+//       records (kind, key, read snapshot lts, observed/committed version
+//       cts, value, written flag, steady-ns real-time interval) stamped at
+//       the OUTERMOST public wrappers (Database::get/put/erase/begin,
+//       Transaction::get/put/erase/commit/abort) so recorded intervals
+//       over-approximate true call intervals — the sound direction for
+//       real-time checks. main.cpp adds lincheck:: — the checker itself:
+//       cts-total-order snapshot verification (every read must equal the
+//       state as of its snapshot, reconstructed by replaying committed
+//       writes in cts order), real-time order verification, and Elle-style
+//       list-append analysis (duplicate / fabricated / lost appends,
+//       precedence cycles, write-fold). A 15-case synthetic anomaly
+//       battery proves the checker fails when it should (roadmap
+//       acceptance), plus mutation checks on a real recorded engine
+//       history.
+//
+//   v27 M1 FIRST LIVE CATCH + FIX (publication-prefix lag) — on its FIRST
+//       engine run the checker reported 109-163 real-time ("stale-start")
+//       violations in a 4-thread list-append workload: cts is reserved in
+//       push order under batch_mu_, but pub_.complete(cts) runs per-thread
+//       after the shared WAL pass, so completion order can invert
+//       reservation order; published_ is a CONTIGUOUS PREFIX, so an
+//       acknowledged write could sit above an in-flight lower cts holding
+//       the prefix down — a reader starting after the ack snapshotted
+//       below it. SSI never promised read freshness, but the roadmap's M1
+//       target model (strict serializability) does, and the fix is cheap:
+//       commit_txn now AWAITS published >= cts before acknowledging
+//       (PublicationTracker::await_published — bounded wait: cts order =
+//       WAL order, so every lower cts is already past its WAL I/O; no
+//       engine lock is held while waiting; deadlock-freedom vs the
+//       writer-preferring checkpoint_mu_ argued at the call site). Two
+//       supporting fixes: (a) the install tail (link_version + dirty map)
+//       now BURNS the cts on throw instead of stranding the prefix
+//       forever (pre-existing silent-staleness bug; with the barrier it
+//       would have been a hang); (b) append-only opens (existing WAL, no
+//       recovery — recover_on_open=false and direct engine construction)
+//       seed the published prefix alongside clock_ (found by the
+//       full-suite verification: without it the first commit's barrier
+//       waits on a hole that is never tracked — in-suite regression test
+//       with a hard timeout, verified to FAIL pre-fix). Positive control:
+//       removing the one barrier line reproduces 163 violations; with it,
+//       zero across the recorded workload, TSan-clean.
+//
+//   HYGIENE (review notes) — restore_pitr now goes through api_engine()
+//       instead of src_db.engine_ (consistent with the v25.8 close-race
+//       contract); the two stale comments claiming bk_* are deliberately
+//       NOT in crashpt::kAll corrected (they have been in kAll since
+//       v25.8); CHRONOKV_VERSION 0.26.1 — the 0.26.x series starts here,
+//       MINOR now tracks the roadmap arc (see the version block).
+//
 // v25.8 SHIPPED (adversarial-review response + v26 milestone M4): the
 // close()-race the adversarial review of bab8435 found in v25.7's lifecycle
 // hardening, two crash-fuzz coverage closures, one PRE-EXISTING checkpoint
@@ -194,10 +293,12 @@
 //       diff, no-over-copy), corruption/truncation/missing-marker
 //       rejection, fork+kill at EACH of six bk_* crash points with
 //       per-point reachability assertions, backup concurrent with active
-//       writers (B1 prefix), no-WAL backup. bk_* points are deliberately
-//       NOT in crashpt::kAll — the dedicated interrupted-backup test arms
-//       every point exactly once, a stronger per-point guarantee than
-//       seeded sampling (deviation recorded in docs/ROADMAP.md).
+//       writers (B1 prefix), no-WAL backup. (v26.1 hygiene: this note
+//       claimed the bk_* points are deliberately NOT in crashpt::kAll —
+//       that was the v25.7 state, superseded at v25.8, which folded all
+//       six into kAll and added a backup regime to the fuzzer's Plan
+//       grammar. The dedicated interrupted-backup test still arms every
+//       point exactly once; the fuzzer now covers them too.)
 //
 //   HYGIENE — stale contradictory v24-Fix-4 comment removed from the WAL
 //       leader; active_segment_bytes_ mutations moved under batch_mu_
@@ -1227,6 +1328,97 @@ struct HistScope {
 };
 #endif
 
+// =====================================================================
+// v27 M1 (roadmap: "History -> strict-serializability checker"): txnrec
+// — a STRUCTURED, transaction-granularity operation recorder.
+//
+// history:: (above) is a text dump for humans: op-scoped, space-delimited,
+// compile-gated behind -DCHRONOKV_RECORD_HISTORY (not part of any default
+// build, so nothing in CI ever exercised it). txnrec is the machine-
+// readable feed the lincheck:: checker (main.cpp) consumes:
+//   * per-op records carry the ENGINE-VISIBLE facts a checker needs:
+//     snapshot cts, observed version cts, assigned commit cts, committed
+//     flag, written value, real-time (steady_ns) call interval;
+//   * intervals are recorded at the OUTERMOST public wrappers
+//     (Database::get/put/erase, Transaction::get/put/erase/commit) so they
+//     OVER-approximate the true call intervals — required soundness
+//     direction for real-time-order checks (a recorded "W ended before T
+//     began" must imply the same for the true intervals);
+//   * RUNTIME-armed (arm()/disarm()), not compile-armed: disarmed cost is
+//     one relaxed atomic load per recorded op, so it can ship inside the
+//     standard CHRONOKV_TEST_HOOKS builds and every CI config pays ~0.
+// Limitations (documented, deliberate):
+//   * a Transaction's records attribute to the txn id stamped at begin();
+//     moving a Transaction to ANOTHER thread mid-life is not tracked
+//     (workloads keep transactions thread-local);
+//   * engine-internal paths (ReadWriteTransaction used directly by engine
+//     tests, async/batch APIs) are NOT recorded — the checker's histories
+//     come from the public sync API surface.
+#ifdef CHRONOKV_TEST_HOOKS
+namespace txnrec {
+    enum class Op : uint8_t {
+        Begin,       // Transaction created (snapshot assigned)
+        Read,        // snapshot read (txn or standalone); value/version observed
+        Stage,       // Transaction::put/erase buffered (not yet committed)
+        Commit,      // Transaction::commit returned (cts if committed)
+        Abort,       // Transaction aborted (explicit or destroyed-active)
+        Write,       // standalone Database::put (single-op txn)
+        Delete,      // standalone Database::erase (single-op txn)
+        RangeScan,   // Database::range_scan (result serialized k=v;...)
+    };
+    struct Record {
+        uint64_t seq = 0;          // global emission order (diagnostics)
+        Op op = Op::Read;
+        uint64_t txn_id = 0;       // 0 = standalone op (its own implicit txn)
+        std::string key;           // RangeScan: "lo..hi"
+        uint64_t snap_cts = 0;     // Read/Begin/Commit: snapshot (UINT64_MAX = write-only standalone)
+        uint64_t version_cts = 0;  // Read: cts of the observed version; 0 = absent;
+                                   // UINT64_MAX = read-your-writes from the txn buffer
+        uint64_t commit_cts = 0;   // Commit/Write/Delete: assigned cts (0 if not committed)
+        std::string value;         // Read: observed value; Write/Stage: written value;
+                                   // RangeScan: "k=v;k=v;..." serialization
+        bool deleted = false;      // write-is-delete / observed-absent
+        bool committed = false;    // Commit/Write/Delete: result was a commit
+        uint64_t begin_ns = 0;     // steady-clock real-time interval (over-approx.)
+        uint64_t end_ns = 0;
+    };
+
+    inline std::mutex mu;
+    inline std::vector<Record> log;
+    inline std::atomic<bool> armed{false};
+    inline std::atomic<uint64_t> seq_ctr{0};
+    inline std::atomic<uint64_t> txn_ctr{0};
+
+    inline uint64_t now_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    inline bool is_armed() { return armed.load(std::memory_order_relaxed); }
+    inline void arm() {
+        std::lock_guard<std::mutex> lk(mu);
+        log.clear();
+        seq_ctr.store(0, std::memory_order_relaxed);
+        armed.store(true, std::memory_order_release);
+    }
+    inline std::vector<Record> disarm() {
+        armed.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lk(mu);
+        std::vector<Record> out;
+        out.swap(log);
+        return out;
+    }
+    inline uint64_t next_txn_id() {
+        return txn_ctr.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+    inline void record(Record r) {
+        if (!armed.load(std::memory_order_acquire)) return;
+        std::lock_guard<std::mutex> lk(mu);
+        r.seq = seq_ctr.fetch_add(1, std::memory_order_relaxed) + 1;
+        log.push_back(std::move(r));
+    }
+}
+#endif
+
 // ======================== Passive diagnostics (Phase 0) ========================
 // Cheap atomic counters incremented inline. They answer "is the system drifting
 // toward a pathological state" (unbounded growth, GC falling behind, WAL
@@ -1260,6 +1452,8 @@ namespace diag {
     inline std::atomic<uint64_t> rec_records{0}, rec_torn{0}, rec_crc_fails{0};
     inline std::atomic<uint64_t> rec_dups{0}, rec_gaps{0};
     inline std::atomic<uint64_t> rec_orphan_empty{0};  // v26 M2: interrupted-rotation residue tolerated
+    inline std::atomic<uint64_t> rec_pitr_filtered{0}; // v26.1: delta entries beyond the PITR boundary, skipped per-entry
+    inline std::atomic<uint64_t> rec_pitr_wal_skipped{0}; // v26.1: WAL records superseded/duplicated by filtered delta entries
     inline std::atomic<uint64_t> epoch_entries{0}, epoch_oldest{0}, epoch_newest{0};
 
     inline void dump() {
@@ -1288,7 +1482,9 @@ namespace diag {
             << "recovery: records=" << rec_records.load() << " torn_tails=" << rec_torn.load()
             << " crc_fails=" << rec_crc_fails.load()
             << " dups=" << rec_dups.load() << " gaps=" << rec_gaps.load()
-            << " orphan_empty=" << rec_orphan_empty.load() << "\n"
+            << " orphan_empty=" << rec_orphan_empty.load()
+            << " pitr_filtered=" << rec_pitr_filtered.load()
+            << " pitr_wal_skipped=" << rec_pitr_wal_skipped.load() << "\n"
             << "epoch:    entries=" << epoch_entries.load()
             << " oldest=" << epoch_oldest.load() << " newest=" << epoch_newest.load() << "\n";
     }
@@ -3766,6 +3962,7 @@ bool rotate_after_checkpoint(uint64_t ckpt_ts) {
 // ================================================================
 class PublicationTracker {
     std::mutex mu_;
+    std::condition_variable cv_;   // v27 M1: publication barrier (await_published)
     std::set<uint64_t> completed_;
     std::set<uint64_t> burned_;
     std::atomic<uint64_t> published_{0};
@@ -3787,21 +3984,56 @@ public:
     uint64_t published() const { return published_.load(std::memory_order_seq_cst); }
 
     void complete(uint64_t ts) {
-        std::lock_guard<std::mutex> lk(mu_);
-        completed_.insert(ts);
-        advance();
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            completed_.insert(ts);
+            advance();
+        }
+        cv_.notify_all();   // v27 M1: barrier waiters watch the prefix
     }
 
     void burn(uint64_t ts) {
-        std::lock_guard<std::mutex> lk(mu_);
-        burned_.insert(ts);
-        advance();
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            burned_.insert(ts);
+            advance();
+        }
+        // v27 M1: a burned hole advances the prefix like a completion —
+        // and must wake barrier waiters exactly the same way, or a
+        // conflict/failure burn would strand every higher commit.
+        cv_.notify_all();
     }
 
     void recover_to(uint64_t prefix) {
-        std::lock_guard<std::mutex> lk(mu_);
-        published_.store(prefix, std::memory_order_seq_cst);
-        diag::store_max(diag::pub_published, prefix);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            published_.store(prefix, std::memory_order_seq_cst);
+            diag::store_max(diag::pub_published, prefix);
+        }
+        cv_.notify_all();
+    }
+
+    // v27 M1 (strict-serializability barrier): block until the contiguous
+    // published prefix covers ts. commit_txn calls this AFTER complete(ts),
+    // so the wait ends when every LOWER cts has completed or burned —
+    // i.e. when any snapshot taken from here on necessarily includes this
+    // write. This is what makes "acknowledged before you began ⇒ you see
+    // it" true: without it, published (a contiguous prefix) could sit
+    // below an acknowledged cts while a lower in-flight commit held the
+    // hole open, and a reader starting after the ack would snapshot below
+    // it (the lincheck "stale-start" anomaly, found live on the first
+    // engine run: 109 instances in a 775-txn 4-thread workload).
+    // Cost is bounded: cts order = WAL order (group_append reserves under
+    // batch_mu_), so by the time OUR records are durable every lower cts
+    // is past its own WAL I/O and only its in-memory install/complete can
+    // be outstanding. No engine lock is held while waiting (mu_ is the
+    // cv's own mutex); deadlock-freedom vs checkpoint_mu_: every thread
+    // holding a reserved cts already holds checkpoint_mu_ SHARED
+    // (commit_txn acquires it before group_append), so no waiter can
+    // depend on a thread that a pending exclusive checkpoint blocks.
+    void await_published(uint64_t ts) {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return published_.load(std::memory_order_relaxed) >= ts; });
     }
 };
 
@@ -4564,6 +4796,19 @@ public:
             uint64_t seed = WalSegments::seed_clock_from_wal(wal_dir);
             if (seed + 1 > clock_.load(std::memory_order_relaxed)) {
                 clock_.store(seed + 1, std::memory_order_relaxed);
+                // v27 M1 FIX (publication barrier): seed the published
+                // prefix alongside the clock. An append-only open never
+                // replays the WAL, so cts 1..seed are neither completed
+                // nor burned in THIS instance — without seeding, the first
+                // commit's await_published(seed+1) would wait forever on
+                // that untracked hole (found by the full-suite run of the
+                // barrier fix: the v20.1-#7 test's second engine wedged).
+                // Raising published changes nothing observable here — the
+                // version chains are empty, so reads return absent at any
+                // snapshot — and recover_with_checkpoint() overwrites this
+                // with the exact contiguous value (possibly LOWER: torn
+                // tail, PITR boundary) when full recovery is requested.
+                pub_.recover_to(seed);
             }
         }
         // v25.1 M0.6: register this instance LAST, after all throwing
@@ -5363,20 +5608,52 @@ public:
 
      stress_point("wal_durable_before_install");
 
-        for (auto& [e, k, v, d] : witems) link_version(e, cts, v, d);
-     {
-         std::lock_guard<std::mutex> dlk(dirty_mu_);
-         for (auto& [di, dk, dv, dd] : witems)
-             {
-                 auto dit = dirty_since_ckpt_.find(dk);
-                 if (dit == dirty_since_ckpt_.end() || cts > dit->second)
-                     dirty_since_ckpt_[dk] = cts;
-             }
-     }
+        // v27 M1 FIX (found by the lincheck checker on its FIRST engine
+        // run — the publication-prefix lag; see PublicationTracker::
+        // await_published): the install -> publish tail is now (1)
+        // exception-safe and (2) barriered.
+        //
+        // (1) burn-on-throw: if link_version or the dirty-map update threw
+        //     (bad_alloc under pool pressure), cts was previously neither
+        //     completed nor burned — the contiguous published prefix would
+        //     stall FOREVER: every later snapshot silently stale (already
+        //     a bug), and with the barrier below, every later commit would
+        //     hang. Burn and rethrow: the prefix keeps moving, the caller
+        //     fails loud. (Mirrors the v24 Group-1 Fix-2 burn-on-throw
+        //     contract inside group_append; transitions recorded by
+        //     on_reserve at this cts are harmless — the same shape every
+        //     conflict/WalFailure burn already leaves.)
+        try {
+            for (auto& [e, k, v, d] : witems) link_version(e, cts, v, d);
+            {
+                std::lock_guard<std::mutex> dlk(dirty_mu_);
+                for (auto& [di, dk, dv, dd] : witems)
+                    {
+                        auto dit = dirty_since_ckpt_.find(dk);
+                        if (dit == dirty_since_ckpt_.end() || cts > dit->second)
+                            dirty_since_ckpt_[dk] = cts;
+                    }
+            }
+        } catch (...) {
+            pub_.burn(cts);
+            throw;
+        }
         // commit_locks release mutexes by RAII
 
         stress_point("before_publish");
         pub_.complete(cts);
+        // (2) publication barrier: acknowledge the commit only once the
+        //     published prefix covers cts — from this point on, EVERY
+        //     snapshot acquired by ANY thread includes this write. Without
+        //     the wait, an acknowledged cts could sit above an in-flight
+        //     lower cts holding the prefix down, and a reader that began
+        //     after the ack would snapshot below it (strict-serializability
+        //     "stale-start" violation — 109 live instances in the first
+        //     recorded 4-thread list-append workload). Cost is bounded:
+        //     cts order = WAL order, so all lower cts are already past
+        //     their WAL I/O here; only their in-memory tails can be
+        //     outstanding.
+        pub_.await_published(cts);
         {
             // Cheap-tier invariant R1: publication never outruns allocation.
             // Read published_ first, then clock_, so clock_ is at least as fresh.
@@ -5654,11 +5931,12 @@ public:
     //
     // Crash points bk_* instrument every step boundary; the interrupted-
     // backup test forks, kills at EACH point, and asserts verify_backup()
-    // rejects. They are deliberately NOT in crashpt::kAll: the fuzzer's
-    // plan grammar has no backup regime, and the dedicated test arms every
-    // bk_* point exactly once with a reachability assertion — a stronger
-    // per-point guarantee than seeded sampling. (Recorded as a deviation
-    // in docs/ROADMAP.md.)
+    // rejects. (v26.1 hygiene: this comment still claimed the bk_* points
+    // are deliberately NOT in crashpt::kAll and that the fuzzer's plan
+    // grammar has no backup regime. Both were true at v25.7 and were
+    // superseded at v25.8: all six bk_* points are in kAll and the Plan
+    // grammar has a backup regime, so the points are covered BOTH by the
+    // deterministic dedicated test and by seeded fuzz sampling.)
     // =====================================================================
 
     // Copy one file to dst, fsync it, and return {size, crc32-of-contents}.
@@ -6000,8 +6278,16 @@ public:
         }
         uint64_t ckpt_cts = 0;
      // v18: load base checkpoint, then apply delta chain.
+     // v26.1 FIX (adversarial review of 929cb00, rank 1 — PITR mid-window
+     // loss): apply_upto_cts != 0 activates PER-ENTRY filtering — entries
+     // whose commit_ts exceeds the PITR boundary are skipped individually
+     // instead of skipping the whole file. max_applied (when non-null)
+     // receives the largest commit_ts actually linked, so the caller can
+     // raise the published watermark over delta-only versions.
      auto parse_and_apply_ckpt = [&](const std::string& path, uint64_t& out_cts,
-                                     uint64_t stale_below_cts = 0) -> bool {
+                                     uint64_t stale_below_cts = 0,
+                                     uint64_t apply_upto_cts = 0,
+                                     uint64_t* max_applied = nullptr) -> bool {
          std::ifstream cf(path, std::ios::binary);
          if (!cf) return false;
          std::vector<uint8_t> buf(
@@ -6086,6 +6372,20 @@ public:
              // same version, so skip it. Strictly-decreasing commit_ts
              // still throws — that remains real corruption (delta
              // misordering or a broken chain).
+             // v26.1 FIX (adversarial review of 929cb00, rank 1): under a
+             // PITR boundary, filter PER ENTRY. A delta whose header cts
+             // exceeds as_of still holds entries with hc <= as_of — for
+             // keys whose newest version at the delta's snapshot predates
+             // the boundary. Those entries are the ONLY surviving copy of
+             // that state once a later checkpoint's rotation unlinks the
+             // WAL segments covering (prev_delta, as_of]; whole-file
+             // skipping silently lost them. Entries with hc > as_of are
+             // future versions and are skipped here (they remain on disk,
+             // untouched — this open is read-only).
+             if (apply_upto_cts && hc > apply_upto_cts) {
+                 diag::rec_pitr_filtered.fetch_add(1, std::memory_order_relaxed);
+                 continue;
+             }
              if (hc < head_ts)
                  throw std::runtime_error("Checkpoint chain corrupt: non-increasing commit_ts for key " + k);
              if (hc == head_ts) {
@@ -6093,6 +6393,7 @@ public:
                  continue;   // idempotent re-emission: already applied
              }
              link_version(e, hc, v, dl);
+             if (max_applied && hc > *max_applied) *max_applied = hc;
          }
          return true;
      };
@@ -6118,21 +6419,51 @@ public:
          }
      }
      // Apply delta chain in order.
+     // v26.1: largest commit_ts linked from a filtered future delta — used
+     // below to raise the published watermark over delta-only versions.
+     uint64_t pitr_max_applied_hc = 0;
      {
          int delta_n = 1;
+         bool pitr_filtered_one = false;   // v26.1: first header>as_of delta already filtered
          while (true) {
              std::string delta_path = ckpt_path + ".delta." + std::to_string(delta_n);
-             // v26 M4 (PITR): stop at the first delta newer than the
-             // boundary. Delta cts is non-decreasing with delta_n (the
-             // chain is written in commit order), so every later delta is
-             // future too. Future deltas are LEFT ON DISK — a read-only
-             // restore must not destroy state a later normal open would
-             // legitimately apply. (Contrast the R-REBASE stale-delta
-             // deletion below: those are provably superseded; these are
-             // provably not-yet-wanted.)
+             // v26 M4 (PITR): stop at deltas newer than the boundary. Delta
+             // cts is non-decreasing with delta_n (the chain is written in
+             // commit order), so every later delta is future too. Future
+             // deltas are LEFT ON DISK — a read-only restore must not
+             // destroy state a later normal open would legitimately apply.
+             // (Contrast the R-REBASE stale-delta deletion below: those are
+             // provably superseded; these are provably not-yet-wanted.)
+             //
+             // v26.1 FIX (adversarial review of 929cb00, rank 1): the FIRST
+             // future delta is no longer skipped whole. It is parsed with
+             // per-entry filtering (hc <= as_of applied, hc > as_of skipped):
+             // its <= as_of entries can be the ONLY surviving copy of
+             // mid-window state once a later checkpoint's rotation unlinked
+             // the WAL segments covering (prev_delta_cts, as_of]. Skipping
+             // the file lost exactly those commits — silently.
+             // Every delta AFTER the first future one is still skipped whole,
+             // provably: delta N+1's entries carry commit_ts in
+             // (cts_N, cts_{N+1}], and cts_N (the first future delta's
+             // header) already exceeds as_of.
              if (as_of_cts && std::filesystem::exists(delta_path) &&
-                 peek_ckpt_cts(delta_path) > as_of_cts)
-                 break;
+                 peek_ckpt_cts(delta_path) > as_of_cts) {
+                 if (pitr_filtered_one)
+                     break;
+                 uint64_t future_cts = 0;
+                 // stale_below is moot here (a future delta's cts exceeds
+                 // as_of >= base cts, so it can never be stale) but passed
+                 // for uniformity.
+                 parse_and_apply_ckpt(delta_path, future_cts, base_cts_for_staleness,
+                                      /*apply_upto_cts=*/as_of_cts, &pitr_max_applied_hc);
+                 pitr_filtered_one = true;
+                 // NOTE: ckpt_cts is deliberately NOT advanced to
+                 // future_cts — WAL replay below must still cover
+                 // (ckpt_cts, as_of]; the filtered delta supplements the
+                 // window, it does not replace it.
+                 delta_n++;
+                 continue;
+             }
              uint64_t delta_cts = 0;
              // v20 M3 R-REBASE: pass base cts so stale deltas left by an
              // interrupted rebase are skipped instead of tripping the
@@ -6142,8 +6473,13 @@ public:
                  // v20 M3 R-REBASE: this delta was skipped as stale. Delete it now
                  // that it has been parsed and confirmed stale, so its filename
                  // slot is reclaimed and it does not accumulate forever.
-                 std::error_code dec;
-                 std::filesystem::remove(delta_path, dec);
+                 // v26.1: NOT under a PITR open — the as-of open is documented
+                 // read-only w.r.t. the source directory (torn-tail repair
+                 // excepted). Leave the stale file for a normal open to reclaim.
+                 if (!as_of_cts) {
+                     std::error_code dec;
+                     std::filesystem::remove(delta_path, dec);
+                 }
              } else if (delta_cts > ckpt_cts) {
                  ckpt_cts = delta_cts;
              }
@@ -6175,13 +6511,54 @@ public:
                 throw std::runtime_error("Recovery failed: duplicate commit_ts=" + std::to_string(ts)
                     + " (expected " + std::to_string(expected) + ")"
                     + " — WAL corruption or segment overlap");
-            if (ts > expected)
+            if (ts > expected) {
+                // v26.1 (PITR): under an as-of open, an interior gap is
+                // usually NOT corruption — a later checkpoint's
+                // rotate_after_checkpoint() legitimately unlinked segments
+                // covering part of (ckpt_cts, as_of] (deletion horizon is
+                // the manifest's ckpt_ts, which sits ABOVE our boundary).
+                // The filtered future delta may cover the hole, but a
+                // surviving record inside the window proves part of the
+                // window was lost while part survived — per-key coverage
+                // cannot be reconstructed. Fail loud, naming the cause and
+                // the remedies, instead of guessing.
+                if (as_of_cts)
+                    throw std::runtime_error(
+                        "PITR: as_of cts " + std::to_string(as_of_cts) +
+                        " is not reconstructable — the WAL records covering "
+                        "commit_ts " + std::to_string(expected) + ".." +
+                        std::to_string(ts - 1) + " were rotated away by a "
+                        "later checkpoint (the applied chain only reaches "
+                        "cts " + std::to_string(ckpt_cts) + ", yet a "
+                        "surviving record at cts " + std::to_string(ts) +
+                        " shows the window was only partially retained). "
+                        "Choose an as_of at a checkpoint boundary or inside "
+                        "a window whose WAL survives, or restore from an "
+                        "older backup.");
                 throw std::runtime_error(std::string("Recovery failed: interior gap")
                     + " expected_ts=" + std::to_string(expected)
                     + " found_ts=" + std::to_string(ts)
                     + " — WAL corruption detected");
+            }
             for (auto& [k, v, d] : ws) {
                 auto [e, dummy] = ensure_index(k);
+                // v26.1 (PITR): the filtered future delta may already hold
+                // this key at ts (same version present both in a surviving
+                // segment and in the delta — idempotent duplicate) or at a
+                // NEWER commit_ts still <= as_of (the delta's entry
+                // supersedes this record: the key was rewritten inside the
+                // delta's window). Linking either would prepend an older-or-
+                // equal commit_ts over the chain head. Both are caught by
+                // head >= ts. Normal replay never takes this branch: there,
+                // every chain head is <= ckpt_cts < ts, strictly increasing.
+                if (as_of_cts) {
+                    Version* hh = e->head.load(std::memory_order_acquire);
+                    uint64_t head_ts = hh ? hh->commit_ts.load(std::memory_order_acquire) : 0;
+                    if (head_ts >= ts) {
+                        diag::rec_pitr_wal_skipped.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+                }
                 link_version(e, ts, v, d);
             }
             diag::rec_records.fetch_add(1, std::memory_order_relaxed);
@@ -6189,6 +6566,17 @@ public:
             contiguous = ts;
             expected++;
         }
+
+        // v26.1 FIX (review rank 1, second half): under PITR the recovered
+        // state can contain versions linked from the filtered future delta
+        // whose commit_ts exceeds the last replayed WAL record — their
+        // segments were rotated away, which is exactly why the filter
+        // exists. Publishing only up to `contiguous` would clamp reads
+        // below those versions and hide them, re-creating the loss AFTER
+        // the fix. Raise the watermark to cover them; it still cannot
+        // exceed as_of (the filter only applies entries with hc <= as_of).
+        if (as_of_cts && pitr_max_applied_hc > contiguous)
+            contiguous = pitr_max_applied_hc;
 
         if (contiguous > 0) {
             clock_.store(contiguous + 1, std::memory_order_relaxed);
@@ -6849,12 +7237,21 @@ private:
     // deferred reclamation via retire() under epoch-pinned GC, same as
     // Version nodes). The version chain walk is protected by the caller's
     // SnapshotGuard pin (same as before).
-    std::optional<std::string> read_at_idx(uint64_t read_ts, KeyEntry* ent) const {
+    // v27 M1 (txnrec): out_version_cts (optional) receives the commit cts
+    // of the version the read landed on — including a DELETED landing (the
+    // caller gets nullopt but a nonzero cts, distinguishing "deleted" from
+    // "never existed"). The strict-serializability checker verifies reads
+    // against the cts-ordered reconstruction, so it needs to know not just
+    // WHAT was observed but WHICH version it was.
+    std::optional<std::string> read_at_idx(uint64_t read_ts, KeyEntry* ent,
+                                           uint64_t* out_version_cts = nullptr) const {
+        if (out_version_cts) *out_version_cts = 0;
         if (!ent) return std::nullopt;
         Version* cur = ent->head.load(std::memory_order_acquire);
         while (cur) {
             uint64_t c = cur->commit_ts.load(std::memory_order_acquire);
             if (c != 0 && c <= read_ts) {
+                if (out_version_cts) *out_version_cts = c;
                 if (cur->deleted) return std::nullopt;
                 return cur->value;
             }
@@ -6882,6 +7279,19 @@ public:
         hs.set_result(res ? *res : "<absent>");
 #endif
         return res;
+    }
+
+    // v27 M1 (txnrec): read() plus the observation metadata the checker
+    // needs — the snapshot actually used and the cts of the observed
+    // version. Same semantics as read(); the extra outputs never change
+    // the returned value.
+    std::optional<std::string> read_observed(const std::string& key,
+                                             uint64_t* out_snapshot,
+                                             uint64_t* out_version_cts) {
+        SnapshotGuard sg(*this);
+        uint64_t r = sg.read_ts();
+        if (out_snapshot) *out_snapshot = r;
+        return read_at_idx(r, find_index(key), out_version_cts);
     }
 };
 
@@ -6914,6 +7324,11 @@ class ReadWriteTransaction {
     std::set<std::string> rs_;
     std::vector<RangeRead> range_reads_;
     TxnState state_ = TxnState::Active;
+    // v27 M1 (txnrec): the cts assigned by a successful commit(). The
+    // public Transaction wrapper records it AFTER the inner call returns,
+    // so the recorded real-time interval stays an over-approximation of
+    // the true call interval (the sound direction for real-time checks).
+    uint64_t commit_cts_ = 0;
     bool slot_released_ = false;
     bool phantom_registered_ = true;
     // v24 fix: when created via chronokv::Transaction (public API),
@@ -6975,6 +7390,10 @@ public:
     ReadWriteTransaction& operator=(const ReadWriteTransaction&) = delete;
 
     TxnState state() const { return state_; }
+    // v27 M1 (txnrec): the snapshot this transaction reads at, and the cts
+    // its successful commit was assigned (0 until then).
+    uint64_t snapshot() const { return read_ts_; }
+    uint64_t commit_cts() const { return commit_cts_; }
 
     // v25.7 (review M3): read-only view of the buffered write set, so
     // chronokv::Transaction::commit() can notify the Database's prefix
@@ -6991,6 +7410,28 @@ public:
             return it->second.second ? std::nullopt : std::optional<std::string>(it->second.first);
         rs_.insert(k);
         return kv_.read_at(read_ts_, k);
+    }
+
+    // v27 M1 (txnrec): read with observation metadata for the checker.
+    // *out_from_buffer distinguishes a read-your-writes overlay hit from a
+    // true snapshot read; a buffered hit reports version cts UINT64_MAX
+    // (the staged write has no committed cts yet). Same value semantics as
+    // read() — the outputs never change what is returned.
+    std::optional<std::string> read_observed(const std::string& k,
+                                             uint64_t* out_version_cts,
+                                             bool* out_from_buffer) {
+        if (out_from_buffer) *out_from_buffer = false;
+        if (out_version_cts) *out_version_cts = 0;
+        if (state_ != TxnState::Active) return std::nullopt;
+        auto it = ws_.find(k);
+        if (it != ws_.end()) {
+            if (out_from_buffer) *out_from_buffer = true;
+            if (out_version_cts) *out_version_cts = UINT64_MAX;
+            return it->second.second ? std::nullopt
+                                     : std::optional<std::string>(it->second.first);
+        }
+        rs_.insert(k);
+        return kv_.read_at_idx(read_ts_, kv_.find_index(k), out_version_cts);
     }
 
     void write(const std::string& k, const std::string& v) {
@@ -7037,6 +7478,7 @@ public:
         for (auto& [k, vd] : ws_) ws.push_back({k, vd.first, vd.second});
         uint64_t cts = 0;
         TxnResult r = kv_.commit_txn(read_ts_, ws, rs_, range_reads_, &cts);
+        if (r == TxnResult::Committed) commit_cts_ = cts;   // v27 M1 (txnrec)
         state_ = (r == TxnResult::Committed) ? TxnState::Committed : TxnState::Aborted;
         kv_.release_slot(slot_);
         slot_released_ = true;
@@ -7140,12 +7582,21 @@ namespace chronokv {
 // applied and clean under Release / ASan+UBSan / TSan / Stress; the
 // hooks-off public_api_smoke.cpp target (28 checks) passes against the
 // same header.
-static constexpr const char* CHRONOKV_VERSION = "0.25.8";
+// v26.1: the 0.26.x series starts here. v26 (the durability + backup +
+// PITR arc) shipped across 0.25.4-0.25.8 while the software version still
+// tracked the v25 series; from this release on, MINOR follows the roadmap
+// arc. There is no 0.26.0 tag: the v26 arc's final state shipped as
+// 0.25.8 ("v26 M4"), and 0.26.1 is its first patch — the adversarial
+// review of 929cb00 found a PITR correctness defect (mid-window as_of
+// silently losing commits once later checkpoints rotate the covering WAL
+// segments), fixed here with in-suite detectors. Also starts v27 M1
+// (history -> strict-serializability checker).
+static constexpr const char* CHRONOKV_VERSION = "0.26.1";
 static constexpr int CHRONOKV_VERSION_MAJOR = 0;
-static constexpr int CHRONOKV_VERSION_MINOR = 25;
+static constexpr int CHRONOKV_VERSION_MINOR = 26;
 // v25.7: PATCH was stale (said 2 while the string said 0.25.6). Kept in
 // lockstep with CHRONOKV_VERSION from here on.
-static constexpr int CHRONOKV_VERSION_PATCH = 8;
+static constexpr int CHRONOKV_VERSION_PATCH = 1;
 
 // ---- Error hierarchy --------------------------------------------------
 class Error : public std::runtime_error {
@@ -7444,6 +7895,25 @@ public:
     std::optional<std::string> get(std::string_view key) {
         auto eng = api_engine();
         try {
+#ifdef CHRONOKV_TEST_HOOKS
+            // v27 M1 (txnrec): record at the OUTERMOST wrapper so the
+            // real-time interval over-approximates the true call.
+            if (txnrec::is_armed()) {
+                uint64_t t0 = txnrec::now_ns(), snap = 0, vcts = 0;
+                auto res = eng->read_observed(std::string(key), &snap, &vcts);
+                txnrec::Record rec;
+                rec.op = txnrec::Op::Read;
+                rec.key = std::string(key);
+                rec.snap_cts = snap;
+                rec.version_cts = vcts;         // 0 = absent (never existed); >0 = landed on a version (tombstone if !res)
+                rec.deleted = !res.has_value(); // read observed ABSENCE
+                if (res) rec.value = *res;
+                rec.begin_ns = t0;
+                rec.end_ns = txnrec::now_ns();
+                txnrec::record(std::move(rec));
+                return res;
+            }
+#endif
             return eng->read(std::string(key));
         } catch (const std::exception& e) {
             throw Error(std::string("get failed: ") + e.what());
@@ -7455,9 +7925,26 @@ public:
         try {
             WriteSet ws = {{std::string(key), std::string(value), false}};
             uint64_t cts = 0;
+#ifdef CHRONOKV_TEST_HOOKS
+            uint64_t t0 = txnrec::is_armed() ? txnrec::now_ns() : 0;
+#endif
             auto r = eng->commit_txn(UINT64_MAX, ws, {}, {}, &cts);
             auto status = map_txn_result(r);
             if (status == Status::OK) notify_observers(ws);
+#ifdef CHRONOKV_TEST_HOOKS
+            if (t0) {   // v27 M1 (txnrec): standalone write = implicit single-op txn
+                txnrec::Record rec;
+                rec.op = txnrec::Op::Write;
+                rec.key = std::string(key);
+                rec.value = std::string(value);
+                rec.snap_cts = UINT64_MAX;      // write-only: no snapshot semantics
+                rec.commit_cts = (r == TxnResult::Committed) ? cts : 0;
+                rec.committed = (r == TxnResult::Committed);
+                rec.begin_ns = t0;
+                rec.end_ns = txnrec::now_ns();
+                txnrec::record(std::move(rec));
+            }
+#endif
             return status;
         } catch (const std::exception& e) {
             throw Error(std::string("put failed: ") + e.what());
@@ -7469,9 +7956,26 @@ public:
         try {
             WriteSet ws = {{std::string(key), "", true}};
             uint64_t cts = 0;
+#ifdef CHRONOKV_TEST_HOOKS
+            uint64_t t0 = txnrec::is_armed() ? txnrec::now_ns() : 0;
+#endif
             auto r = eng->commit_txn(UINT64_MAX, ws, {}, {}, &cts);
             auto status = map_txn_result(r);
             if (status == Status::OK) notify_observers(ws);
+#ifdef CHRONOKV_TEST_HOOKS
+            if (t0) {   // v27 M1 (txnrec)
+                txnrec::Record rec;
+                rec.op = txnrec::Op::Delete;
+                rec.key = std::string(key);
+                rec.deleted = true;
+                rec.snap_cts = UINT64_MAX;
+                rec.commit_cts = (r == TxnResult::Committed) ? cts : 0;
+                rec.committed = (r == TxnResult::Committed);
+                rec.begin_ns = t0;
+                rec.end_ns = txnrec::now_ns();
+                txnrec::record(std::move(rec));
+            }
+#endif
             return status;
         } catch (const std::exception& e) {
             throw Error(std::string("erase failed: ") + e.what());
@@ -7589,7 +8093,12 @@ public:
             throw Error("restore_pitr: cannot create dest_dir: " + ec.message());
         const std::string dest_ckpt = dest_dir + "/ckpt";
         try {
-            (void)src_db.engine_->export_checkpoint_no_rotate(dest_ckpt);
+            // v26.1 (review note): go through api_engine() instead of
+            // reaching for engine_ directly. src_db is a local, so no
+            // concurrent close is possible today; this keeps the static
+            // helper consistent with the v25.8 close-race contract (every
+            // engine access copies the shared_ptr under close_mu_).
+            (void)src_db.api_engine()->export_checkpoint_no_rotate(dest_ckpt);
         } catch (const std::exception& e) {
             throw Error(std::string("restore_pitr: export failed: ") + e.what());
         }
@@ -8012,13 +8521,43 @@ class Transaction {
     // (boolean set to false before engine is reset).
     std::weak_ptr<std::atomic<bool>> db_alive_;
 
+#ifdef CHRONOKV_TEST_HOOKS
+    // v27 M1 (txnrec): recording identity for this transaction. Stamped at
+    // begin() when the recorder is armed; 0 = not recorded. Moved with the
+    // Transaction (a moved txn keeps its identity on the new owner's thread;
+    // cross-thread moves mid-transaction are outside the recorder's
+    // documented scope).
+    uint64_t rec_txn_id_ = 0;
+    uint64_t rec_begin_ns_ = 0;
+#endif
+
     // Private constructor (used by Database::begin)
+    // v27 M1 (txnrec): rec_begin_ns is stamped at Database::begin() ENTRY
+    // (before api_engine()), so the recorded interval is as close to an
+    // over-approximation of the caller-visible transaction lifetime as an
+    // in-library recorder can get. 0 = recorder disarmed at begin time.
     Transaction(Database& db, ChronoKV& engine, std::weak_ptr<std::atomic<bool>> db_alive,
-                std::shared_ptr<ChronoKV> engine_keepalive)
+                std::shared_ptr<ChronoKV> engine_keepalive, uint64_t rec_begin_ns = 0)
         : db_(&db),
           txn_(std::make_unique<ReadWriteTransaction>(engine, db_alive)),
           engine_keepalive_(std::move(engine_keepalive)),
-          db_alive_(std::move(db_alive)) {}
+          db_alive_(std::move(db_alive)) {
+#ifdef CHRONOKV_TEST_HOOKS
+        if (rec_begin_ns && txn_) {
+            rec_txn_id_ = txnrec::next_txn_id();
+            rec_begin_ns_ = rec_begin_ns;
+            txnrec::Record rec;
+            rec.op = txnrec::Op::Begin;
+            rec.txn_id = rec_txn_id_;
+            rec.snap_cts = txn_->snapshot();
+            rec.begin_ns = rec_begin_ns_;
+            rec.end_ns = rec_begin_ns_;
+            txnrec::record(std::move(rec));
+        }
+#else
+        (void)rec_begin_ns;
+#endif
+    }
 
     void check_active() const {
         if (!active_) throw LifecycleError("transaction is not active");
@@ -8055,6 +8594,12 @@ public:
           , engine_keepalive_(std::move(o.engine_keepalive_))
           , active_(o.active_)
           , db_alive_(std::move(o.db_alive_)) {
+#ifdef CHRONOKV_TEST_HOOKS
+        rec_txn_id_ = o.rec_txn_id_;        // v27 M1 (txnrec): identity follows the txn
+        rec_begin_ns_ = o.rec_begin_ns_;
+        o.rec_txn_id_ = 0;
+        o.rec_begin_ns_ = 0;
+#endif
         o.active_ = false;
     }
     Transaction& operator=(Transaction&& o) noexcept {
@@ -8102,6 +8647,12 @@ public:
             active_ = o.active_;
             db_alive_ = std::move(o.db_alive_);
             db_ = o.db_;   // v25.7 (review M3): observer target follows the txn
+#ifdef CHRONOKV_TEST_HOOKS
+            rec_txn_id_ = o.rec_txn_id_;    // v27 M1 (txnrec)
+            rec_begin_ns_ = o.rec_begin_ns_;
+            o.rec_txn_id_ = 0;
+            o.rec_begin_ns_ = 0;
+#endif
             o.active_ = false;
         }
         return *this;
@@ -8111,17 +8662,58 @@ public:
 
     std::optional<std::string> get(std::string_view key) {
         check_active();
+#ifdef CHRONOKV_TEST_HOOKS
+        // v27 M1 (txnrec): record at the outermost wrapper (over-approx
+        // real-time interval) with observation metadata.
+        if (rec_txn_id_ && txnrec::is_armed()) {
+            uint64_t t0 = txnrec::now_ns(), vcts = 0;
+            bool from_buf = false;
+            auto res = txn_->read_observed(std::string(key), &vcts, &from_buf);
+            txnrec::Record rec;
+            rec.op = txnrec::Op::Read;
+            rec.txn_id = rec_txn_id_;
+            rec.key = std::string(key);
+            rec.snap_cts = txn_->snapshot();
+            rec.version_cts = vcts;   // 0=never-existed, UINT64_MAX=read-your-writes
+            rec.deleted = !res.has_value();
+            if (res) rec.value = *res;
+            rec.begin_ns = t0;
+            rec.end_ns = txnrec::now_ns();
+            txnrec::record(std::move(rec));
+            return res;
+        }
+#endif
         return txn_->read(std::string(key));
     }
 
     void put(std::string_view key, std::string_view value) {
         check_active();
         txn_->write(std::string(key), std::string(value));
+#ifdef CHRONOKV_TEST_HOOKS
+        if (rec_txn_id_ && txnrec::is_armed()) {   // v27 M1 (txnrec)
+            txnrec::Record rec;
+            rec.op = txnrec::Op::Stage;
+            rec.txn_id = rec_txn_id_;
+            rec.key = std::string(key);
+            rec.value = std::string(value);
+            txnrec::record(std::move(rec));
+        }
+#endif
     }
 
     void erase(std::string_view key) {
         check_active();
         txn_->del(std::string(key));
+#ifdef CHRONOKV_TEST_HOOKS
+        if (rec_txn_id_ && txnrec::is_armed()) {   // v27 M1 (txnrec)
+            txnrec::Record rec;
+            rec.op = txnrec::Op::Stage;
+            rec.txn_id = rec_txn_id_;
+            rec.key = std::string(key);
+            rec.deleted = true;
+            txnrec::record(std::move(rec));
+        }
+#endif
     }
 
     std::vector<std::pair<std::string, std::string>>
@@ -8169,6 +8761,22 @@ public:
         // the commit side never reads previous values).
         if (result == ::TxnResult::Committed && !obs_ws.empty())
             db_->notify_observers(obs_ws);
+#ifdef CHRONOKV_TEST_HOOKS
+        // v27 M1 (txnrec): recorded AFTER the engine commit and observer
+        // notify — the latest point inside the call — so end_ns
+        // over-approximates as much as an in-library recorder can.
+        if (rec_txn_id_ && txnrec::is_armed() && txn_) {
+            txnrec::Record rec;
+            rec.op = txnrec::Op::Commit;
+            rec.txn_id = rec_txn_id_;
+            rec.snap_cts = txn_->snapshot();
+            rec.commit_cts = txn_->commit_cts();   // 0 unless Committed
+            rec.committed = (result == ::TxnResult::Committed);
+            rec.begin_ns = rec_begin_ns_;
+            rec.end_ns = txnrec::now_ns();
+            txnrec::record(std::move(rec));
+        }
+#endif
         return Database::map_txn_result(result);
     }
 
@@ -8179,6 +8787,16 @@ public:
             // slot and deregisters the phantom reader.
             txn_.reset();
             active_ = false;
+#ifdef CHRONOKV_TEST_HOOKS
+            if (rec_txn_id_ && txnrec::is_armed()) {   // v27 M1 (txnrec)
+                txnrec::Record rec;
+                rec.op = txnrec::Op::Abort;
+                rec.txn_id = rec_txn_id_;
+                rec.begin_ns = rec_begin_ns_;
+                rec.end_ns = txnrec::now_ns();
+                txnrec::record(std::move(rec));
+            }
+#endif
         }
     }
 
@@ -8189,8 +8807,16 @@ public:
 
 // Database::begin implementation (must be after Transaction is defined)
 inline Transaction Database::begin() {
+#ifdef CHRONOKV_TEST_HOOKS
+    // v27 M1 (txnrec): stamp the real-time interval start at ENTRY, before
+    // api_engine(), so it over-approximates the caller-visible begin.
+    uint64_t t0 = txnrec::is_armed() ? txnrec::now_ns() : 0;
+    auto eng = api_engine();
+    return Transaction(*this, *eng, alive_, eng, t0);
+#else
     auto eng = api_engine();
     return Transaction(*this, *eng, alive_, eng);
+#endif
 }
 
 } // namespace chronokv

@@ -10,7 +10,11 @@ transactions with phantom detection, a paged B+ tree index, and
 io_uring-accelerated WAL writes — all in one header with no external
 dependencies.
 
-Current version: **0.25.8** (`CHRONOKV_VERSION` in `chronokv.hpp`).
+Current version: **0.26.1** (`CHRONOKV_VERSION` in `chronokv.hpp`). Starting
+with this release the version's MINOR tracks the roadmap arc: the v26 arc
+(M0–M4) shipped across 0.25.4–0.25.8, and 0.26.1 is its first patch (the
+adversarial review of `929cb00` found a PITR correctness defect — fixed here)
+plus the start of v27 M1.
 
 ## Highlights
 
@@ -19,6 +23,13 @@ Current version: **0.25.8** (`CHRONOKV_VERSION` in `chronokv.hpp`).
 - **Serializable transactions (SSI)** — snapshot reads with write-set
   validation, including phantom detection over registered scan ranges
   (no write skews, no phantoms).
+- **Strict-serializable acknowledgements (v27 M1)** — a commit is
+  acknowledged only once the published prefix covers its cts, so any
+  snapshot taken after an ack necessarily includes that write (real-time
+  order). The in-suite `lincheck` checker verifies snapshot soundness,
+  real-time order, and Elle-style list-append properties on recorded
+  histories — and found the publication-prefix lag it now guards on its
+  first engine run.
 - **Crash-safe WAL** — CRC-checked, segmented (64 MiB) WAL with torn-tail
   truncation, batch group-commit, and strict LSN gap/duplicate detection
   on recovery.
@@ -51,14 +62,21 @@ Current version: **0.25.8** (`CHRONOKV_VERSION` in `chronokv.hpp`).
   (per-file size + CRC32) written last; `Database::verify_backup(dir)`
   validates a copy without opening it. Restore = point `Options` at the
   copy. Invariant **B1**.
-- **Point-in-time restore** (v26 M4) — `Options::pitr_as_of_cts` recovers
-  a database directory to an exact cts boundary (read-only open), and
-  `Database::restore_pitr(...)` materializes a **writable** as-of database
-  into a fresh directory. The as-of window of a live/crashed directory is
-  the WAL beyond its last checkpoint; a `backup()` copy restores to
-  exactly its marker cts (`Database::backup_cts`).
+- **Point-in-time restore** (v26 M4, mid-window recovery fixed in v26.1) —
+  `Options::pitr_as_of_cts` recovers a database directory to an exact cts
+  boundary (read-only open), and `Database::restore_pitr(...)` materializes
+  a **writable** as-of database into a fresh directory. The as-of window of
+  a live/crashed directory is the WAL beyond its last checkpoint; a
+  `backup()` copy restores to exactly its marker cts (`Database::backup_cts`).
+  Since v26.1 an `as_of` that falls *between* checkpoint boundaries is
+  recovered by per-entry filtering of the first delta beyond the boundary
+  (entries with `cts <= as_of` are the only surviving copy of mid-window
+  state once later checkpoints rotate the covering WAL segments); see
+  Safety properties for the exact reconstructability rules.
 - **Heavy-duty validation** — engine tests, B+ tree fuzzing, fault
-  injection, deterministic stress mode, randomized crash-point fuzzing, and a
+  injection, deterministic stress mode, randomized crash-point fuzzing, a
+  strict-serializability history checker (v27 M1 `lincheck`, with a
+  synthetic anomaly battery proving it fails when it should), and a
   linearizability history recorder, all run under a four-config sanitizer
   matrix (Release / ASan+UBSan / TSan / Stress).
 - **Crash-consistent recovery** — 20 instrumented crash points cover the whole
@@ -160,6 +178,16 @@ superseded — `open` fails loud). For a `backup()` copy the only valid
 boundary is its marker cts (`Database::backup_cts(dir)`): backups
 checkpoint before copying, so they hold exactly one point in time.
 
+Mid-window boundaries (v26.1): an `as_of` *between* checkpoint boundaries
+is recovered from the checkpoint chain plus whatever WAL still covers the
+window. The first delta beyond the boundary contributes its entries with
+`cts <= as_of` (per-entry filtering); a later checkpoint's rotation may
+already have unlinked the segments covering the window. Rules, in short:
+boundary cts values always work; a mid-window cts works when the window's
+WAL survives **or** the next delta still holds every needed version; and a
+partially-rotated window fails loud at open (never silently wrong). One
+documented residual limit remains — see Safety properties.
+
 Compile:
 
 ```sh
@@ -232,7 +260,48 @@ inactive transaction), `Error` (engine failures), `NotYetImplementedError`.
   writes return `Status::Failed`, `checkpoint()` throws, and `health()`
   reports level 1 with the mode — the WAL still holds records newer than
   the boundary, and appending after them would collide on cts. Use
-  `restore_pitr()` to obtain a writable as-of database.
+  `restore_pitr()` to obtain a writable as-of database. A PITR open does
+  not modify the source directory at all (not even stale-delta cleanup —
+  that is left to a normal open).
+- **PITR mid-window reconstructability (v26.1, review rank-1 fix)**:
+  for `as_of` strictly between checkpoint boundaries, recovery applies the
+  base plus every delta whose header cts `<= as_of` in full, then applies
+  the first delta beyond the boundary **per entry** (`hc <= as_of` only),
+  then replays surviving WAL records in `(last_applied_header, as_of]`.
+  Consequences, precisely:
+  * a delta entry with `hc <= as_of` is *provably exact* — it is the key's
+    newest version at the delta's snapshot, so nothing in `(hc, as_of]`
+    superseded it, regardless of which WAL segments survive;
+  * if the WAL covering the window was rotated away by a later checkpoint
+    and a surviving record still sits **inside** the window, the per-key
+    coverage of the hole cannot be proven — `open` fails loud with a
+    "rotated away" diagnosis (never silently wrong);
+  * **residual limit (documented deviation)**: if the covering WAL is
+    *entirely* gone, a key that was written in the window **and rewritten
+    again between `as_of` and the next checkpoint boundary** keeps only its
+    post-`as_of` version in that delta; its as-of version is unrecoverable
+    and the key reads as absent-or-older at `as_of`. The two on-disk worlds
+    ("rewritten after as_of" vs "first written after as_of") are
+    byte-identical, so no recovery policy can distinguish them without
+    retaining the WAL. Take `backup()` copies, or choose boundary cts
+    values, when exact mid-window semantics must be guaranteed.
+- **Strict-serializable acknowledgements (v27 M1)**: `commit_txn` waits
+  for the contiguous published prefix to cover its cts before returning
+  `Committed` (a publication barrier). Therefore: if a write is
+  acknowledged before a transaction begins, that transaction's snapshot —
+  and every read in it — includes the write (real-time order); writer
+  order equals cts order because cts is reserved under the WAL batch
+  mutex; and reads are exact state-as-of-snapshot by the MVCC construction
+  the `lincheck` checker verifies on recorded histories. The barrier's cost
+  is bounded: cts order equals WAL order, so by the time a commit's own
+  records are durable, every lower cts is past its WAL I/O and only
+  in-memory install can be outstanding. A throw between WAL durability and
+  publication now **burns** the cts (prefix keeps advancing; the caller
+  fails loud) instead of stalling the prefix forever. Append-only opens
+  (existing WAL, `recover_on_open=false`) seed the published prefix
+  alongside the commit clock, so the first commit's barrier never waits on
+  holes the instance will never track (regression-tested with a hard
+  timeout).
 - **Backup semantics (v26 M3)**: a backup is *at least* as new as the
   checkpoint taken inside `backup()` and *at most* as new as copy
   completion — not a point-in-time snapshot. `verify_backup()` succeeds

@@ -568,6 +568,7 @@ static int run_gc_idle_test();        // v25.7 review H2 detector
 static int run_lifecycle_test();      // v25.7 review M2 detectors
 static int run_backup_test();         // v26 M3 online backup
 static int run_pitr_test();           // v26 M4 point-in-time restore
+static int run_lincheck_test();       // v27 M1 strict-serializability checker
 static int run_m16_phase1_test();
 static int run_m2_phase1_test();
 static int run_m2_phase2_test();
@@ -1669,6 +1670,26 @@ return 0;
 #ifdef CHRONOKV_FAULT_INJECTION
         f += run_crash_fuzz();
 #endif
+        std::cout.flush();
+        return f == 0 ? 0 : 1;
+    }
+
+    // v26.1: CKV_ONLY_PITR=1 runs just the PITR suite — used to prove the
+    // new rank-1 detectors (multi-checkpoint mid-window as_of) fail against
+    // the unfixed header, and to let a reviewer rerun them in seconds
+    // instead of a full-suite build.
+    if (getenv("CKV_ONLY_PITR")) {
+        crc_init();
+        int f = run_pitr_test();
+        std::cout.flush();
+        return f == 0 ? 0 : 1;
+    }
+
+    // v27 M1: CKV_ONLY_LINCHECK=1 runs just the serializability-checker
+    // suite (synthetic battery + engine workload + mutations).
+    if (getenv("CKV_ONLY_LINCHECK")) {
+        crc_init();
+        int f = run_lincheck_test();
         std::cout.flush();
         return f == 0 ? 0 : 1;
     }
@@ -6968,6 +6989,7 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     fails += run_backup_test();
     // v26 M4: point-in-time restore.
     fails += run_pitr_test();
+    fails += run_lincheck_test();
     // async benchmark (skips under sanitizer anyway)
     fails += run_async_benchmark();
 
@@ -9442,8 +9464,1047 @@ static int run_pitr_test() {
         check("pitr: pitr_as_of_cts without recover_on_open is rejected", threw);
     }
 
+    // ================= v26.1 detectors (adversarial review of 929cb00) =================
+    //
+    // (8) RANK-1 DETECTOR — the reviewer's exact scenario: as_of BETWEEN two
+    //     checkpoint boundaries after a LATER checkpoint's rotation unlinked
+    //     the WAL segments covering the window. The mid-window commit's only
+    //     surviving copy is an entry inside a delta whose HEADER cts exceeds
+    //     as_of — pre-v26.1 recovery skipped that file whole and the commit
+    //     vanished silently.
+    //     Timeline: a,b,c -> ckpt base@W3 | d@W4, e@W5 -> ckpt delta.1@W5
+    //               | f@W6 -> ckpt delta.2@W6 (rotation deletes the segment
+    //               holding W4/W5) | g@W7 -> close | open as_of=W4.
+    //     Expected: d=4 (from delta.1's per-entry-filtered d@4), e/f absent.
+    //     Verified against 929cb00: FAILS with d=<none> e=<none> f=<none>
+    //     (the reviewer's positive control, reproduced byte-for-byte).
+    {
+        const std::string g8 = root + "/gap";
+        std::error_code ec8;
+        std::filesystem::create_directories(g8, ec8);
+        Options go = o;
+        go.wal_dir = g8 + "/wal";
+        go.checkpoint_path = g8 + "/ckpt";
+        uint64_t gW3 = 0, gW4 = 0, gW5 = 0, gW6 = 0;
+        {
+            auto db = Database::open(go);
+            db.put("a", "1"); db.put("b", "2"); db.put("c", "3");
+            gW3 = db.published_watermark();
+            db.checkpoint();                    // full base @ gW3
+            db.put("d", "4"); gW4 = db.published_watermark();
+            db.put("e", "5"); gW5 = db.published_watermark();
+            db.checkpoint();                    // delta.1 @ gW5
+            db.put("f", "6"); gW6 = db.published_watermark();
+            db.checkpoint();                    // delta.2 @ gW6 — rotation unlinks W4/W5 segment
+            db.put("g", "7");
+            db.close();
+        }
+        // The composition only exercises the defect if delta.2's rotation
+        // really deleted the segment that held W4/W5 — assert the scene so
+        // this check cannot silently degrade into the old single-delta test.
+        bool scene_ok = !std::filesystem::exists(go.wal_dir + "/wal_000002.log") &&
+                        std::filesystem::exists(go.checkpoint_path + ".delta.2");
+        bool d_ok = false, e_absent = false, f_absent = false;
+        std::string detail;
+        try {
+            Options po = go;
+            po.pitr_as_of_cts = gW4;
+            auto db = Database::open(po);
+            d_ok = db.get("d").value_or("") == "4";
+            e_absent = !db.get("e").has_value();
+            f_absent = !db.get("f").has_value();
+            db.close();
+        } catch (const std::exception& ex) { detail = ex.what(); }
+        check("pitr: mid-window as_of survives later-checkpoint WAL rotation (review rank 1)",
+              scene_ok && d_ok && e_absent && f_absent, detail);
+        // restore_pitr rides the same recovery path: the materialized
+        // database must carry d across the rotated window and be writable.
+        bool r_ok = false;
+        detail.clear();
+        try {
+            auto db = Database::restore_pitr(go.wal_dir, go.checkpoint_path,
+                                             g8 + "/restored", gW4);
+            r_ok = db.get("d").value_or("") == "4" && !db.get("e").has_value() &&
+                   db.put("new", "x") == Status::OK;
+            db.close();
+        } catch (const std::exception& ex) { detail = ex.what(); }
+        check("pitr: restore_pitr across the rotated window materializes d (review rank 1)",
+              r_ok, detail);
+    }
+
+    // (9) Filtered delta entries COEXISTING with surviving WAL records for
+    //     the same window: (a) a key whose delta entry (hc > as_of) is
+    //     filtered out but whose mid-window version survives in the WAL
+    //     must read from the WAL; (b) a key applied FROM the filtered delta
+    //     at ts equal to a surviving record must be deduped, not
+    //     double-linked (equal commit_ts over the chain head).
+    //     Timeline: a,b,c -> base@W3 | txn{k=v4, j=v4b}@W4 | k=v5@W5 ->
+    //     delta.1@W5 (its rotation deletes seg1 only; the W4/W5 segment
+    //     was old_id and survives) | as_of=W4.
+    {
+        const std::string g9 = root + "/dedupe";
+        std::error_code ec9;
+        std::filesystem::create_directories(g9, ec9);
+        Options go = o;
+        go.wal_dir = g9 + "/wal";
+        go.checkpoint_path = g9 + "/ckpt";
+        uint64_t dW4 = 0;
+        {
+            auto db = Database::open(go);
+            db.put("a", "1"); db.put("b", "2"); db.put("c", "3");
+            db.checkpoint();                    // full base
+            auto txn = db.begin();
+            txn.put("k", "v4");
+            txn.put("j", "v4b");
+            txn.commit();
+            dW4 = db.published_watermark();
+            db.put("k", "v5");
+            db.checkpoint();                    // delta.1 = {k@W5, j@W4}
+            db.close();
+        }
+        bool k_ok = false, j_ok = false, a_ok = false;
+        std::string detail;
+        try {
+            Options po = go;
+            po.pitr_as_of_cts = dW4;
+            auto db = Database::open(po);
+            k_ok = db.get("k").value_or("") == "v4";   // delta k@W5 filtered; WAL supplies v4
+            j_ok = db.get("j").value_or("") == "v4b";  // delta j@W4 applied; WAL dup deduped
+            a_ok = db.get("a").value_or("") == "1";
+            db.close();
+        } catch (const std::exception& ex) { detail = ex.what(); }
+        check("pitr: filtered delta + surviving WAL dedupe/supersede correctly",
+              k_ok && j_ok && a_ok, detail);
+        // The same artifacts at the delta boundary (as_of = delta.1's cts)
+        // and at a normal open must be untouched by the filter machinery.
+        bool b_ok = false, n_ok = false;
+        detail.clear();
+        try {
+            Options po = go;
+            po.pitr_as_of_cts = dW4 + 1;       // = delta.1's header cts (W5)
+            auto db = Database::open(po);
+            b_ok = db.get("k").value_or("") == "v5" && db.get("j").value_or("") == "v4b";
+            db.close();
+            auto db2 = Database::open(go);
+            n_ok = db2.get("k").value_or("") == "v5" && db2.get("j").value_or("") == "v4b";
+            db2.close();
+        } catch (const std::exception& ex) { detail = ex.what(); }
+        check("pitr: boundary as_of and normal open unaffected by per-entry filtering",
+              b_ok && n_ok, detail);
+    }
+
+    // (10) PARTIAL window loss fails LOUD (review fix direction 2 for the
+    //      genuinely unrecoverable composition): when a surviving WAL record
+    //      sits INSIDE the window above rotated-away records, per-key
+    //      coverage of the hole cannot be proven — recovery must refuse
+    //      with the real cause instead of guessing (pre-v26.1 this threw
+    //      the misleading "WAL corruption detected"; the state was equally
+    //      unprovable). Scene: a forced size rotation splits the window
+    //      across two segments; the next checkpoint's rotation deletes the
+    //      earlier one (d@W4) while keeping the later (e@W5, f@W6).
+    //      as_of=W5 -> interior gap (W4 missing below surviving W5) -> throw.
+    //      as_of=W4 -> surviving records all exceed the boundary -> no gap
+    //      check; the filtered delta covers d@W4 exactly -> opens, d=4.
+    {
+        const std::string g10 = root + "/partial";
+        std::error_code ec10;
+        std::filesystem::create_directories(g10, ec10);
+        Options go = o;
+        go.wal_dir = g10 + "/wal";
+        go.checkpoint_path = g10 + "/ckpt";
+        uint64_t pW4 = 0, pW5 = 0;
+        {
+            auto db = Database::open(go);
+            db.put("a", "1"); db.put("b", "2"); db.put("c", "3");
+            db.checkpoint();                    // base @ W3; seg2 becomes active
+            db.put("d", "4"); pW4 = db.published_watermark();   // -> seg2
+            db.force_wal_rotation_for_test();   // next commit seals seg2, opens seg3
+            db.put("e", "5"); pW5 = db.published_watermark();   // -> seg3
+            db.put("f", "6");                                   // -> seg3
+            db.checkpoint();                    // delta.1 @ W6: old_id=seg3 -> seg2 (d@W4) unlinked
+            db.put("g", "7");
+            db.close();
+        }
+        bool scene_ok = !std::filesystem::exists(go.wal_dir + "/wal_000002.log") &&
+                        std::filesystem::exists(go.wal_dir + "/wal_000003.log");
+        bool threw = false;
+        std::string what;
+        try {
+            Options po = go;
+            po.pitr_as_of_cts = pW5;
+            auto db = Database::open(po);
+            db.close();
+        } catch (const std::exception& ex) { threw = true; what = ex.what(); }
+        bool loud_ok = threw && what.find("rotated away") != std::string::npos;
+        check("pitr: partially-rotated window under as_of fails loud, naming the cause",
+              scene_ok && loud_ok, threw ? what : "open unexpectedly succeeded");
+        // as_of=W4: the hole {W4-record... } — every surviving record exceeds
+        // the boundary, so replay breaks before the contiguity check; the
+        // filtered delta's d@W4 entry (latest <= its header, so exact) is
+        // sufficient. Contrast with the W5 case above: same artifacts,
+        // different reconstructability.
+        bool w4_ok = false, w4_e_absent = false;
+        what.clear();
+        try {
+            Options po = go;
+            po.pitr_as_of_cts = pW4;
+            auto db = Database::open(po);
+            w4_ok = db.get("d").value_or("") == "4" && db.get("a").value_or("") == "1";
+            w4_e_absent = !db.get("e").has_value();
+            db.close();
+        } catch (const std::exception& ex) { what = ex.what(); }
+        check("pitr: fully-rotated window with delta coverage still opens (as_of=W4)",
+              w4_ok && w4_e_absent, what);
+    }
+
     std::filesystem::remove_all(root);
     if (fails == 0) std::cout << "   PITR TEST PASSED\n";
+    return fails;
+}
+
+// =====================================================================
+// v27 M1 (ROADMAP v27 M1: "History -> strict-serializability checker")
+//
+// lincheck consumes txnrec:: records — a structured history of public-API
+// calls — and checks the recorded history against the consistency model
+// the engine claims: STRICT SERIALIZABILITY = snapshot isolation over the
+// global cts total order + real-time order.
+//
+// Why no Knossos/Jepsen-style search is needed (the roadmap's argument,
+// restated): cts is a TOTAL, monotonic counter — every committed write
+// transaction gets a unique cts and every snapshot read is defined as
+// "the state as of read_ts". The candidate total order is therefore not
+// searched for; it IS cts order, and checking collapses to:
+//
+//   (a) SNAPSHOT SOUNDNESS — replay committed writes in cts order; every
+//       recorded read must equal the reconstructed state as of its
+//       snapshot (read-your-writes overlay included), and no read may
+//       observe a version whose cts exceeds its snapshot.
+//   (b) REAL-TIME ORDER — if a write W was acknowledged before a txn T
+//       began (recorded intervals separated by a small slack that absorbs
+//       in-library timestamping error), then W.cts < T.cts for committed
+//       writers T, and W.cts <= T.snapshot for any snapshot-taking T.
+//       Both are theorems about this engine: commit_txn publishes
+//       (pub_.complete) BEFORE returning, cts is assigned from a
+//       monotonic clock, and a snapshot equals published_ at slot
+//       acquisition — so any violation is a genuine defect (or a recorder
+//       bug, which the mutation battery below distinguishes).
+//   (c) ELLE-STYLE LIST-APPEND analysis, cts-independent: per key, the
+//       observed token lists must contain no duplicates, no tokens that
+//       no committed append wrote (fabrication / aborted-write leakage),
+//       must equal the canonical prefix implied by append cts order
+//       (lost updates), and the pairwise precedence graph induced by the
+//       observations must be acyclic (fractured reads). Plus a write-side
+//       fold check: every committed append must extend the previous
+//       committed value by exactly its last token.
+//
+// A CHECKER THAT HAS NEVER FAILED IS NOT A CHECKER (roadmap acceptance):
+// run_lincheck_test fires every violation kind below at hand-built
+// synthetic histories AND at deliberate mutations of a real recorded
+// engine history, and asserts the clean engine history passes.
+//
+// Recorder limitations this checker inherits (documented at txnrec::):
+// async/batch APIs and range scans are not recorded; arm on an EMPTY (or
+// quiesced-and-unread) database, else pre-arm state reads as fabricated.
+namespace lincheck {
+
+struct ReadEv {
+    std::string key;
+    bool found = false;          // a value was observed (false = absence observed)
+    std::string value;
+    uint64_t version_cts = 0;    // 0 = never existed; UINT64_MAX = read-your-writes buffer
+};
+struct WriteEv { std::string key; std::string value; bool deleted = false; };
+struct OpSeq { bool is_read; size_t idx; };   // program order within the txn
+
+struct Txn {
+    uint64_t id = 0;
+    bool is_write = false;
+    bool committed = true;       // read-only txns: vacuously committed
+    bool has_snapshot = false;
+    uint64_t snapshot = 0;       // UINT64_MAX = write-only (standalone put/erase)
+    uint64_t commit_cts = 0;     // assigned cts (0 if none/aborted)
+    uint64_t begin_ns = 0, end_ns = 0;   // 0 = interval not recorded
+    std::vector<ReadEv> reads;
+    std::vector<WriteEv> writes;
+    std::vector<OpSeq> order;
+};
+
+struct Violation { std::string kind; std::string detail; };
+
+inline std::vector<Txn> from_txnrec(const std::vector<txnrec::Record>& recs) {
+    std::vector<Txn> out;
+    std::map<uint64_t, size_t> by_id;
+    uint64_t synth = UINT64_MAX;   // standalone ops get synthetic ids (count down; real ids count up from 1)
+    for (const auto& r : recs) {
+        size_t pos;
+        if (r.txn_id != 0) {
+            auto it = by_id.find(r.txn_id);
+            if (it == by_id.end()) {
+                pos = out.size();
+                by_id.emplace(r.txn_id, pos);
+                out.emplace_back();
+                out.back().id = r.txn_id;
+                out.back().begin_ns = r.begin_ns;
+            } else pos = it->second;
+        } else {
+            pos = out.size();
+            out.emplace_back();
+            out.back().id = synth--;
+            out.back().begin_ns = r.begin_ns;
+            out.back().end_ns = r.end_ns;
+        }
+        Txn& t = out[pos];
+        switch (r.op) {
+        case txnrec::Op::Begin:
+            t.has_snapshot = true;
+            t.snapshot = r.snap_cts;
+            if (t.begin_ns == 0) t.begin_ns = r.begin_ns;
+            break;
+        case txnrec::Op::Read: {
+            if (!t.has_snapshot && r.snap_cts != UINT64_MAX) {
+                t.has_snapshot = true;
+                t.snapshot = r.snap_cts;
+            }
+            ReadEv ev;
+            ev.key = r.key;
+            ev.found = !r.deleted;
+            ev.value = r.value;
+            ev.version_cts = r.version_cts;
+            t.order.push_back({true, t.reads.size()});
+            t.reads.push_back(std::move(ev));
+            break;
+        }
+        case txnrec::Op::Stage: {
+            WriteEv w; w.key = r.key; w.value = r.value; w.deleted = r.deleted;
+            t.order.push_back({false, t.writes.size()});
+            t.writes.push_back(std::move(w));
+            t.is_write = true;
+            break;
+        }
+        case txnrec::Op::Write:
+        case txnrec::Op::Delete: {
+            WriteEv w; w.key = r.key; w.value = r.value;
+            w.deleted = (r.op == txnrec::Op::Delete) || r.deleted;
+            t.order.push_back({false, t.writes.size()});
+            t.writes.push_back(std::move(w));
+            t.is_write = true;
+            t.committed = r.committed;
+            t.commit_cts = r.committed ? r.commit_cts : 0;
+            t.has_snapshot = true;
+            t.snapshot = r.snap_cts;      // UINT64_MAX: write-only, no snapshot semantics
+            break;
+        }
+        case txnrec::Op::Commit:
+            t.committed = r.committed;
+            t.commit_cts = r.committed ? r.commit_cts : 0;
+            t.end_ns = r.end_ns;
+            if (!t.has_snapshot) { t.has_snapshot = true; t.snapshot = r.snap_cts; }
+            break;
+        case txnrec::Op::Abort:
+            t.committed = false;
+            t.commit_cts = 0;
+            t.end_ns = r.end_ns;
+            break;
+        case txnrec::Op::RangeScan:
+            break;   // not modeled — documented recorder limitation
+        }
+    }
+    return out;
+}
+
+inline bool has_kind(const std::vector<Violation>& v, const char* kind) {
+    for (const auto& x : v) if (x.kind == kind) return true;
+    return false;
+}
+
+inline std::string describe(const std::vector<Violation>& v, size_t maxn = 3) {
+    std::string s;
+    for (size_t i = 0; i < v.size() && i < maxn; ++i) {
+        if (i) s += " | ";
+        s += v[i].kind + ": " + v[i].detail;
+    }
+    if (v.size() > maxn) s += " | (+" + std::to_string(v.size() - maxn) + " more)";
+    return s;
+}
+
+// rt_slack_ns: only enforce a real-time edge when the recorded intervals
+// are separated by at least this much. In-library timestamps sit INSIDE
+// the true call intervals (by the wrapper entry/exit overhead), so a
+// zero-slack comparison could manufacture an edge the true intervals do
+// not support. A few microseconds is orders of magnitude above the error
+// and orders below the workload's inter-op gaps.
+inline std::vector<Violation> check_cts_order(const std::vector<Txn>& txns,
+                                              uint64_t rt_slack_ns = 4000) {
+    std::vector<Violation> v;
+    auto viol = [&](const char* kind, std::string d) {
+        v.push_back(Violation{kind, std::move(d)});
+    };
+    auto sid = [](const Txn& t) { return std::to_string(t.id); };
+
+    // (0) committed writers: unique nonzero cts; cts > own snapshot.
+    std::vector<const Txn*> writers;
+    std::map<uint64_t, const Txn*> by_cts;
+    for (const auto& t : txns) {
+        if (!t.is_write || !t.committed) continue;
+        if (t.commit_cts == 0) {
+            viol("commit-cts-missing", "txn " + sid(t) + " is a committed writer with no assigned cts");
+            continue;
+        }
+        auto ins = by_cts.emplace(t.commit_cts, &t);
+        if (!ins.second)
+            viol("duplicate-commit-cts",
+                 "txns " + sid(*ins.first->second) + " and " + sid(t) +
+                 " both claim commit cts " + std::to_string(t.commit_cts) +
+                 " — cts must be a TOTAL order");
+        if (t.has_snapshot && t.snapshot != UINT64_MAX && t.commit_cts <= t.snapshot)
+            viol("commit-not-after-snapshot",
+                 "txn " + sid(t) + " snapshot=" + std::to_string(t.snapshot) +
+                 " but commit cts=" + std::to_string(t.commit_cts) +
+                 " — a txn must not order at-or-before its own snapshot");
+        writers.push_back(&t);
+    }
+    std::sort(writers.begin(), writers.end(),
+              [](const Txn* a, const Txn* b) { return a->commit_cts < b->commit_cts; });
+
+    // (a) snapshot soundness: replay committed writes in cts order and
+    //     compare every read against the state as of its snapshot.
+    {
+        const std::optional<std::string> ABSENT;
+        std::map<std::string, std::optional<std::string>> state;
+        std::vector<const Txn*> readers;
+        for (const auto& t : txns)
+            if (!t.reads.empty() && t.has_snapshot && t.snapshot != UINT64_MAX)
+                readers.push_back(&t);
+        std::sort(readers.begin(), readers.end(), [](const Txn* a, const Txn* b) {
+            if (a->snapshot != b->snapshot) return a->snapshot < b->snapshot;
+            return a->id < b->id;
+        });
+        size_t wi = 0;
+        for (const Txn* t : readers) {
+            while (wi < writers.size() && writers[wi]->commit_cts <= t->snapshot) {
+                for (const auto& w : writers[wi]->writes)
+                    state[w.key] = w.deleted ? ABSENT : std::optional<std::string>(w.value);
+                wi++;
+            }
+            std::map<std::string, std::optional<std::string>> own_store;
+            for (const auto& op : t->order) {
+                if (!op.is_read) {
+                    const auto& w = t->writes[op.idx];
+                    own_store[w.key] = w.deleted ? ABSENT : std::optional<std::string>(w.value);
+                    continue;
+                }
+                const auto& r = t->reads[op.idx];
+                if (r.version_cts == UINT64_MAX)
+                    continue;   // read-your-writes overlay hit: tautological, not a snapshot claim
+                auto oit = own_store.find(r.key);
+                const std::optional<std::string>& exp =
+                    (oit != own_store.end()) ? oit->second
+                                             : (state.count(r.key) ? state[r.key] : ABSENT);
+                bool exp_found = exp.has_value();
+                if (exp_found != r.found || (exp_found && *exp != r.value))
+                    viol("snapshot-violation",
+                         "txn " + sid(*t) + " (snapshot " + std::to_string(t->snapshot) +
+                         ") read key '" + r.key + "': cts-order state says " +
+                         (exp_found ? "'" + *exp + "'" : "<absent>") + ", observed " +
+                         (r.found ? "'" + r.value + "'" : "<absent>") +
+                         " (version cts " + std::to_string(r.version_cts) + ")");
+                if (r.version_cts > t->snapshot)
+                    viol("future-version-read",
+                         "txn " + sid(*t) + " (snapshot " + std::to_string(t->snapshot) +
+                         ") observed version cts " + std::to_string(r.version_cts) +
+                         " on key '" + r.key + "'");
+                if (r.found && r.version_cts == 0)
+                    viol("malformed-record",
+                         "txn " + sid(*t) + " read key '" + r.key +
+                         "' found a value but the recorder saw version cts 0");
+            }
+        }
+    }
+
+    // (b) real-time order (with slack; see rt_slack_ns).
+    {
+        std::vector<const Txn*> ended;
+        for (const Txn* w : writers)
+            if (w->begin_ns && w->end_ns) ended.push_back(w);
+        std::sort(ended.begin(), ended.end(),
+                  [](const Txn* a, const Txn* b) { return a->end_ns < b->end_ns; });
+        std::vector<uint64_t> prefmax(ended.size(), 0);
+        for (size_t i = 0; i < ended.size(); ++i)
+            prefmax[i] = std::max(i ? prefmax[i - 1] : 0, ended[i]->commit_cts);
+        auto acked_before = [&](uint64_t begin_ns) -> uint64_t {
+            if (!begin_ns || ended.empty()) return 0;
+            size_t lo = 0, hi = ended.size();
+            while (lo < hi) {
+                size_t mid = (lo + hi) / 2;
+                if (ended[mid]->end_ns + rt_slack_ns < begin_ns) lo = mid + 1;
+                else hi = mid;
+            }
+            return lo ? prefmax[lo - 1] : 0;
+        };
+        for (const auto& t : txns) {
+            if (!t.begin_ns) continue;
+            uint64_t m = acked_before(t.begin_ns);
+            if (!m) continue;
+            if (t.is_write && t.committed && t.commit_cts && m >= t.commit_cts)
+                viol("realtime-inversion",
+                     "txn " + sid(t) + " (cts " + std::to_string(t.commit_cts) +
+                     ") began after a write at cts " + std::to_string(m) +
+                     " was acknowledged, yet orders at-or-before it — real-time order violated");
+            if (t.has_snapshot && t.snapshot != UINT64_MAX && m > t.snapshot)
+                viol("stale-start",
+                     "txn " + sid(t) + " (snapshot " + std::to_string(t.snapshot) +
+                     ") began after the write at cts " + std::to_string(m) +
+                     " was acknowledged, but its snapshot does not include it");
+        }
+    }
+    return v;
+}
+
+inline std::vector<std::string> split_tokens(const std::string& s, char sep) {
+    std::vector<std::string> out;
+    if (s.empty()) return out;
+    size_t i = 0;
+    while (true) {
+        size_t j = s.find(sep, i);
+        if (j == std::string::npos) { out.push_back(s.substr(i)); break; }
+        out.push_back(s.substr(i, j - i));
+        i = j + 1;
+    }
+    return out;
+}
+
+// Elle-style list-append checker (roadmap v27 M1, item 2). Workload
+// convention: every value is an append-only token list joined by `sep`;
+// an append transaction reads the current list and writes list+sep+token
+// with a GLOBALLY UNIQUE token, so the appended token is the LAST element
+// of the written value. Under that convention:
+//   * the canonical per-key token order is the appends' commit-cts order;
+//   * any observed list must equal the canonical prefix of appends with
+//     cts <= the observer's snapshot (catches lost updates and stale
+//     fabrications with an exact expected value);
+//   * observed lists must not repeat or invent tokens;
+//   * the precedence graph induced by the observations must be acyclic —
+//     this check is CTS-INDEPENDENT (the Elle part): it would catch an
+//     order anomaly even if the cts bookkeeping itself were the bug;
+//   * the committed appends must fold: each write extends the previous
+//     committed value by exactly its last token (write-side lost update).
+inline std::vector<Violation> check_list_append(const std::vector<Txn>& txns, char sep = '+') {
+    std::vector<Violation> v;
+    auto viol = [&](const char* kind, std::string d) {
+        v.push_back(Violation{kind, std::move(d)});
+    };
+    struct Append { uint64_t cts; std::string token; std::string value; const Txn* txn; };
+    std::map<std::string, std::vector<Append>> appends;
+    std::map<std::string, std::set<std::string>> known;
+    std::map<std::string, std::vector<std::pair<const Txn*, const ReadEv*>>> obs;
+    for (const auto& t : txns) {
+        if (t.is_write && t.committed && t.commit_cts) {
+            for (const auto& w : t.writes) {
+                if (w.deleted) continue;
+                auto toks = split_tokens(w.value, sep);
+                if (toks.empty()) continue;
+                appends[w.key].push_back(Append{t.commit_cts, toks.back(), w.value, &t});
+                known[w.key].insert(toks.begin(), toks.end());
+            }
+        }
+        for (const auto& r : t.reads) {
+            if (r.version_cts == UINT64_MAX) continue;   // read-your-writes: not committed state
+            if (!r.found) continue;                       // absence carries no list content
+            obs[r.key].emplace_back(&t, &r);
+        }
+    }
+    for (auto& [key, ap] : appends)
+        std::sort(ap.begin(), ap.end(),
+                  [](const Append& a, const Append& b) { return a.cts < b.cts; });
+
+    static const std::vector<Append> NO_APPENDS;
+    for (const auto& [key, ob] : obs) {
+        auto ait = appends.find(key);
+        const std::vector<Append>& ap = (ait == appends.end()) ? NO_APPENDS : ait->second;
+        auto kit = known.find(key);
+        for (const auto& [t, r] : ob) {
+            auto toks = split_tokens(r->value, sep);
+            std::set<std::string> uniq(toks.begin(), toks.end());
+            if (uniq.size() != toks.size())
+                viol("duplicate-token",
+                     "txn " + std::to_string(t->id) + " read key '" + key +
+                     "' with a repeated token: '" + r->value + "'");
+            if (kit != known.end())
+                for (const auto& tk : uniq)
+                    if (!kit->second.count(tk))
+                        viol("unknown-token",
+                             "txn " + std::to_string(t->id) + " observed token '" + tk +
+                             "' on key '" + key +
+                             "' that no committed append wrote (fabrication or aborted-write leak)");
+            if (!t->has_snapshot || t->snapshot == UINT64_MAX) continue;
+            std::vector<std::string> expect;
+            for (const auto& a : ap)
+                if (a.cts <= t->snapshot) expect.push_back(a.token);
+            if (toks == expect) continue;
+            bool missing = false;
+            for (const auto& e : expect)
+                if (!uniq.count(e)) { missing = true; break; }
+            std::string exp_s, got_s = r->value;
+            for (size_t i = 0; i < expect.size(); ++i) { if (i) exp_s += sep; exp_s += expect[i]; }
+            if (missing)
+                viol("lost-append",
+                     "txn " + std::to_string(t->id) + " (snapshot " + std::to_string(t->snapshot) +
+                     ") read key '" + key + "' as '" + got_s + "' but appends committed at cts <= snapshot require '" +
+                     exp_s + "' — an acknowledged append was lost");
+            else
+                viol("fractured-read",
+                     "txn " + std::to_string(t->id) + " (snapshot " + std::to_string(t->snapshot) +
+                     ") read key '" + key + "' as '" + got_s + "' but the appends' cts order requires '" +
+                     exp_s + "' — tokens present in the wrong order");
+        }
+    }
+
+    // Write-side fold: each committed append must extend the previous
+    // committed value by exactly its last token.
+    for (const auto& [key, ap] : appends) {
+        std::string fold;
+        for (const auto& a : ap) {
+            std::string expect = fold.empty() ? a.token : fold + sep + a.token;
+            if (a.value != expect)
+                viol("append-fold-mismatch",
+                     "committed write to '" + key + "' at cts " + std::to_string(a.cts) +
+                     " (txn " + std::to_string(a.txn->id) + ") wrote '" + a.value +
+                     "' but folding the prior committed appends requires '" + expect +
+                     "' — the writer did not extend the latest committed state (lost update at the write level)");
+            fold = expect;
+        }
+    }
+
+    // Cts-independent precedence-cycle check (Elle G-single flavor):
+    // adjacency edges from every observed list; a cycle means two reads
+    // disagree on the order of two appends — no total order exists.
+    for (const auto& [key, ob] : obs) {
+        std::map<std::string, std::set<std::string>> edges;
+        for (const auto& [t, r] : ob) {
+            auto toks = split_tokens(r->value, sep);
+            for (size_t i = 0; i + 1 < toks.size(); ++i)
+                edges[toks[i]].insert(toks[i + 1]);
+        }
+        struct Dfs {
+            const std::map<std::string, std::set<std::string>>& e;
+            std::map<std::string, int> color;   // 0/absent = unvisited, 1 = on stack, 2 = done
+            bool cycle = false;
+            std::string witness;
+            void go(const std::string& n) {
+                if (cycle) return;
+                color[n] = 1;
+                auto it = e.find(n);
+                if (it != e.end())
+                    for (const auto& m : it->second) {
+                        int c = color.count(m) ? color[m] : 0;
+                        if (c == 1) { cycle = true; witness = n + " -> " + m + " -> ... -> " + n; return; }
+                        if (c == 0) go(m);
+                    }
+                color[n] = 2;
+            }
+        } dfs{edges};
+        for (const auto& [n, _] : edges)
+            if (!(dfs.color.count(n) ? dfs.color[n] : 0)) dfs.go(n);
+        if (dfs.cycle)
+            viol("order-cycle",
+                 "observations of key '" + key +
+                 "' induce a precedence cycle (" + dfs.witness +
+                 ") — no total append order is consistent with the reads (fractured reads)");
+    }
+    return v;
+}
+
+}   // namespace lincheck
+
+// =====================================================================
+// v27 M1 test driver: proves the checker works before trusting it.
+//
+// Section 1 — SYNTHETIC battery: a hand-built clean history must pass
+//             with zero violations, and thirteen injected anomalies (one
+//             per violation kind, plus combinations) must each be flagged.
+//             Roadmap acceptance: "The checker must flag a deliberately
+//             injected anomaly in a synthetic history. A checker that has
+//             never failed is not a checker."
+// Section 2 — ENGINE workload: concurrent list-append transactions +
+//             readers against a real Database, recorded via txnrec; the
+//             checkers must report ZERO violations (with non-vacuity
+//             guards: the history must actually contain the workload).
+// Section 3 — ENGINE-history mutations: deliberate corruptions of the
+//             RECORDED history (dropped token, duplicated token, swapped
+//             commit cts across a real-time edge, future version cts)
+//             must be flagged — the checker bites engine-shaped data too.
+// =====================================================================
+static int run_lincheck_test() {
+    using namespace chronokv;
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) {
+            ++fails;
+            if (!detail.empty()) std::cout << "      (" << detail << ")\n";
+        }
+    };
+
+    // ---- Section 0: barrier regression — append-only open on an existing
+    // WAL must be able to commit. The publication barrier waits for the
+    // contiguous prefix to cover the commit's cts; an append-only open
+    // (recover_on_open=false, or direct engine construction over a
+    // non-empty wal_dir) never replays cts 1..N, so the prefix must be
+    // SEEDED to N at construction or the first commit waits forever on an
+    // untracked hole. Found by the full-suite verification of the barrier
+    // fix (the v20.1-#7 engine hung pre-fix). Runs on a worker with a hard
+    // timeout so a regression FAILS instead of wedging the suite.
+    {
+        const std::string wd = "/tmp/ckv_lincheck_appendonly";
+        std::filesystem::remove_all(wd);
+        {
+            Options ao;
+            ao.wal_dir = wd;
+            ao.durability = DurabilityMode::Group;
+            auto db = Database::open(ao);
+            db.put("x", "1");
+            db.close();
+        }
+        Options o2;
+        o2.wal_dir = wd;
+        o2.recover_on_open = false;      // append-only: clock seeded, no replay
+        o2.durability = DurabilityMode::Group;
+        // Heap + deliberate leak on the failure path: the worker below may
+        // be stuck INSIDE db2->put forever (that is the regression), so the
+        // Database must outlive this scope, and the signaling future must
+        // NOT be a std::async future — ~future() of std::async JOINS the
+        // task, which would re-create the very hang this test detects.
+        auto* db2 = new Database(Database::open(o2));
+        auto pr = std::make_shared<std::promise<Status>>();
+        auto fut = pr->get_future();
+        std::thread([db2, pr] { pr->set_value(db2->put("y", "2")); }).detach();
+        bool done = fut.wait_for(std::chrono::seconds(20)) == std::future_status::ready;
+        bool ok = done && fut.get() == Status::OK;
+        check("lincheck: append-only open commits under the publication barrier", ok,
+              done ? "put did not return Status::OK"
+                   : "commit HUNG: published prefix not seeded past the existing WAL");
+        if (done) {
+            db2->close();
+            delete db2;
+            std::filesystem::remove_all(wd);
+        }
+        // else: db2 and its directory are intentionally leaked — a hung
+        // worker still references both. The suite reports FAIL and moves on.
+    }
+
+    // ---- builders for synthetic histories ----
+    auto mkw = [](uint64_t id, uint64_t snap, uint64_t cts, uint64_t b, uint64_t e,
+                  std::vector<std::pair<std::string, std::string>> ws) {
+        lincheck::Txn t;
+        t.id = id; t.is_write = true; t.committed = true;
+        t.has_snapshot = true; t.snapshot = snap; t.commit_cts = cts;
+        t.begin_ns = b; t.end_ns = e;
+        for (auto& [k, val] : ws) {
+            t.order.push_back({false, t.writes.size()});
+            t.writes.push_back(lincheck::WriteEv{k, val, false});
+        }
+        return t;
+    };
+    auto mkr = [](uint64_t id, uint64_t snap, uint64_t b, uint64_t e,
+                  std::vector<std::tuple<std::string, bool, std::string, uint64_t>> rs) {
+        lincheck::Txn t;
+        t.id = id; t.is_write = false; t.committed = true;
+        t.has_snapshot = true; t.snapshot = snap; t.begin_ns = b; t.end_ns = e;
+        for (auto& [k, found, val, vcts] : rs) {
+            t.order.push_back({true, t.reads.size()});
+            t.reads.push_back(lincheck::ReadEv{k, found, val, vcts});
+        }
+        return t;
+    };
+    // Clean baseline (times in ns, microsecond scale so the 4us real-time
+    // slack is far below every interval gap):
+    //   W1@cts1 a=[t1] | W2@cts2 b=[u1] | W3@cts3 a=[t1,t2]
+    //   R4(snap2) a=[t1] b=[u1] | R5(snap1) a=[t1] b=absent | R6(snap3) a=[t1,t2] b=[u1]
+    auto base_hist = [&]() {
+        std::vector<lincheck::Txn> h;
+        h.push_back(mkw(1, 0, 1, 1000000, 2000000, {{"a", "t1"}}));
+        h.push_back(mkw(2, 1, 2, 3000000, 4000000, {{"b", "u1"}}));
+        h.push_back(mkw(3, 2, 3, 7000000, 8000000, {{"a", "t1+t2"}}));
+        h.push_back(mkr(4, 2, 5000000, 6000000,
+                        {{"a", true, "t1", 1}, {"b", true, "u1", 2}}));
+        h.push_back(mkr(5, 1, 2200000, 2800000,
+                        {{"a", true, "t1", 1}, {"b", false, "", 0}}));
+        h.push_back(mkr(6, 3, 9000000, 9500000,
+                        {{"a", true, "t1+t2", 3}, {"b", true, "u1", 2}}));
+        return h;
+    };
+    auto both = [](const std::vector<lincheck::Txn>& h) {
+        auto v = lincheck::check_cts_order(h);
+        auto w = lincheck::check_list_append(h);
+        v.insert(v.end(), w.begin(), w.end());
+        return v;
+    };
+
+    // ---- Section 1: clean baseline ----
+    {
+        auto h = base_hist();
+        auto v = both(h);
+        check("lincheck: synthetic clean history passes both checkers",
+              v.empty(), lincheck::describe(v));
+    }
+
+    // ---- Section 1: injected anomalies (each must be flagged) ----
+    struct Case { const char* name; const char* expect_kind; const char* absent_kind;
+                  std::function<void(std::vector<lincheck::Txn>&)> mutate; };
+    std::vector<Case> cases = {
+        {"snapshot reads a committed write it should not see", "snapshot-violation", "",
+         [](std::vector<lincheck::Txn>& h) {   // R4 misses b=u1 at snap 2
+             h[3].reads[1].found = false; h[3].reads[1].value = ""; h[3].reads[1].version_cts = 0;
+         }},
+        {"read observes a version newer than its snapshot", "future-version-read", "",
+         [](std::vector<lincheck::Txn>& h) {   // R5(snap1) sees b=u1@cts2
+             h[4].reads[1] = lincheck::ReadEv{"b", true, "u1", 2};
+         }},
+        {"write acknowledged before another began orders after it", "realtime-inversion", "",
+         [](std::vector<lincheck::Txn>& h) {   // W3 runs [0.5us,0.9us], before W1
+             h[2].begin_ns = 500000; h[2].end_ns = 900000;
+         }},
+        {"txn starts after an ack its snapshot does not include", "stale-start", "snapshot-violation",
+         [](std::vector<lincheck::Txn>& h) {   // R6 begins at 9us with snap 2 (W3 acked at 8us)
+             h[5].snapshot = 2;
+             h[5].reads[0] = lincheck::ReadEv{"a", true, "t1", 1};
+         }},
+        {"two committed writers claim the same cts", "duplicate-commit-cts", "",
+         [](std::vector<lincheck::Txn>& h) { h[2].commit_cts = 2; }},
+        {"commit cts at-or-before the txn's own snapshot", "commit-not-after-snapshot", "",
+         [](std::vector<lincheck::Txn>& h) { h[1].snapshot = 5; }},
+        {"observed list repeats a token", "duplicate-token", "",
+         [](std::vector<lincheck::Txn>& h) {
+             h[5].reads[0] = lincheck::ReadEv{"a", true, "t1+t1", 3};
+         }},
+        {"acknowledged append missing from a later read", "lost-append", "",
+         [](std::vector<lincheck::Txn>& h) {
+             h[5].reads[0] = lincheck::ReadEv{"a", true, "t1", 1};
+         }},
+        {"read returns a token no committed append wrote", "unknown-token", "",
+         [](std::vector<lincheck::Txn>& h) {
+             h[5].reads[0] = lincheck::ReadEv{"a", true, "t1+tX", 3};
+         }},
+        {"two reads disagree on append order (cycle)", "order-cycle", "",
+         [](std::vector<lincheck::Txn>& h) {
+             h[3].reads[0] = lincheck::ReadEv{"a", true, "t1+t2", 1};   // t1 before t2
+             h[5].reads[0] = lincheck::ReadEv{"a", true, "t2+t1", 3};   // t2 before t1
+         }},
+        {"read orders tokens against the cts order", "fractured-read", "",
+         [](std::vector<lincheck::Txn>& h) {
+             h[5].reads[0] = lincheck::ReadEv{"a", true, "t2+t1", 3};
+         }},
+        {"committed append does not extend the prior state", "append-fold-mismatch", "",
+         [](std::vector<lincheck::Txn>& h) { h[2].writes[0].value = "tX+t2"; }},
+        {"committed writer carries no cts", "commit-cts-missing", "",
+         [](std::vector<lincheck::Txn>& h) { h[1].commit_cts = 0; }},
+        {"aborted write's value leaks into a read", "unknown-token", "order-cycle",
+         [&](std::vector<lincheck::Txn>& h) {
+             lincheck::Txn w;
+             w.id = 7; w.is_write = true; w.committed = false; w.commit_cts = 0;
+             w.has_snapshot = true; w.snapshot = 3;
+             w.begin_ns = 10000000; w.end_ns = 11000000;
+             w.order.push_back({false, 0});
+             w.writes.push_back(lincheck::WriteEv{"a", "t1+t2+t7", false});
+             h.push_back(std::move(w));
+             h.push_back(mkr(8, 3, 12000000, 13000000,
+                             {{"a", true, "t1+t2+t7", 3}}));
+         }},
+    };
+    for (auto& c : cases) {
+        auto h = base_hist();
+        c.mutate(h);
+        auto v = both(h);
+        bool flagged = lincheck::has_kind(v, c.expect_kind);
+        bool clean_absent = true;
+        if (c.absent_kind[0]) clean_absent = !lincheck::has_kind(v, c.absent_kind);
+        std::string nm = std::string("lincheck: synthetic anomaly flagged — ") + c.name;
+        check(nm.c_str(), flagged && clean_absent,
+              flagged ? (std::string("unexpected extra kind ") + c.absent_kind)
+                      : ("expected kind not flagged; got: " + (v.empty() ? "<none>" : lincheck::describe(v))));
+    }
+
+    // ---- Section 2: real engine workload ----
+    std::vector<lincheck::Txn> hist;
+    size_t n_readers = 0, n_writers = 0;
+    {
+        const std::string wd = "/tmp/ckv_lincheck_wal";
+        std::filesystem::remove_all(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.durability = DurabilityMode::Group;
+        o.page_pool_bytes = 32ULL * 1024 * 1024;
+        auto db = Database::open(o);
+        constexpr int NT = 4, NKEYS = 5, OPS = 140;
+        std::atomic<uint64_t> committed_appends{0};
+        txnrec::arm();
+        std::vector<std::thread> ths;
+        for (int t = 0; t < NT; ++t) ths.emplace_back([&, t] {
+            uint64_t s = 0xC0FFEE11ULL + static_cast<uint64_t>(t) * 7919;
+            auto lcg = [&] { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return s >> 33; };
+            for (int i = 0; i < OPS; ++i) {
+                uint64_t r = lcg();
+                std::string key = "L" + std::to_string(r % NKEYS);
+                if ((r >> 8) % 10 < 6) {
+                    // append transaction: read list, extend with a unique
+                    // token, commit; retry on SSI conflict. Tokens embed
+                    // (thread, op, attempt) so even aborted attempts can
+                    // never collide with committed ones — an aborted token
+                    // showing up in a read is fabrication, and the checker
+                    // reads it exactly that way (unknown-token).
+                    for (int att = 0; att < 25; ++att) {
+                        std::string tok = "t" + std::to_string(t) + "_" +
+                                          std::to_string(i) + "_" + std::to_string(att);
+                        auto txn = db.begin();
+                        auto cur = txn.get(key);
+                        std::string old = cur.value_or("");
+                        txn.put(key, old.empty() ? tok : old + "+" + tok);
+                        if (txn.commit() == Status::OK) {
+                            committed_appends.fetch_add(1, std::memory_order_relaxed);
+                            break;
+                        }
+                    }
+                } else {
+                    // snapshot read transaction over two keys
+                    std::string k2 = "L" + std::to_string((r >> 16) % NKEYS);
+                    auto txn = db.begin();
+                    (void)txn.get(key);
+                    (void)txn.get(k2);
+                    (void)txn.commit();
+                }
+            }
+        });
+        for (auto& th : ths) th.join();
+        // Quiesced full reads — the lost-append detectors of the workload.
+        for (int k = 0; k < NKEYS; ++k) (void)db.get("L" + std::to_string(k));
+        auto recs = txnrec::disarm();
+        db.close();
+        std::filesystem::remove_all(wd);
+        hist = lincheck::from_txnrec(recs);
+        for (const auto& t : hist) {
+            if (t.is_write && t.committed) n_writers++;
+            if (!t.reads.empty()) n_readers++;
+        }
+        auto v = both(hist);
+        bool nonvacuous = hist.size() >= 100 && n_writers >= 5 && n_readers >= 10 &&
+                          committed_appends.load() >= 5;
+        check("lincheck: engine list-append workload is strictly serializable",
+              v.empty() && nonvacuous,
+              v.empty() ? ("history too small: txns=" + std::to_string(hist.size()) +
+                           " writers=" + std::to_string(n_writers) +
+                           " readers=" + std::to_string(n_readers))
+                        : lincheck::describe(v, 4));
+        std::cout << "      (history: " << hist.size() << " txns, " << n_writers
+                  << " committed writers, " << n_readers << " readers, "
+                  << committed_appends.load() << " committed appends)\n";
+    }
+
+    // ---- Section 3: mutations of the RECORDED engine history ----
+    auto find_final_read = [&](const char* key) -> std::pair<size_t, size_t> {
+        // last found read of `key` whose list has >= 2 tokens (a quiesced final read)
+        for (size_t i = hist.size(); i-- > 0;) {
+            for (size_t j = hist[i].reads.size(); j-- > 0;) {
+                const auto& r = hist[i].reads[j];
+                if (r.key == key && r.found && r.value.find('+') != std::string::npos &&
+                    r.version_cts != UINT64_MAX)
+                    return {i, j};
+            }
+        }
+        return {SIZE_MAX, SIZE_MAX};
+    };
+    {
+        auto [ti, ri] = find_final_read("L0");
+        bool ok = ti != SIZE_MAX;
+        if (ok) {
+            auto h = hist;
+            auto& r = h[ti].reads[ri];
+            r.value = r.value.substr(0, r.value.rfind('+'));   // drop the last committed token
+            auto v = lincheck::check_list_append(h);
+            auto w = lincheck::check_cts_order(h);
+            v.insert(v.end(), w.begin(), w.end());
+            ok = lincheck::has_kind(v, "lost-append");
+            check("lincheck: engine-history mutation flagged — dropped acknowledged token",
+                  ok, lincheck::describe(v, 2));
+        } else {
+            check("lincheck: engine-history mutation flagged — dropped acknowledged token",
+                  false, "no multi-token final read of L0 recorded");
+        }
+    }
+    {
+        auto [ti, ri] = find_final_read("L0");
+        bool ok = ti != SIZE_MAX;
+        if (ok) {
+            auto h = hist;
+            auto& r = h[ti].reads[ri];
+            r.value = r.value.substr(0, r.value.find('+')) + "+" + r.value;  // duplicate first token
+            auto v = lincheck::check_list_append(h);
+            ok = lincheck::has_kind(v, "duplicate-token");
+            check("lincheck: engine-history mutation flagged — duplicated token in a read",
+                  ok, lincheck::describe(v, 2));
+        } else {
+            check("lincheck: engine-history mutation flagged — duplicated token in a read",
+                  false, "no multi-token final read of L0 recorded");
+        }
+    }
+    {
+        // swap commit cts across a real-time edge: find committed writers
+        // A, B with A fully acknowledged before B began; after the swap B
+        // orders before an already-acknowledged A -> realtime-inversion.
+        std::vector<const lincheck::Txn*> ws;
+        for (const auto& t : hist)
+            if (t.is_write && t.committed && t.commit_cts && t.begin_ns && t.end_ns)
+                ws.push_back(&t);
+        std::sort(ws.begin(), ws.end(),
+                  [](const lincheck::Txn* a, const lincheck::Txn* b) { return a->end_ns < b->end_ns; });
+        size_t ai = SIZE_MAX, bi = SIZE_MAX;
+        for (size_t i = 0; i < ws.size() && ai == SIZE_MAX; ++i)
+            for (size_t j = ws.size(); j-- > i + 1;)
+                if (ws[i]->end_ns + 100000 < ws[j]->begin_ns) { ai = i; bi = j; break; }
+        bool ok = ai != SIZE_MAX;
+        if (ok) {
+            auto h = hist;
+            // map ids -> indices in the copy
+            auto find_by_id = [&](uint64_t id) -> size_t {
+                for (size_t i = 0; i < h.size(); ++i) if (h[i].id == id) return i;
+                return SIZE_MAX;
+            };
+            size_t x = find_by_id(ws[ai]->id), y = find_by_id(ws[bi]->id);
+            std::swap(h[x].commit_cts, h[y].commit_cts);
+            auto v = lincheck::check_cts_order(h);
+            ok = lincheck::has_kind(v, "realtime-inversion");
+            check("lincheck: engine-history mutation flagged — cts swap across a real-time edge",
+                  ok, lincheck::describe(v, 2));
+        } else {
+            check("lincheck: engine-history mutation flagged — cts swap across a real-time edge",
+                  false, "no disjoint-interval writer pair found in the recorded history");
+        }
+    }
+    {
+        // push an observed version cts past the reader's snapshot
+        bool done = false, ok = false;
+        auto h = hist;
+        for (auto& t : h) {
+            if (!t.has_snapshot || t.snapshot == UINT64_MAX) continue;
+            for (auto& r : t.reads) {
+                if (r.found && r.version_cts > 0 && r.version_cts != UINT64_MAX &&
+                    r.version_cts <= t.snapshot) {
+                    r.version_cts = t.snapshot + 1;
+                    done = true;
+                    break;
+                }
+            }
+            if (done) break;
+        }
+        if (done) {
+            auto v = lincheck::check_cts_order(h);
+            ok = lincheck::has_kind(v, "future-version-read");
+        }
+        check("lincheck: engine-history mutation flagged — version cts beyond snapshot",
+              ok, done ? "" : "no suitable read found in the recorded history");
+    }
+
+    if (fails == 0) std::cout << "   LINCHECK TEST PASSED\n";
     return fails;
 }
 

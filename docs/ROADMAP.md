@@ -15,7 +15,9 @@ Progress:
 | v26 M3 — online backup API (invariant B1) | **DONE** | see below, `0.25.7` |
 | v25.8 — adversarial-review response: **rank-1** close()-race (plain-bool `closed_` + engine TOCTOU; v25.7's close-safety claim was false for concurrent *creation*), **rank-2** bk_* points folded into crashpt::kAll + fuzz plan grammar, **rank-3** compound fault×crash-point plans; plus a PRE-EXISTING checkpoint re-emission defect the matrix found on its first run | **DONE** | see below, `0.25.8` |
 | v26 M4 — point-in-time restore | **DONE** | see below, `0.25.8` |
-| v27–v30 | not started | — |
+| v26.1 — adversarial review of `929cb00`: **rank-1** PITR mid-window `as_of` silently loses acknowledged commits (whole-delta skip × post-checkpoint WAL rotation) — fixed with per-entry delta filtering + loud failure on unprovable partial windows + in-suite detectors matching the reviewer's positive control; review hygiene notes (`restore_pitr` engine access, stale `bk_*`-not-in-`kAll` comments) | **DONE** | see below, `0.26.1` |
+| v27 M1 — history → strict-serializability checker: **START SHIPPED** — `txnrec::` structured recorder (runtime-armed, hooks builds) + `lincheck::` checker (cts-total-order snapshot verification, real-time order, Elle-style list-append: duplicates / fabrication / lost appends / order cycles / write-fold) + 15-case synthetic anomaly battery + engine workload with mutation battery. The checker found a LIVE anomaly on its first engine run (publication-prefix lag: acknowledged writes invisible to later snapshots while a lower cts is in flight — 109–163 instances per 4-thread run); fixed in the same release via a commit-ack publication barrier + burn-on-throw on the install tail | **IN PROGRESS** | see below, `0.26.1` |
+| v27 M0 / M2 / M3, v28–v30 | not started | — |
 
 > **v25.7 note (the load-bearing constraint, re-confirmed).** H1 and H2 were
 > found by an outside reviewer *reading code and writing three-line repros* —
@@ -83,7 +85,7 @@ v30 ergonomics (any time) ┘                        └─> v29 page reclamatio
 
 # v26 — Durability correctness + online backup
 
-**Status:** M0 **DONE** (`3509586`, `0.25.4`) · M1 **DONE** (`f73d7f6`, `0.25.5`) · M2 **DONE** (`b793486`, `0.25.6`) · M3 **DONE** (`0.25.7`, see below). M4 (stretch, PITR) not started.
+**Status:** M0 **DONE** (`3509586`, `0.25.4`) · M1 **DONE** (`f73d7f6`, `0.25.5`) · M2 **DONE** (`b793486`, `0.25.6`) · M3 **DONE** (`0.25.7`, see below) · M4 **DONE** (`0.25.8`, see below). Post-arc patch `0.26.1`: the adversarial review of `929cb00` found one HIGH correctness defect in M4's PITR (mid-window `as_of` × WAL rotation ⇒ silent loss of acknowledged commits); fixed with per-entry delta filtering, a loud failure for unprovable partial windows, published-watermark coverage of delta-only versions, and in-suite detectors (the reviewer's positive control now passes and was verified to fail pre-fix). See chronokv.hpp's v26.1 header block and README "Safety properties".
 
 Theme: the durability path has a confirmed live defect, and the backup API is cheap
 because both hard primitives already exist. Small, coherent, ships fast.
@@ -518,6 +520,72 @@ both, deterministically, within a bounded seed count. Then run N=100k seeds in C
 **Acceptance.** The checker must flag a deliberately injected anomaly (e.g. a snapshot
 violation, a lost update) in a synthetic history. A checker that has never failed is not
 a checker.
+
+> ### What shipped at 0.26.1 (M1 START)
+>
+> **Recorder — `txnrec::` (chronokv.hpp, `CHRONOKV_TEST_HOOKS`, runtime-armed).**
+> `history::` is a human-readable text dump behind a compile flag no CI build
+> sets. `txnrec` is the machine-readable feed: structured per-op records
+> (snapshot cts, observed version cts, assigned commit cts, committed flag,
+> written value, steady-ns real-time interval) stamped at the OUTERMOST public
+> wrappers (`Database::get/put/erase/begin`, `Transaction::get/put/erase/commit/abort`)
+> so recorded intervals over-approximate true call intervals — the sound
+> direction for real-time checks. Disarmed cost is one relaxed atomic load, so
+> it ships in every hooks build. Not recorded (documented): async/batch APIs,
+> range scans, engine-internal `ReadWriteTransaction` use.
+>
+> **Checker — `lincheck::` (main.cpp).** Exactly the plan's two items:
+> (1) cts-total-order verification — every read must equal the state produced
+> by replaying committed writes with `cts <= snapshot` in cts order
+> (read-your-writes overlay included), no read may observe a version newer
+> than its snapshot, committed writers must have unique cts above their own
+> snapshot, and real-time edges (ack-before-begin, with a 4 µs slack absorbing
+> in-library timestamping error) must respect cts order and snapshot freshness;
+> (2) Elle-style list-append analysis — per-key duplicate/fabricated-token
+> detection, canonical-prefix checks against append cts (lost updates),
+> a cts-INDEPENDENT precedence-cycle check (fractured reads), and a
+> committed-write fold check (each append must extend the prior committed
+> value by exactly its last token). No search is needed: cts is total, per the
+> plan's own argument.
+>
+> **Acceptance met:** `run_lincheck_test()` fires all thirteen synthetic
+> anomaly kinds (each asserted flagged, clean baseline asserted silent), runs
+> a 4-thread list-append + reader engine workload (≈650 txns) with ZERO
+> violations, and re-flags four deliberate mutations of the RECORDED engine
+> history (dropped token, duplicated token, cts swap across a real-time edge,
+> version cts beyond snapshot).
+>
+> **First live catch (and fix): the publication-prefix lag.** On its first
+> engine run the checker reported 109–163 `stale-start` violations: cts is
+> reserved in push order under `batch_mu_`, but `pub_.complete(cts)` runs
+> per-thread AFTER the shared WAL pass, so completion order can invert
+> reservation order; `published_` is a contiguous prefix, so an acknowledged
+> write could sit above an in-flight lower cts — and a reader beginning after
+> the ack would snapshot below it. Real-time order violation (SSI does not
+> promise read freshness; the roadmap's M1 target model — strict
+> serializability — does). Fix shipped in the same release: `commit_txn`
+> awaits `published >= cts` before acknowledging (bounded wait: every lower
+> cts is already past its WAL I/O), and the install tail burns the cts on
+> throw (previously a `link_version`/dirty-map throw stalled the prefix
+> forever — silent permanent staleness; with the barrier it would have been a
+> hang). Positive control verified: removing the one barrier line reproduces
+> the failures (163 violations); with it, zero.
+>
+> The full-suite verification of the barrier then found the seeding hole:
+> append-only opens (`recover_on_open=false`, and direct engine construction
+> over a non-empty `wal_dir`) seed `clock_` from the WAL (v24 Fix 5) but did
+> not seed `published_`, so the first commit's barrier awaited cts 1..N that
+> this instance will never complete or burn — a hang (the v20.1-#7 test
+> wedged the suite). Fixed by seeding the published prefix alongside the
+> clock (`recover_with_checkpoint` still overwrites it with the exact
+> contiguous value — possibly lower — on any full recovery); ships with a
+> hard-timeout regression test on a worker thread (verified FAIL pre-fix,
+> no wedge: the timeout turns the hang into a report).
+>
+> **Remaining M1 work:** a set-checker shape for adversarial workloads (the
+> list-append checker covers order/loss/duplication; set semantics add
+> read-back-set workloads), range-scan modeling in the recorder, async/batch
+> recording, and N-seed scaling of the engine workload (feeds M2's CI job).
 
 ## M2 — CI integration  **[S]**
 
