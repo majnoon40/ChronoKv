@@ -1679,11 +1679,21 @@ static int run_review_regression_tests();   // defined above main()
 static int run_v26_durability_tests();      // defined above main()
 #ifdef CHRONOKV_FAULT_INJECTION
 static int run_crash_fuzz();                // defined above main()
-// v27 M3 (0.27.0 hardening): libgcov's manual flush, WEAK so non-coverage
-// builds still link (the symbol only exists under --coverage; the handlers
-// below null-check it). Lets a coverage run save its counters even when
-// the suite dies under global fault forcing.
+// v27 M3 (0.27.0 hardening II): libgcov's manual flush, so a coverage run
+// saves its counters even when the suite dies under global fault forcing.
+// COVERAGE builds take the STRONG reference: a weak undefined symbol does
+// NOT pull its member out of a static archive (libgcov.a), so the weak
+// form silently binds to null under --coverage and dumps nothing — the
+// exact failure dispatch run #21 showed (six kinds died by signal, no
+// .gcda, "no gcov data"). Non-coverage builds keep the weak+null-checked
+// form so the handlers still compile and no-op.
+#ifdef CKV_COVERAGE_BUILD
+extern "C" void __gcov_dump(void);
+#define CKV_GCOV_DUMP() __gcov_dump()
+#else
 extern "C" { __attribute__((weak)) void __gcov_dump(void); }
+#define CKV_GCOV_DUMP() do { if (__gcov_dump != nullptr) __gcov_dump(); } while (0)
+#endif
 #endif
 #endif
 
@@ -1766,7 +1776,7 @@ return 0;
         // null and the dump is skipped (the terminate hook still normalizes
         // the exit, which is what makes forced runs gradeable).
         std::set_terminate([] {
-            if (__gcov_dump != nullptr) __gcov_dump();
+            CKV_GCOV_DUMP();
             fprintf(stderr, "coverage-run: terminate under forcing — gcov "
                             "counters dumped; coverage for this kind is "
                             "PARTIAL (up to the escape point)\n");
@@ -1775,7 +1785,11 @@ return 0;
         });
         struct CovSig {
             static void handle(int sig) {
-                if (__gcov_dump != nullptr) __gcov_dump();
+                CKV_GCOV_DUMP();
+                fprintf(stderr, "coverage-run: signal %d under forcing — gcov "
+                                "counters dumped; coverage for this kind is "
+                                "PARTIAL (up to the crash point)\n", sig);
+                fflush(stderr);
                 signal(sig, SIG_DFL);
                 raise(sig);
             }

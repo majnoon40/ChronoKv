@@ -64,7 +64,9 @@ TSAN_FLAGS    = -O1 -g -fsanitize=thread \
 # it keeps the build inside a 1 GiB container's RSS (with -g, cc1plus is
 # OOM-killed there; runners would not care, but local verification must
 # run the exact CI flags).
-COVERAGE_FLAGS = -O0 --coverage
+# CKV_COVERAGE_BUILD switches the __gcov_dump reference STRONG (a weak
+# undefined symbol does not pull its member out of libgcov.a — run #21).
+COVERAGE_FLAGS = -O0 --coverage -DCKV_COVERAGE_BUILD=1
 STRESS_FLAGS  = -O2 -g -DCHRONOKV_STRESS
 
 BIN_DIR = build

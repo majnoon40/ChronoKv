@@ -785,21 +785,29 @@ is an untested line, and that is exactly where the last four bugs were.
 > limit (~1 GB VA) — the CI run on the 0.27.0 push is its proof, same
 > policy as ASan/-O2 builds.
 >
-> **Nightly-vehicle finding (dispatch run #20, fixed same-day, no bump):**
-> the FULL suite under global forcing dies early for five of the eight
-> kinds (std::terminate from escaping async `fut.get()` rethrows and stoi
-> cascades — the suite was never designed to survive every fault being on
-> at once), and a dead process flushed no `.gcda`, failing the job. Fix:
-> death hooks — weak `__gcov_dump` in `std::set_terminate` (then `_exit(70)`)
-> and in SIGSEGV/BUS/FPE/ILL handlers (dump, restore `SIG_DFL`, re-raise) —
-> so forced death is DATA-PRESERVING; crash-fuzz semantics untouched
-> (`crashpt::point` kills via `_exit(97)`, never a catchable signal).
-> Affected kinds now report honest PARTIAL coverage (warning + shallow
-> table rows); WriteFail/WriteShort survive the full suite and get full
-> depth. **Follow-up (M3-adjacent hygiene): harden the suite's escape
-> points** — catch at the async `get()` sites and the stoi parsers — so
-> all eight kinds run full-suite-deep; each fixed escape point deepens
-> five kinds' coverage at once.
+> **Nightly-vehicle findings (dispatch runs #20/#21, fixed same-day, no
+> bump):** the FULL suite under global forcing dies within seconds for six
+> of the eight kinds (std::terminate from escaping async `fut.get()`
+> rethrows and stoi cascades, plus signal deaths — the suite was never
+> designed to survive every fault being on at once), and a dead process
+> flushed no `.gcda`, failing the job. Run #21 then exposed a subtle
+> linker trap in the first fix: a WEAK undefined `__gcov_dump` reference
+> does not pull its member out of static `libgcov.a` — the "dump" silently
+> bound to null. Final design: (1) death hooks with a STRONG dump
+> reference under `-DCKV_COVERAGE_BUILD=1` (weak+null-checked elsewhere)
+> in `std::set_terminate` (log, `_exit(70)`) and SIGSEGV/BUS/FPE/ILL
+> handlers (log, dump, restore `SIG_DFL`, re-raise) — forced death is
+> DATA-PRESERVING; crash-fuzz semantics untouched (`crashpt::point` kills
+> via `_exit(97)`, never a catchable signal); (2) the nightly vehicle is
+> TWO-STAGE per kind — review gate first (proven to survive all eight
+> kinds), then the best-effort full suite — libgcov merges both into one
+> `.gcda`, so every kind keeps at least gate depth and gains full-suite
+> depth wherever it survives; (3) the analyze gate warns per kind and
+> hard-fails only when NO kind produced data. **Follow-up (M3-adjacent
+> hygiene): harden the suite's escape points** — catch at the async
+> `get()` sites and the stoi parsers — so all eight kinds run
+> full-suite-deep; each fixed escape point deepens six kinds' coverage at
+> once.
 >
 > **Next consumers of this signal:** the ledger should be triaged into
 > new fault kinds/tests where gaps are real (candidate v28 M-adjacent
