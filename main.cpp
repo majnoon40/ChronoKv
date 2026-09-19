@@ -1144,16 +1144,31 @@ static int run_crash_fuzz() {
         if (!ok) { fails++; if (!fr.empty()) std::cout << "    (" << fr << ")\n"; }
     };
 
-    // Rounds per crash point. Total iterations = rounds * kAllCount (20).
-    // The default keeps the always-run suite fast (~10s); round 0 of every
-    // point uses occurrence 0, so full coverage of all 20 boundaries is
-    // guaranteed even at rounds=1. Raise CKV_CRASHFUZZ_ROUNDS for a long
-    // nightly run -- 40 gives 800 iterations, 500 gives 10k (the figure the
-    // v26 plan targeted for CI) at roughly 7 minutes on a 2-CPU box at -O0.
+    // Rounds per crash point per seed base. Total iterations =
+    // seeds * rounds * kAllCount (26 points since v25.8 folded in the six
+    // bk_*; the "(20)" that stood here was stale). The default keeps the
+    // always-run suite fast (~10s); round 0 of every point uses occurrence
+    // 0, so full coverage of all 26 boundaries is guaranteed even at
+    // rounds=1. Raise CKV_CRASHFUZZ_ROUNDS for a long run -- 40 gives 1040
+    // iterations per seed, 500 gives 13k. Measured at -O0 on a 2-CPU
+    // container: ~380 plans/s (25k plans ≈ 65 s), dominated by the
+    // fork+recovery of compound checkpoint/backup plans.
+    // v27 M2: CKV_CRASHFUZZ_SEEDS=N sweeps N seed bases (stepped by the
+    // golden-ratio prime from CKV_CRASHFUZZ_SEED, default 0xC0FFEE), each
+    // base getting a full rounds*kAllCount plan stream. This is the "N
+    // seeds" scaling the dedicated CI crashfuzz job drives: bounded on PR
+    // runs, long on the nightly schedule. Stats aggregate across bases;
+    // every base is echoed to the log so a failing stream replays from
+    // (seed, rounds) alone — the v27 reproducibility contract.
     int rounds = 12;
     if (const char* e = getenv("CKV_CRASHFUZZ_ROUNDS")) {
         int v = atoi(e);
         if (v > 0) rounds = v;
+    }
+    int nseeds = 1;
+    if (const char* e = getenv("CKV_CRASHFUZZ_SEEDS")) {
+        int v = atoi(e);
+        if (v > 0) nseeds = v;
     }
 
     const size_t npts = crashpt::kAllCount;
@@ -1165,11 +1180,24 @@ static int run_crash_fuzz() {
 
     uint64_t seed_base = 0xC0FFEEULL;
     if (const char* e = getenv("CKV_CRASHFUZZ_SEED")) seed_base = strtoull(e, nullptr, 10);
+    std::cout << "    (crashfuzz config: seed_base=" << seed_base << " seeds=" << nseeds
+              << " rounds=" << rounds << " points=" << npts << " plans="
+              << ((size_t)nseeds * (size_t)rounds * npts) << ")\n";
 
-    for (size_t pi = 0; pi < npts; ++pi) {
+    // Flat (seed-base, point) sweep — base-major, so each base runs its own
+    // complete rounds*kAllCount stream. Kept flat rather than nesting a new
+    // loop around this ~190-line body so the diff stays reviewable; the
+    // per-base seed folds into the existing (pi, r) seed formula.
+    for (size_t idx = 0; idx < npts * (size_t)nseeds; ++idx) {
+        const int sb = (int)(idx / npts);
+        const size_t pi = idx % npts;
+        const uint64_t eff_base = seed_base + (uint64_t)sb * 0x9E3779B97F4A7C15ULL;
+        if (pi == 0 && nseeds > 1)
+            std::cout << "    (seed base " << (sb + 1) << "/" << nseeds << ": "
+                      << eff_base << ")\n";
         const char* point = crashpt::kAll[pi];
         for (int r = 0; r < rounds; ++r) {
-            uint64_t seed = seed_base + pi * 1000003ULL + (uint64_t)r * 7919ULL;
+            uint64_t seed = eff_base + pi * 1000003ULL + (uint64_t)r * 7919ULL;
             crashfuzz::Plan plan = crashfuzz::make_plan(seed);
             // Reachability: force the plan regimes the TARGET point needs, so
             // coverage does not depend on the seeded plan happening to rotate
@@ -1333,7 +1361,7 @@ static int run_crash_fuzz() {
         }
     }
 
-    const int total_iters = (int)(npts * (size_t)rounds);
+    const int total_iters = (int)(npts * (size_t)rounds * (size_t)nseeds);
     int total_hits = 0;
     std::vector<std::string> never_hit;
     for (size_t i = 0; i < npts; ++i) {
@@ -1659,6 +1687,27 @@ int main() {
 return 0;
 #endif
 
+#ifdef CHRONOKV_STRESS
+    // v27 M2: the stress seed is overridable — the CI dst job scales
+    // interleaving seeds (CKV_STRESS_SEED=<n>, decimal or 0x-hex) without a
+    // rebuild, and the effective seed is ECHOED so any stress run is
+    // replayable from its log alone (the v27 reproducibility contract;
+    // the seed used to be a silent hardcoded 0x5EED). Parsed before the
+    // CKV_ONLY_* gates so gated runs are seedable too, and outside the
+    // hooks-on section so the hooks-off stress smoke build echoes it as
+    // well. Default is unchanged (0x5EED).
+    {
+        uint64_t sseed = 0x5EED;
+        if (const char* e = getenv("CKV_STRESS_SEED")) {
+            uint64_t v = strtoull(e, nullptr, 0);
+            if (v) sseed = v;
+        }
+        stress::set_seed(sseed);
+        std::cout << "stress seed: " << sseed << " (0x" << std::hex << sseed
+                  << std::dec << ")" << std::endl;
+    }
+#endif
+
 #ifdef CHRONOKV_TEST_HOOKS
     // First step toward test selection (review M4): the suite is one long
     // main() with no way to run a subset, which makes triaging a hang or a
@@ -1694,14 +1743,28 @@ return 0;
         return f == 0 ? 0 : 1;
     }
 
+    // v27 M2: CKV_ONLY_CRASHFUZZ=1 runs just the crash-fuzz regime — the
+    // dedicated CI crashfuzz job drives this gate with
+    // CKV_CRASHFUZZ_{SEED,SEEDS,ROUNDS} (bounded PR / long nightly) so seed
+    // scaling lives outside the full-suite and sanitizer jobs, where
+    // fork+recovery costs far more. Same anti-vacuity and no-loss/no-
+    // resurrection assertions as the in-suite run.
+#ifdef CHRONOKV_FAULT_INJECTION
+    if (getenv("CKV_ONLY_CRASHFUZZ")) {
+        crc_init();
+        int f = run_crash_fuzz();
+        std::cout.flush();
+        return f == 0 ? 0 : 1;
+    }
+#endif
+
     // v25.2: TSan runs the FULL suite as a single step (the former
     // CHRONOKV_TSAN_BATCH 1/2/3 split was a workaround for tiny dev VMs;
     // CI runners complete the whole suite comfortably within one job).
     // ----- hooks-on: full internal test suite -----
     crc_init();
-#ifdef CHRONOKV_STRESS
-    stress::set_seed(0x5EED);  // deterministic stress seed for this run
-#endif
+    // (v27 M2: the stress seed is parsed and echoed at the TOP of main(),
+    // before the CKV_ONLY_* gates — see CKV_STRESS_SEED there.)
     int fails = 0;
 
     auto report = [&](const char* n, bool ok) {
@@ -10325,10 +10388,38 @@ static int run_lincheck_test() {
                       : ("expected kind not flagged; got: " + (v.empty() ? "<none>" : lincheck::describe(v))));
     }
 
-    // ---- Section 2: real engine workload ----
+    // ---- Section 2: real engine workload (v27 M2: N-seed scaling) ----
+    // CKV_LINCHECK_SEEDS=N sweeps the workload's PRNG base (default: ONE
+    // run at the historical 0xC0FFEE11 base, so the always-run suite is
+    // unchanged); CKV_LINCHECK_SEED overrides the base. This is the M1
+    // leftover "N-seed scaling of the engine workload (feeds M2's CI
+    // job)": the CI dst job runs a bounded (PR) / long (nightly) sweep.
+    // Every seed's history must independently pass both checkers AND be
+    // non-vacuous; Section 3's mutations run against the last seed's
+    // history (any non-vacuous history exercises the same detector paths).
+    int lc_seeds = 1;
+    if (const char* e = getenv("CKV_LINCHECK_SEEDS")) {
+        int v = atoi(e);
+        if (v > 0) lc_seeds = v;
+    }
+    uint64_t lc_seed_base = 0xC0FFEE11ULL;
+    if (const char* e = getenv("CKV_LINCHECK_SEED")) {
+        uint64_t v = strtoull(e, nullptr, 0);
+        if (v) lc_seed_base = v;
+    }
     std::vector<lincheck::Txn> hist;
     size_t n_readers = 0, n_writers = 0;
-    {
+    for (int si = 0; si < lc_seeds; ++si) {
+        const uint64_t wseed = lc_seed_base + (uint64_t)si * 0x9E3779B97F4A7C15ULL;
+        std::string lbl;
+        if (lc_seeds > 1) {
+            char hb[32];
+            snprintf(hb, sizeof hb, "0x%llx", (unsigned long long)wseed);
+            lbl = std::string(" [seed ") + std::to_string(si + 1) + "/" +
+                  std::to_string(lc_seeds) + " " + hb + "]";
+        }
+        n_readers = 0;
+        n_writers = 0;
         const std::string wd = "/tmp/ckv_lincheck_wal";
         std::filesystem::remove_all(wd);
         Options o;
@@ -10341,7 +10432,7 @@ static int run_lincheck_test() {
         txnrec::arm();
         std::vector<std::thread> ths;
         for (int t = 0; t < NT; ++t) ths.emplace_back([&, t] {
-            uint64_t s = 0xC0FFEE11ULL + static_cast<uint64_t>(t) * 7919;
+            uint64_t s = wseed + static_cast<uint64_t>(t) * 7919;
             auto lcg = [&] { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return s >> 33; };
             for (int i = 0; i < OPS; ++i) {
                 uint64_t r = lcg();
@@ -10389,13 +10480,14 @@ static int run_lincheck_test() {
         auto v = both(hist);
         bool nonvacuous = hist.size() >= 100 && n_writers >= 5 && n_readers >= 10 &&
                           committed_appends.load() >= 5;
-        check("lincheck: engine list-append workload is strictly serializable",
+        check((std::string("lincheck: engine list-append workload is strictly serializable") +
+               lbl).c_str(),
               v.empty() && nonvacuous,
               v.empty() ? ("history too small: txns=" + std::to_string(hist.size()) +
                            " writers=" + std::to_string(n_writers) +
                            " readers=" + std::to_string(n_readers))
                         : lincheck::describe(v, 4));
-        std::cout << "      (history: " << hist.size() << " txns, " << n_writers
+        std::cout << "      (history" << lbl << ": " << hist.size() << " txns, " << n_writers
                   << " committed writers, " << n_readers << " readers, "
                   << committed_appends.load() << " committed appends)\n";
     }

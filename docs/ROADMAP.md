@@ -17,7 +17,8 @@ Progress:
 | v26 M4 — point-in-time restore | **DONE** | see below, `0.25.8` |
 | v26.1 — adversarial review of `929cb00`: **rank-1** PITR mid-window `as_of` silently loses acknowledged commits (whole-delta skip × post-checkpoint WAL rotation) — fixed with per-entry delta filtering + loud failure on unprovable partial windows + in-suite detectors matching the reviewer's positive control; review hygiene notes (`restore_pitr` engine access, stale `bk_*`-not-in-`kAll` comments) | **DONE** | see below, `0.26.1` |
 | v27 M1 — history → strict-serializability checker: **START SHIPPED** — `txnrec::` structured recorder (runtime-armed, hooks builds) + `lincheck::` checker (cts-total-order snapshot verification, real-time order, Elle-style list-append: duplicates / fabrication / lost appends / order cycles / write-fold) + 15-case synthetic anomaly battery + engine workload with mutation battery. The checker found a LIVE anomaly on its first engine run (publication-prefix lag: acknowledged writes invisible to later snapshots while a lower cts is in flight — 109–163 instances per 4-thread run); fixed in the same release via a commit-ack publication barrier + burn-on-throw on the install tail | **IN PROGRESS** | see below, `0.26.1` |
-| v27 M0 / M2 / M3, v28–v30 | not started | — |
+| v27 M2 — CI integration: dedicated `crashfuzz` (N seed bases via `CKV_CRASHFUZZ_SEEDS`, run-id-derived base echoed for deterministic replay) and `dst` (seeded-stress full suite × N interleaving seeds + lincheck engine workload × N seeds) jobs; bounded PR configs, long nightly schedule, both folded into `ci-passed`; the dst runner swaps to the M0 scheduler behind the same job name when M0 ships | **DONE** | see below, `0.26.2` |
+| v27 M0 / M3, v28–v30 | not started | — |
 
 > **v25.7 note (the load-bearing constraint, re-confirmed).** H1 and H2 were
 > found by an outside reviewer *reading code and writing three-line repros* —
@@ -584,13 +585,52 @@ a checker.
 >
 > **Remaining M1 work:** a set-checker shape for adversarial workloads (the
 > list-append checker covers order/loss/duplication; set semantics add
-> read-back-set workloads), range-scan modeling in the recorder, async/batch
-> recording, and N-seed scaling of the engine workload (feeds M2's CI job).
+> read-back-set workloads), range-scan modeling in the recorder, and
+> async/batch recording. (The fourth leftover — N-seed scaling of the
+> engine workload — shipped at 0.26.2 as `CKV_LINCHECK_SEEDS`, feeding the
+> M2 `dst` job.)
 
 ## M2 — CI integration  **[S]**
 
 New jobs: `dst` (N seeds) and `crashfuzz` (from v26 M2). Bounded runtime in PR CI, long
 runs nightly. Fold both into the existing `ci-passed` aggregate gate.
+
+> ### What shipped at 0.26.2 (M2)
+>
+> Both jobs exist, fold into `ci-passed`, and follow the bounded-PR /
+> long-nightly policy via a new nightly schedule (03:17 UTC; manual
+> dispatch also gets the long config, and the concurrency group changed so
+> a push can no longer cancel a nightly/dispatch run mid-flight).
+>
+> **`crashfuzz`** runs the v26 M2 regime alone behind a new
+> `CKV_ONLY_CRASHFUZZ` gate, and scales by SEEDS rather than rounds alone:
+> `CKV_CRASHFUZZ_SEEDS=N` sweeps N bases (golden-ratio-prime step from
+> `CKV_CRASHFUZZ_SEED`). PR: 2 bases × 24 rounds (1,248 plans); nightly:
+> 8 × 120 (24,960 plans). In CI the base derives from `github.run_id` —
+> every run explores fresh plan space — and the binary echoes the config
+> and every base, so a failure replays deterministically from the log
+> alone (`CKV_CRASHFUZZ_SEED/SEEDS/ROUNDS`). Preserved failure scenes
+> (`/tmp/ckv_cf_*`, first three violations) upload as artifacts.
+>
+> **`dst`** — with the honest caveat the plan implies: the M0 deterministic
+> scheduler has NOT shipped, so the job runs the two seeded regimes that
+> exist today under the reserved name, and the M0 harness swaps in later
+> without touching branch protection: (1) the FULL suite under
+> `CHRONOKV_STRESS` across N interleaving seeds — new `CKV_STRESS_SEED`
+> knob (was a silent hardcoded `0x5EED`), effective seed echoed by every
+> stress build, hooks-off smoke included (PR: seed 7; nightly: 7, 21, 42);
+> (2) the lincheck engine workload × N seeds — new
+> `CKV_LINCHECK_SEEDS`/`CKV_LINCHECK_SEED`, the M1 leftover "N-seed
+> scaling (feeds M2's CI job)" (PR: 4; nightly: 64); each seed's history
+> must independently pass both checkers and be non-vacuous.
+>
+> All knobs default to the prior behavior — same seeds, same plans, same
+> check names (the only default-run output delta is one echoed crashfuzz
+> config line) — so the always-run matrix is untouched. Note the gap vs
+> M0's acceptance ("find C1/H3 deterministically within a bounded seed
+> count"): until M0 ships, the `dst` job's seeds VARY interleavings
+> without making them replayable op-for-op. That is precisely what M0
+> exists to close, and v28 stays gated on M0 — not on this job.
 
 ## M3 — Coverage, aimed at error paths  **[S]**
 

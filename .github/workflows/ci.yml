@@ -16,6 +16,18 @@
 #   hooks-off: public-API smoke across release / asan / tsan / stress —
 #              proves the header works with no test hooks defined, i.e.
 #              how a real user consumes it.
+#   v27 M2:    two dedicated seeded jobs, bounded on push/PR and long on
+#              the nightly schedule / manual dispatch:
+#                - crashfuzz: just the v26 M2 crash-fuzz regime via the
+#                  CKV_ONLY_CRASHFUZZ gate, scaled by CKV_CRASHFUZZ_SEEDS
+#                  (N seed bases per run, base derived from the run id and
+#                  echoed to the log for deterministic replay).
+#                - dst: the seeded-concurrency battery — full suite under
+#                  CHRONOKV_STRESS across N interleaving seeds
+#                  (CKV_STRESS_SEED, echoed) plus the lincheck engine
+#                  workload at CKV_LINCHECK_SEEDS=N. Named per the roadmap;
+#                  when the v27 M0 deterministic scheduler ships it swaps
+#                  in behind this job so the gate contract stays put.
 #   gate:      ci-passed aggregates every job — a single required check
 #              for branch protection.
 #
@@ -32,14 +44,23 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  # v27 M2: nightly long-run config. schedule (and manual dispatch) scale
+  # the dst/crashfuzz jobs up; push/PR keep the bounded configs so the
+  # per-PR runtime stays where it was before this milestone.
+  schedule:
+    - cron: '17 3 * * *'
 
 # Least-privilege token: no job in this workflow needs write access.
 permissions:
   contents: read
 
+# v27 M2: push/PR runs share a per-ref group and supersede each other
+# (unchanged behavior), but nightly/dispatch runs get a run-scoped group
+# and are never cancelled — a push landing mid-nightly must not kill the
+# long seed sweep halfway through.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.ref }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || 'shared' }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 jobs:
   # ---- hooks-on: full internal test suite --------------------------------
@@ -56,9 +77,12 @@ jobs:
             target: release
             bin: build/release/test
             cxx: g++
-            # v26 M2: this job carries the heavy crash-fuzz run (800 iterations
-            # vs the in-suite default of 240). Kept to one job so the sanitizer
-            # and TSan jobs -- where fork+recovery costs far more -- stay fast.
+            # v26 M2: this job carries the heavy crash-fuzz run (40 rounds
+            # x 26 points = 1040 iterations vs the in-suite default of 312;
+            # the "800 vs 240" figures that stood here were stale pre-v25.8
+            # 20-point math). Kept to one job so the sanitizer and TSan
+            # jobs -- where fork+recovery costs far more -- stay fast.
+            # v27 M2: SEED scaling lives in the dedicated `crashfuzz` job.
             crashfuzz_rounds: 40
           - name: release (g++-14)
             os: ubuntu-24.04
@@ -196,10 +220,109 @@ jobs:
           path: test.log
           if-no-files-found: ignore
 
+  # ---- v27 M2: dedicated crash-fuzz job (N seeds) --------------------------
+  # Scales the v26 M2 crash-fuzz regime by SEEDS, independently of the
+  # full-suite jobs: push/PR run a bounded config (2 bases x 24 rounds x 26
+  # points = 1248 plans); the nightly schedule and manual dispatch run the
+  # long config (8 bases x 120 rounds = 24,960 plans). The base seed derives
+  # from github.run_id so every run explores fresh plan space, and the
+  # binary echoes the full config + every base to the log — a failing plan
+  # replays deterministically with CKV_CRASHFUZZ_SEED/SEEDS/ROUNDS from the
+  # log alone (the v27 reproducibility contract). Failure scenes the binary
+  # preserves under /tmp/ckv_cf_* are collected into the workspace and
+  # uploaded with the log.
+  crashfuzz:
+    name: crashfuzz (N seeds)
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'pull_request') && '30' || '150') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make release
+
+      - name: Run crash-fuzz (bounded PR / long nightly)
+        env:
+          CKV_ONLY_CRASHFUZZ: "1"
+          CKV_CRASHFUZZ_SEED: ${{ github.run_id }}
+          CKV_CRASHFUZZ_SEEDS: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '2' || '8' }}
+          CKV_CRASHFUZZ_ROUNDS: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '24' || '120' }}
+        run: |
+          set -o pipefail
+          ./build/release/test 2>&1 | tee crashfuzz.log
+
+      - name: Collect preserved crash scenes
+        if: failure()
+        run: mkdir -p scenes && cp -r /tmp/ckv_cf_* scenes/ 2>/dev/null || true
+
+      - name: Upload crash-fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crashfuzz-run-${{ github.run_id }}
+          path: |
+            crashfuzz.log
+            scenes/
+          if-no-files-found: ignore
+
+  # ---- v27 M2: dst job (N seeds) -------------------------------------------
+  # The roadmap names this job `dst`. Honest caveat: the deterministic
+  # scheduler is v27 M0 and has NOT shipped yet — until it does, this job
+  # runs the two seeded regimes that exist today, under the name the
+  # roadmap reserved so branch protection and the ci-passed gate survive
+  # the M0 swap unchanged:
+  #   1. the FULL suite under CHRONOKV_STRESS (seeded sparse yields at the
+  #      race windows) across N interleaving seeds — push/PR: seed 7;
+  #      nightly/dispatch: seeds 7, 21, 42. CKV_STRESS_SEED is echoed by
+  #      the binary, so any run replays from its log.
+  #   2. the lincheck engine workload at CKV_LINCHECK_SEEDS=N — the M1
+  #      leftover "N-seed scaling of the engine workload (feeds M2's CI
+  #      job)". push/PR: 4 seeds; nightly/dispatch: 64. Each seed's history
+  #      must pass both checkers and be non-vacuous.
+  dst:
+    name: dst (N seeds)
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'pull_request') && '60' || '240') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (stress + release)
+        run: |
+          make stress
+          make release
+
+      - name: Stress full suite across interleaving seeds (bounded PR / long nightly)
+        env:
+          STRESS_SEEDS: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '7' || '7 21 42' }}
+        run: |
+          set -o pipefail
+          for s in $STRESS_SEEDS; do
+            echo "=== stress full suite, seed $s ==="
+            CKV_STRESS_SEED=$s ./build/stress/test 2>&1 | tee stress-$s.log
+          done
+
+      - name: Lincheck engine workload, N seeds (bounded PR / long nightly)
+        env:
+          CKV_ONLY_LINCHECK: "1"
+          CKV_LINCHECK_SEEDS: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '4' || '64' }}
+        run: |
+          set -o pipefail
+          ./build/release/test 2>&1 | tee lincheck-seeds.log
+
+      - name: Upload dst logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dst-run-${{ github.run_id }}
+          path: |
+            stress-*.log
+            lincheck-seeds.log
+          if-no-files-found: ignore
+
   # ---- gate: single aggregate check for branch protection ----------------
   ci-passed:
     name: ci-passed
-    needs: [engine-tests, tsan, public-api-smoke]
+    needs: [engine-tests, tsan, public-api-smoke, dst, crashfuzz]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     if: always()

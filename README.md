@@ -10,11 +10,13 @@ transactions with phantom detection, a paged B+ tree index, and
 io_uring-accelerated WAL writes — all in one header with no external
 dependencies.
 
-Current version: **0.26.1** (`CHRONOKV_VERSION` in `chronokv.hpp`). Starting
-with this release the version's MINOR tracks the roadmap arc: the v26 arc
-(M0–M4) shipped across 0.25.4–0.25.8, and 0.26.1 is its first patch (the
-adversarial review of `929cb00` found a PITR correctness defect — fixed here)
-plus the start of v27 M1.
+Current version: **0.26.2** (`CHRONOKV_VERSION` in `chronokv.hpp`). The
+version's MINOR tracks the roadmap arc: the v26 arc (M0–M4) shipped across
+0.25.4–0.25.8; 0.26.1 was its first patch (the adversarial review of
+`929cb00` found a PITR correctness defect — fixed there) plus the start of
+v27 M1; 0.26.2 ships v27 M2 (CI integration: dedicated `dst` and
+`crashfuzz` seed-scaled jobs — bounded on PRs, long on the nightly
+schedule — folded into the `ci-passed` gate).
 
 ## Highlights
 
@@ -363,7 +365,8 @@ available and skips otherwise.
 ## CI
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push,
-pull request, and manual dispatch:
+pull request, manual dispatch, and a nightly schedule (03:17 UTC — the
+long-run config; a push can no longer cancel a nightly run mid-flight):
 
 - **hooks-on matrix**: `release` (g++-13, g++-14, clang++-18), `asan+ubsan`,
   `stress`, `release (g++-12)` on ubuntu-22.04 (older 5.15 kernel —
@@ -373,6 +376,18 @@ pull request, and manual dispatch:
 - **hooks-off matrix**: public-API smoke under `release`, `asan+ubsan`,
   `tsan`, and `stress` — proves the header is usable without any test
   hooks defined
+- **`crashfuzz` (v27 M2)**: the crash-fuzz regime alone
+  (`CKV_ONLY_CRASHFUZZ`), seed-scaled via `CKV_CRASHFUZZ_SEEDS` — 2 bases ×
+  24 rounds on push/PR, 8 × 120 nightly. The base seed derives from the
+  run id and every base is echoed to the log, so a failing plan replays
+  deterministically from the log alone; preserved crash scenes are
+  uploaded as artifacts on failure
+- **`dst` (v27 M2)**: the seeded-concurrency battery — the full suite under
+  `CHRONOKV_STRESS` across interleaving seeds (`CKV_STRESS_SEED`, echoed;
+  1 seed on PR, 3 nightly) plus the lincheck engine workload at
+  `CKV_LINCHECK_SEEDS=N` (4 on PR, 64 nightly). Named per the roadmap:
+  when the v27 M0 deterministic scheduler ships it swaps in behind this
+  job, gate contract unchanged
 - **`ci-passed` gate**: aggregates every job into one required check for
   branch protection
 

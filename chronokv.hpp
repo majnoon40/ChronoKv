@@ -1,5 +1,44 @@
 // chronokv.hpp — ChronoKV engine and public C++ API.
 //
+// v26.2 SHIPPED (v27 M2 — CI integration):
+// roadmap v27 M2 lands: dedicated `crashfuzz` and `dst` CI jobs with a
+// bounded-PR / long-nightly policy, both folded into the `ci-passed`
+// aggregate gate. No engine changes — the work is seed-scaling knobs for
+// the existing regimes, the workflow, and honest labeling: M0 (the
+// deterministic scheduler) has NOT shipped, so the `dst` job runs the
+// SEEDED-STRESS interleavings (full suite under CHRONOKV_STRESS, seed
+// echoed) plus the N-seed lincheck engine workload until the M0 harness
+// swaps in behind the same job name (branch protection untouched).
+//
+//   KNOBS (main.cpp; defaults preserve prior behavior bit-for-bit):
+//     CKV_ONLY_CRASHFUZZ=1  run just the crash-fuzz regime (new gate;
+//                           same anti-vacuity / no-loss / no-resurrection
+//                           assertions as the in-suite run)
+//     CKV_CRASHFUZZ_SEEDS=N sweep N seed bases (golden-ratio-prime step
+//                           from CKV_CRASHFUZZ_SEED); stats aggregate,
+//                           every base and the config are echoed — a
+//                           failing stream replays from the log alone
+//     CKV_LINCHECK_SEEDS=N  N-seed scaling of the lincheck engine workload
+//                           (the M1 leftover that feeds this milestone);
+//                           CKV_LINCHECK_SEED overrides the base. Every
+//                           seed's history must pass independently AND be
+//                           non-vacuous
+//     CKV_STRESS_SEED=<n>   override the stress interleaving seed (was a
+//                           silent hardcoded 0x5EED); the effective seed
+//                           is echoed by every stress build, hooks-off
+//                           smoke included
+//   CI: nightly schedule (03:17 UTC) and workflow_dispatch run the long
+//       configs; push/PR stay bounded. The concurrency group no longer
+//       lets a push cancel a nightly/dispatch run. Hygiene: the stale
+//       "kAllCount (20)" crash-fuzz comment and the stale "800 vs 240
+//       iterations" ci.yml comment corrected to the post-v25.8 26-point
+//       reality; the silent CKV_UNDER_SANITIZER redefinition fixed (the
+//       header now honors a command-line -D; the STRESS_FLAGS copy of the
+//       flag — dead since introduction, the header always overrode it to 0 —
+//       was REMOVED rather than activated, because activating it would
+//       have skipped the stress job's fork-based crash tests: a coverage
+//       change nobody reviewed). CHRONOKV_VERSION 0.26.2.
+//
 // v26.1 SHIPPED (adversarial-review response for 929cb00 + v27 M1 start):
 // the HIGH PITR correctness defect — mid-window as_of silently losing
 // acknowledged commits after later checkpoints rotate the covering WAL
@@ -1072,6 +1111,12 @@
 // __SANITIZE_ADDRESS__/__SANITIZE_THREAD__ built-ins (supported on all GCC
 // versions), and __has_feature is only consulted inside a nested guard where
 // it is known to exist.
+// v26.2 hygiene: a command-line -DCKV_UNDER_SANITIZER (the Makefile's
+// asan/tsan/stress flags all pass one) WINS — the auto-detect is wrapped in
+// #ifndef, so the #else branch no longer redefines the macro to 0 and the
+// "CKV_UNDER_SANITIZER redefined" warning disappears from every sanitizer
+// and stress build log (pre-existing since the flag was introduced).
+#ifndef CKV_UNDER_SANITIZER
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
 #define CKV_UNDER_SANITIZER 1
 #elif defined(__has_feature)
@@ -1082,6 +1127,7 @@
 #endif
 #else
 #define CKV_UNDER_SANITIZER 0
+#endif
 #endif
 
 // ======================== Fault injection (Phase 0 item 5) ========================
@@ -7591,12 +7637,18 @@ namespace chronokv {
 // silently losing commits once later checkpoints rotate the covering WAL
 // segments), fixed here with in-suite detectors. Also starts v27 M1
 // (history -> strict-serializability checker).
-static constexpr const char* CHRONOKV_VERSION = "0.26.1";
+// v26.2: v27 M2 (CI integration) — dedicated `dst` + `crashfuzz` CI jobs
+// (bounded PR / long nightly) folded into the `ci-passed` gate; the
+// seed-scaling knobs CKV_CRASHFUZZ_SEEDS / CKV_LINCHECK_SEEDS /
+// CKV_STRESS_SEED and the CKV_ONLY_CRASHFUZZ gate ship in main.cpp. No
+// engine changes; the dst runner swaps to the M0 deterministic scheduler
+// when M0 ships.
+static constexpr const char* CHRONOKV_VERSION = "0.26.2";
 static constexpr int CHRONOKV_VERSION_MAJOR = 0;
 static constexpr int CHRONOKV_VERSION_MINOR = 26;
 // v25.7: PATCH was stale (said 2 while the string said 0.25.6). Kept in
 // lockstep with CHRONOKV_VERSION from here on.
-static constexpr int CHRONOKV_VERSION_PATCH = 1;
+static constexpr int CHRONOKV_VERSION_PATCH = 2;
 
 // ---- Error hierarchy --------------------------------------------------
 class Error : public std::runtime_error {

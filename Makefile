@@ -48,7 +48,16 @@ ASAN_FLAGS    = -O1 -g -fsanitize=address,undefined \
                 -DCKV_UNDER_SANITIZER=1 -static-libasan
 TSAN_FLAGS    = -O1 -g -fsanitize=thread \
                 -fno-omit-frame-pointer -DCKV_UNDER_SANITIZER=1
-STRESS_FLAGS  = -O2 -g -DCHRONOKV_STRESS -DCKV_UNDER_SANITIZER=1
+# v26.2: -DCKV_UNDER_SANITIZER=1 was REMOVED from STRESS_FLAGS. It had
+# always been silently ineffective: the header's sanitizer auto-detection
+# redefined the macro to 0 (with a "redefined" warning) because a stress
+# build sets no __SANITIZE_* builtin. The header now honors command-line
+# defines (#ifndef guard), so keeping the flag would have SUDDENLY flipped
+# the stress job to the lighter sanitizer test variant (skipping the
+# fork-based crash tests) — a coverage change nobody ever reviewed, after
+# years of green runs at the effective value 0. Stress builds now get
+# exactly what they always effectively had (auto-detect -> 0), warning-free.
+STRESS_FLAGS  = -O2 -g -DCHRONOKV_STRESS
 
 BIN_DIR = build
 TSAN_BIN = $(BIN_DIR)/tsan/test
