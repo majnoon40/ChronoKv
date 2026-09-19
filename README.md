@@ -79,17 +79,20 @@ scan checkers; mixed-API engine workload).
   (per-file size + CRC32) written last; `Database::verify_backup(dir)`
   validates a copy without opening it. Restore = point `Options` at the
   copy. Invariant **B1**.
-- **Point-in-time restore** (v26 M4, mid-window recovery fixed in v26.1) —
+- **Point-in-time restore** (v26 M4; mid-window policy refined by the
+  `6d8a13d` review) —
   `Options::pitr_as_of_cts` recovers a database directory to an exact cts
   boundary (read-only open), and `Database::restore_pitr(...)` materializes
   a **writable** as-of database into a fresh directory. The as-of window of
   a live/crashed directory is the WAL beyond its last checkpoint; a
   `backup()` copy restores to exactly its marker cts (`Database::backup_cts`).
-  Since v26.1 an `as_of` that falls *between* checkpoint boundaries is
-  recovered by per-entry filtering of the first delta beyond the boundary
-  (entries with `cts <= as_of` are the only surviving copy of mid-window
-  state once later checkpoints rotate the covering WAL segments); see
-  Safety properties for the exact reconstructability rules.
+  An `as_of` that falls *between* checkpoint boundaries is recovered by
+  per-entry filtering of the first delta beyond the boundary **while the
+  window's WAL survives**; once later checkpoints have rotated that WAL
+  away, a filtered open is refused loudly instead of risking a silently
+  wrong snapshot (a mid-window rewrite and a first write after `as_of`
+  leave byte-identical artifacts). See Safety properties for the exact
+  reconstructability rules.
 - **Heavy-duty validation** — engine tests, B+ tree fuzzing, fault
   injection, deterministic stress mode, the v27 M0 deterministic-scheduler
   (DST) harness, randomized crash-point fuzzing, a strict-serializability
@@ -202,9 +205,13 @@ window. The first delta beyond the boundary contributes its entries with
 `cts <= as_of` (per-entry filtering); a later checkpoint's rotation may
 already have unlinked the segments covering the window. Rules, in short:
 boundary cts values always work; a mid-window cts works when the window's
-WAL survives **or** the next delta still holds every needed version; and a
-partially-rotated window fails loud at open (never silently wrong). One
-documented residual limit remains — see Safety properties.
+WAL survives (the filtered delta and the surviving records dedupe against
+each other); and any window the WAL no longer covers fails loud at open —
+partially rotated (a surviving record witnesses the hole) or fully rotated
+with filtered delta entries (the `6d8a13d` review: a skipped post-`as_of`
+entry is indistinguishable from a lost mid-window rewrite, so serving the
+best-effort snapshot could be silently wrong). Never silently wrong — see
+Safety properties.
 
 Compile:
 
@@ -294,15 +301,21 @@ inactive transaction), `Error` (engine failures), `NotYetImplementedError`.
     and a surviving record still sits **inside** the window, the per-key
     coverage of the hole cannot be proven — `open` fails loud with a
     "rotated away" diagnosis (never silently wrong);
-  * **residual limit (documented deviation)**: if the covering WAL is
-    *entirely* gone, a key that was written in the window **and rewritten
-    again between `as_of` and the next checkpoint boundary** keeps only its
-    post-`as_of` version in that delta; its as-of version is unrecoverable
-    and the key reads as absent-or-older at `as_of`. The two on-disk worlds
-    ("rewritten after as_of" vs "first written after as_of") are
-    byte-identical, so no recovery policy can distinguish them without
-    retaining the WAL. Take `backup()` copies, or choose boundary cts
-    values, when exact mid-window semantics must be guaranteed.
+  * **fully-rotated window with filtered entries ⇒ loud rejection
+    (`6d8a13d` review fix)**: if the covering WAL is *entirely* gone and
+    the first delta beyond the boundary holds **any** entry with
+    `commit_ts > as_of` (per-entry filtering had to skip it), the as-of
+    state of that key is unprovable: the delta keeps only its post-`as_of`
+    version, and "rewritten after `as_of` over a mid-window version" is
+    byte-identical on disk to "first written after `as_of`". v26.1 served
+    the best-effort snapshot here; the review showed that can be silently
+    WRONG (its `k="at4"`/`k="at5"` repro returned `k` absent), so `open`
+    now throws a "not reconstructable" diagnosis with the remedies
+    (boundary `as_of`, a covering `backup()`, or retaining WAL segments).
+    A filter pass that skips NOTHING over a rotated window still opens —
+    every window write is then provably in the applied chain. Restoring
+    the rejected capability soundly requires multi-version deltas (the
+    review's direction 3 — tracked as future work in the ROADMAP).
 - **Strict-serializable acknowledgements (v27 M1)**: `commit_txn` waits
   for the contiguous published prefix to cover its cts before returning
   `Committed` (a publication barrier). Therefore: if a write is

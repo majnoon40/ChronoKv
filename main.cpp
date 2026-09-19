@@ -9540,20 +9540,26 @@ static int run_pitr_test() {
         check("pitr: pitr_as_of_cts without recover_on_open is rejected", threw);
     }
 
-    // ================= v26.1 detectors (adversarial review of 929cb00) =================
+    // ============ v26.1 detectors (adversarial review of 929cb00), refined
+    // ============ by the 6d8a13d review (conservative loud failure) =======
     //
-    // (8) RANK-1 DETECTOR — the reviewer's exact scenario: as_of BETWEEN two
-    //     checkpoint boundaries after a LATER checkpoint's rotation unlinked
-    //     the WAL segments covering the window. The mid-window commit's only
-    //     surviving copy is an entry inside a delta whose HEADER cts exceeds
-    //     as_of — pre-v26.1 recovery skipped that file whole and the commit
-    //     vanished silently.
+    // (8) RANK-1 SCENARIO — as_of BETWEEN two checkpoint boundaries after a
+    //     LATER checkpoint's rotation unlinked the WAL segments covering the
+    //     window. Pre-v26.1, recovery skipped the future delta whole and the
+    //     mid-window commit d@W4 vanished SILENTLY (the 929cb00 reviewer's
+    //     positive control). v26.1's per-entry filter recovered d=4 — but the
+    //     6d8a13d review showed that capability cannot be made sound: the
+    //     skipped e@5 entry is byte-identical on disk to a mid-window
+    //     REWRITE whose <= as_of version died with the rotated segment (their
+    //     k="at4"/k="at5" repro, block (13) below), so a filtered open over a
+    //     fully-rotated window can silently materialize a WRONG snapshot.
+    //     Both reviews accept loud failure over silent loss (929cb00's
+    //     direction 2; 6d8a13d's directions 1/2), so the policy is now:
+    //     REFUSE. Expected here: throw naming the cause; the on-disk
+    //     artifacts stay intact for a normal open / a boundary as_of.
     //     Timeline: a,b,c -> ckpt base@W3 | d@W4, e@W5 -> ckpt delta.1@W5
     //               | f@W6 -> ckpt delta.2@W6 (rotation deletes the segment
     //               holding W4/W5) | g@W7 -> close | open as_of=W4.
-    //     Expected: d=4 (from delta.1's per-entry-filtered d@4), e/f absent.
-    //     Verified against 929cb00: FAILS with d=<none> e=<none> f=<none>
-    //     (the reviewer's positive control, reproduced byte-for-byte).
     {
         const std::string g8 = root + "/gap";
         std::error_code ec8;
@@ -9580,32 +9586,43 @@ static int run_pitr_test() {
         // this check cannot silently degrade into the old single-delta test.
         bool scene_ok = !std::filesystem::exists(go.wal_dir + "/wal_000002.log") &&
                         std::filesystem::exists(go.checkpoint_path + ".delta.2");
-        bool d_ok = false, e_absent = false, f_absent = false;
+        bool threw = false;
         std::string detail;
         try {
             Options po = go;
             po.pitr_as_of_cts = gW4;
             auto db = Database::open(po);
-            d_ok = db.get("d").value_or("") == "4";
-            e_absent = !db.get("e").has_value();
-            f_absent = !db.get("f").has_value();
+            db.close();
+        } catch (const std::exception& ex) { threw = true; detail = ex.what(); }
+        bool loud_ok = threw && detail.find("not reconstructable") != std::string::npos &&
+                       detail.find("Refusing to guess") != std::string::npos;
+        check("pitr: mid-window as_of over a fully-rotated window fails loud (929cb00 rank 1, refined by 6d8a13d review)",
+              scene_ok && loud_ok, threw ? detail : "open unexpectedly succeeded");
+        // The refusal must be NON-DESTRUCTIVE: a normal open still recovers
+        // the full state (d, e, f, g all present).
+        bool n_ok = false;
+        detail.clear();
+        try {
+            auto db = Database::open(go);
+            n_ok = db.get("d").value_or("") == "4" && db.get("e").value_or("") == "5" &&
+                   db.get("f").value_or("") == "6" && db.get("g").value_or("") == "7";
             db.close();
         } catch (const std::exception& ex) { detail = ex.what(); }
-        check("pitr: mid-window as_of survives later-checkpoint WAL rotation (review rank 1)",
-              scene_ok && d_ok && e_absent && f_absent, detail);
-        // restore_pitr rides the same recovery path: the materialized
-        // database must carry d across the rotated window and be writable.
-        bool r_ok = false;
+        check("pitr: loud refusal leaves the artifacts intact for a normal open",
+              n_ok, detail);
+        // restore_pitr rides the same recovery path: it must propagate the
+        // refusal instead of materializing a possibly-wrong database.
+        bool r_threw = false;
         detail.clear();
         try {
             auto db = Database::restore_pitr(go.wal_dir, go.checkpoint_path,
                                              g8 + "/restored", gW4);
-            r_ok = db.get("d").value_or("") == "4" && !db.get("e").has_value() &&
-                   db.put("new", "x") == Status::OK;
             db.close();
-        } catch (const std::exception& ex) { detail = ex.what(); }
-        check("pitr: restore_pitr across the rotated window materializes d (review rank 1)",
-              r_ok, detail);
+        } catch (const std::exception& ex) {
+            r_threw = true; detail = ex.what();
+        }
+        check("pitr: restore_pitr across the rotated window propagates the refusal (review rank 1, refined)",
+              r_threw && detail.find("not reconstructable") != std::string::npos, detail);
     }
 
     // (9) Filtered delta entries COEXISTING with surviving WAL records for
@@ -9714,23 +9731,79 @@ static int run_pitr_test() {
         bool loud_ok = threw && what.find("rotated away") != std::string::npos;
         check("pitr: partially-rotated window under as_of fails loud, naming the cause",
               scene_ok && loud_ok, threw ? what : "open unexpectedly succeeded");
-        // as_of=W4: the hole {W4-record... } — every surviving record exceeds
-        // the boundary, so replay breaks before the contiguity check; the
-        // filtered delta's d@W4 entry (latest <= its header, so exact) is
-        // sufficient. Contrast with the W5 case above: same artifacts,
-        // different reconstructability.
-        bool w4_ok = false, w4_e_absent = false;
+        // as_of=W4 (6d8a13d review): every surviving record exceeds the
+        // boundary, so replay breaks before the contiguity check — no
+        // witness, no in-loop throw. v26.1 opened here on the strength of
+        // the filtered delta's d@W4 entry alone; but the SAME delta also
+        // held skipped e@5/f@6 entries, and a skipped entry over a window
+        // whose WAL is gone is unprovable (e@5 might have rewritten a
+        // lost mid-window e@4). The conservative gate now refuses.
+        bool w4_threw = false;
         what.clear();
         try {
             Options po = go;
             po.pitr_as_of_cts = pW4;
             auto db = Database::open(po);
-            w4_ok = db.get("d").value_or("") == "4" && db.get("a").value_or("") == "1";
-            w4_e_absent = !db.get("e").has_value();
             db.close();
-        } catch (const std::exception& ex) { what = ex.what(); }
-        check("pitr: fully-rotated window with delta coverage still opens (as_of=W4)",
-              w4_ok && w4_e_absent, what);
+        } catch (const std::exception& ex) { w4_threw = true; what = ex.what(); }
+        check("pitr: filtered skips over an unprovable window fail loud (as_of=W4, 6d8a13d review)",
+              w4_threw && what.find("not reconstructable") != std::string::npos,
+              w4_threw ? what : "open unexpectedly succeeded");
+    }
+
+    // (13) 6d8a13d REVIEW DETECTOR — the residual hole the review ranked
+    //      MEDIUM-HIGH: a key REWRITTEN inside the mid-window whose WAL a
+    //      later checkpoint rotated away. Timeline: a,b,c -> base@W3 |
+    //      k="at4"@W4 | k="at5"@W5 -> delta.1@W5 (holds ONLY k@5 — the
+    //      at4 version died with the WAL) | f@W6 -> delta.2@W6 (rotation
+    //      unlinks the W4/W5 segment) | open as_of=W4.
+    //      True as-of state: k=="at4". Pre-fix: k silently ABSENT (the
+    //      reviewer's positive control, reproduced byte-for-byte against
+    //      6d8a13d). Post-fix: loud refusal naming the unprovable
+    //      filtered-entry x rotated-window composition — no snapshot is
+    //      materialized at all, so no wrong one can be served.
+    {
+        const std::string g13 = root + "/rewrite";
+        std::error_code ec13;
+        std::filesystem::create_directories(g13, ec13);
+        Options go = o;
+        go.wal_dir = g13 + "/wal";
+        go.checkpoint_path = g13 + "/ckpt";
+        uint64_t rW4 = 0;
+        {
+            auto db = Database::open(go);
+            db.put("a", "1"); db.put("b", "2"); db.put("c", "3");
+            db.checkpoint();                        // base @ W3
+            db.put("k", "at4"); rW4 = db.published_watermark();
+            db.put("k", "at5");
+            db.checkpoint();                        // delta.1 @ W5: only k@5
+            db.put("f", "6");
+            db.checkpoint();                        // delta.2 @ W6: rotation kills W4/W5
+            db.close();
+        }
+        bool threw13 = false;
+        std::string what13;
+        try {
+            Options po = go;
+            po.pitr_as_of_cts = rW4;
+            auto db = Database::open(po);
+            (void)db.get("k");
+            db.close();
+        } catch (const std::exception& ex) { threw13 = true; what13 = ex.what(); }
+        check("pitr: mid-window REWRITE with rotated WAL fails loud instead of serving a wrong snapshot (6d8a13d review)",
+              threw13 && what13.find("not reconstructable") != std::string::npos &&
+              what13.find("Refusing to guess") != std::string::npos,
+              threw13 ? what13 : "open unexpectedly succeeded — silent wrong snapshot");
+        // Artifacts intact: a normal open still sees the full chain.
+        bool n13 = false;
+        what13.clear();
+        try {
+            auto db = Database::open(go);
+            n13 = db.get("k").value_or("") == "at5" && db.get("f").value_or("") == "6";
+            db.close();
+        } catch (const std::exception& ex) { what13 = ex.what(); }
+        check("pitr: rewrite-scene refusal is non-destructive (normal open sees k=at5)",
+              n13, what13);
     }
 
     std::filesystem::remove_all(root);

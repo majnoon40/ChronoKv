@@ -274,8 +274,10 @@ jobs:
   #   1. DST HARNESS (primary): four fork-isolated scenarios over the three
   #      bug-dense areas + the two historical anchors (wal_mixed_handoff =
   #      H3 class, wal_leader_fault = C1 class, gc_epoch_scan,
-  #      tree_cursor_split), N seeds each — push/PR: 100; nightly/dispatch:
-  #      25,000 (= 100k scenario-runs total, the roadmap's N). Failures
+  #      tree_cursor_split), N seeds each — push/PR: 100 (single shard);
+  #      nightly/dispatch: 4 shards x 6,250 = 25,000 per scenario (= 100k
+  #      scenario-runs total, the roadmap's N), sharded because a single
+  #      job measured ~225 min at that scale vs the 240-min timeout. Failures
   #      print (scenario, seed, op-count, last point): the replay handle.
   #      Acceptance was proven by reintroducing C1 (hang, caught on >=3/10
   #      seeds per run) and H3 (SEGV, caught on 12/12 seeds) — see the
@@ -288,26 +290,45 @@ jobs:
   #      4 seeds; nightly/dispatch: 64. Each seed's history must pass every
   #      checker and be non-vacuous.
   dst:
-    name: dst (N seeds)
+    name: dst (N seeds, shard ${{ matrix.shard }})
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'pull_request') && '60' || '240') }}
+    # v26.3-review-era fix: the nightly 100k-seed DST sweep measured
+    # ~135 ms/seed on runners (run #15: 400 seeds in 54 s) — ~225 min in a
+    # SINGLE job against a 240-min timeout, i.e. a coin-flip timeout on the
+    # first cron run. Nightly/dispatch now shard 4 ways (6,250 seeds per
+    # scenario each, ~1 h wall); push/PR stay single-shard and bounded.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'pull_request') && '[0]' || '[0,1,2,3]') }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build (stress + release)
+      - name: Build (stress${{ matrix.shard == 0 && ' + release' || '' }})
         run: |
           make stress
-          make release
+          if [ "${{ matrix.shard }}" = "0" ]; then make release; fi
 
-      - name: DST harness, N seeds per scenario (bounded PR / long nightly)
+      - name: DST harness, N seeds per scenario (bounded PR / sharded nightly)
         env:
           CKV_ONLY_DST: "1"
-          CKV_DST_SEEDS: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '100' || '25000' }}
+          # Nightly: 4 shards x 6,250 = 25,000 seeds per scenario = 100k
+          # scenario-runs total (the roadmap's N). Shard bases are 911 +
+          # shard*1000003 (literal table — the expression lexer rejects
+          # inline '+'); the binary's per-scenario seed offset is a
+          # multiple of the same prime and the per-seed step is a larger
+          # prime, so shards are provably disjoint within each scenario.
+          CKV_DST_SEED: ${{ fromJSON('[911, 1000914, 2001817, 3002720]')[matrix.shard] }}
+          CKV_DST_SEEDS: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '100' || '6250' }}
         run: |
           set -o pipefail
-          ./build/stress/test 2>&1 | tee dst-seeds.log
+          ./build/stress/test 2>&1 | tee dst-seeds-shard${{ matrix.shard }}.log
 
+      # The complementary M2 regimes run once, on shard 0 (no reason to
+      # multiply the stress-suite/lincheck cost by the shard count).
       - name: Stress full suite across interleaving seeds (bounded PR / long nightly)
+        if: matrix.shard == 0
         env:
           STRESS_SEEDS: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '7' || '7 21 42' }}
         run: |
@@ -318,6 +339,7 @@ jobs:
           done
 
       - name: Lincheck engine workload, N seeds (bounded PR / long nightly)
+        if: matrix.shard == 0
         env:
           CKV_ONLY_LINCHECK: "1"
           CKV_LINCHECK_SEEDS: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '4' || '64' }}
@@ -329,9 +351,9 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: dst-run-${{ github.run_id }}
+          name: dst-run-${{ github.run_id }}-shard-${{ matrix.shard }}
           path: |
-            dst-seeds.log
+            dst-seeds-shard*.log
             stress-*.log
             lincheck-seeds.log
           if-no-files-found: ignore

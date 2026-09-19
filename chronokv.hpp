@@ -1,5 +1,62 @@
 // chronokv.hpp — ChronoKV engine and public C++ API.
 //
+// 6d8a13d-REVIEW RESPONSE SHIPPED (version stays 0.26.3 — maintainer
+// directive, no bump): the adversarial review of v26.3 ranked ONE new
+// defect, MEDIUM-HIGH, and it is a real one — the "documented residual
+// limit" of the v26.1 PITR fix is a silent-wrong-snapshot path, and a
+// documented deviation is still a deviation for an API that claims
+// restore-to-as_of.
+//
+//   THE HOLE (reviewer's repro, reproduced byte-for-byte pre-fix):
+//       base@W3 | k="at4"@W4 | k="at5"@W5 | delta.1@W5 (keeps ONLY k@5)
+//       | f@W6 | delta.2@W6 — whose rotation unlinks the W4/W5 segment |
+//       open as_of=W4 -> v26.1 returned k ABSENT; the true as-of value is
+//       "at4". Mechanism: per-entry filtering skips the delta's k@5
+//       (hc > as_of) — sound ONLY if k had no window version, but the
+//       WAL that could prove either way is gone, and "rewritten after
+//       as_of" vs "first written after as_of" are byte-identical on
+//       disk. The v26.1 partial-window loud failure needs a SURVIVING
+//       record to witness the hole; a fully-rotated window leaves none.
+//   FIX (review direction 1/2 — conservative loud failure): after WAL
+//       replay, if the filter skipped ANY entry (hc > as_of) AND the
+//       surviving WAL does not cover the window (contiguous < as_of;
+//       partial-with-witness already threw in-loop), recovery THROWS a
+//       "not reconstructable" diagnosis naming the composition and the
+//       remedies (boundary as_of / covering backup / retain WAL). The
+//       refusal is non-destructive (read-only open promise intact) and
+//       restore_pitr propagates it. Cost, accepted and documented: the
+//       v26.1 "fully-rotated window still opens" capability is GONE —
+//       including the 929cb00 reviewer's own d=4 scene, whose skipped
+//       e@5 entry is indistinguishable from this hole. Both reviews
+//       accept loud failure over silent loss (929cb00's direction 2 said
+//       exactly that). Direction 3 (multi-version deltas — retain every
+//       window version in the delta, restoring mid-window restores
+//       soundly) is the capability-recovery path, tracked as future work
+//       in the ROADMAP; it is a checkpoint-format change with a GC
+//       interaction (window versions must survive to checkpoint time)
+//       and deliberately NOT smuggled into a review-response commit.
+//   DETECTORS: run_pitr_test block (13) is the reviewer's exact scenario
+//       (verified silent-wrong pre-fix via the standalone repro, loud
+//       post-fix) + non-destructiveness; blocks (8)/(10) flipped to the
+//       refusal policy with scene asserts kept; surviving-window rewrite
+//       (block 9a: WAL holds k=v4, delta holds k@5 -> opens, k=v4) and
+//       boundary/normal opens stay green — the gate fires ONLY on the
+//       unprovable composition. Standalone repros in verify/:
+//       pitr_rewrite.cpp (--expect-loud) and pitr_gap.cpp (policy
+//       updated).
+//   Review's other notes: DST steal semantics — acknowledged as the
+//       documented bounded-patience limit (counted, logged); no change.
+//       await_published under shared checkpoint_mu_ — re-verified against
+//       current code: the barrier waits in the install tail with the
+//       per-key commit mutexes RELEASED (commit_locks RAII scope ends
+//       before before_publish) while checkpoint_mu_ is still held SHARED
+//       (commit_txn's outer ckpt_lk). Deadlock-freedom vs the writer-
+//       preferring rwlock is the v26.1 argument, intact at 4388: every
+//       thread holding a reserved cts acquired the shared lock BEFORE
+//       reserving, so a queued checkpoint writer can never block the
+//       lower-cts completions the barrier waits for. (The reviewer's note
+//       was cut off mid-sentence and claimed no defect.)
+//
 // v26.3 SHIPPED (v27 M0 deterministic scheduler + v27 M1 completion):
 // the reproduction problem the whole v27 arc exists for is now fixed:
 // an interleaving you hit once CAN be replayed.
@@ -129,15 +186,13 @@
 //       composition (surviving record inside a partially-rotated window);
 //       (d) PITR opens no longer delete R-REBASE stale deltas — the
 //       read-only promise on the source directory now holds literally.
-//       DOCUMENTED RESIDUAL LIMIT (README "Point-in-time restore"): when
-//       the WAL covering (prev_delta, as_of] is gone, a key rewritten
-//       AGAIN between as_of and the next checkpoint boundary keeps only
-//       its post-as_of version in that delta; its as_of version is
-//       unrecoverable and the key reads as absent-or-older at as_of. This
-//       is indistinguishable on disk from "first write after as_of" (both
-//       worlds produce byte-identical artifacts), so no recovery policy
-//       can do better without retaining the WAL; the in-suite detector
-//       pins the recoverable composition. Detectors: run_pitr_test blocks
+//       RESIDUAL LIMIT -> SUPERSEDED by the 6d8a13d-review fix (below):
+//       the best-effort open this release documented as a "residual
+//       limit" (rotated-window rewrite reads absent-or-older) was ranked a
+//       correctness defect by the next adversarial review — a documented
+//       silent-wrong answer is still a silent-wrong answer. The
+//       composition now fails loud; see the v26.3-review block at the top
+//       of this header. Detectors: run_pitr_test blocks
 //       6-8 (multi-checkpoint gap = the reviewer's scenario, verified
 //       FAIL pre-fix; delta+WAL dedupe; partial-rotation loud failure).
 //
@@ -6596,7 +6651,12 @@ public:
      auto parse_and_apply_ckpt = [&](const std::string& path, uint64_t& out_cts,
                                      uint64_t stale_below_cts = 0,
                                      uint64_t apply_upto_cts = 0,
-                                     uint64_t* max_applied = nullptr) -> bool {
+                                     uint64_t* max_applied = nullptr,
+                                     // 6d8a13d-review fix: recovery-local count of
+                                     // per-entry-filtered versions (hc > as_of). The
+                                     // diag counter is process-wide; the loud-failure
+                                     // decision below needs THIS recovery's number.
+                                     uint64_t* filtered_skips = nullptr) -> bool {
          std::ifstream cf(path, std::ios::binary);
          if (!cf) return false;
          std::vector<uint8_t> buf(
@@ -6693,6 +6753,7 @@ public:
              // untouched — this open is read-only).
              if (apply_upto_cts && hc > apply_upto_cts) {
                  diag::rec_pitr_filtered.fetch_add(1, std::memory_order_relaxed);
+                 if (filtered_skips) (*filtered_skips)++;
                  continue;
              }
              if (hc < head_ts)
@@ -6731,6 +6792,9 @@ public:
      // v26.1: largest commit_ts linked from a filtered future delta — used
      // below to raise the published watermark over delta-only versions.
      uint64_t pitr_max_applied_hc = 0;
+     // 6d8a13d-review fix: entries skipped by the per-entry filter — the
+     // loud-failure gate after WAL replay consumes this.
+     uint64_t pitr_filtered_skips = 0;
      {
          int delta_n = 1;
          bool pitr_filtered_one = false;   // v26.1: first header>as_of delta already filtered
@@ -6764,7 +6828,8 @@ public:
                  // as_of >= base cts, so it can never be stale) but passed
                  // for uniformity.
                  parse_and_apply_ckpt(delta_path, future_cts, base_cts_for_staleness,
-                                      /*apply_upto_cts=*/as_of_cts, &pitr_max_applied_hc);
+                                      /*apply_upto_cts=*/as_of_cts, &pitr_max_applied_hc,
+                                      &pitr_filtered_skips);
                  pitr_filtered_one = true;
                  // NOTE: ckpt_cts is deliberately NOT advanced to
                  // future_cts — WAL replay below must still cover
@@ -6876,6 +6941,56 @@ public:
             expected++;
         }
 
+        // 6d8a13d-REVIEW FIX (MEDIUM-HIGH: residual PITR correctness hole).
+        // v26.1's per-entry filter is SOUND for the entries it APPLIES (an
+        // entry with hc <= as_of is the delta's newest version <= its
+        // snapshot, so nothing in (hc, as_of] can exist) — but every entry
+        // it SKIPS (hc > as_of) leaves that key's as-of state unproven when
+        // the WAL covering (ckpt_cts, as_of] is gone: the delta keeps only
+        // the key's POST-as_of version, and "first written after as_of"
+        // (correctly absent/old) is byte-identical on disk to "rewritten
+        // after as_of over a mid-window version" (whose as-of value died
+        // with the rotated segment). The reviewer's repro: k="at4"@W4,
+        // k="at5"@W5, delta.1@W5 holds only k@5, delta.2's rotation unlinks
+        // the W4/W5 segment, as_of=W4 -> v26.1 silently returned k ABSENT
+        // instead of "at4". The v26.1 partial-window loud failure does not
+        // fire here: it needs a SURVIVING record to witness the gap, and a
+        // fully-rotated window leaves none. Per-key provability collapses
+        // (no artifact distinguishes the two worlds), so the only sound
+        // policies are conservative rejection or multi-version deltas
+        // (review direction 3 — future work, noted in the ROADMAP).
+        // Direction 1/2 ships:
+        //   filtered skips > 0  AND  the surviving WAL does not cover the
+        //   window up to as_of (contiguous < as_of; a partial window with
+        //   surviving witnesses already threw inside the replay loop)
+        //   => FAIL LOUD. This trades the v26.1 "fully-rotated window still
+        //   opens" capability for correctness: the 929cb00 review accepted
+        //   loud failure over silent loss as an adequate policy (its
+        //   direction 2), and this review ranks the silent best-effort a
+        //   defect. Boundary as_of (empty window, contiguous == as_of) and
+        //   fully-surviving windows (contiguous reaches as_of; the
+        //   dedupe/supersede path) are unaffected.
+        if (as_of_cts && pitr_filtered_skips > 0 && contiguous < as_of_cts)
+            throw std::runtime_error(
+                "PITR: as_of cts " + std::to_string(as_of_cts) +
+                " is not reconstructable — the WAL covering (" +
+                std::to_string(ckpt_cts) + ", " + std::to_string(as_of_cts) +
+                "] was fully rotated away by later checkpoints, and the "
+                "checkpoint delta at cts > as_of holds " +
+                std::to_string(pitr_filtered_skips) +
+                " entr" + (pitr_filtered_skips == 1 ? "y" : "ies") +
+                " with commit_ts > as_of that per-entry filtering had to "
+                "skip. For each such key the delta retains only its "
+                "post-as_of version; whether the key ALSO had a version <= "
+                "as_of inside the lost window is not distinguishable on "
+                "disk (a mid-window rewrite and a first write after as_of "
+                "leave identical artifacts), so any materialized snapshot "
+                "could be silently wrong. Refusing to guess. Remedies: "
+                "choose as_of at a checkpoint boundary; restore from a "
+                "backup whose backup_cts covers as_of; or retain WAL "
+                "segments (skip post-checkpoint rotation) until the "
+                "boundaries you restore to.");
+
         // v26.1 FIX (review rank 1, second half): under PITR the recovered
         // state can contain versions linked from the filtered future delta
         // whose commit_ts exceeds the last replayed WAL record — their
@@ -6884,6 +6999,8 @@ public:
         // below those versions and hide them, re-creating the loss AFTER
         // the fix. Raise the watermark to cover them; it still cannot
         // exceed as_of (the filter only applies entries with hc <= as_of).
+        // 6d8a13d review: with the loud gate above, delta-only versions now
+        // only coexist with FULL window coverage (contiguous == as_of).
         if (as_of_cts && pitr_max_applied_hc > contiguous)
             contiguous = pitr_max_applied_hc;
 
