@@ -785,6 +785,22 @@ is an untested line, and that is exactly where the last four bugs were.
 > limit (~1 GB VA) — the CI run on the 0.27.0 push is its proof, same
 > policy as ASan/-O2 builds.
 >
+> **Nightly-vehicle finding (dispatch run #20, fixed same-day, no bump):**
+> the FULL suite under global forcing dies early for five of the eight
+> kinds (std::terminate from escaping async `fut.get()` rethrows and stoi
+> cascades — the suite was never designed to survive every fault being on
+> at once), and a dead process flushed no `.gcda`, failing the job. Fix:
+> death hooks — weak `__gcov_dump` in `std::set_terminate` (then `_exit(70)`)
+> and in SIGSEGV/BUS/FPE/ILL handlers (dump, restore `SIG_DFL`, re-raise) —
+> so forced death is DATA-PRESERVING; crash-fuzz semantics untouched
+> (`crashpt::point` kills via `_exit(97)`, never a catchable signal).
+> Affected kinds now report honest PARTIAL coverage (warning + shallow
+> table rows); WriteFail/WriteShort survive the full suite and get full
+> depth. **Follow-up (M3-adjacent hygiene): harden the suite's escape
+> points** — catch at the async `get()` sites and the stoi parsers — so
+> all eight kinds run full-suite-deep; each fixed escape point deepens
+> five kinds' coverage at once.
+>
 > **Next consumers of this signal:** the ledger should be triaged into
 > new fault kinds/tests where gaps are real (candidate v28 M-adjacent
 > hygiene), and v28's WAL-writer-thread rewrite should land with

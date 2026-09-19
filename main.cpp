@@ -1679,6 +1679,11 @@ static int run_review_regression_tests();   // defined above main()
 static int run_v26_durability_tests();      // defined above main()
 #ifdef CHRONOKV_FAULT_INJECTION
 static int run_crash_fuzz();                // defined above main()
+// v27 M3 (0.27.0 hardening): libgcov's manual flush, WEAK so non-coverage
+// builds still link (the symbol only exists under --coverage; the handlers
+// below null-check it). Lets a coverage run save its counters even when
+// the suite dies under global fault forcing.
+extern "C" { __attribute__((weak)) void __gcov_dump(void); }
 #endif
 #endif
 
@@ -1745,6 +1750,38 @@ return 0;
                           << " times" << std::endl;
             }
         } forced_fire_report;
+        // 0.27.0 hardening (nightly-vehicle fix, found by dispatch run #20):
+        // the FULL suite under global forcing dies early for several kinds
+        // (std::terminate from escaping async fut.get() rethrows and stoi
+        // cascades — the suite was never designed to survive EVERY fault
+        // being on at once), and a dead process flushes no .gcda, so the
+        // analyze step hard-failed with "no gcov data". These hooks turn
+        // death into data-preserving death:
+        //   terminate            -> dump counters, log, _exit(70)
+        //   SIGSEGV/BUS/FPE/ILL  -> dump counters, restore SIG_DFL, re-raise
+        // Crash-fuzz semantics are untouched: crashpt::point kills via
+        // _exit(97), never a catchable signal; forked children inherit the
+        // handlers but only reach them on a genuine crash — itself already
+        // a fuzzer-reported bug. In non-coverage builds __gcov_dump is
+        // null and the dump is skipped (the terminate hook still normalizes
+        // the exit, which is what makes forced runs gradeable).
+        std::set_terminate([] {
+            if (__gcov_dump != nullptr) __gcov_dump();
+            fprintf(stderr, "coverage-run: terminate under forcing — gcov "
+                            "counters dumped; coverage for this kind is "
+                            "PARTIAL (up to the escape point)\n");
+            fflush(stderr);
+            _exit(70);
+        });
+        struct CovSig {
+            static void handle(int sig) {
+                if (__gcov_dump != nullptr) __gcov_dump();
+                signal(sig, SIG_DFL);
+                raise(sig);
+            }
+        };
+        for (int sig : {SIGSEGV, SIGBUS, SIGFPE, SIGILL})
+            signal(sig, &CovSig::handle);
     }
 #endif
 
