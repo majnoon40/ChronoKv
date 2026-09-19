@@ -16,9 +16,10 @@ Progress:
 | v25.8 — adversarial-review response: **rank-1** close()-race (plain-bool `closed_` + engine TOCTOU; v25.7's close-safety claim was false for concurrent *creation*), **rank-2** bk_* points folded into crashpt::kAll + fuzz plan grammar, **rank-3** compound fault×crash-point plans; plus a PRE-EXISTING checkpoint re-emission defect the matrix found on its first run | **DONE** | see below, `0.25.8` |
 | v26 M4 — point-in-time restore | **DONE** | see below, `0.25.8` |
 | v26.1 — adversarial review of `929cb00`: **rank-1** PITR mid-window `as_of` silently loses acknowledged commits (whole-delta skip × post-checkpoint WAL rotation) — fixed with per-entry delta filtering + loud failure on unprovable partial windows + in-suite detectors matching the reviewer's positive control; review hygiene notes (`restore_pitr` engine access, stale `bk_*`-not-in-`kAll` comments) | **DONE** | see below, `0.26.1` |
-| v27 M1 — history → strict-serializability checker: **START SHIPPED** — `txnrec::` structured recorder (runtime-armed, hooks builds) + `lincheck::` checker (cts-total-order snapshot verification, real-time order, Elle-style list-append: duplicates / fabrication / lost appends / order cycles / write-fold) + 15-case synthetic anomaly battery + engine workload with mutation battery. The checker found a LIVE anomaly on its first engine run (publication-prefix lag: acknowledged writes invisible to later snapshots while a lower cts is in flight — 109–163 instances per 4-thread run); fixed in the same release via a commit-ack publication barrier + burn-on-throw on the install tail | **IN PROGRESS** | see below, `0.26.1` |
-| v27 M2 — CI integration: dedicated `crashfuzz` (N seed bases via `CKV_CRASHFUZZ_SEEDS`, run-id-derived base echoed for deterministic replay) and `dst` (seeded-stress full suite × N interleaving seeds + lincheck engine workload × N seeds) jobs; bounded PR configs, long nightly schedule, both folded into `ci-passed`; the dst runner swaps to the M0 scheduler behind the same job name when M0 ships | **DONE** | see below, `0.26.2` |
-| v27 M0 / M3, v28–v30 | not started | — |
+| v27 M1 — history → strict-serializability checker: **DONE (completed at 0.26.3** — set-shape checker, range-scan modeling, async/batch recording, mixed-API workload; start shipped at 0.26.1**)** — `txnrec::` structured recorder (runtime-armed, hooks builds) + `lincheck::` checker (cts-total-order snapshot verification, real-time order, Elle-style list-append: duplicates / fabrication / lost appends / order cycles / write-fold) + 15-case synthetic anomaly battery + engine workload with mutation battery. The checker found a LIVE anomaly on its first engine run (publication-prefix lag: acknowledged writes invisible to later snapshots while a lower cts is in flight — 109–163 instances per 4-thread run); fixed in the same release via a commit-ack publication barrier + burn-on-throw on the install tail | **DONE** | see below, `0.26.1` + `0.26.3` |
+| v27 M2 — CI integration: dedicated `crashfuzz` (N seed bases via `CKV_CRASHFUZZ_SEEDS`, run-id-derived base echoed for deterministic replay) and `dst` (seeded-stress full suite × N interleaving seeds + lincheck engine workload × N seeds) jobs; bounded PR configs, long nightly schedule, both folded into `ci-passed`; the dst runner swapped to the real M0 harness at 0.26.3, job name and gate contract unchanged as planned | **DONE** | see below, `0.26.2` |
+| v27 M0 — deterministic scheduler for the bug-dense paths: **DONE** — `dst::` seeded baton controller behind every `stress_point` (WAL group-commit/handoff, GC+epoch vs scans, tree cursor vs splits; 11 new points at the historical bug windows), fork-isolated 4-scenario harness with `(seed, op-count, last-point)` replay handles, bounded-patience steal as the documented deadlock breaker. Acceptance PROVEN: reintroduced C1 caught as a deadline-hang (>=3/10 seeds/run at the widened 4x8 scenario), reintroduced H3 caught as SEGV on 12/12 seeds, clean tree silent over 200-seed sweeps; CI runs 100k scenario-seeds nightly | **DONE** | see below, `0.26.3` |
+| v27 M3, v28–v30 | not started | — |
 
 > **v25.7 note (the load-bearing constraint, re-confirmed).** H1 and H2 were
 > found by an outside reviewer *reading code and writing three-line repros* —
@@ -503,6 +504,73 @@ Full global DST is the FoundationDB end-state and is not worth it yet.
 **Acceptance.** Deliberately reintroduce C1 and H3 on a branch; the harness must find
 both, deterministically, within a bounded seed count. Then run N=100k seeds in CI.
 
+> ### What shipped at 0.26.3 (M0)
+>
+> **Scheduler — `dst::` (chronokv.hpp, CHRONOKV_STRESS builds, runtime-
+> armed).** Exactly the plan's shape: each instrumentation site calls
+> `sched::point(id)` — here, the EXISTING `stress_point(name)` sites route
+> to `dst::point(name)` while the controller is armed (unarmed they keep
+> the old seeded 1/8-yield behavior, so the standing stress suite is
+> untouched), and a central controller picks the next runnable thread from
+> the seeded PRNG. Baton semantics: one runner at a time; reaching the
+> next point hands the baton back. Two additions reality forced:
+> (1) RENDEZVOUS — the first grant waits until all N scenario threads have
+> parked, so even the initial schedule is a pure function of the seed
+> (thread-spawn timing cannot leak in); (2) BOUNDED-PATIENCE STEAL — the
+> engine blocks on real mutexes/cvs we do not intercept (group-commit
+> followers park on `batch_cv_` BY DESIGN), so if the baton makes no
+> progress for 5 ms any parked thread steals it; steals are COUNTED in the
+> shared progress page. Clean scenarios that never block-behind-a-parked-
+> holder run strictly serialized; a stealing run is replayable from
+> `(seed, op-count)` up to the logged steal points — the honest limit of
+> retrofit DST on lock-based code, documented rather than papered over.
+>
+> **Instrumentation — 11 new points at the windows the bugs actually lived
+> in** (on top of the 9 existing sites, which now double as scheduling
+> points): `wal_mixed_handoff` (the exact line the H3 orphaning happened
+> on), `wal_leader_elected` / `wal_leader_done` (leader I/O window and the
+> C1 cleanup/state-flip window), `gc_pass_begin` / `gc_epoch_advance` /
+> `gc_reclaim_begin` + `scan_guard_acquired` (the pin-vs-reclaim pair),
+> `tree_leaf_latch_gap` (BOTH put and erase descents: shared-release ->
+> exclusive-acquire), `tree_split_begin`, `tree_cursor_leaf_switch`
+> (latch released, successor not yet latched).
+>
+> **Harness — `run_dst_test()` (main.cpp, `CKV_ONLY_DST` gate; in-suite on
+> every stress run).** Four fork-isolated scenarios: `wal_mixed_handoff`
+> (H3 class: durability flipper + 3 committers, every commit must land),
+> `wal_leader_fault` (C1 class: forced rotation + armed `SegOpenFail` +
+> 4x8 concurrent puts — resurrects the variant the suite DROPPED because
+> it wedged ~Database pre-fix; fork isolation turns the wedge into a
+> deadline FAIL), `gc_epoch_scan` (churn + synchronous passes + scans with
+> a written-value legitimacy oracle), `tree_cursor_split` (400 ascending
+> inserts vs contiguous-prefix scan validation). Parent classifies each
+> seed: exit / signal / deadline, and every failure prints the replay
+> handle: `(scenario, seed, ops, last_point, steals)` + a copy-pasteable
+> `CKV_DST_SEED=... CKV_DST_SEEDS=1` command. Progress lives in a shared
+> mmap page, so even SIGKILLed hangs report their op-count.
+>
+> **Acceptance — PROVEN on scratch trees (not pushed):** reintroducing C1
+> (unconditional `lk.lock()` -> EDEADLK skips the cleanup) makes
+> `wal_leader_fault` HANG; caught in every control run at >=3/10 seeds
+> (per-seed catch ~0.6 at the widened 4x8 shape — the hang needs a
+> follower in-flight against the doomed batch, since post-failstop puts
+> legitimately short-circuit; at the CI PR count of 100 seeds/scenario the
+> miss probability is ~1e-14). Reintroducing H3 (leader drains `cur_batch_`
+> with no null guard) SEGVs on **12/12 seeds across 4 control runs**,
+> signal 11, matching the historical signature. Clean tree: 200-seed
+> sweeps, zero failures, ~70 ms/seed at -O0. The harness additionally
+> caught its OWN S3 oracle bug on the first run ever (per-key version
+> monotonicity is false under a shared seq counter — snapshot order
+> follows commit cts, not reservation order): a detector that has never
+> failed is not a detector, and this one failed first.
+>
+> **CI:** the `dst` job (name and gate contract preserved from M2, as
+> planned) now runs the real harness: 100 seeds/scenario on push/PR,
+> 25,000 x 4 scenarios = the roadmap's **N=100k** nightly.
+>
+> **v28's gate condition ("do not start before the DST harness is green")
+> is satisfied for M0**; v27 M3 (coverage) remains open.
+
 ## M1 — History → strict-serializability checker  **[M]**
 
 **Anchor.** `history::` recorder and `SerialOracle` both exist; nothing checks a
@@ -583,12 +651,34 @@ a checker.
 > hard-timeout regression test on a worker thread (verified FAIL pre-fix,
 > no wedge: the timeout turns the hang into a report).
 >
-> **Remaining M1 work:** a set-checker shape for adversarial workloads (the
-> list-append checker covers order/loss/duplication; set semantics add
-> read-back-set workloads), range-scan modeling in the recorder, and
-> async/batch recording. (The fourth leftover — N-seed scaling of the
-> engine workload — shipped at 0.26.2 as `CKV_LINCHECK_SEEDS`, feeding the
-> M2 `dst` job.)
+> **M1 is COMPLETE (0.26.3).** All four leftovers shipped: N-seed scaling
+> at 0.26.2 (`CKV_LINCHECK_SEEDS`), and at 0.26.3: (1) the set-checker
+> shape — `check_set_adds`: order-INSENSITIVE set algebra over read-back
+> sets (duplicate / fabricated / snapshot-mismatch vs the canonical
+> committed set / write-fold / add-duplicate / cts-independent realtime
+> loss), with the defining asymmetry asserted in-suite: a permuted token
+> order passes `check_set_adds` and FAILS `check_list_append`; (2)
+> range-scan modeling — `Database::range_scan` and transactional scans
+> record the engine's PRE-overlay snapshot view (`k\x1Fv\x1E` wire
+> format, `effective_ts` as the snapshot; RWT scans attach to the parent
+> txn — standalone attribution made correctly-consistent scans read as
+> stale-start, caught by the mixed workload on its first run);
+> `check_scans` demands the scan equal the EXACT live key set in
+> `[lo,hi]` at its snapshot (phantom / missing / stale / bounds /
+> duplicate), so the SSI no-phantom claim is now machine-checked on real
+> histories; (3) async recording — interval `[API entry, shared-state
+> ready]` with `ack_deferred` semantics: the end is DROPPED for real-time
+> ack edges (the caller's `future.get()` ack is unobservable in-library;
+> deriving edges from readiness would be unsound), begin-side freshness
+> and all cts checks still apply; (4) batch recording — `Batch::commit`
+> records Stage*+Commit under one id (synchronous: full interval
+> soundness, participates in real-time edges — proven by the batch-cts-
+> swap mutation). The new mixed-API engine workload (sets + async +
+> batch + standalone & transactional scans, seeded) runs all four
+> checkers with non-vacuity guards per API family; batteries grew by 6
+> scan cases, 9 set cases and 4 mixed-history mutations.
+> `RangeScanStream` remains unrecorded (lazy multi-call iteration has no
+> single sound interval — documented).
 
 ## M2 — CI integration  **[S]**
 

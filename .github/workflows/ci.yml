@@ -22,12 +22,14 @@
 #                  CKV_ONLY_CRASHFUZZ gate, scaled by CKV_CRASHFUZZ_SEEDS
 #                  (N seed bases per run, base derived from the run id and
 #                  echoed to the log for deterministic replay).
-#                - dst: the seeded-concurrency battery — full suite under
-#                  CHRONOKV_STRESS across N interleaving seeds
-#                  (CKV_STRESS_SEED, echoed) plus the lincheck engine
-#                  workload at CKV_LINCHECK_SEEDS=N. Named per the roadmap;
-#                  when the v27 M0 deterministic scheduler ships it swaps
-#                  in behind this job so the gate contract stays put.
+#                - dst: the v27 M0 deterministic-scheduler harness (the
+#                  real DST runner — M0 shipped at 0.26.3): N seeds per
+#                  scenario via CKV_DST_SEEDS, fork-isolated, replayable
+#                  from (seed, op-count). Complemented by the seeded
+#                  regimes the M2 placeholder introduced: full suite under
+#                  CHRONOKV_STRESS across interleaving seeds
+#                  (CKV_STRESS_SEED, echoed) and the lincheck engine
+#                  workload at CKV_LINCHECK_SEEDS=N.
 #   gate:      ci-passed aggregates every job — a single required check
 #              for branch protection.
 #
@@ -265,20 +267,26 @@ jobs:
             scenes/
           if-no-files-found: ignore
 
-  # ---- v27 M2: dst job (N seeds) -------------------------------------------
-  # The roadmap names this job `dst`. Honest caveat: the deterministic
-  # scheduler is v27 M0 and has NOT shipped yet — until it does, this job
-  # runs the two seeded regimes that exist today, under the name the
-  # roadmap reserved so branch protection and the ci-passed gate survive
-  # the M0 swap unchanged:
-  #   1. the FULL suite under CHRONOKV_STRESS (seeded sparse yields at the
+  # ---- v27 M2+M0: dst job (N seeds) ----------------------------------------
+  # The roadmap names this job `dst`. As of 0.26.3 it runs the REAL v27 M0
+  # deterministic-scheduler harness (the M2 placeholder regimes stay as
+  # complementary coverage):
+  #   1. DST HARNESS (primary): four fork-isolated scenarios over the three
+  #      bug-dense areas + the two historical anchors (wal_mixed_handoff =
+  #      H3 class, wal_leader_fault = C1 class, gc_epoch_scan,
+  #      tree_cursor_split), N seeds each — push/PR: 100; nightly/dispatch:
+  #      25,000 (= 100k scenario-runs total, the roadmap's N). Failures
+  #      print (scenario, seed, op-count, last point): the replay handle.
+  #      Acceptance was proven by reintroducing C1 (hang, caught on >=3/10
+  #      seeds per run) and H3 (SEGV, caught on 12/12 seeds) — see the
+  #      0.26.3 notes in docs/ROADMAP.md.
+  #   2. the FULL suite under CHRONOKV_STRESS (seeded sparse yields at the
   #      race windows) across N interleaving seeds — push/PR: seed 7;
   #      nightly/dispatch: seeds 7, 21, 42. CKV_STRESS_SEED is echoed by
   #      the binary, so any run replays from its log.
-  #   2. the lincheck engine workload at CKV_LINCHECK_SEEDS=N — the M1
-  #      leftover "N-seed scaling of the engine workload (feeds M2's CI
-  #      job)". push/PR: 4 seeds; nightly/dispatch: 64. Each seed's history
-  #      must pass both checkers and be non-vacuous.
+  #   3. the lincheck engine workloads at CKV_LINCHECK_SEEDS=N — push/PR:
+  #      4 seeds; nightly/dispatch: 64. Each seed's history must pass every
+  #      checker and be non-vacuous.
   dst:
     name: dst (N seeds)
     runs-on: ubuntu-24.04
@@ -290,6 +298,14 @@ jobs:
         run: |
           make stress
           make release
+
+      - name: DST harness, N seeds per scenario (bounded PR / long nightly)
+        env:
+          CKV_ONLY_DST: "1"
+          CKV_DST_SEEDS: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '100' || '25000' }}
+        run: |
+          set -o pipefail
+          ./build/stress/test 2>&1 | tee dst-seeds.log
 
       - name: Stress full suite across interleaving seeds (bounded PR / long nightly)
         env:
@@ -315,6 +331,7 @@ jobs:
         with:
           name: dst-run-${{ github.run_id }}
           path: |
+            dst-seeds.log
             stress-*.log
             lincheck-seeds.log
           if-no-files-found: ignore

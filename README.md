@@ -10,13 +10,17 @@ transactions with phantom detection, a paged B+ tree index, and
 io_uring-accelerated WAL writes — all in one header with no external
 dependencies.
 
-Current version: **0.26.2** (`CHRONOKV_VERSION` in `chronokv.hpp`). The
+Current version: **0.26.3** (`CHRONOKV_VERSION` in `chronokv.hpp`). The
 version's MINOR tracks the roadmap arc: the v26 arc (M0–M4) shipped across
 0.25.4–0.25.8; 0.26.1 was its first patch (the adversarial review of
 `929cb00` found a PITR correctness defect — fixed there) plus the start of
-v27 M1; 0.26.2 ships v27 M2 (CI integration: dedicated `dst` and
-`crashfuzz` seed-scaled jobs — bounded on PRs, long on the nightly
-schedule — folded into the `ci-passed` gate).
+v27 M1; 0.26.2 shipped v27 M2 (CI integration: dedicated `dst` and
+`crashfuzz` seed-scaled jobs, bounded on PRs, long nightly, folded into
+`ci-passed`); 0.26.3 ships **v27 M0** — the deterministic scheduler that
+makes concurrency failures replayable from `(seed, op-count)`, with the
+roadmap acceptance proven by catching reintroduced C1 and H3 mutants — and
+**completes v27 M1** (range-scan, async and batch recording; set-shape and
+scan checkers; mixed-API engine workload).
 
 ## Highlights
 
@@ -25,13 +29,24 @@ schedule — folded into the `ci-passed` gate).
 - **Serializable transactions (SSI)** — snapshot reads with write-set
   validation, including phantom detection over registered scan ranges
   (no write skews, no phantoms).
-- **Strict-serializable acknowledgements (v27 M1)** — a commit is
-  acknowledged only once the published prefix covers its cts, so any
-  snapshot taken after an ack necessarily includes that write (real-time
-  order). The in-suite `lincheck` checker verifies snapshot soundness,
-  real-time order, and Elle-style list-append properties on recorded
-  histories — and found the publication-prefix lag it now guards on its
-  first engine run.
+- **Strict-serializable acknowledgements (v27 M1, completed in 0.26.3)** —
+  a commit is acknowledged only once the published prefix covers its cts,
+  so any snapshot taken after an ack necessarily includes that write
+  (real-time order). The in-suite `lincheck` checker verifies snapshot
+  soundness, real-time order, Elle-style list-append properties, exact
+  range-scan snapshot consistency (`check_scans`), and order-insensitive
+  set algebra (`check_set_adds`) on recorded histories — covering the
+  sync, transactional, async, batch and scan APIs — and it found the
+  publication-prefix lag it now guards on its first engine run.
+- **Reproducible concurrency testing (v27 M0)** — under `CHRONOKV_STRESS`,
+  a seeded baton scheduler (`dst::`) turns every instrumentation point in
+  the WAL group-commit, GC/epoch-vs-scan and B+ tree cursor-vs-split paths
+  into a deterministic scheduling decision; failures reproduce from
+  `(seed, op-count)`. The fork-isolated harness runs four scenarios
+  (including the C1 leader-hang and H3 mixed-durability-crash classes) at
+  100 seeds/scenario on PRs and 100k nightly, and its acceptance was proven
+  by reintroducing both historical bugs on scratch trees: the harness
+  caught the C1 hang and the H3 SEGV every run.
 - **Crash-safe WAL** — CRC-checked, segmented (64 MiB) WAL with torn-tail
   truncation, batch group-commit, and strict LSN gap/duplicate detection
   on recovery.
@@ -76,9 +91,10 @@ schedule — folded into the `ci-passed` gate).
   state once later checkpoints rotate the covering WAL segments); see
   Safety properties for the exact reconstructability rules.
 - **Heavy-duty validation** — engine tests, B+ tree fuzzing, fault
-  injection, deterministic stress mode, randomized crash-point fuzzing, a
-  strict-serializability history checker (v27 M1 `lincheck`, with a
-  synthetic anomaly battery proving it fails when it should), and a
+  injection, deterministic stress mode, the v27 M0 deterministic-scheduler
+  (DST) harness, randomized crash-point fuzzing, a strict-serializability
+  history checker (v27 M1 `lincheck`, with synthetic anomaly batteries
+  proving every violation kind fails when it should), and a
   linearizability history recorder, all run under a four-config sanitizer
   matrix (Release / ASan+UBSan / TSan / Stress).
 - **Crash-consistent recovery** — 20 instrumented crash points cover the whole
@@ -382,12 +398,14 @@ long-run config; a push can no longer cancel a nightly run mid-flight):
   run id and every base is echoed to the log, so a failing plan replays
   deterministically from the log alone; preserved crash scenes are
   uploaded as artifacts on failure
-- **`dst` (v27 M2)**: the seeded-concurrency battery — the full suite under
-  `CHRONOKV_STRESS` across interleaving seeds (`CKV_STRESS_SEED`, echoed;
-  1 seed on PR, 3 nightly) plus the lincheck engine workload at
-  `CKV_LINCHECK_SEEDS=N` (4 on PR, 64 nightly). Named per the roadmap:
-  when the v27 M0 deterministic scheduler ships it swaps in behind this
-  job, gate contract unchanged
+- **`dst` (v27 M0+M2)**: the real deterministic-scheduler harness — four
+  fork-isolated scenarios over the bug-dense paths at `CKV_DST_SEEDS=N`
+  per scenario (100 on PR; 25,000 nightly = the roadmap's 100k), failures
+  reported with the `(seed, op-count, last point)` replay handle — plus
+  the M2 seeded regimes: the full suite under `CHRONOKV_STRESS` across
+  interleaving seeds (`CKV_STRESS_SEED`, echoed; 1 seed on PR, 3 nightly)
+  and the lincheck engine workloads at `CKV_LINCHECK_SEEDS=N` (4 on PR,
+  64 nightly)
 - **`ci-passed` gate**: aggregates every job into one required check for
   branch protection
 

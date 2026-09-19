@@ -569,6 +569,7 @@ static int run_lifecycle_test();      // v25.7 review M2 detectors
 static int run_backup_test();         // v26 M3 online backup
 static int run_pitr_test();           // v26 M4 point-in-time restore
 static int run_lincheck_test();       // v27 M1 strict-serializability checker
+static int run_dst_test();            // v27 M0 deterministic-scheduler harness
 static int run_m16_phase1_test();
 static int run_m2_phase1_test();
 static int run_m2_phase2_test();
@@ -1739,6 +1740,17 @@ return 0;
     if (getenv("CKV_ONLY_LINCHECK")) {
         crc_init();
         int f = run_lincheck_test();
+        std::cout.flush();
+        return f == 0 ? 0 : 1;
+    }
+
+    // v27 M0: CKV_ONLY_DST=1 runs just the deterministic-scheduler harness
+    // (real under CHRONOKV_STRESS builds; a skip-PASS line elsewhere). The
+    // CI dst job drives it with CKV_DST_SEEDS / CKV_DST_SEED (bounded PR /
+    // long nightly — roadmap acceptance: N=100k seeds in CI).
+    if (getenv("CKV_ONLY_DST")) {
+        crc_init();
+        int f = run_dst_test();
         std::cout.flush();
         return f == 0 ? 0 : 1;
     }
@@ -7053,6 +7065,7 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     // v26 M4: point-in-time restore.
     fails += run_pitr_test();
     fails += run_lincheck_test();
+    fails += run_dst_test();
     // async benchmark (skips under sanitizer anyway)
     fails += run_async_benchmark();
 
@@ -9766,8 +9779,17 @@ static int run_pitr_test() {
 // synthetic histories AND at deliberate mutations of a real recorded
 // engine history, and asserts the clean engine history passes.
 //
-// Recorder limitations this checker inherits (documented at txnrec::):
-// async/batch APIs and range scans are not recorded; arm on an EMPTY (or
+// v27 M1 completion (0.26.3): the recorder gaps this checker inherited are
+// CLOSED — range scans (Database + Transaction; the engine's pre-overlay
+// snapshot view, wire-packed k\x1Fv\x1E*), async put/get/erase (interval
+// [API entry, shared-state ready]; ack is deferred to the caller's future
+// read, so ack_deferred records contribute NO real-time ack edge — the
+// sound direction) and Batch commits (Stage* + Commit under one synthetic
+// txn id; synchronous, full interval soundness) are all recorded and
+// checked: check_scans (phantom/missing/stale vs cts replay) and
+// check_set_adds (order-insensitive set algebra) join check_cts_order and
+// check_list_append. RangeScanStream remains unrecorded (lazy multi-call
+// iteration has no single sound interval; documented). Arm on an EMPTY (or
 // quiesced-and-unread) database, else pre-arm state reads as fabricated.
 namespace lincheck {
 
@@ -9776,6 +9798,13 @@ struct ReadEv {
     bool found = false;          // a value was observed (false = absence observed)
     std::string value;
     uint64_t version_cts = 0;    // 0 = never existed; UINT64_MAX = read-your-writes buffer
+};
+// v27 M1 (scan modeling): one recorded range scan — the engine's snapshot
+// view of [lo,hi] at `snap` (pre read-your-writes overlay for txn scans).
+struct ScanEv {
+    std::string lo, hi;
+    uint64_t snap = 0;           // effective_ts the scan resolved versions at
+    std::vector<std::pair<std::string, std::string>> entries;  // observed (k,v)
 };
 struct WriteEv { std::string key; std::string value; bool deleted = false; };
 struct OpSeq { bool is_read; size_t idx; };   // program order within the txn
@@ -9791,6 +9820,7 @@ struct Txn {
     std::vector<ReadEv> reads;
     std::vector<WriteEv> writes;
     std::vector<OpSeq> order;
+    std::vector<ScanEv> scans;   // v27 M1: recorded range scans
 };
 
 struct Violation { std::string kind; std::string detail; };
@@ -9836,6 +9866,7 @@ inline std::vector<Txn> from_txnrec(const std::vector<txnrec::Record>& recs) {
             ev.version_cts = r.version_cts;
             t.order.push_back({true, t.reads.size()});
             t.reads.push_back(std::move(ev));
+            if (r.ack_deferred) t.end_ns = 0;   // v27 M1: async get — see Write case
             break;
         }
         case txnrec::Op::Stage: {
@@ -9856,12 +9887,17 @@ inline std::vector<Txn> from_txnrec(const std::vector<txnrec::Record>& recs) {
             t.commit_cts = r.committed ? r.commit_cts : 0;
             t.has_snapshot = true;
             t.snapshot = r.snap_cts;      // UINT64_MAX: write-only, no snapshot semantics
+            // v27 M1 (async recording): end_ns marks shared-state readiness,
+            // NOT the caller's ack (future.get()) — a real-time ack edge
+            // derived from it would be unsound. Drop it; begin_ns stays
+            // exact (API entry), so begin-side freshness checks still apply.
+            if (r.ack_deferred) t.end_ns = 0;
             break;
         }
         case txnrec::Op::Commit:
             t.committed = r.committed;
             t.commit_cts = r.committed ? r.commit_cts : 0;
-            t.end_ns = r.end_ns;
+            t.end_ns = r.ack_deferred ? 0 : r.end_ns;   // v27 M1: see Write case
             if (!t.has_snapshot) { t.has_snapshot = true; t.snapshot = r.snap_cts; }
             break;
         case txnrec::Op::Abort:
@@ -9869,8 +9905,30 @@ inline std::vector<Txn> from_txnrec(const std::vector<txnrec::Record>& recs) {
             t.commit_cts = 0;
             t.end_ns = r.end_ns;
             break;
-        case txnrec::Op::RangeScan:
-            break;   // not modeled — documented recorder limitation
+        case txnrec::Op::RangeScan: {
+            // v27 M1 (scan modeling): unpack lo..hi and the k\x1Fv\x1E wire
+            // format (txnrec::pack_scan). A standalone scan becomes its own
+            // synthetic txn whose snapshot IS the scan's effective_ts, so
+            // check_cts_order's stale-start freshness applies to scans too.
+            ScanEv sc;
+            auto dd = r.key.find("..");
+            if (dd == std::string::npos) break;   // malformed record: skip
+            sc.lo = r.key.substr(0, dd);
+            sc.hi = r.key.substr(dd + 2);
+            sc.snap = r.snap_cts;
+            size_t i = 0;
+            while (i < r.value.size()) {
+                size_t us = r.value.find('\x1F', i);
+                size_t re = r.value.find('\x1E', i);
+                if (us == std::string::npos || re == std::string::npos || us > re) break;
+                sc.entries.emplace_back(r.value.substr(i, us - i),
+                                        r.value.substr(us + 1, re - us - 1));
+                i = re + 1;
+            }
+            t.scans.push_back(std::move(sc));
+            if (!t.has_snapshot) { t.has_snapshot = true; t.snapshot = r.snap_cts; }
+            break;
+        }
         }
     }
     return out;
@@ -10178,14 +10236,628 @@ inline std::vector<Violation> check_list_append(const std::vector<Txn>& txns, ch
     return v;
 }
 
+// v27 M1 (range-scan modeling): verify every recorded scan against the
+// cts replay. A scan over [lo,hi] at effective snapshot S must return
+// EXACTLY the keys live in [lo,hi] in the state produced by the committed
+// writes with cts <= S, with exactly their values:
+//   * extra key           -> scan-phantom        (SSI phantom intrusion)
+//   * missing live key    -> scan-missing-key    (lost entry / cursor skip)
+//   * wrong value         -> scan-stale-value    (stale or corrupt read)
+//   * key outside bounds  -> scan-out-of-bounds  (cursor over-run)
+//   * repeated key        -> scan-duplicate-key  (cursor double-visit)
+// Real-time freshness for scans (an acked write absent from a later scan's
+// snapshot) is enforced by check_cts_order's stale-start rule: a recorded
+// scan becomes a synthetic txn whose snapshot IS its effective_ts.
+inline std::vector<Violation> check_scans(const std::vector<Txn>& txns) {
+    std::vector<Violation> v;
+    auto viol = [&](const char* kind, std::string d) {
+        v.push_back(Violation{kind, std::move(d)});
+    };
+    const std::optional<std::string> ABSENT;
+    std::vector<const Txn*> writers;
+    for (const auto& t : txns)
+        if (t.is_write && t.committed && t.commit_cts) writers.push_back(&t);
+    std::sort(writers.begin(), writers.end(), [](const Txn* a, const Txn* b) {
+        if (a->commit_cts != b->commit_cts) return a->commit_cts < b->commit_cts;
+        return a->id < b->id;
+    });
+    struct ScanRef { const Txn* t; const ScanEv* s; };
+    std::vector<ScanRef> scans;
+    for (const auto& t : txns)
+        for (const auto& sc : t.scans) scans.push_back(ScanRef{&t, &sc});
+    if (scans.empty()) return v;
+    std::sort(scans.begin(), scans.end(), [](const ScanRef& a, const ScanRef& b) {
+        if (a.s->snap != b.s->snap) return a.s->snap < b.s->snap;
+        return a.t->id < b.t->id;
+    });
+    std::map<std::string, std::optional<std::string>> state;
+    size_t wi = 0;
+    for (const auto& sr : scans) {
+        while (wi < writers.size() && writers[wi]->commit_cts <= sr.s->snap) {
+            for (const auto& w : writers[wi]->writes)
+                state[w.key] = w.deleted ? ABSENT : std::optional<std::string>(w.value);
+            wi++;
+        }
+        std::map<std::string, std::string> expect;
+        for (const auto& kv : state)
+            if (kv.second && kv.first >= sr.s->lo && kv.first <= sr.s->hi)
+                expect[kv.first] = *kv.second;
+        std::set<std::string> seen;
+        const std::string tag = "txn " + std::to_string(sr.t->id) + " scan [" +
+                                sr.s->lo + ".." + sr.s->hi + "] @snap " +
+                                std::to_string(sr.s->snap);
+        for (const auto& kv : sr.s->entries) {
+            if (!seen.insert(kv.first).second) {
+                viol("scan-duplicate-key", tag + " returned key '" + kv.first + "' twice");
+                continue;
+            }
+            if (kv.first < sr.s->lo || kv.first > sr.s->hi) {
+                viol("scan-out-of-bounds", tag + " returned key '" + kv.first + "' outside bounds");
+                continue;
+            }
+            auto it = expect.find(kv.first);
+            if (it == expect.end())
+                viol("scan-phantom", tag + " returned key '" + kv.first +
+                     "' not live at its snapshot (phantom)");
+            else if (it->second != kv.second)
+                viol("scan-stale-value", tag + " key '" + kv.first + "': cts-order state says '" +
+                     it->second + "', scan observed '" + kv.second + "'");
+        }
+        for (const auto& kv : expect)
+            if (!seen.count(kv.first))
+                viol("scan-missing-key", tag + " omitted live key '" + kv.first +
+                     "' (value '" + kv.second + "')");
+    }
+    return v;
+}
+
+// v27 M1 (set-checker shape, roadmap item): the list-append checker treats
+// token ORDER as canonical; set semantics must not. Workload convention:
+// a set key's value is a sep-joined collection of globally unique tokens;
+// an add transaction reads the set and writes it back with exactly one new
+// token appended (the wire form looks append-like, but the CHECKER's algebra
+// is order-insensitive). Checks, per key with the given prefix:
+//   * observed value repeats a token            -> set-duplicate
+//   * observed token no committed add ever wrote-> set-fabricated
+//   * observed set != canonical set at snapshot -> set-snapshot-mismatch
+//     (canonical(key,S) = value of the newest committed add with cts <= S;
+//      catches lost adds and stale sets without consulting order)
+//   * committed add's value != prev ∪ {token}   -> set-write-fold
+//     (write-side lost update; token already present -> set-add-duplicate)
+//   * add ACKED before a reader began, token    -> set-realtime-loss
+//     absent from that reader's observed set       (cts-independent; only
+//     sound-interval writes participate — ack_deferred ends are zeroed)
+// A PERMUTED token order is explicitly NOT a violation — that is the whole
+// point of the set shape, and the battery asserts the silence.
+inline std::vector<Violation> check_set_adds(const std::vector<Txn>& txns,
+                                             const std::string& prefix,
+                                             char sep = '+',
+                                             uint64_t rt_slack_ns = 4000) {
+    std::vector<Violation> v;
+    auto viol = [&](const char* kind, std::string d) {
+        v.push_back(Violation{kind, std::move(d)});
+    };
+    auto has_prefix = [&](const std::string& k) {
+        return k.size() >= prefix.size() && k.compare(0, prefix.size(), prefix) == 0;
+    };
+    struct Add { uint64_t cts; std::string token; std::set<std::string> value;
+                 uint64_t end_ns; const Txn* txn; };
+    std::map<std::string, std::vector<Add>> adds;
+    std::map<std::string, std::set<std::string>> known;
+    for (const auto& t : txns) {
+        if (!(t.is_write && t.committed && t.commit_cts)) continue;
+        for (const auto& w : t.writes) {
+            if (w.deleted || !has_prefix(w.key)) continue;
+            auto toks = split_tokens(w.value, sep);
+            std::set<std::string> sset(toks.begin(), toks.end());
+            if (sset.size() != toks.size())
+                viol("set-write-duplicate",
+                     "committed add txn " + std::to_string(t.id) + " wrote duplicate tokens to '" +
+                     w.key + "': '" + w.value + "'");
+            known[w.key].insert(toks.begin(), toks.end());
+            adds[w.key].push_back(Add{t.commit_cts, toks.empty() ? std::string() : toks.back(),
+                                      sset, t.end_ns, &t});
+        }
+    }
+    for (auto& kv : adds) {
+        auto& vec = kv.second;
+        std::sort(vec.begin(), vec.end(), [](const Add& a, const Add& b) {
+            if (a.cts != b.cts) return a.cts < b.cts;
+            return a.txn->id < b.txn->id;
+        });
+        std::set<std::string> acc;
+        for (const auto& a : vec) {
+            if (!a.token.empty() && acc.count(a.token))
+                viol("set-add-duplicate",
+                     "add txn " + std::to_string(a.txn->id) + " re-added existing token '" +
+                     a.token + "' to '" + kv.first + "'");
+            std::set<std::string> expect = acc;
+            expect.insert(a.token);
+            if (a.value != expect)
+                viol("set-write-fold",
+                     "add txn " + std::to_string(a.txn->id) + " on '" + kv.first +
+                     "': committed value != prior set + its token (write-side lost/garbled add)");
+            acc = a.value;   // canonical state follows what ACTUALLY committed
+        }
+    }
+    auto canonical_at = [&](const std::string& key, uint64_t snap) {
+        std::set<std::string> out;
+        auto it = adds.find(key);
+        if (it == adds.end()) return out;
+        for (const auto& a : it->second)      // cts-sorted
+            if (a.cts <= snap) out = a.value;
+            else break;
+        return out;
+    };
+    // readers
+    for (const auto& t : txns) {
+        for (const auto& r : t.reads) {
+            if (!has_prefix(r.key) || r.version_cts == UINT64_MAX) continue;
+            auto toks = split_tokens(r.value, sep);
+            std::set<std::string> obs;
+            bool dup = false;
+            for (const auto& tk : toks)
+                if (!obs.insert(tk).second) dup = true;
+            if (dup)
+                viol("set-duplicate",
+                     "txn " + std::to_string(t.id) + " read of '" + r.key +
+                     "' repeated a token: '" + r.value + "'");
+            for (const auto& tk : obs)
+                if (!known[r.key].count(tk))
+                    viol("set-fabricated",
+                         "txn " + std::to_string(t.id) + " read of '" + r.key +
+                         "' returned token '" + tk + "' no committed add ever wrote");
+            if (t.has_snapshot && t.snapshot != UINT64_MAX && r.found) {
+                auto expect = canonical_at(r.key, t.snapshot);
+                if (obs != expect) {
+                    std::string missing, extra;
+                    for (const auto& e : expect) if (!obs.count(e)) missing += (missing.empty() ? "" : ",") + e;
+                    for (const auto& o : obs) if (!expect.count(o)) extra += (extra.empty() ? "" : ",") + o;
+                    viol("set-snapshot-mismatch",
+                         "txn " + std::to_string(t.id) + " (snapshot " + std::to_string(t.snapshot) +
+                         ") read '" + r.key + "': canonical set {" +
+                         [&]{ std::string j; for (const auto& e : expect) j += (j.empty()?"":",") + e; return j; }() +
+                         "}, observed {" + [&]{ std::string j; for (const auto& o : obs) j += (j.empty()?"":",") + o; return j; }() +
+                         "}" + (missing.empty() ? "" : " missing=" + missing) +
+                         (extra.empty() ? "" : " extra=" + extra));
+                }
+            }
+            if (r.found && t.begin_ns) {
+                // cts-independent real-time: adds acked before this read began
+                // must be present. Only sound-interval (end_ns != 0) adds count.
+                for (const auto& a : (adds.count(r.key) ? adds[r.key] : std::vector<Add>{})) {
+                    if (a.end_ns && a.end_ns + rt_slack_ns < t.begin_ns && !obs.count(a.token))
+                        viol("set-realtime-loss",
+                             "txn " + std::to_string(t.id) + " began after add '" + a.token +
+                             "' (txn " + std::to_string(a.txn->id) + ") was acknowledged, but its read of '" +
+                             r.key + "' does not contain it");
+                }
+            }
+        }
+    }
+    return v;
+}
+
 }   // namespace lincheck
+
+// =====================================================================
+// v27 M0 test driver: the deterministic-scheduler (DST) harness.
+//
+// Why fork-per-seed: the two anchor bugs this harness exists to catch
+// class of are a HANG (C1: followers stranded on batch_cv_ when the
+// leader's cleanup was skipped) and a SEGV (H3: null batch dereference).
+// In-process, either takes the whole suite down — which is exactly why
+// the old "8 concurrent committers vs a failing rotation" variant was
+// DROPPED from the suite (it wedged ~Database against unfixed code).
+// Forked children turn both into ordinary, reportable failures: the
+// parent classifies exit status (invariant), signal (crash) or deadline
+// (hang), and prints (scenario, seed, op-count, last point) — the
+// replay handle the roadmap demands ("a failure then reproduces from
+// (seed, op-count)").
+//
+// Scenarios (one per bug-dense area the roadmap scopes, plus the two
+// historical anchors):
+//   S1 wal_mixed_handoff  — H3 class: durability flipper + concurrent
+//                           engine commits; mixed-class batch handoffs on
+//                           every flip. Clean code: every commit lands.
+//                           H3 mutant: orphaned batch -> SEGV or livelock.
+//   S2 wal_leader_fault   — C1 class: forced rotation + armed SegOpenFail
+//                           + concurrent Database::put. The leader throws
+//                           WHILE OWNING batch_mu_; followers are parked on
+//                           batch_cv_. Clean code: fail-stop, WalFailure,
+//                           every thread RETURNS. C1 mutant: cleanup
+//                           skipped -> followers strand -> parent deadline.
+//   S3 gc_epoch_scan      — GC class: version churn + synchronous gc_once
+//                           passes + range scans with monotonic-value
+//                           validation. Reclaim-vs-scan defects surface as
+//                           SEGV (use-after-free) or garbage/rewound
+//                           values (invariant exit).
+//   S4 tree_cursor_split  — tree class: ascending inserts (rightmost-leaf
+//                           splits) + concurrent full-range scans asserting
+//                           prefix contiguity, order and exact values.
+//                           Cursor-vs-split defects drop/duplicate/reorder
+//                           keys or crash.
+//
+// Determinism notes: every scenario thread parks at dst::point("start")
+// for the rendezvous, so the schedule is a pure function of the seed;
+// the child's Progress page (shared mmap) carries the op count, grant and
+// steal counters and the last point name to the parent for triage. Steals
+// (bounded-patience deadlock breaking) are counted; clean scenarios on
+// clean code complete without the parent deadline ever firing.
+// =====================================================================
+#ifdef CHRONOKV_STRESS
+namespace dstscn {
+    using namespace chronokv;
+
+    // S1 — WAL mixed-durability handoff (H3 class).
+    inline int s1_mixed_handoff(uint64_t seed, dst::Progress* prog, const std::string& wd) {
+        ChronoKV kv(wd);
+        constexpr int NT = 3, OPS = 8;
+        std::atomic<long> commits{0};
+        std::atomic<bool> stop{false};
+        dst::arm(seed, NT + 1, prog);
+        std::thread flipper([&] {
+            dst::point("start");
+            while (!stop.load(std::memory_order_relaxed)) {
+                kv.set_durability(DurabilityMode::Async);
+                dst::point("flip_a");
+                kv.set_durability(DurabilityMode::Group);
+                dst::point("flip_g");
+            }
+            dst::thread_done();
+        });
+        std::vector<std::thread> ws;
+        for (int i = 0; i < NT; ++i) ws.emplace_back([&, i] {
+            dst::point("start");
+            for (int n = 0; n < OPS; ++n) {
+                dst::point("w_op");
+                try {
+                    if (kv.commit("s1_k" + std::to_string(i) + "_" + std::to_string(n), "v")
+                            == TxnResult::Committed)
+                        commits.fetch_add(1, std::memory_order_relaxed);
+                } catch (...) {}
+            }
+            dst::thread_done();
+        });
+        for (auto& t : ws) t.join();
+        stop.store(true, std::memory_order_relaxed);
+        flipper.join();
+        dst::disarm();
+        if (commits.load() != NT * OPS) {
+            fprintf(stderr, "dst S1: only %ld of %d commits landed (orphaned batch?)\n",
+                    commits.load(), NT * OPS);
+            return 9;
+        }
+        return 0;
+    }
+
+    // S2 — WAL leader exception with parked followers (C1 class).
+    inline int s2_leader_fault(uint64_t seed, dst::Progress* prog, const std::string& wd) {
+#ifdef CHRONOKV_FAULT_INJECTION
+        Options o;
+        o.wal_dir = wd;
+        o.auto_start_gc = false;
+        o.durability = DurabilityMode::Sync;   // every commit takes the leader path
+        auto db = Database::open(o);
+        db.force_wal_rotation_for_test();      // next leader pass MUST rotate
+        fault::arm(fault::Kind::SegOpenFail, 1);  // ... and the rotation MUST fail
+        // 4 threads x 8 puts: the C1 hang needs a FOLLOWER whose record is
+        // already in (or parks against) the doomed leader's batch when the
+        // mutated cleanup is skipped — puts that ENTER group_append after
+        // failed_ was set short-circuit to WalFailure without ever parking.
+        // More overlap raises the per-seed catch probability (measured:
+        // ~0.4 at 3x6, higher here); at the CI seed counts (>=30/scenario)
+        // the miss probability is negligible.
+        constexpr int NT = 4, OPS = 8;
+        std::atomic<int> returned{0}, escaped{0};
+        dst::arm(seed, NT, prog);
+        std::vector<std::thread> ts;
+        for (int i = 0; i < NT; ++i) ts.emplace_back([&, i] {
+            dst::point("start");
+            for (int n = 0; n < OPS; ++n) {
+                dst::point("p_op");
+                try {
+                    (void)db.put("s2_k" + std::to_string(i) + "_" + std::to_string(n), "v");
+                    returned.fetch_add(1, std::memory_order_relaxed);
+                } catch (...) {
+                    escaped.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            dst::thread_done();
+        });
+        for (auto& t : ts) t.join();
+        dst::disarm();
+        fault::disarm();
+        bool failed = db.wal_failed_for_test();
+        try { db.close(); } catch (...) {}
+        if (!failed) {
+            fprintf(stderr, "dst S2: armed rotation failure never fired\n");
+            return 9;
+        }
+        if (escaped.load() != 0) {
+            fprintf(stderr, "dst S2: %d puts threw (leader exception escaped)\n", escaped.load());
+            return 9;
+        }
+        if (returned.load() != NT * OPS) {
+            fprintf(stderr, "dst S2: only %d of %d puts returned\n", returned.load(), NT * OPS);
+            return 9;
+        }
+        return 0;
+#else
+        (void)seed; (void)prog; (void)wd;
+        return 0;   // scenario is a no-op without fault injection
+#endif
+    }
+
+    // S3 — GC/epoch reclamation vs concurrent scans.
+    inline int s3_gc_scan(uint64_t seed, dst::Progress* prog, const std::string& wd) {
+        ChronoKV kv(wd);
+        constexpr int NW = 2, OPS = 30, NKEYS = 4;
+        std::atomic<long> seq{0};
+        std::atomic<int> bad{0};
+        dst::arm(seed, NW + 2, prog);
+        std::mutex legit_mu;
+        std::map<std::string, std::set<std::string>> legit;
+        std::vector<std::thread> ws;
+        for (int i = 0; i < NW; ++i) ws.emplace_back([&] {
+            dst::point("start");
+            for (int n = 0; n < OPS; ++n) {
+                dst::point("w");
+                long v = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+                std::string k = "g" + std::to_string(n % NKEYS);
+                std::string val = "v" + std::to_string(v);
+                {
+                    std::lock_guard<std::mutex> g(legit_mu);
+                    legit[k].insert(val);
+                }
+                try { (void)kv.commit(k, val); } catch (...) {}
+            }
+            dst::thread_done();
+        });
+        // Legitimacy oracle (declared above, before the writers): every
+        // (key, value) pair any writer ever handed to commit(). NOTE:
+        // per-key MONOTONICITY would be a WRONG oracle — the two writers
+        // share one global seq counter, and snapshot order follows commit
+        // cts, not seq reservation order, so a later scan may legitimately
+        // observe an EARLIER seq (the first DST run flagged exactly that).
+        // "Observed => actually written to this key" is the sound invariant:
+        // use-after-free / reclaim-vs-scan races surface as garbage or
+        // foreign-key values, which are not in the set.
+        std::thread scanner([&] {
+            dst::point("start");
+            for (int n = 0; n < OPS; ++n) {
+                dst::point("scan");
+                std::vector<std::pair<std::string, std::string>> rs;
+                try { rs = kv.range_scan(UINT64_MAX, "g0", "g9"); }
+                catch (...) { bad.fetch_add(1); break; }
+                for (auto& [k, v] : rs) {
+                    if (k.size() != 2 || k[0] != 'g') { bad.fetch_add(1); continue; }
+                    std::lock_guard<std::mutex> g(legit_mu);
+                    auto it = legit.find(k);
+                    if (it == legit.end() || !it->second.count(v)) bad.fetch_add(1);
+                }
+            }
+            dst::thread_done();
+        });
+        std::thread gct([&] {
+            dst::point("start");
+            for (int n = 0; n < OPS * 2; ++n) {
+                dst::point("gc");
+                try { kv.gc_pass_for_test(); } catch (...) {}
+            }
+            dst::thread_done();
+        });
+        for (auto& t : ws) t.join();
+        scanner.join();
+        gct.join();
+        dst::disarm();
+        if (bad.load()) {
+            fprintf(stderr, "dst S3: %d scan anomalies (garbage/rewound values)\n", bad.load());
+            return 9;
+        }
+        return 0;
+    }
+
+    // S4 — B+ tree cursor vs concurrent splits.
+    inline int s4_tree_split(uint64_t seed, dst::Progress* prog, const std::string& wd) {
+        ChronoKV kv(wd);
+        constexpr int NINS = 400, NSCANS = 30;
+        std::atomic<int> bad{0};
+        dst::arm(seed, 3, prog);
+        std::thread writer([&] {
+            dst::point("start");
+            for (int i = 0; i < NINS; ++i) {
+                dst::point("ins");
+                char k[16];
+                snprintf(k, sizeof k, "t%05d", i);
+                try { (void)kv.commit(k, std::string("val_") + k); } catch (...) {}
+            }
+            dst::thread_done();
+        });
+        auto scan_loop = [&] {
+            dst::point("start");
+            for (int n = 0; n < NSCANS; ++n) {
+                dst::point("scan");
+                std::vector<std::pair<std::string, std::string>> rs;
+                try { rs = kv.range_scan(UINT64_MAX, "t00000", "t99999"); }
+                catch (...) { bad.fetch_add(1); break; }
+                // Ascending single-writer inserts: every snapshot scan must
+                // be a CONTIGUOUS PREFIX t00000..tK with exact values. A
+                // cursor that loses a leaf-switch race drops, duplicates or
+                // reorders keys — all caught here.
+                for (size_t j = 0; j < rs.size(); ++j) {
+                    char k[16];
+                    snprintf(k, sizeof k, "t%05d", (int)j);
+                    if (rs[j].first != k || rs[j].second != std::string("val_") + k) {
+                        bad.fetch_add(1);
+                        break;
+                    }
+                }
+            }
+            dst::thread_done();
+        };
+        std::thread sc1(scan_loop), sc2(scan_loop);
+        writer.join();
+        sc1.join();
+        sc2.join();
+        dst::disarm();
+        if (bad.load()) {
+            fprintf(stderr, "dst S4: %d scan-prefix violations\n", bad.load());
+            return 9;
+        }
+        return 0;
+    }
+}   // namespace dstscn
+#endif   // CHRONOKV_STRESS
+
+static int run_dst_test() {
+    using namespace chronokv;
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) {
+            ++fails;
+            if (!detail.empty()) std::cout << "      (" << detail << ")\n";
+        }
+    };
+#ifndef CHRONOKV_STRESS
+    check("dst: deterministic-scheduler harness (skipped — needs CHRONOKV_STRESS)", true);
+    std::cout << "   DST TEST PASSED (skipped in this build)\n";
+    return fails;
+#else
+    // In-suite default: a small sweep per scenario — enough to detect a
+    // broken harness or an engine regression on every stress run, cheap
+    // enough for the always-run suite. The CI dst job scales via
+    // CKV_DST_SEEDS (bounded PR / long nightly, roadmap: N=100k total).
+    int nseeds = 3;
+    if (const char* e = getenv("CKV_DST_SEEDS")) { int v = atoi(e); if (v > 0) nseeds = v; }
+    uint64_t seed_base = 0xD57D57ULL;
+    if (const char* e = getenv("CKV_DST_SEED")) {
+        uint64_t v = strtoull(e, nullptr, 0);
+        if (v) seed_base = v;
+    }
+    std::cout << "    (dst config: seed_base=" << seed_base << " seeds/scenario=" << nseeds << ")\n";
+
+    struct Scn {
+        const char* name;
+        int (*fn)(uint64_t, dst::Progress*, const std::string&);
+    };
+    const Scn scns[] = {
+        {"wal_mixed_handoff (H3 class)", dstscn::s1_mixed_handoff},
+        {"wal_leader_fault (C1 class)",  dstscn::s2_leader_fault},
+        {"gc_epoch_scan",                dstscn::s3_gc_scan},
+        {"tree_cursor_split",            dstscn::s4_tree_split},
+    };
+
+    const int DEADLINE_MS = 20000;   // clean children finish in ~ms-seconds
+    for (size_t si = 0; si < sizeof(scns) / sizeof(scns[0]); ++si) {
+        int n_hang = 0, n_crash = 0, n_assert = 0, n_pass = 0;
+        uint64_t max_ops = 0, max_steals = 0;
+        std::vector<std::string> first_fails;
+        for (int s = 0; s < nseeds; ++s) {
+            const uint64_t seed = seed_base + (uint64_t)si * 1000003ULL +
+                                  (uint64_t)s * 2654435761ULL;
+            auto* prog = (dst::Progress*)mmap(nullptr, sizeof(dst::Progress),
+                                              PROT_READ | PROT_WRITE,
+                                              MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+            if (prog == MAP_FAILED) { check("dst: mmap progress page", false, strerror(errno)); break; }
+            new (prog) dst::Progress();
+            const std::string wd = "/tmp/ckv_dst_" + std::to_string(getpid()) +
+                                   "_" + std::to_string(si) + "_" + std::to_string(seed);
+            std::filesystem::remove_all(wd);
+            std::cout.flush();     // child must not inherit unflushed stdout
+            pid_t child = fork();
+            if (child < 0) {
+                check("dst: fork", false, strerror(errno));
+                munmap((void*)prog, sizeof(dst::Progress));
+                break;
+            }
+            if (child == 0) {
+                int rc = 3;
+                try {
+                    rc = scns[si].fn(seed, prog, wd);
+                } catch (const std::exception& ex) {
+                    fprintf(stderr, "dst child exception: %s\n", ex.what());
+                    rc = 8;
+                } catch (...) {
+                    rc = 8;
+                }
+                std::error_code ec;
+                std::filesystem::remove_all(wd, ec);
+                fflush(stderr);
+                _exit(rc);
+            }
+            // Parent: bounded wait, then classify.
+            int wst = 0;
+            bool reaped = false;
+            auto t0 = std::chrono::steady_clock::now();
+            while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - t0).count() < DEADLINE_MS) {
+                pid_t r = waitpid(child, &wst, WNOHANG);
+                if (r == child) { reaped = true; break; }
+                if (r < 0) { reaped = true; wst = 0; break; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            std::string outcome;
+            if (!reaped) {
+                kill(child, SIGKILL);
+                waitpid(child, &wst, 0);
+                n_hang++;
+                outcome = "HANG (deadline " + std::to_string(DEADLINE_MS) + "ms)";
+            } else if (WIFSIGNALED(wst)) {
+                n_crash++;
+                outcome = "CRASH signal " + std::to_string(WTERMSIG(wst));
+            } else if (WEXITSTATUS(wst) != 0) {
+                n_assert++;
+                outcome = "INVARIANT exit " + std::to_string(WEXITSTATUS(wst));
+            } else {
+                n_pass++;
+            }
+            uint64_t ops = prog->ops.load(std::memory_order_relaxed);
+            uint64_t steals = prog->timeouts.load(std::memory_order_relaxed);
+            if (ops > max_ops) max_ops = ops;
+            if (steals > max_steals) max_steals = steals;
+            if (!outcome.empty() && first_fails.size() < 3) {
+                char lname[64] = {0};
+                memcpy(lname, prog->last_name, sizeof(lname) - 1);
+                first_fails.push_back(std::string(scns[si].name) + " seed=" +
+                                      std::to_string(seed) + ": " + outcome +
+                                      " ops=" + std::to_string(ops) +
+                                      " last_point=" + (lname[0] ? lname : "?") +
+                                      " steals=" + std::to_string(steals) +
+                                      " — replay: CKV_DST_SEED=" + std::to_string(seed) +
+                                      " CKV_DST_SEEDS=1 (scenario " + std::to_string(si) + ")");
+            }
+            munmap((void*)prog, sizeof(dst::Progress));
+            std::error_code ec;
+            std::filesystem::remove_all(wd, ec);   // best-effort after a kill
+        }
+        std::string nm = std::string("dst: ") + scns[si].name + " x " +
+                         std::to_string(nseeds) + " seeds";
+        bool ok = (n_hang + n_crash + n_assert) == 0 && n_pass == nseeds;
+        check(nm.c_str(), ok, first_fails.empty() ? "" : first_fails[0]);
+        std::cout << "      (pass=" << n_pass << " hang=" << n_hang << " crash=" << n_crash
+                  << " invariant=" << n_assert << ", max child ops=" << max_ops
+                  << ", max steals=" << max_steals << ")\n";
+        for (size_t f = 1; f < first_fails.size(); ++f)
+            std::cout << "      (also: " << first_fails[f] << ")\n";
+    }
+    if (fails == 0) std::cout << "   DST TEST PASSED\n";
+    else std::cout << "   DST FAILURES: " << fails << "\n";
+    return fails;
+#endif
+}
 
 // =====================================================================
 // v27 M1 test driver: proves the checker works before trusting it.
 //
 // Section 1 — SYNTHETIC battery: a hand-built clean history must pass
-//             with zero violations, and thirteen injected anomalies (one
-//             per violation kind, plus combinations) must each be flagged.
+//             with zero violations, and every injected anomaly (one per
+//             violation kind, plus combinations) must be flagged — since
+//             0.26.3 including the SCAN kinds (phantom / missing / stale /
+//             bounds / duplicate) and the SET kinds (duplicate / fabricated
+//             / snapshot-mismatch / write-fold / add-duplicate / realtime-
+//             loss, plus the asserted SILENCE on permuted token order).
 //             Roadmap acceptance: "The checker must flag a deliberately
 //             injected anomaly in a synthetic history. A checker that has
 //             never failed is not a checker."
@@ -10193,10 +10865,17 @@ inline std::vector<Violation> check_list_append(const std::vector<Txn>& txns, ch
 //             readers against a real Database, recorded via txnrec; the
 //             checkers must report ZERO violations (with non-vacuity
 //             guards: the history must actually contain the workload).
+// Section 2b — MIXED-API engine workload (0.26.3): set-add transactions,
+//             async put/get with prompt future reads, Batch multi-key
+//             commits, standalone + transactional range scans over the
+//             churned keyspace; checked by ALL FOUR checkers.
 // Section 3 — ENGINE-history mutations: deliberate corruptions of the
 //             RECORDED history (dropped token, duplicated token, swapped
 //             commit cts across a real-time edge, future version cts)
 //             must be flagged — the checker bites engine-shaped data too.
+// Section 3b — MUTATIONS of the mixed-API history: a dropped scan entry,
+//             an injected scan phantom, a duplicated set token, and a
+//             batch-txn cts swap across a real-time edge.
 // =====================================================================
 static int run_lincheck_test() {
     using namespace chronokv;
@@ -10388,6 +11067,146 @@ static int run_lincheck_test() {
                       : ("expected kind not flagged; got: " + (v.empty() ? "<none>" : lincheck::describe(v))));
     }
 
+    // ---- Section 1b: synthetic SCAN battery (v27 M1 completion) ----
+    // Clean: a=a1@cts1, b=b1@cts2, a=a2@cts3; scans over [a..b] at snap 1/2/3
+    // must see exactly the live prefix. Then one injected anomaly per
+    // scan violation kind.
+    {
+        auto scan_hist = [&]() {
+            std::vector<lincheck::Txn> h;
+            h.push_back(mkw(1, 0, 1, 1000000, 2000000, {{"a", "a1"}}));
+            h.push_back(mkw(2, 1, 2, 3000000, 4000000, {{"b", "b1"}}));
+            h.push_back(mkw(3, 2, 3, 7000000, 8000000, {{"a", "a2"}}));
+            auto mk = [&](uint64_t id, uint64_t snap, uint64_t b, uint64_t e,
+                          std::vector<std::pair<std::string, std::string>> ents) {
+                lincheck::Txn t;
+                t.id = id; t.committed = true;
+                t.has_snapshot = true; t.snapshot = snap;
+                t.begin_ns = b; t.end_ns = e;
+                lincheck::ScanEv sc; sc.lo = "a"; sc.hi = "b"; sc.snap = snap;
+                sc.entries = std::move(ents);
+                t.scans.push_back(std::move(sc));
+                return t;
+            };
+            h.push_back(mk(4, 1, 2200000, 2400000, {{"a", "a1"}}));
+            h.push_back(mk(5, 2, 5000000, 5200000, {{"a", "a1"}, {"b", "b1"}}));
+            h.push_back(mk(6, 3, 9000000, 9200000, {{"a", "a2"}, {"b", "b1"}}));
+            return h;
+        };
+        {
+            auto v = lincheck::check_scans(scan_hist());
+            check("lincheck: synthetic clean scan history passes check_scans",
+                  v.empty(), lincheck::describe(v));
+        }
+        struct ScanCase { const char* name; const char* kind;
+                          std::function<void(std::vector<lincheck::Txn>&)> mutate; };
+        std::vector<ScanCase> scases = {
+            {"scan returns a key not live at its snapshot (phantom)", "scan-phantom",
+             [](std::vector<lincheck::Txn>& h) {   // snap-1 scan sees b (committed @2)
+                 h[3].scans[0].entries.push_back({"b", "b1"});
+             }},
+            {"scan omits a live key", "scan-missing-key",
+             [](std::vector<lincheck::Txn>& h) {   // snap-2 scan drops b
+                 h[4].scans[0].entries.erase(h[4].scans[0].entries.begin() + 1);
+             }},
+            {"scan observes a stale value", "scan-stale-value",
+             [](std::vector<lincheck::Txn>& h) {   // snap-3 scan sees a1, not a2
+                 h[5].scans[0].entries[0].second = "a1";
+             }},
+            {"scan returns a key outside its bounds", "scan-out-of-bounds",
+             [](std::vector<lincheck::Txn>& h) {
+                 h[5].scans[0].entries.push_back({"z", "zz"});
+             }},
+            {"scan returns the same key twice", "scan-duplicate-key",
+             [](std::vector<lincheck::Txn>& h) {
+                 h[5].scans[0].entries.push_back({"a", "a2"});
+             }},
+        };
+        for (auto& c : scases) {
+            auto h = scan_hist();
+            c.mutate(h);
+            auto v = lincheck::check_scans(h);
+            bool ok = lincheck::has_kind(v, c.kind);
+            std::string nm = std::string("lincheck: synthetic scan anomaly flagged — ") + c.name;
+            check(nm.c_str(), ok,
+                  ok ? "" : ("expected " + std::string(c.kind) + "; got: " +
+                             (v.empty() ? "<none>" : lincheck::describe(v))));
+        }
+        // Scan freshness rides on check_cts_order's stale-start rule: the
+        // snap-2 scan re-timed to BEGIN after W3@cts3 was acknowledged must
+        // be flagged even though check_scans alone is satisfied (its entries
+        // still match snap 2 — the snapshot itself is stale in real time).
+        {
+            auto h = scan_hist();
+            h[4].begin_ns = 8500000; h[4].end_ns = 8600000;
+            auto v = lincheck::check_cts_order(h);
+            check("lincheck: scan begun after an ack its snapshot misses is flagged (stale-start)",
+                  lincheck::has_kind(v, "stale-start"), lincheck::describe(v));
+        }
+    }
+
+    // ---- Section 1c: synthetic SET battery (v27 M1 completion) ----
+    // Clean: S={x1}@cts1, S={x1,x2}@cts2; readers at snap 1 and 2. The
+    // permutation case asserts the DEFINING difference from list-append:
+    // reordered tokens are legal under set semantics (and the same history
+    // WOULD fail the list-append checker — both directions asserted).
+    {
+        auto set_hist = [&]() {
+            std::vector<lincheck::Txn> h;
+            h.push_back(mkw(1, 0, 1, 1000000, 2000000, {{"S", "x1"}}));
+            h.push_back(mkw(2, 1, 2, 3000000, 4000000, {{"S", "x1+x2"}}));
+            h.push_back(mkr(3, 1, 2500000, 2700000, {{"S", true, "x1", 1}}));
+            h.push_back(mkr(4, 2, 5000000, 5200000, {{"S", true, "x1+x2", 2}}));
+            return h;
+        };
+        {
+            auto v = lincheck::check_set_adds(set_hist(), "S");
+            check("lincheck: synthetic clean set history passes check_set_adds",
+                  v.empty(), lincheck::describe(v));
+        }
+        {
+            auto h = set_hist();
+            h[3].reads[0].value = "x2+x1";       // permuted, same set
+            auto v = lincheck::check_set_adds(h, "S");
+            auto w = lincheck::check_list_append(h);
+            check("lincheck: permuted tokens pass check_set_adds but fail list-append (set shape is real)",
+                  v.empty() && !w.empty(),
+                  v.empty() ? lincheck::describe(w, 2) : lincheck::describe(v));
+        }
+        struct SetCase { const char* name; const char* kind;
+                         std::function<void(std::vector<lincheck::Txn>&)> mutate; };
+        std::vector<SetCase> xcases = {
+            {"read repeats a token", "set-duplicate",
+             [](std::vector<lincheck::Txn>& h) { h[3].reads[0].value = "x1+x2+x2"; }},
+            {"read returns a token no committed add wrote", "set-fabricated",
+             [](std::vector<lincheck::Txn>& h) { h[2].reads[0].value = "x1+x9"; }},
+            {"read misses an add at-or-below its snapshot", "set-snapshot-mismatch",
+             [](std::vector<lincheck::Txn>& h) { h[3].reads[0].value = "x1"; }},
+            {"committed add drops a prior token (write-side lost add)", "set-write-fold",
+             [](std::vector<lincheck::Txn>& h) { h[1].writes[0].value = "x2"; }},
+            {"committed add writes duplicate tokens", "set-write-duplicate",
+             [](std::vector<lincheck::Txn>& h) { h[1].writes[0].value = "x1+x1"; }},
+            {"add re-adds an already-present token", "set-add-duplicate",
+             [&](std::vector<lincheck::Txn>& h) {
+                 h.push_back(mkw(5, 2, 3, 9000000, 9500000, {{"S", "x1+x2+x2"}}));
+             }},
+            {"read begun after an add's ack misses its token", "set-realtime-loss",
+             [&](std::vector<lincheck::Txn>& h) {   // R5 begins 4.5us > ack(x2)=4.0us
+                 h.push_back(mkr(5, 2, 4500000, 4700000, {{"S", true, "x1", 1}}));
+             }},
+        };
+        for (auto& c : xcases) {
+            auto h = set_hist();
+            c.mutate(h);
+            auto v = lincheck::check_set_adds(h, "S");
+            bool ok = lincheck::has_kind(v, c.kind);
+            std::string nm = std::string("lincheck: synthetic set anomaly flagged — ") + c.name;
+            check(nm.c_str(), ok,
+                  ok ? "" : ("expected " + std::string(c.kind) + "; got: " +
+                             (v.empty() ? "<none>" : lincheck::describe(v))));
+        }
+    }
+
     // ---- Section 2: real engine workload (v27 M2: N-seed scaling) ----
     // CKV_LINCHECK_SEEDS=N sweeps the workload's PRNG base (default: ONE
     // run at the historical 0xC0FFEE11 base, so the always-run suite is
@@ -10492,6 +11311,166 @@ static int run_lincheck_test() {
                   << committed_appends.load() << " committed appends)\n";
     }
 
+    // ---- Section 2b: mixed-API engine workload (v27 M1 completion) ----
+    // Every formerly-unrecorded API in ONE live history: set-add RMW
+    // transactions (S keys, set-checker shape), async put/get with prompt
+    // future reads (A keys; ack_deferred => no ack edges, begin-side
+    // freshness still checked), synchronous Batch multi-key commits (B/C
+    // key pairs, full interval soundness), and range scans — standalone
+    // (Database::range_scan over the churned space) and transactional
+    // (pre-overlay engine view). Checked by cts-order + scans + sets.
+    // (check_list_append deliberately does NOT run here: A/B/C keys are
+    // OVERWRITE workloads, and the list-append fold algebra assumes the
+    // append-only wire convention — the set checker is the right shape
+    // for S, and cts-order replay is the right shape for the rest.)
+    std::vector<lincheck::Txn> hist2;
+    for (int si = 0; si < lc_seeds; ++si) {
+        const uint64_t wseed = (lc_seed_base ^ 0x5EED1234ULL) +
+                               (uint64_t)si * 0x9E3779B97F4A7C15ULL;
+        std::string lbl;
+        if (lc_seeds > 1) {
+            char hb[32];
+            snprintf(hb, sizeof hb, "0x%llx", (unsigned long long)wseed);
+            lbl = std::string(" [seed ") + std::to_string(si + 1) + "/" +
+                  std::to_string(lc_seeds) + " " + hb + "]";
+        }
+        const std::string wd = "/tmp/ckv_lincheck_mix_wal";
+        std::filesystem::remove_all(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.durability = DurabilityMode::Group;
+        o.page_pool_bytes = 32ULL * 1024 * 1024;
+        auto db = Database::open(o);
+        std::atomic<uint64_t> set_adds{0}, async_ops{0}, batch_commits{0}, scans_done{0};
+        txnrec::arm();
+        std::vector<std::thread> ths;
+        // Two set-add threads: RMW appends of unique tokens onto S0/S1.
+        for (int t = 0; t < 2; ++t) ths.emplace_back([&, t] {
+            std::string key = "S" + std::to_string(t);
+            for (int i = 0; i < 40; ++i) {
+                for (int att = 0; att < 25; ++att) {
+                    std::string tok = "x" + std::to_string(t) + "_" +
+                                      std::to_string(i) + "_" + std::to_string(att);
+                    auto txn = db.begin();
+                    auto cur = txn.get(key);
+                    std::string old = cur.value_or("");
+                    txn.put(key, old.empty() ? tok : old + "+" + tok);
+                    if (txn.commit() == Status::OK) {
+                        set_adds.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    }
+                }
+            }
+        });
+        // Async churn thread: put_async with PROMPT get() (documented
+        // soundness contract for ack_deferred intervals) + occasional
+        // get_async.
+        ths.emplace_back([&] {
+            for (int i = 0; i < 60; ++i) {
+                std::string k = "A" + std::to_string(i % 3);
+                auto f = db.put_async(k, "a" + std::to_string(i));
+                if (f.get() == Status::OK)
+                    async_ops.fetch_add(1, std::memory_order_relaxed);
+                if ((i % 5) == 4) {
+                    auto g = db.get_async(k);
+                    (void)g.get();
+                }
+            }
+        });
+        // Batch thread: atomic multi-key commits (write-only, no conflicts).
+        ths.emplace_back([&] {
+            for (int i = 0; i < 30; ++i) {
+                auto b = db.create_batch();
+                b.put("B" + std::to_string(i % 4), "b" + std::to_string(i));
+                b.put("C" + std::to_string(i % 4), "c" + std::to_string(i));
+                if (b.commit() == Status::OK)
+                    batch_commits.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        // Standalone scan thread over the churned keyspace.
+        ths.emplace_back([&] {
+            for (int i = 0; i < 40; ++i) {
+                (void)db.range_scan("A0", "C9");
+                scans_done.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        // Transactional reader: get + scan + staged write + commit. The
+        // staged T-key write makes the txn's OWN scan overlay-dirty — the
+        // recorder must capture the PRE-overlay engine view (verified by
+        // check_scans against the committed-only replay). Range reads over
+        // the churn space will often conflict-abort under SSI; aborts are
+        // recorded and legal (their scans were still snapshot-consistent).
+        ths.emplace_back([&] {
+            for (int i = 0; i < 40; ++i) {
+                auto txn = db.begin();
+                (void)txn.get("A" + std::to_string(i % 3));
+                (void)txn.range_scan("A0", "B9");
+                txn.put("T" + std::to_string(i % 5), "t" + std::to_string(i));
+                (void)txn.commit();
+            }
+        });
+        for (auto& th : ths) th.join();
+        // Quiesced final reads — the lost-add / lost-write detectors.
+        for (int k = 0; k < 2; ++k) (void)db.get("S" + std::to_string(k));
+        (void)db.range_scan("A0", "C9");
+        auto recs = txnrec::disarm();
+        db.close();
+        std::filesystem::remove_all(wd);
+        hist2 = lincheck::from_txnrec(recs);
+
+        size_t n_scans = 0, n_setw = 0, n_aw = 0, n_bw = 0;
+        for (const auto& t : hist2) {
+            n_scans += t.scans.size();
+            if (t.is_write && t.committed)
+                for (const auto& w : t.writes) {
+                    if (w.key.rfind("S", 0) == 0) n_setw++;
+                    else if (w.key.rfind("A", 0) == 0) n_aw++;
+                    else if (w.key.rfind("B", 0) == 0 || w.key.rfind("C", 0) == 0) n_bw++;
+                }
+        }
+        auto v = lincheck::check_cts_order(hist2);
+        {
+            auto w = lincheck::check_scans(hist2);
+            v.insert(v.end(), w.begin(), w.end());
+            auto x = lincheck::check_set_adds(hist2, "S");
+            v.insert(v.end(), x.begin(), x.end());
+        }
+        // CKV_LINCHECK_DUMP=1: full recorded-history dump to stderr on
+        // violation — the triage handle for mixed-workload failures (the
+        // per-txn record lines are what diagnosed the v27 scan-attribution
+        // artifact: RWT scans recorded as standalone synthetic txns).
+        if (!v.empty() && getenv("CKV_LINCHECK_DUMP")) {
+            for (const auto& x : v) fprintf(stderr, "VIOL %s: %s\n", x.kind.c_str(), x.detail.c_str());
+            for (const auto& t : hist2) {
+                fprintf(stderr, "TXN id=%llu w=%d c=%d cts=%llu snap=%llu hs=%d b=%llu e=%llu R=%zu W=%zu S=%zu",
+                        (unsigned long long)t.id, (int)t.is_write, (int)t.committed,
+                        (unsigned long long)t.commit_cts, (unsigned long long)t.snapshot,
+                        (int)t.has_snapshot, (unsigned long long)t.begin_ns, (unsigned long long)t.end_ns,
+                        t.reads.size(), t.writes.size(), t.scans.size());
+                for (auto& r : t.reads) fprintf(stderr, " [r:%s=%s@%llu]", r.key.c_str(), r.value.c_str(), (unsigned long long)r.version_cts);
+                for (auto& w2 : t.writes) fprintf(stderr, " [w:%s=%s]", w2.key.c_str(), w2.value.c_str());
+                for (auto& sc : t.scans) fprintf(stderr, " [s:%s..%s@%llu n=%zu]", sc.lo.c_str(), sc.hi.c_str(), (unsigned long long)sc.snap, sc.entries.size());
+                fprintf(stderr, "\n");
+            }
+        }
+        bool nonvacuous = hist2.size() >= 100 && n_scans >= 10 && n_setw >= 10 &&
+                          n_aw >= 5 && n_bw >= 5 &&
+                          set_adds.load() >= 10 && async_ops.load() >= 5 &&
+                          batch_commits.load() >= 5 && scans_done.load() >= 10;
+        check((std::string("lincheck: mixed-API workload (sets+scans+async+batch) is strictly serializable") +
+               lbl).c_str(),
+              v.empty() && nonvacuous,
+              v.empty() ? ("history under-populated: txns=" + std::to_string(hist2.size()) +
+                           " scans=" + std::to_string(n_scans) +
+                           " set-writes=" + std::to_string(n_setw) +
+                           " async=" + std::to_string(n_aw) +
+                           " batch=" + std::to_string(n_bw))
+                        : lincheck::describe(v, 4));
+        std::cout << "      (mixed history" << lbl << ": " << hist2.size() << " txns, "
+                  << n_scans << " scans, " << n_setw << " set-writes, "
+                  << n_aw << " async-writes, " << n_bw << " batch-writes)\n";
+    }
+
     // ---- Section 3: mutations of the RECORDED engine history ----
     auto find_final_read = [&](const char* key) -> std::pair<size_t, size_t> {
         // last found read of `key` whose list has >= 2 tokens (a quiesced final read)
@@ -10594,6 +11573,110 @@ static int run_lincheck_test() {
         }
         check("lincheck: engine-history mutation flagged — version cts beyond snapshot",
               ok, done ? "" : "no suitable read found in the recorded history");
+    }
+
+    // ---- Section 3b: mutations of the RECORDED mixed-API history ----
+    // The new checkers must bite engine-shaped data too, not just synthetics.
+    {
+        // (i) drop a scan entry -> scan-missing-key (every recorded entry was
+        // live at the scan's snapshot, so any deletion is a true omission).
+        bool done = false, ok = false;
+        auto h = hist2;
+        for (auto& t : h) {
+            for (auto& sc : t.scans)
+                if (!done && sc.entries.size() >= 2) {
+                    sc.entries.erase(sc.entries.begin());
+                    done = true;
+                }
+            if (done) break;
+        }
+        if (done) {
+            auto v = lincheck::check_scans(h);
+            ok = lincheck::has_kind(v, "scan-missing-key");
+        }
+        check("lincheck: mixed-history mutation flagged — dropped scan entry",
+              ok, done ? "scan-missing-key not flagged" : "no scan with >=2 entries recorded");
+    }
+    {
+        // (ii) inject a never-written key inside a scan's bounds -> scan-phantom.
+        bool done = false, ok = false;
+        auto h = hist2;
+        for (auto& t : h) {
+            for (auto& sc : t.scans)
+                if (!done && sc.lo <= std::string("A0~ghost") && std::string("A0~ghost") <= sc.hi) {
+                    sc.entries.push_back({"A0~ghost", "nope"});
+                    done = true;
+                }
+            if (done) break;
+        }
+        if (done) {
+            auto v = lincheck::check_scans(h);
+            ok = lincheck::has_kind(v, "scan-phantom");
+        }
+        check("lincheck: mixed-history mutation flagged — injected scan phantom",
+              ok, done ? "scan-phantom not flagged" : "no scan covering 'A0~ghost' recorded");
+    }
+    {
+        // (iii) duplicate a token in an S-key read -> set-duplicate.
+        bool done = false, ok = false;
+        auto h = hist2;
+        for (auto& t : h) {
+            for (auto& r : t.reads)
+                if (!done && r.found && r.key.rfind("S", 0) == 0 &&
+                    r.value.find('+') != std::string::npos) {
+                    r.value += "+" + r.value.substr(0, r.value.find('+'));
+                    done = true;
+                }
+            if (done) break;
+        }
+        if (done) {
+            auto v = lincheck::check_set_adds(h, "S");
+            ok = lincheck::has_kind(v, "set-duplicate");
+        }
+        check("lincheck: mixed-history mutation flagged — duplicated set token",
+              ok, done ? "set-duplicate not flagged" : "no multi-token S read recorded");
+    }
+    {
+        // (iv) swap a BATCH txn's commit cts across a real-time edge ->
+        // realtime-inversion. Batch commits are synchronous, so their
+        // intervals carry full ack-edge soundness — this mutation proves
+        // the recorded batch intervals actually participate in real-time
+        // checking (an unrecorded/zeroed interval would make it inert).
+        auto is_batch = [](const lincheck::Txn& t) {
+            if (!(t.is_write && t.committed && t.commit_cts)) return false;
+            int bc = 0;
+            for (const auto& w : t.writes)
+                if (w.key.rfind("B", 0) == 0 || w.key.rfind("C", 0) == 0) bc++;
+            return bc >= 2;
+        };
+        std::vector<const lincheck::Txn*> ws;
+        for (const auto& t : hist2)
+            if (t.is_write && t.committed && t.commit_cts && t.begin_ns && t.end_ns)
+                ws.push_back(&t);
+        std::sort(ws.begin(), ws.end(),
+                  [](const lincheck::Txn* a, const lincheck::Txn* b) { return a->end_ns < b->end_ns; });
+        size_t ai = SIZE_MAX, bi = SIZE_MAX;
+        for (size_t i = 0; i < ws.size() && ai == SIZE_MAX; ++i)
+            for (size_t j = ws.size(); j-- > i + 1;)
+                if (ws[i]->end_ns + 100000 < ws[j]->begin_ns &&
+                    (is_batch(*ws[i]) || is_batch(*ws[j]))) { ai = i; bi = j; break; }
+        bool ok = ai != SIZE_MAX;
+        if (ok) {
+            auto h = hist2;
+            auto find_by_id = [&](uint64_t id) -> size_t {
+                for (size_t i = 0; i < h.size(); ++i) if (h[i].id == id) return i;
+                return SIZE_MAX;
+            };
+            size_t x = find_by_id(ws[ai]->id), y = find_by_id(ws[bi]->id);
+            std::swap(h[x].commit_cts, h[y].commit_cts);
+            auto v = lincheck::check_cts_order(h);
+            ok = lincheck::has_kind(v, "realtime-inversion");
+            check("lincheck: mixed-history mutation flagged — batch cts swap across a real-time edge",
+                  ok, lincheck::describe(v, 2));
+        } else {
+            check("lincheck: mixed-history mutation flagged — batch cts swap across a real-time edge",
+                  false, "no batch txn with a disjoint-interval real-time partner found");
+        }
     }
 
     if (fails == 0) std::cout << "   LINCHECK TEST PASSED\n";

@@ -1,5 +1,60 @@
 // chronokv.hpp — ChronoKV engine and public C++ API.
 //
+// v26.3 SHIPPED (v27 M0 deterministic scheduler + v27 M1 completion):
+// the reproduction problem the whole v27 arc exists for is now fixed:
+// an interleaving you hit once CAN be replayed.
+//
+//   M0 — dst:: baton scheduler (below, CHRONOKV_STRESS builds). Every
+//       stress_point() in the three roadmap-scoped bug-dense areas (WAL
+//       group-commit/batch handoff, GC+epoch vs concurrent scans, B+ tree
+//       cursor vs splits) becomes a scheduling point while the controller
+//       is armed: the calling thread parks, a seeded PRNG picks the next
+//       runner. Thread rendezvous makes even the initial schedule a pure
+//       function of the seed; a bounded-patience steal (5 ms default,
+//       COUNTED) breaks the deadlocks that strict batons hit on
+//       un-intercepted real mutex/cv blocking (group-commit followers park
+//       on batch_cv_ BY DESIGN). 11 new points at the exact windows the
+//       historical bugs lived in: wal_mixed_handoff (the H3 orphaning
+//       site), wal_leader_elected/done (the C1 cleanup window),
+//       gc_pass_begin/gc_epoch_advance/gc_reclaim_begin,
+//       scan_guard_acquired, tree_leaf_latch_gap (put AND erase descents),
+//       tree_split_begin, tree_cursor_leaf_switch. Unarmed cost: one
+//       relaxed bool load per point.
+//       Harness (main.cpp run_dst_test, CKV_ONLY_DST gate): four
+//       fork-isolated scenarios — hangs become deadline FAILs, SEGVs
+//       become signal FAILs, each reported with (scenario, seed,
+//       op-count, last point, steals) + a copy-pasteable replay command.
+//       ACCEPTANCE PROVEN: reintroducing C1 (unconditional re-lock ->
+//       EDEADLK skips cleanup) hangs and is caught on >=3/10 seeds per run
+//       (~0.6/seed; PR runs use 100 seeds/scenario); reintroducing H3
+//       (leader drains cur_batch_, no null guard) SEGVs on 12/12 seeds.
+//       Clean tree: 200-seed sweep, zero failures. The harness also caught
+//       its own S3 oracle bug on the very first run (per-key monotonicity
+//       is WRONG under a shared seq counter — snapshot order follows cts,
+//       not reservation order).
+//   M1 COMPLETION — recorder: range scans (Database + Transaction; the
+//       engine's PRE-overlay snapshot view, packed k\x1Fv\x1E; RWT scans
+//       attach to the parent txn — recording them standalone made
+//       correctly-snapshot-consistent scans read as stale-start),
+//       async put/get/erase (interval [API entry, shared-state ready];
+//       ack_deferred => end dropped so no unsound ack edge is derived),
+//       Batch::commit (Stage*+Commit under one id; synchronous, sound).
+//       Checkers: check_scans (scan == exact live set in [lo,hi] at the
+//       scan snapshot: phantom / missing / stale / bounds / duplicate) and
+//       check_set_adds (order-INSENSITIVE set algebra: duplicate /
+//       fabricated / snapshot-mismatch / write-fold / add-duplicate /
+//       realtime-loss; permutation asserted SILENT — and the same history
+//       asserted to FAIL list-append, proving the shape is real). New
+//       mixed-API engine workload (sets + async + batch + standalone &
+//       transactional scans) checked by all checkers, seeded via
+//       CKV_LINCHECK_SEEDS; batteries: +6 scan cases, +9 set cases, +4
+//       mixed-history mutations. CKV_LINCHECK_DUMP=1 dumps the recorded
+//       history on violation.
+//   CI: the dst job now runs the REAL harness (PR 100 seeds/scenario;
+//       nightly 25,000 x 4 = the roadmap's 100k), alongside the M2
+//       seeded-stress and lincheck regimes.
+//   CHRONOKV_VERSION 0.26.3.
+//
 // v26.2 SHIPPED (v27 M2 — CI integration):
 // roadmap v27 M2 lands: dedicated `crashfuzz` and `dst` CI jobs with a
 // bounded-PR / long-nightly policy, both folded into the `ci-passed`
@@ -1289,8 +1344,174 @@ namespace stress {
     inline std::function<void()> gap_callback_ensure{nullptr};
 }
 
+// ===================== v27 M0: deterministic scheduler =====================
+// The bug-dense paths (WAL group-commit/batch handoff, GC+epoch reclamation
+// vs concurrent scans, B+ tree cursor vs splits) were instrumented with
+// stress_point() long ago — but those yields were real std::this_thread::
+// yield() calls: an interleaving you hit once could not be replayed, which
+// is exactly why C1 and H3 were found by READING instead of by running.
+//
+// dst:: replaces the probabilistic yield with a seeded, centrally-controlled
+// baton scheduler (the roadmap's sched::point(id) design):
+//   * Every instrumented site calls stress_point(name), which — while the
+//     controller is ARMED — hands control to dst::point(name).
+//   * At each point the calling thread parks and the controller picks the
+//     next runner from the parked set with the seeded PRNG. One baton ⇒ one
+//     runner at a time ⇒ the interleaving is a pure function of the seed
+//     (given the rendezvous below and no timeout steals).
+//   * RENDEZVOUS: arm(seed, nthreads, prog) withholds the first grant until
+//     all nthreads have parked at their first point, so even the initial
+//     schedule does not depend on real thread-spawn timing.
+//   * DEADLOCK BREAKER (bounded steal): a granted runner may still block on
+//     a REAL mutex/cv held by a parked thread (the engine is lock-based; we
+//     do not intercept blocking primitives). If the baton makes no progress
+//     for steal_wait_ms, any parked thread steals it (logged in
+//     Progress::timeouts). This sacrifices strict determinism ONLY in runs
+//     that would otherwise deadlock — clean scenarios never steal, and a
+//     stealing run is still replayable from (seed, op-count) up to the
+//     logged steal points.
+//   * REPLAY CONTRACT: every thread that can reach a dst point must call
+//     dst::thread_done() before it exits (scenarios do; engine-internal
+//     threads are kept out of scenarios by using synchronous gc_once and
+//     auto_start_gc=false). Progress lives in a caller-provided page so a
+//     fork()-isolated harness can report (ops, last point) after a hang.
+namespace dst {
+    struct Progress {
+        std::atomic<uint64_t> ops{0};        // dst points executed
+        std::atomic<uint64_t> grants{0};     // baton handoffs
+        std::atomic<uint64_t> timeouts{0};   // deadlock-breaker steals
+        char last_name[64] = {0};            // last point entered (triage)
+    };
+
+    inline std::mutex mu;
+    inline std::condition_variable cv;
+    inline bool armed = false;               // set under mu before workers spawn
+    inline uint64_t rng = 0;
+    inline Progress* prog = nullptr;
+    inline size_t expect_n = 0;              // rendezvous: grants start at n parked
+    inline bool rendezvous_done = false;
+    inline uint64_t holder = UINT64_MAX;     // tid currently holding the baton
+    inline uint64_t next_tid = 0;
+    inline std::chrono::steady_clock::time_point granted_at;
+    // Steal window: the baton holder may block on a REAL mutex/cv between
+    // points (the engine is lock-based; group-commit followers park on
+    // batch_cv_ by design). Parked threads cannot be granted while the
+    // holder is stuck, so after steal_wait_ms any waiter takes over — the
+    // bounded-patience compromise that keeps retrofit DST deadlock-free on
+    // un-intercepted blocking primitives. Milliseconds, not hundreds: a
+    // WAL fsync is sub-ms on CI NVMe, and every stall costs one window.
+    inline int steal_wait_ms = 5;
+
+    struct Waiter { uint64_t tid; bool granted; };
+    inline std::vector<Waiter> waiting;      // parked at a point, want the baton
+
+    thread_local uint64_t my_tid = UINT64_MAX;
+
+    inline uint64_t prng() {
+        rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+        return rng >> 11;
+    }
+    inline bool is_armed() { return armed; }  // written once before threads spawn
+
+    inline void arm(uint64_t seed, size_t nthreads, Progress* p, int steal_ms = 5) {
+        std::lock_guard<std::mutex> g(mu);
+        rng = seed | 1;
+        prog = p;
+        expect_n = nthreads;
+        rendezvous_done = (nthreads == 0);
+        holder = UINT64_MAX;
+        next_tid = 0;
+        waiting.clear();
+        steal_wait_ms = steal_ms > 0 ? steal_ms : 5;
+        armed = true;
+    }
+    inline void disarm() {
+        std::lock_guard<std::mutex> g(mu);
+        armed = false;
+        prog = nullptr;
+        waiting.clear();
+        holder = UINT64_MAX;
+        cv.notify_all();
+    }
+
+    // mu held; holder == UINT64_MAX; waiting non-empty (or rendezvous pending).
+    inline void grant_one() {
+        if (holder != UINT64_MAX || waiting.empty()) return;
+        if (!rendezvous_done) {
+            if (waiting.size() < expect_n) return;   // keep gathering
+            rendezvous_done = true;
+        }
+        size_t k = (size_t)(prng() % waiting.size());
+        waiting[k].granted = true;
+        cv.notify_all();
+    }
+
+    inline void point(const char* name) {
+        if (!armed) return;
+        std::unique_lock<std::mutex> lk(mu);
+        if (my_tid == UINT64_MAX) my_tid = next_tid++;
+        if (prog) {
+            prog->ops.fetch_add(1, std::memory_order_relaxed);
+            size_t i = 0;
+            for (; i + 1 < sizeof(prog->last_name) && name[i]; ++i)
+                prog->last_name[i] = name[i];
+            prog->last_name[i] = '\0';
+        }
+        // Release the baton if I held it: reaching the next point is the
+        // runner yielding control back to the scheduler.
+        if (holder == my_tid) holder = UINT64_MAX;
+        waiting.push_back(Waiter{my_tid, false});
+        grant_one();
+        while (true) {
+            bool me = false;
+            for (size_t i = 0; i < waiting.size(); ++i)
+                if (waiting[i].tid == my_tid) { me = waiting[i].granted; break; }
+            if (me) break;
+            cv.wait_for(lk, std::chrono::milliseconds(1));
+            // Deadlock breaker: baton granted but the runner is stuck on a
+            // real lock held by a parked thread (or died). Steal it.
+            if (holder != UINT64_MAX &&
+                std::chrono::steady_clock::now() - granted_at >
+                    std::chrono::milliseconds(steal_wait_ms)) {
+                if (prog) prog->timeouts.fetch_add(1, std::memory_order_relaxed);
+                holder = UINT64_MAX;
+                grant_one();
+            } else if (holder == UINT64_MAX) {
+                grant_one();   // rendezvous completed / straggler arrived
+            }
+        }
+        for (size_t i = 0; i < waiting.size(); ++i)
+            if (waiting[i].tid == my_tid) { waiting.erase(waiting.begin() + (long)i); break; }
+        holder = my_tid;
+        granted_at = std::chrono::steady_clock::now();
+        if (prog) prog->grants.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Contract call before a controlled thread exits: releases the baton and
+    // shrinks the rendezvous expectation so parked threads are not stranded.
+    inline void thread_done() {
+        if (!armed) return;
+        std::lock_guard<std::mutex> lk(mu);
+        if (my_tid == UINT64_MAX) return;
+        if (holder == my_tid) holder = UINT64_MAX;
+        for (size_t i = 0; i < waiting.size(); ++i)
+            if (waiting[i].tid == my_tid) { waiting.erase(waiting.begin() + (long)i); break; }
+        if (expect_n) --expect_n;
+        my_tid = UINT64_MAX;
+        grant_one();
+        cv.notify_all();
+    }
+}
+
 static inline void stress_point(const char* name) {
     (void)name;
+    // v27 M0: while the deterministic controller is armed, every stress
+    // point is a scheduling point — the seeded baton handoff REPLACES the
+    // probabilistic yield (yielding under dst would reintroduce exactly the
+    // nondeterminism M0 exists to remove). The v25.1 gap hooks are not
+    // consulted while armed: the m16 gap tests never arm dst, and a dst
+    // scenario never installs gap hooks.
+    if (dst::is_armed()) { dst::point(name); return; }
     thread_local stress::ThreadRng rng;
     // Sparse: yield ~1/8 of the time. Widens the target window without
     // exploding the interleaving state space.
@@ -1427,7 +1648,31 @@ namespace txnrec {
         bool committed = false;    // Commit/Write/Delete: result was a commit
         uint64_t begin_ns = 0;     // steady-clock real-time interval (over-approx.)
         uint64_t end_ns = 0;
+        bool ack_deferred = false; // v27 M1 (async recording): the op's result
+                                   // reaches the caller via a future AFTER the
+                                   // recorded end_ns (shared-state ready), so
+                                   // end_ns UNDER-approximates the ack time.
+                                   // from_txnrec zeroes end_ns for these txns:
+                                   // real-time ACK edges are unsound for them,
+                                   // everything else (cts order, snapshot
+                                   // soundness, begin-side freshness) applies.
     };
+
+    // v27 M1 (scan recording): wire format for RangeScan payloads —
+    // key \x1F value pairs joined by \x1E. Chosen so arbitrary key/value
+    // bytes survive round-trips (the "k=v;..." sketch in the Op comment
+    // could not carry a ';' inside a value).
+    inline std::string pack_scan(
+            const std::vector<std::pair<std::string, std::string>>& rs) {
+        std::string out;
+        for (const auto& [k, v] : rs) {
+            out += k;
+            out += '\x1F';
+            out += v;
+            out += '\x1E';
+        }
+        return out;
+    }
 
     inline std::mutex mu;
     inline std::vector<Record> log;
@@ -3330,6 +3575,10 @@ public:
         // cur_batch_, so no new records join it) and a leader drains it
         // front-first like any other.
         cur_batch_ = nullptr;
+        // v27 M0 (dst): the H3 window — the old handoff orphaned the batch
+        // RIGHT HERE (cur_batch_ = nullptr with waiters still on it, and a
+        // later leader dereferenced the null in sort(batch->records...)).
+        stress_point("wal_mixed_handoff");
     }
     if (!cur_batch_) {
         cur_batch_ = std::make_shared<Batch>();
@@ -3345,6 +3594,12 @@ public:
         if (!leader_active_) {
             leader_active_ = true;
             lk.unlock();
+            // v27 M0 (dst): leader-election window — between unlocking and
+            // draining pending_, other committers can enqueue records, flip
+            // durability classes, or even become waiters on this batch. The
+            // bare yield() below widens it nondeterministically; the dst
+            // point makes the window schedulable from the seed.
+            stress_point("wal_leader_elected");
             std::this_thread::yield();
             lk.lock();
 
@@ -3701,6 +3956,11 @@ public:
             }
             leader_active_ = false;
             batch_cv_.notify_all();
+            // v27 M0 (dst): the C1 window — cleanup just ran (or, pre-fix,
+            // was SKIPPED when the re-lock threw EDEADLK, stranding every
+            // follower parked on batch_cv_). Parking here lets the schedule
+            // decide who observes the state flip first.
+            stress_point("wal_leader_done");
             // If the leader threw, propagate the exception AFTER cleanup.
             // Callers (commit_txn) catch it via Fix 1b and return WalFailure.
             // A bare `throw;` here would be OUTSIDE the handler (no active
@@ -4483,6 +4743,7 @@ class ChronoKV {
     }
 
     size_t reclaim_retired() {
+        stress_point("gc_reclaim_begin");   // v27 M0 (dst): min-pin vs scan window
         const uint64_t min_epoch = min_active_pin_epoch();
         std::vector<std::unique_ptr<Version>> victims;
         {
@@ -4618,6 +4879,7 @@ class ChronoKV {
     }
 
     bool gc_once() {
+        stress_point("gc_pass_begin");   // v27 M0 (dst): pass vs scan window
      auto gc_t0 = std::chrono::steady_clock::now();
      uint64_t m = gc_threshold();
 
@@ -4712,6 +4974,7 @@ class ChronoKV {
      // All nodes retired in this pass carry the pre-advance epoch.
      // A node is physically destroyed only after every active pin is
      // strictly newer (or after all pins have left).
+     stress_point("gc_epoch_advance");   // v27 M0 (dst): pin vs epoch window
      advance_reclaim_epoch();
      reclaim_retired();
      // v24 Fix 12: route through prune_phantom_tracker() so the
@@ -6663,7 +6926,8 @@ public:
 
     std::vector<std::pair<std::string, std::string>> range_scan(uint64_t read_ts,
                                              const std::string& lo,
-                                             const std::string& hi) {
+                                             const std::string& hi,
+                                             uint64_t* eff_ts_out = nullptr) {
 #ifdef CHRONOKV_RECORD_HISTORY
         HistScope hs("range_scan", lo + ".." + hi);
         hs.set_lts(read_ts);
@@ -6677,7 +6941,12 @@ public:
         // the current published timestamp. For historical reads (read_ts <
         // published), the slot still prevents GC from running concurrently.
         uint64_t effective_ts = std::min(read_ts, pub_.published());
+        if (eff_ts_out) *eff_ts_out = effective_ts;   // v27 M1: scan recording
         SnapshotGuard sg(*this);  // v20.1 (#11): RAII slot, exception-safe
+        // v27 M0 (dst): the scan side of the GC-vs-scan race: the pin is
+        // live from here, and gc_once()/reclaim_retired() consult it. The
+        // scheduler can now interleave the pass against the pinned scan.
+        stress_point("scan_guard_acquired");
         // The SnapshotGuard publishes a physical-lifetime pin. Phase C
         // reclamation therefore needs no long-held GC/scan lock.
 
@@ -7375,6 +7644,16 @@ class ReadWriteTransaction {
     // so the recorded real-time interval stays an over-approximation of
     // the true call interval (the sound direction for real-time checks).
     uint64_t commit_cts_ = 0;
+    // v27 M1 (scan recording): txnrec id of the OWNING public Transaction,
+    // plumbed via set_rec_txn_id() so range_scan emissions attach to the
+    // parent txn. Attachment matters for soundness: the txn's BEGIN — not
+    // the scan call — establishes the snapshot and the real-time start; a
+    // scan-only synthetic txn would claim freshness from the wrong instant
+    // (and correctly-snapshot-consistent scans inside older transactions
+    // would read as stale-start violations). 0 = engine-level RWT use:
+    // the scan records as its own standalone txn (sound for one-shot
+    // Database::range_scan, whose snapshot IS taken at call time).
+    uint64_t rec_txn_id_ = 0;
     bool slot_released_ = false;
     bool phantom_registered_ = true;
     // v24 fix: when created via chronokv::Transaction (public API),
@@ -7439,6 +7718,9 @@ public:
     // v27 M1 (txnrec): the snapshot this transaction reads at, and the cts
     // its successful commit was assigned (0 until then).
     uint64_t snapshot() const { return read_ts_; }
+#ifdef CHRONOKV_TEST_HOOKS
+    void set_rec_txn_id(uint64_t id) { rec_txn_id_ = id; }   // v27 M1: see member
+#endif
     uint64_t commit_cts() const { return commit_cts_; }
 
     // v25.7 (review M3): read-only view of the buffered write set, so
@@ -7492,8 +7774,35 @@ public:
 
     std::vector<std::pair<std::string, std::string>> range_scan(const std::string& lo, const std::string& hi) {
         if (state_ != TxnState::Active) return {};
-        auto result = kv_.range_scan(read_ts_, lo, hi);
+        std::vector<std::pair<std::string, std::string>> result;
+#ifdef CHRONOKV_TEST_HOOKS
+        // v27 M1 (scan recording): record the ENGINE's snapshot view, i.e.
+        // BEFORE the read-your-writes overlay below — the overlay entries
+        // are this txn's own staged writes (already recorded as Stage ops),
+        // and mixing them in would make the scan's snapshot claim
+        // unverifiable. Stamped here rather than at the public wrapper:
+        // the wrapper->engine gap is a few hundred ns, comfortably inside
+        // the checker's 4 us real-time slack.
+        if (txnrec::is_armed()) {
+            uint64_t t0 = txnrec::now_ns(), eff = 0;
+            result = kv_.range_scan(read_ts_, lo, hi, &eff);
+            txnrec::Record rec;
+            rec.op = txnrec::Op::RangeScan;
+            rec.txn_id = rec_txn_id_;   // 0 -> standalone synthetic txn
+            rec.key = lo + ".." + hi;
+            rec.snap_cts = eff;
+            rec.value = txnrec::pack_scan(result);
+            rec.begin_ns = t0;
+            rec.end_ns = txnrec::now_ns();
+            txnrec::record(std::move(rec));
+        } else {
+            result = kv_.range_scan(read_ts_, lo, hi);
+        }
         range_reads_.push_back({lo, hi, read_ts_, 0});
+#else
+        result = kv_.range_scan(read_ts_, lo, hi);
+        range_reads_.push_back({lo, hi, read_ts_, 0});
+#endif
         // v22 M2 (invariant T1, read-your-writes): overlay this transaction's
         // buffered write-set onto the snapshot scan. Buffered deletes suppress
         // keys; buffered writes insert/override. Result stays key-sorted. The
@@ -7637,18 +7946,25 @@ namespace chronokv {
 // silently losing commits once later checkpoints rotate the covering WAL
 // segments), fixed here with in-suite detectors. Also starts v27 M1
 // (history -> strict-serializability checker).
+// v26.3: v27 M0 (deterministic scheduler) + M1 completion. The dst::
+// baton scheduler below makes the stress_point instrumentation in the
+// three bug-dense areas replayable from (seed, op-count); the fork-
+// isolated 4-scenario harness in main.cpp proved the roadmap acceptance
+// by catching reintroduced C1 (hang) and H3 (SEGV) mutants. The txnrec
+// recorder gained range-scan, async and Batch emission; lincheck gained
+// check_scans + check_set_adds.
 // v26.2: v27 M2 (CI integration) — dedicated `dst` + `crashfuzz` CI jobs
 // (bounded PR / long nightly) folded into the `ci-passed` gate; the
 // seed-scaling knobs CKV_CRASHFUZZ_SEEDS / CKV_LINCHECK_SEEDS /
 // CKV_STRESS_SEED and the CKV_ONLY_CRASHFUZZ gate ship in main.cpp. No
 // engine changes; the dst runner swaps to the M0 deterministic scheduler
 // when M0 ships.
-static constexpr const char* CHRONOKV_VERSION = "0.26.2";
+static constexpr const char* CHRONOKV_VERSION = "0.26.3";
 static constexpr int CHRONOKV_VERSION_MAJOR = 0;
 static constexpr int CHRONOKV_VERSION_MINOR = 26;
 // v25.7: PATCH was stale (said 2 while the string said 0.25.6). Kept in
 // lockstep with CHRONOKV_VERSION from here on.
-static constexpr int CHRONOKV_VERSION_PATCH = 2;
+static constexpr int CHRONOKV_VERSION_PATCH = 3;
 
 // ---- Error hierarchy --------------------------------------------------
 class Error : public std::runtime_error {
@@ -8042,6 +8358,26 @@ public:
     range_scan(std::string_view lo, std::string_view hi) {
         auto eng = api_engine();
         try {
+#ifdef CHRONOKV_TEST_HOOKS
+            // v27 M1 (scan recording): outermost wrapper, so the recorded
+            // interval over-approximates the true call (same contract as
+            // get/put). snap_cts is the engine's effective_ts — the cts the
+            // scan actually resolved versions at.
+            if (txnrec::is_armed()) {
+                uint64_t t0 = txnrec::now_ns(), eff = 0;
+                auto res = eng->range_scan(UINT64_MAX, std::string(lo),
+                                           std::string(hi), &eff);
+                txnrec::Record rec;
+                rec.op = txnrec::Op::RangeScan;
+                rec.key = std::string(lo) + ".." + std::string(hi);
+                rec.snap_cts = eff;
+                rec.value = txnrec::pack_scan(res);
+                rec.begin_ns = t0;
+                rec.end_ns = txnrec::now_ns();
+                txnrec::record(std::move(rec));
+                return res;
+            }
+#endif
             return eng->range_scan(UINT64_MAX, std::string(lo), std::string(hi));
         } catch (const std::exception& e) {
             throw Error(std::string("range_scan failed: ") + e.what());
@@ -8289,7 +8625,19 @@ public:
         auto eng = api_engine();   // v25.8: race-free check + keepalive copy
         std::weak_ptr<std::atomic<bool>> w = alive_;
         Database* self = this;
-        return std::async(std::launch::async, [eng, w, self,
+#ifdef CHRONOKV_TEST_HOOKS
+        // v27 M1 (async recording): begin stamped at the API entry; the end
+        // is stamped in the worker when the shared state is made ready.
+        // The caller's ACK (future.get()) happens at-or-after that, so the
+        // recorded interval UNDER-approximates the true one on the end side
+        // — flagged ack_deferred; from_txnrec drops end_ns so no real-time
+        // ack edge is derived from it (unsound direction). Everything else
+        // (cts order, snapshot soundness, begin-side freshness) applies.
+        const uint64_t rec_t0 = txnrec::is_armed() ? txnrec::now_ns() : 0;
+#else
+        const uint64_t rec_t0 = 0;
+#endif
+        return std::async(std::launch::async, [eng, w, self, rec_t0,
                           key = std::move(key), value = std::move(value)]() {
             if (auto sp = w.lock(); !sp || !*sp) return Status::Failed;
             WriteSet ws = {{key, value, false}};
@@ -8299,6 +8647,21 @@ public:
             if (status == Status::OK) {
                 if (auto sp2 = w.lock(); sp2 && *sp2) self->notify_observers(ws);
             }
+#ifdef CHRONOKV_TEST_HOOKS
+            if (rec_t0) {
+                txnrec::Record rec;
+                rec.op = txnrec::Op::Write;
+                rec.snap_cts = UINT64_MAX;      // write-only standalone txn
+                rec.key = key;
+                rec.value = value;
+                rec.commit_cts = (status == Status::OK) ? cts : 0;
+                rec.committed = (status == Status::OK);
+                rec.begin_ns = rec_t0;
+                rec.end_ns = txnrec::now_ns();
+                rec.ack_deferred = true;
+                txnrec::record(std::move(rec));
+            }
+#endif
             return status;
         });
     }
@@ -8307,11 +8670,34 @@ public:
     std::future<Result<std::optional<std::string>>> get_async(std::string key) {
         auto eng = api_engine();   // v25.8: race-free check + keepalive copy
         std::weak_ptr<std::atomic<bool>> w = alive_;
-        return std::async(std::launch::async, [eng, w, key = std::move(key)]()
+#ifdef CHRONOKV_TEST_HOOKS
+        const uint64_t rec_t0 = txnrec::is_armed() ? txnrec::now_ns() : 0;  // v27 M1: see put_async
+#else
+        const uint64_t rec_t0 = 0;
+#endif
+        return std::async(std::launch::async, [eng, w, rec_t0, key = std::move(key)]()
                               -> Result<std::optional<std::string>> {
             if (auto sp = w.lock(); !sp || !*sp)
                 return Result<std::optional<std::string>>::failure(Status::Failed);
             try {
+#ifdef CHRONOKV_TEST_HOOKS
+                if (rec_t0) {
+                    uint64_t snap = 0, vcts = 0;
+                    auto res = eng->read_observed(key, &snap, &vcts);
+                    txnrec::Record rec;
+                    rec.op = txnrec::Op::Read;
+                    rec.key = key;
+                    rec.snap_cts = snap;
+                    rec.version_cts = vcts;
+                    rec.deleted = !res.has_value();
+                    if (res) rec.value = *res;
+                    rec.begin_ns = rec_t0;
+                    rec.end_ns = txnrec::now_ns();
+                    rec.ack_deferred = true;
+                    txnrec::record(std::move(rec));
+                    return Result<std::optional<std::string>>::success(res);
+                }
+#endif
                 return Result<std::optional<std::string>>::success(eng->read(key));
             } catch (...) {
                 return Result<std::optional<std::string>>::failure(Status::Failed);
@@ -8324,7 +8710,12 @@ public:
         auto eng = api_engine();   // v25.8: race-free check + keepalive copy
         std::weak_ptr<std::atomic<bool>> w = alive_;
         Database* self = this;
-        return std::async(std::launch::async, [eng, w, self, key = std::move(key)]() {
+#ifdef CHRONOKV_TEST_HOOKS
+        const uint64_t rec_t0 = txnrec::is_armed() ? txnrec::now_ns() : 0;  // v27 M1: see put_async
+#else
+        const uint64_t rec_t0 = 0;
+#endif
+        return std::async(std::launch::async, [eng, w, self, rec_t0, key = std::move(key)]() {
             if (auto sp = w.lock(); !sp || !*sp) return Status::Failed;
             WriteSet ws = {{key, "", true}};
             uint64_t cts = 0;
@@ -8333,6 +8724,21 @@ public:
             if (status == Status::OK) {
                 if (auto sp2 = w.lock(); sp2 && *sp2) self->notify_observers(ws);
             }
+#ifdef CHRONOKV_TEST_HOOKS
+            if (rec_t0) {
+                txnrec::Record rec;
+                rec.op = txnrec::Op::Delete;
+                rec.snap_cts = UINT64_MAX;      // write-only standalone txn
+                rec.key = key;
+                rec.deleted = true;
+                rec.commit_cts = (status == Status::OK) ? cts : 0;
+                rec.committed = (status == Status::OK);
+                rec.begin_ns = rec_t0;
+                rec.end_ns = txnrec::now_ns();
+                rec.ack_deferred = true;
+                txnrec::record(std::move(rec));
+            }
+#endif
             return status;
         });
     }
@@ -8359,6 +8765,16 @@ public:
         Status commit() {
             auto eng = db_.api_engine();   // v25.8: race-free vs close()
             if (entries_.empty()) return Status::OK;
+#ifdef CHRONOKV_TEST_HOOKS
+            // v27 M1 (batch recording): a Batch commit is a SYNCHRONOUS
+            // multi-key write-only txn — recorded as Stage* + Commit under
+            // a fresh txn id, which from_txnrec folds into one Txn with the
+            // full write set. Synchronous, so the interval is sound (no
+            // ack_deferred) and real-time edges apply.
+            const uint64_t rec_t0 = txnrec::is_armed() ? txnrec::now_ns() : 0;
+#else
+            const uint64_t rec_t0 = 0;
+#endif
             WriteSet ws;
             ws.reserve(entries_.size());
             for (auto& e : entries_) {
@@ -8368,6 +8784,30 @@ public:
             auto r = eng->commit_txn(UINT64_MAX, ws, {}, {}, &cts);
             entries_.clear();
             auto status = db_.map_txn_result(r);
+#ifdef CHRONOKV_TEST_HOOKS
+            if (rec_t0) {
+                const uint64_t rid = txnrec::next_txn_id();
+                for (const auto& w : ws) {
+                    txnrec::Record rec;
+                    rec.op = txnrec::Op::Stage;
+                    rec.txn_id = rid;
+                    rec.key = std::get<0>(w);
+                    rec.value = std::get<1>(w);
+                    rec.deleted = std::get<2>(w);
+                    rec.begin_ns = rec_t0;
+                    txnrec::record(std::move(rec));
+                }
+                txnrec::Record c;
+                c.op = txnrec::Op::Commit;
+                c.txn_id = rid;
+                c.snap_cts = UINT64_MAX;         // write-only txn
+                c.commit_cts = (status == Status::OK) ? cts : 0;
+                c.committed = (status == Status::OK);
+                c.begin_ns = rec_t0;
+                c.end_ns = txnrec::now_ns();
+                txnrec::record(std::move(c));
+            }
+#endif
             // v25.1 M1.5 fix D: Batch::commit must notify observers on
             // success, exactly as put()/erase()/put_async()/erase_async()
             // do (see Database::put at line ~4954). Previously Batch
@@ -8598,6 +9038,7 @@ class Transaction {
         if (rec_begin_ns && txn_) {
             rec_txn_id_ = txnrec::next_txn_id();
             rec_begin_ns_ = rec_begin_ns;
+            txn_->set_rec_txn_id(rec_txn_id_);   // v27 M1: scan attachment
             txnrec::Record rec;
             rec.op = txnrec::Op::Begin;
             rec.txn_id = rec_txn_id_;
@@ -9624,6 +10065,10 @@ public:
                 leave_leaf();
                 leaf_id_ = next;
                 slot_idx_ = 0;
+                // v27 M0 (dst): cursor leaf-switch — latch released, next
+                // leaf not yet latched: the window where a split can extend
+                // or relocate the successor chain under the cursor.
+                stress_point("tree_cursor_leaf_switch");
                 if (leaf_id_ != 0) {
                     enter_leaf();
                 }
@@ -10284,6 +10729,10 @@ private:
             PageId leaf = find_leaf_crabbing_with_fence(cur_root, key, leaf_shared, desc_fence);
             leaf_shared.unlock();
 
+            // v27 M0 (dst): THE cursor-vs-split window — no latch held, so
+            // a concurrent split can move this key to a sibling before the
+            // exclusive acquire; the fence re-check below is the guard.
+            stress_point("tree_leaf_latch_gap");
             auto leaf_excl = latches_.lock_exclusive(leaf);
             // Re-check: did the leaf change between shared-release and exclusive-acquire?
             Page* p = pool_.get(leaf);
@@ -10516,6 +10965,10 @@ private:
     InsertResult split_leaf(PageId page_id, const std::string& new_key,
                              const std::string& new_value,
                              bool update, size_t update_idx) {
+        // v27 M0 (dst): split in progress — the caller holds this leaf's
+        // exclusive latch, and cursors/descents racing the split are the
+        // exact bug class this point exists to schedule.
+        stress_point("tree_split_begin");
         Page* p = pool_.get(page_id);
         PageHeader* h = header(p);
         LeafSlot* slots = leaf_slots(p);
@@ -11085,6 +11538,10 @@ private:
             PageId leaf = find_leaf_crabbing_with_fence(cur_root, key, leaf_shared, desc_fence);
             leaf_shared.unlock();
 
+            // v27 M0 (dst): THE cursor-vs-split window — no latch held, so
+            // a concurrent split can move this key to a sibling before the
+            // exclusive acquire; the fence re-check below is the guard.
+            stress_point("tree_leaf_latch_gap");
             auto leaf_excl = latches_.lock_exclusive(leaf);
             Page* p = pool_.get(leaf);
             PageHeader* h = header(p);
