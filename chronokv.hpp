@@ -1,5 +1,56 @@
 // chronokv.hpp — ChronoKV engine and public C++ API.
 //
+// v27.0 SHIPPED (v27 M3 — coverage aimed at error paths; THE V27 ARC IS
+// COMPLETE: M0 0.26.3, M1 start 0.26.1 / completion 0.26.3, M2 0.26.2,
+// M3 here):
+//
+//   M3 — the roadmap anchor: "C1 and H3 both lived in code with
+//       effectively zero coverage... publish per-fault-kind coverage —
+//       which lines are reached under each armed fault. An error-path
+//       line no fault ever reaches is an untested line, and that is
+//       exactly where the last four bugs were."
+//       ENGINE: fault:: gains coverage forcing — CKV_COVERAGE_FAULT=<Kind>
+//       [,budget] fires that kind at EVERY matching site for the whole
+//       run, INDEPENDENT of the suite's own arm()/disarm() windows (the
+//       independence is the point: per-kind coverage must not merely mean
+//       "reached inside the test written for that kind"). The budget
+//       (default 500) bounds the blast radius so the run still completes
+//       and exits cleanly, which is what flushes .gcda; the forced-fire
+//       count is printed at exit so a 0-fire kind is VISIBLY vacuous.
+//       disarm() deliberately does not clear the forcing.
+//       BUILD: `make coverage` (--coverage at compile AND link, -O0 for
+//       exact line attribution, no -g: gcov's text output needs no debug
+//       info and dropping it keeps the instrumented build inside a 1 GiB
+//       container's commit limit — with -g cc1plus dies there).
+//       ANALYSIS: scripts/fault_coverage.py parses raw gcov output (zero
+//       external deps — stable across distro gcov/lcov versions),
+//       classifies error-path lines by a documented heuristic (fail-stop
+//       flips, throw, error returns, WalFailure/Status::Failed, FATAL,
+//       errno, cerr) and publishes: per-run line counts/%, per-kind
+//       error-path counts, each kind's UNIQUE contributions (the
+//       roadmap's per-fault-kind number), forced-fire counts, and the
+//       ledger of error-path lines NO run reached — the untested lines.
+//       The CI job gates on pipeline health (every kind produced gcov
+//       data), NOT on the gap count: publishing the ledger is the
+//       deliverable; failing PRs on it would gate unrelated changes.
+//       CI VEHICLES: push/PR force each of the 8 kinds over the review-
+//       regression gate (error-path-dense subset, ~25 s/kind measured);
+//       nightly/dispatch force each kind over the FULL suite — which owns
+//       the checkpoint paths where OpenFail/DirFsyncFail live; both
+//       measured 0 fires under the gate vehicle, exactly the vacuity this
+//       milestone exists to expose — plus one unforced full-suite run for
+//       the headline number. `coverage` folds into ci-passed.
+//       LOCAL VERIFICATION: all 8 forced kinds complete hang-free (~24 s
+//       each on the gate vehicle; fires: SegOpenFail 320, WriteShort 48,
+//       FsyncFail/FsyncFailAfterPersist 15 each, WriteFail 2, RenameFail 1,
+//       OpenFail/DirFsyncFail 0-gate-vacuous); the gcov invocation form
+//       (positional *.gcda, binary-name != source-name) and the script are
+//       proven end-to-end on probe TUs including the gap ledger catching a
+//       planted untested error line. The engine-sized gcov BUILD exceeds
+//       this container's ~1 GB commit limit — the CI run on this push is
+//       its proof (as with ASan/-O2 builds before it).
+//       CHRONOKV_VERSION 0.27.0.
+//
 // 6d8a13d-REVIEW RESPONSE SHIPPED (version stays 0.26.3 — maintainer
 // directive, no bump): the adversarial review of v26.3 ranked ONE new
 // defect, MEDIUM-HIGH, and it is a real one — the "documented residual
@@ -1264,12 +1315,39 @@ namespace fault {
     inline std::atomic<int> armed{0};
     inline std::atomic<int> remaining{0};
 
+    // v27 M3 (coverage aimed at error paths): a FORCED kind fires on every
+    // fire-site match for the whole run, independent of the test-local
+    // arm()/disarm() windows — that independence is the point: gcov must
+    // see the error branches OUTSIDE the narrow windows the in-suite tests
+    // arm, or "reached under fault kind X" would only ever mean "reached
+    // inside the test that was written for X". The budget bounds the
+    // blast radius (after exhaustion the run proceeds normally and exits
+    // cleanly, which is what flushes .gcda) and the fired counter is
+    // printed at exit so a coverage run with 0 fires is visibly vacuous.
+    inline std::atomic<int> forced_kind{0};
+    inline std::atomic<int> forced_budget{0};
+    inline std::atomic<int> forced_fired{0};
+
     inline bool fire(Kind k) {
-        if (armed.load(std::memory_order_relaxed) != static_cast<int>(k)) return false;
-        int r = remaining.load(std::memory_order_relaxed);
-        if (r <= 0) return false;
-        remaining.fetch_sub(1, std::memory_order_relaxed);
-        return true;
+        if (armed.load(std::memory_order_relaxed) == static_cast<int>(k)) {
+            int r = remaining.load(std::memory_order_relaxed);
+            if (r <= 0) return false;
+            remaining.fetch_sub(1, std::memory_order_relaxed);
+            return true;
+        }
+        // v27 M3: coverage forcing (never for Kind::None).
+        if (k != Kind::None &&
+            forced_kind.load(std::memory_order_relaxed) == static_cast<int>(k)) {
+            int b = forced_budget.load(std::memory_order_relaxed);
+            while (b > 0 &&
+                   !forced_budget.compare_exchange_weak(b, b - 1,
+                                                        std::memory_order_relaxed)) {}
+            if (b > 0) {
+                forced_fired.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+        }
+        return false;
     }
     inline void arm(Kind k, int times = 1) {
         armed.store(static_cast<int>(k), std::memory_order_relaxed);
@@ -1278,6 +1356,28 @@ namespace fault {
     inline void disarm() {
         armed.store(0, std::memory_order_relaxed);
         remaining.store(0, std::memory_order_relaxed);
+        // NOTE: deliberately does NOT clear forced_kind — coverage forcing
+        // must survive the suite's own disarm() calls (see above).
+    }
+    inline void force_for_coverage(Kind k, int budget) {
+        forced_kind.store(static_cast<int>(k), std::memory_order_relaxed);
+        forced_budget.store(budget, std::memory_order_relaxed);
+        forced_fired.store(0, std::memory_order_relaxed);
+    }
+    inline Kind kind_from_name(const std::string& n) {
+        static const std::pair<const char*, Kind> tbl[] = {
+            {"FsyncFail", Kind::FsyncFail},
+            {"WriteFail", Kind::WriteFail},
+            {"WriteShort", Kind::WriteShort},
+            {"RenameFail", Kind::RenameFail},
+            {"OpenFail", Kind::OpenFail},
+            {"DirFsyncFail", Kind::DirFsyncFail},
+            {"SegOpenFail", Kind::SegOpenFail},
+            {"FsyncFailAfterPersist", Kind::FsyncFailAfterPersist},
+        };
+        for (const auto& [name, k] : tbl)
+            if (n == name) return k;
+        return Kind::None;
     }
 }
 
@@ -8063,6 +8163,12 @@ namespace chronokv {
 // silently losing commits once later checkpoints rotate the covering WAL
 // segments), fixed here with in-suite detectors. Also starts v27 M1
 // (history -> strict-serializability checker).
+// v27.0: the v27 arc is COMPLETE — M0 (deterministic scheduler) + M1
+// completion at 0.26.3, M2 (CI integration) at 0.26.2, M3 (coverage aimed
+// at error paths) here. MINOR keeps tracking the roadmap arc: the v26 arc
+// shipped as 0.25.4-0.25.8 plus patches 0.26.1-0.26.3; 0.27.0 opens the
+// v28 horizon (whose "do not start before the DST harness is green" gate
+// is met — the harness is green in CI at 100k nightly seeds).
 // v26.3: v27 M0 (deterministic scheduler) + M1 completion. The dst::
 // baton scheduler below makes the stress_point instrumentation in the
 // three bug-dense areas replayable from (seed, op-count); the fork-
@@ -8076,12 +8182,12 @@ namespace chronokv {
 // CKV_STRESS_SEED and the CKV_ONLY_CRASHFUZZ gate ship in main.cpp. No
 // engine changes; the dst runner swaps to the M0 deterministic scheduler
 // when M0 ships.
-static constexpr const char* CHRONOKV_VERSION = "0.26.3";
+static constexpr const char* CHRONOKV_VERSION = "0.27.0";
 static constexpr int CHRONOKV_VERSION_MAJOR = 0;
-static constexpr int CHRONOKV_VERSION_MINOR = 26;
+static constexpr int CHRONOKV_VERSION_MINOR = 27;
 // v25.7: PATCH was stale (said 2 while the string said 0.25.6). Kept in
 // lockstep with CHRONOKV_VERSION from here on.
-static constexpr int CHRONOKV_VERSION_PATCH = 3;
+static constexpr int CHRONOKV_VERSION_PATCH = 0;
 
 // ---- Error hierarchy --------------------------------------------------
 class Error : public std::runtime_error {

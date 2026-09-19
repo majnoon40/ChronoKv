@@ -1709,6 +1709,45 @@ return 0;
     }
 #endif
 
+#ifdef CHRONOKV_FAULT_INJECTION
+    // v27 M3: CKV_COVERAGE_FAULT=Kind[,budget] — force ONE fault kind to
+    // fire at every matching site for the whole run (independent of the
+    // suite's own arm/disarm windows; see fault::forced_kind). Under
+    // forcing the engine fail-stops early and the suite REPORTS FAILURES —
+    // expected and fine: a coverage run is graded on the .gcda it flushes
+    // at exit, not on the verdict (the CI step runs it with `|| true` and
+    // gates on the gcov data existing). The budget (default 500) bounds
+    // the blast radius so the run still completes and exits cleanly; the
+    // fired count is printed at exit so a 0-fire run is visibly vacuous.
+    if (const char* kf = getenv("CKV_COVERAGE_FAULT")) {
+        std::string spec(kf);
+        int budget = 500;
+        auto comma = spec.find(',');
+        if (comma != std::string::npos) {
+            budget = atoi(spec.c_str() + comma + 1);
+            spec = spec.substr(0, comma);
+        }
+        fault::Kind fk = fault::kind_from_name(spec);
+        if (fk == fault::Kind::None || budget <= 0) {
+            std::cerr << "CKV_COVERAGE_FAULT: unknown kind or bad budget: '"
+                      << kf << "' (kinds: FsyncFail WriteFail WriteShort "
+                         "RenameFail OpenFail DirFsyncFail SegOpenFail "
+                         "FsyncFailAfterPersist)" << std::endl;
+            return 2;
+        }
+        fault::force_for_coverage(fk, budget);
+        std::cout << "coverage-fault: forcing " << spec << " (budget "
+                  << budget << ") for the whole run" << std::endl;
+        static struct ForcedFireReport {
+            ~ForcedFireReport() {
+                std::cout << "coverage-fault: fired "
+                          << fault::forced_fired.load(std::memory_order_relaxed)
+                          << " times" << std::endl;
+            }
+        } forced_fire_report;
+    }
+#endif
+
 #ifdef CHRONOKV_TEST_HOOKS
     // First step toward test selection (review M4): the suite is one long
     // main() with no way to run a subset, which makes triaging a hang or a

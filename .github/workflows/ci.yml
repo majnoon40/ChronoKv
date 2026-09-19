@@ -30,6 +30,12 @@
 #                  CHRONOKV_STRESS across interleaving seeds
 #                  (CKV_STRESS_SEED, echoed) and the lincheck engine
 #                  workload at CKV_LINCHECK_SEEDS=N.
+#   v27 M3:    `coverage` — gcov build + per-fault-kind forced runs
+#              (CKV_COVERAGE_FAULT), publishing per-kind error-path
+#              coverage, unique per-kind contributions, vacuous-kind
+#              fire counts, and the ledger of error-path lines no run
+#              reaches (bounded PR vehicle: review gate; nightly: full
+#              suite per kind + unforced headline run).
 #   gate:      ci-passed aggregates every job — a single required check
 #              for branch protection.
 #
@@ -358,10 +364,91 @@ jobs:
             lincheck-seeds.log
           if-no-files-found: ignore
 
+  # ---- v27 M3: coverage aimed at error paths ------------------------------
+  # gcov-instrumented build + one forced-fault run PER fault kind
+  # (CKV_COVERAGE_FAULT=<Kind> fires that kind at EVERY site for the whole
+  # run, independent of the suite's own arm/disarm windows), analyzed by
+  # scripts/fault_coverage.py, which publishes: per-run line counts/%,
+  # per-kind error-path lines and their UNIQUE contributions (the
+  # roadmap's per-fault-kind number), forced-fire counts (a kind that
+  # fires 0 times is flagged VACUOUS for that vehicle — measured:
+  # OpenFail/DirFsyncFail never fire under the review-gate vehicle because
+  # their sites live in checkpoint paths the gate does not enter), and the
+  # ledger of error-path lines NO run reached — the untested lines where
+  # C1/H3/H1/H2 once lived.
+  # Vehicle: push/PR run each kind over the review-regression gate
+  # (CKV_ONLY_REVIEW: review + durability + crash-fuzz — the error-path-
+  # dense subset, ~25 s/kind measured locally); nightly/dispatch switch to
+  # the FULL suite per kind (which owns the checkpoint paths) plus an
+  # unforced full-suite run for the headline number.
+  # Suite verdicts under forcing are IGNORED (`|| true`: engines fail-stop,
+  # so failing checks are the expected outcome); what a run must produce is
+  # gcov data — the analyze step hard-fails only if a kind produced none.
+  coverage:
+    name: coverage (error paths, per fault kind)
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'pull_request') && '60' || '240') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (gcov-instrumented)
+        run: make coverage
+
+      - name: Per-fault-kind forced runs (bounded PR vehicle / nightly full suite)
+        run: |
+          set -u
+          mkdir -p cov
+          NIGHTLY=0
+          case "${{ github.event_name }}" in schedule|workflow_dispatch) NIGHTLY=1;; esac
+          for k in FsyncFail WriteFail WriteShort RenameFail OpenFail DirFsyncFail SegOpenFail FsyncFailAfterPersist; do
+            find build/coverage -name '*.gcda' -delete
+            mkdir -p cov/$k
+            if [ "$NIGHTLY" = 1 ]; then
+              CKV_COVERAGE_FAULT=$k ./build/coverage/test > cov/$k/run.log 2>&1 || true
+            else
+              CKV_COVERAGE_FAULT=$k CKV_ONLY_REVIEW=1 ./build/coverage/test > cov/$k/run.log 2>&1 || true
+            fi
+            rm -f ./*.gcov
+            gcov build/coverage/*.gcda > /dev/null 2>&1 || true
+            mv -f ./*.gcov cov/$k/ 2>/dev/null || true
+            grep -h 'coverage-fault' cov/$k/run.log || echo "::warning::no forced-fire report for $k"
+          done
+
+      - name: Unforced full-suite run (headline coverage number)
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        run: |
+          find build/coverage -name '*.gcda' -delete
+          mkdir -p cov/full
+          ./build/coverage/test > cov/full/run.log 2>&1 || true
+          rm -f ./*.gcov
+          gcov build/coverage/*.gcda > /dev/null 2>&1 || true
+          mv -f ./*.gcov cov/full/ 2>/dev/null || true
+          tail -1 cov/full/run.log
+
+      - name: Analyze + publish report
+        run: |
+          set -o pipefail
+          python3 scripts/fault_coverage.py cov cov/untested-error-paths.txt | tee cov-report.md
+          cat cov-report.md >> "$GITHUB_STEP_SUMMARY"
+          for k in FsyncFail WriteFail WriteShort RenameFail OpenFail DirFsyncFail SegOpenFail FsyncFailAfterPersist; do
+            test -s cov/$k/main.cpp.gcov || { echo "::error::no gcov data for $k"; exit 1; }
+          done
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.run_id }}
+          path: |
+            cov-report.md
+            cov/untested-error-paths.txt
+            cov/*/run.log
+          if-no-files-found: ignore
+
   # ---- gate: single aggregate check for branch protection ----------------
   ci-passed:
     name: ci-passed
-    needs: [engine-tests, tsan, public-api-smoke, dst, crashfuzz]
+    needs: [engine-tests, tsan, public-api-smoke, dst, crashfuzz, coverage]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     if: always()

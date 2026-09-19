@@ -20,7 +20,8 @@ Progress:
 | v27 M2 — CI integration: dedicated `crashfuzz` (N seed bases via `CKV_CRASHFUZZ_SEEDS`, run-id-derived base echoed for deterministic replay) and `dst` (seeded-stress full suite × N interleaving seeds + lincheck engine workload × N seeds) jobs; bounded PR configs, long nightly schedule, both folded into `ci-passed`; the dst runner swapped to the real M0 harness at 0.26.3, job name and gate contract unchanged as planned | **DONE** | see below, `0.26.2` |
 | v27 M0 — deterministic scheduler for the bug-dense paths: **DONE** — `dst::` seeded baton controller behind every `stress_point` (WAL group-commit/handoff, GC+epoch vs scans, tree cursor vs splits; 11 new points at the historical bug windows), fork-isolated 4-scenario harness with `(seed, op-count, last-point)` replay handles, bounded-patience steal as the documented deadlock breaker. Acceptance PROVEN: reintroduced C1 caught as a deadline-hang (>=3/10 seeds/run at the widened 4x8 scenario), reintroduced H3 caught as SEGV on 12/12 seeds, clean tree silent over 200-seed sweeps; CI runs 100k scenario-seeds nightly | **DONE** | see below, `0.26.3` |
 | adversarial review of `6d8a13d` (v26.3), **no version bump** (maintainer directive): **MEDIUM–HIGH** residual PITR hole — a key rewritten inside the mid-window whose WAL a later checkpoint rotated away reads absent-or-older at `as_of` (silently wrong; the v26.1 "documented residual limit" ranked as a defect). Fixed per the review's direction 1/2: filtered skips over an uncovered window now fail LOUD ("not reconstructable" + remedies) instead of serving a best-effort snapshot; the v26.1 fully-rotated-window open capability is deliberately traded away (indistinguishable on disk from the hole — both reviews accept loud failure over silent loss). Direction 3 (multi-version deltas) tracked below as the sound capability-recovery path | **DONE** | see below, `0.26.3` (unbumped) |
-| v27 M3, v28–v30 | not started | — |
+| v27 M3 — coverage aimed at error paths: **DONE** — gcov build (`make coverage`), `CKV_COVERAGE_FAULT` forcing (per-kind, whole-run, independent of test-local arm/disarm; budget-bounded; fire counts echoed so vacuity is visible), `scripts/fault_coverage.py` publishing per-kind error-path coverage + UNIQUE per-kind contributions + the ledger of error-path lines NO run reaches; CI `coverage` job folded into `ci-passed` (PR vehicle: review gate per kind; nightly: full suite per kind + unforced headline run). First measurement already exposes the anchor's point: OpenFail/DirFsyncFail fire 0 times under the gate vehicle | **DONE** | see below, `0.27.0` |
+| v28–v30 | not started | — |
 
 > **v25.7 note (the load-bearing constraint, re-confirmed).** H1 and H2 were
 > found by an outside reviewer *reading code and writing three-line repros* —
@@ -483,6 +484,10 @@ diff against the source.
 
 # v27 — Make concurrency bugs reproducible
 
+**Status: COMPLETE (0.26.1 → 0.27.0).** M1 start `0.26.1` · M2 `0.26.2` ·
+M0 + M1 completion `0.26.3` · M3 `0.27.0`. The DST harness is green in CI
+(100k seeds nightly), so v28's gate condition is met.
+
 Theme: fix the reproduction problem before touching concurrent code again.
 
 ## M0 — Deterministic scheduler for the bug-dense paths  **[L]**
@@ -732,6 +737,59 @@ coverage signal anywhere today.
 gcov/lcov job; publish the number; but more usefully, publish **per-fault-kind coverage**
 — which lines are reached under each armed fault. An error-path line no fault ever reaches
 is an untested line, and that is exactly where the last four bugs were.
+
+> ### What shipped at 0.27.0 (M3 — v27 arc complete)
+>
+> **Forcing mechanism (`CKV_COVERAGE_FAULT=<Kind>[,budget]`).** The suite's
+> own `fault::arm()/disarm()` windows are narrow by design — coverage
+> confined to them would just re-measure the tests that were written.
+> Forcing fires the kind at EVERY matching site for the whole run,
+> independent of those windows (`disarm()` deliberately does not clear
+> it). The budget (default 500) bounds the blast radius so the binary
+> still exits cleanly — which is what flushes `.gcda` — and the fired
+> count is echoed at exit, so a 0-fire kind is VISIBLY vacuous for that
+> vehicle instead of silently publishing the suite's own coverage under a
+> fault label. Under forcing the engine fail-stops and the suite REPORTS
+> FAILURES: expected; the CI step grades the gcov data, not the verdict.
+>
+> **Build + analysis.** `make coverage` (--coverage at compile and link,
+> -O0 for exact line attribution, no -g — gcov's text output needs no
+> debug info and it keeps the instrumented build inside a 1 GiB
+> container's commit limit). `scripts/fault_coverage.py` parses raw gcov
+> output (zero external deps — no lcov-version roulette across distros),
+> classifies error-path lines by a documented heuristic (fail-stop flips,
+> `throw`, error returns, `WalFailure`/`Status::Failed`, `FATAL`, `errno`,
+> `cerr`), and publishes: per-run lines/%, per-kind error-path counts,
+> each kind's UNIQUE contributions (the per-fault-kind number this
+> milestone exists for), fire counts, and the **ledger of error-path
+> lines no run reached** — job summary + artifact. The job gates on
+> pipeline health only; the ledger is the deliverable, and red-PR-ing on
+> gap count would gate unrelated changes.
+>
+> **Vehicles.** push/PR: every kind forced over the review-regression
+> gate (`CKV_ONLY_REVIEW` — review + durability + crash-fuzz, the
+> error-path-dense subset; ~25 s/kind). Nightly/dispatch: every kind over
+> the FULL suite + one unforced full-suite headline run. The split is
+> measured, not guessed: **OpenFail and DirFsyncFail fire 0 times under
+> the gate vehicle** (their sites live in checkpoint paths the gate never
+> enters) — the report flags exactly this vacuity, which is the anchor's
+> point demonstrated on day one.
+>
+> **Verified locally:** all 8 forced kinds complete hang-free (~24 s each;
+> fires: SegOpenFail 320, WriteShort 48, FsyncFail 15,
+> FsyncFailAfterPersist 15, WriteFail 2, RenameFail 1, OpenFail 0,
+> DirFsyncFail 0); gcov invocation form (positional `*.gcda` — the
+> binary/source basenames differ) and the script proven end-to-end on
+> probe TUs, including the ledger catching a planted untested error
+> line. The engine-sized gcov build exceeds the dev container's commit
+> limit (~1 GB VA) — the CI run on the 0.27.0 push is its proof, same
+> policy as ASan/-O2 builds.
+>
+> **Next consumers of this signal:** the ledger should be triaged into
+> new fault kinds/tests where gaps are real (candidate v28 M-adjacent
+> hygiene), and v28's WAL-writer-thread rewrite should land with
+> before/after per-kind tables so the rewrite cannot silently un-cover
+> the error paths it replaces.
 
 ---
 

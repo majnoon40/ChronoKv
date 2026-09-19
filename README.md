@@ -10,17 +10,17 @@ transactions with phantom detection, a paged B+ tree index, and
 io_uring-accelerated WAL writes — all in one header with no external
 dependencies.
 
-Current version: **0.26.3** (`CHRONOKV_VERSION` in `chronokv.hpp`). The
-version's MINOR tracks the roadmap arc: the v26 arc (M0–M4) shipped across
-0.25.4–0.25.8; 0.26.1 was its first patch (the adversarial review of
-`929cb00` found a PITR correctness defect — fixed there) plus the start of
-v27 M1; 0.26.2 shipped v27 M2 (CI integration: dedicated `dst` and
-`crashfuzz` seed-scaled jobs, bounded on PRs, long nightly, folded into
-`ci-passed`); 0.26.3 ships **v27 M0** — the deterministic scheduler that
-makes concurrency failures replayable from `(seed, op-count)`, with the
-roadmap acceptance proven by catching reintroduced C1 and H3 mutants — and
-**completes v27 M1** (range-scan, async and batch recording; set-shape and
-scan checkers; mixed-API engine workload).
+Current version: **0.27.0** (`CHRONOKV_VERSION` in `chronokv.hpp`) — the
+**v27 arc is complete**. The version's MINOR tracks the roadmap arc: the
+v26 arc (M0–M4) shipped across 0.25.4–0.25.8 plus patches 0.26.1–0.26.3,
+which also carried v27 M0–M2 (the `929cb00`/`6d8a13d` review responses,
+the deterministic scheduler with proven C1/H3 catch, the completed
+strict-serializability checker, and the seed-scaled CI jobs). 0.27.0 ships
+**v27 M3** — coverage aimed at error paths: a gcov job with per-fault-kind
+forced runs, publishing each kind's unique error-path contributions and a
+ledger of the error-path lines no run reaches ("untested lines, and that
+is exactly where the last four bugs were"). v28's gate ("do not start
+before the DST harness is green") is met.
 
 ## Highlights
 
@@ -97,9 +97,10 @@ scan checkers; mixed-API engine workload).
   injection, deterministic stress mode, the v27 M0 deterministic-scheduler
   (DST) harness, randomized crash-point fuzzing, a strict-serializability
   history checker (v27 M1 `lincheck`, with synthetic anomaly batteries
-  proving every violation kind fails when it should), and a
-  linearizability history recorder, all run under a four-config sanitizer
-  matrix (Release / ASan+UBSan / TSan / Stress).
+  proving every violation kind fails when it should), a linearizability
+  history recorder, and per-fault-kind error-path coverage with an
+  untested-lines ledger (v27 M3) — all run under a four-config sanitizer
+  matrix (Release / ASan+UBSan / TSan / Stress) plus the gcov build.
 - **Crash-consistent recovery** — 20 instrumented crash points cover the whole
   durability state machine (WAL leader, segment rotation, MANIFEST
   write/rename, checkpoint, rebase). The fuzzer forks a child, kills it at a
@@ -419,6 +420,14 @@ long-run config; a push can no longer cancel a nightly run mid-flight):
   interleaving seeds (`CKV_STRESS_SEED`, echoed; 1 seed on PR, 3 nightly)
   and the lincheck engine workloads at `CKV_LINCHECK_SEEDS=N` (4 on PR,
   64 nightly)
+- **`coverage` (v27 M3)**: gcov-instrumented build; every fault kind is
+  FORCED for a whole run (`CKV_COVERAGE_FAULT`, independent of the
+  suite's own arm/disarm windows) — over the review-regression gate on
+  push/PR, over the full suite nightly plus an unforced headline run.
+  `scripts/fault_coverage.py` publishes per-kind error-path coverage,
+  each kind's UNIQUE contributions, forced-fire counts (0 = vacuous kind
+  for that vehicle, flagged), and the ledger of error-path lines no run
+  reached, as the job summary + an artifact
 - **`ci-passed` gate**: aggregates every job into one required check for
   branch protection
 

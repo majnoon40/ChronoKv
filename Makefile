@@ -57,6 +57,14 @@ TSAN_FLAGS    = -O1 -g -fsanitize=thread \
 # fork-based crash tests) — a coverage change nobody ever reviewed, after
 # years of green runs at the effective value 0. Stress builds now get
 # exactly what they always effectively had (auto-detect -> 0), warning-free.
+# v27 M3: gcov-instrumented build for the coverage job. -O0 keeps gcov's
+# line attribution exact; --coverage adds -fprofile-arcs -ftest-coverage
+# (and must appear at link time too — see the coverage rule). No -g: the
+# gcov text output this project parses needs no debug info, and dropping
+# it keeps the build inside a 1 GiB container's RSS (with -g, cc1plus is
+# OOM-killed there; runners would not care, but local verification must
+# run the exact CI flags).
+COVERAGE_FLAGS = -O0 --coverage
 STRESS_FLAGS  = -O2 -g -DCHRONOKV_STRESS
 
 BIN_DIR = build
@@ -67,6 +75,7 @@ release: $(BIN_DIR)/release/test
 asan:    $(BIN_DIR)/asan/test
 tsan:    $(TSAN_BIN)
 stress:  $(BIN_DIR)/stress/test
+coverage: $(BIN_DIR)/coverage/test
 
 # ---- hooks-off targets ----
 smoke_off_release: $(BIN_DIR)/smoke_off/release/test
@@ -97,6 +106,12 @@ $(BIN_DIR)/tsan/test: main.cpp chronokv.hpp | $(BIN_DIR)/tsan
 $(BIN_DIR)/stress/test: main.cpp chronokv.hpp | $(BIN_DIR)/stress
 	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(STRESS_FLAGS) \
 	    main.cpp -o $@ -lpthread
+# v27 M3: gcov build. --coverage at BOTH compile and link; .gcno lands next
+# to the binary, .gcda is written there on clean exit (the coverage CI job
+# zeroes .gcda between per-fault-kind runs and collects via `gcov -o`).
+$(BIN_DIR)/coverage/test: main.cpp chronokv.hpp | $(BIN_DIR)/coverage
+	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(COVERAGE_FLAGS) \
+	    main.cpp -o $@ -lpthread --coverage
 
 # ---- hooks-off build rules ----
 $(BIN_DIR)/smoke_off/release/test: main.cpp chronokv.hpp | $(BIN_DIR)/smoke_off/release
@@ -113,7 +128,7 @@ $(BIN_DIR)/smoke_off/stress/test: main.cpp chronokv.hpp | $(BIN_DIR)/smoke_off/s
 	    main.cpp -o $@ -lpthread
 
 # ---- dirs ----
-$(BIN_DIR)/release $(BIN_DIR)/asan $(BIN_DIR)/tsan $(BIN_DIR)/stress \
+$(BIN_DIR)/release $(BIN_DIR)/asan $(BIN_DIR)/tsan $(BIN_DIR)/stress $(BIN_DIR)/coverage \
 $(BIN_DIR)/smoke_off/release $(BIN_DIR)/smoke_off/asan \
 $(BIN_DIR)/smoke_off/tsan $(BIN_DIR)/smoke_off/stress:
 	mkdir -p $@
@@ -121,6 +136,6 @@ $(BIN_DIR)/smoke_off/tsan $(BIN_DIR)/smoke_off/stress:
 clean:
 	rm -rf $(BIN_DIR)
 
-.PHONY: release asan tsan stress \
+.PHONY: release asan tsan stress coverage \
 	smoke_off_release smoke_off_asan smoke_off_tsan smoke_off_stress \
 	all clean
