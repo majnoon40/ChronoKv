@@ -10608,9 +10608,20 @@ namespace dstscn {
         std::atomic<long> commits{0};
         std::atomic<bool> stop{false};
         dst::arm(seed, NT + 1, prog);
+        // 0.27.0 hardening: BOUND the flipper. The free-running flip loop
+        // was the scenario's only unbounded workload, and a flipper-
+        // dominant schedule turns into millions of baton handoffs — one
+        // measured child ran 8.3M ops. Under a slow-disk runner that tail
+        // stretches shard wall time by hours (observed: one nightly shard
+        // at 2h15m+ vs 49-58m for its identical-code siblings). The budget
+        // (8 flips per writer op) keeps the durability-class mixing dense
+        // — every commit still sees multiple handoff opportunities — while
+        // capping the spin source. H3/C1 detection re-verified with the
+        // budget in place (mutants: SEGV 3/3, hang caught).
+        constexpr long FLIP_BUDGET = (long)NT * OPS * 8;
         std::thread flipper([&] {
             dst::point("start");
-            while (!stop.load(std::memory_order_relaxed)) {
+            for (long f = 0; f < FLIP_BUDGET && !stop.load(std::memory_order_relaxed); ++f) {
                 kv.set_durability(DurabilityMode::Async);
                 dst::point("flip_a");
                 kv.set_durability(DurabilityMode::Group);
@@ -10943,6 +10954,16 @@ static int run_dst_test() {
             munmap((void*)prog, sizeof(dst::Progress));
             std::error_code ec;
             std::filesystem::remove_all(wd, ec);   // best-effort after a kill
+            // 0.27.0 hardening: periodic progress — a slow shard must be
+            // diagnosable from its log (which seed window it is grinding
+            // on, whether hangs are accumulating) instead of opaque.
+            if (nseeds >= 1000 && (s + 1) % 1000 == 0) {
+                std::cout << "      (" << scns[si].name << ": " << (s + 1)
+                          << "/" << nseeds << " seeds — pass=" << n_pass
+                          << " hang=" << n_hang << " crash=" << n_crash
+                          << " invariant=" << n_assert << ")" << std::flush;
+                std::cout << "\n" << std::flush;
+            }
         }
         std::string nm = std::string("dst: ") + scns[si].name + " x " +
                          std::to_string(nseeds) + " seeds";

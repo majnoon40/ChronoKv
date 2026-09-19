@@ -281,9 +281,11 @@ jobs:
   #      bug-dense areas + the two historical anchors (wal_mixed_handoff =
   #      H3 class, wal_leader_fault = C1 class, gc_epoch_scan,
   #      tree_cursor_split), N seeds each — push/PR: 100 (single shard);
-  #      nightly/dispatch: 4 shards x 6,250 = 25,000 per scenario (= 100k
+  #      nightly/dispatch: 8 shards x 3,125 = 25,000 per scenario (= 100k
   #      scenario-runs total, the roadmap's N), sharded because a single
-  #      job measured ~225 min at that scale vs the 240-min timeout. Failures
+  #      job measured ~225 min at that scale vs the 240-min timeout, and
+  #      8-way because runner variance gave one 4-way shard 2h15m+ while
+  #      its siblings finished in ~50 min. Failures
   #      print (scenario, seed, op-count, last point): the replay handle.
   #      Acceptance was proven by reintroducing C1 (hang, caught on >=3/10
   #      seeds per run) and H3 (SEGV, caught on 12/12 seeds) — see the
@@ -301,13 +303,15 @@ jobs:
     timeout-minutes: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'pull_request') && '60' || '240') }}
     # v26.3-review-era fix: the nightly 100k-seed DST sweep measured
     # ~135 ms/seed on runners (run #15: 400 seeds in 54 s) — ~225 min in a
-    # SINGLE job against a 240-min timeout, i.e. a coin-flip timeout on the
-    # first cron run. Nightly/dispatch now shard 4 ways (6,250 seeds per
-    # scenario each, ~1 h wall); push/PR stay single-shard and bounded.
+    # SINGLE job against a 240-min timeout. 0.27.0 hardening: 8 shards x
+    # 3,125 (was 4 x 6,250) after run #17 showed the runner-variance tail —
+    # three shards finished in 49-58 min while one identical-code shard
+    # ground past 2h15m on a slow node. Smaller shards halve the bad-node
+    # worst case; push/PR stay single-shard and bounded.
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'pull_request') && '[0]' || '[0,1,2,3]') }}
+        shard: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'pull_request') && '[0]' || '[0,1,2,3,4,5,6,7]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -319,14 +323,14 @@ jobs:
       - name: DST harness, N seeds per scenario (bounded PR / sharded nightly)
         env:
           CKV_ONLY_DST: "1"
-          # Nightly: 4 shards x 6,250 = 25,000 seeds per scenario = 100k
+          # Nightly: 8 shards x 3,125 = 25,000 seeds per scenario = 100k
           # scenario-runs total (the roadmap's N). Shard bases are 911 +
           # shard*1000003 (literal table — the expression lexer rejects
           # inline '+'); the binary's per-scenario seed offset is a
           # multiple of the same prime and the per-seed step is a larger
           # prime, so shards are provably disjoint within each scenario.
-          CKV_DST_SEED: ${{ fromJSON('[911, 1000914, 2001817, 3002720]')[matrix.shard] }}
-          CKV_DST_SEEDS: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '100' || '6250' }}
+          CKV_DST_SEED: ${{ fromJSON('[911, 1000914, 2001817, 3002720, 4003623, 5004526, 6005429, 7006332]')[matrix.shard] }}
+          CKV_DST_SEEDS: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '100' || '3125' }}
         run: |
           set -o pipefail
           ./build/stress/test 2>&1 | tee dst-seeds-shard${{ matrix.shard }}.log
