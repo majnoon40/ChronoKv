@@ -1,0 +1,2083 @@
+ChronoKV — Full Adversarial Repository Audit
+
+Repository:
+
+https://github.com/majnoon40/chronokv
+
+You are conducting an exhaustive, adversarial engineering audit of the ChronoKV repository.
+
+This is NOT a normal code review.
+
+Your objective is to discover real defects, incorrect assumptions, violated invariants, concurrency failures, durability failures, recovery bugs, memory-safety problems, API inconsistencies, portability problems, test weaknesses, and cases where the implementation does not actually provide the guarantees it claims.
+
+Assume that the author is competent.
+
+Do not produce generic warnings merely because code looks complicated.
+
+Do not praise the project unless necessary for context.
+
+Do not assume documentation, comments, tests, assertions, or function names are correct.
+
+Treat the implementation itself as the source of truth.
+
+The most valuable result is a small number of deeply verified bugs with convincing evidence.
+
+---
+
+1. CORE AUDIT PRINCIPLES
+
+Follow these rules throughout the entire review.
+
+Rule 1 — Inspect the actual repository
+
+Clone/inspect the repository and examine the current contents.
+
+Do not rely on:
+
+- README claims
+- release notes
+- comments
+- function names
+- TODOs
+- issue descriptions
+- commit messages
+- previous reviews
+- assumptions about how a database "normally" works
+
+Trace actual execution.
+
+For every important guarantee, answer:
+
+1. Where is the guarantee implemented?
+2. What state represents it?
+3. Which thread/process owns that state?
+4. Which synchronization protects it?
+5. What is the linearization point?
+6. What happens if the operation fails halfway through?
+7. What happens if another thread runs simultaneously?
+8. What happens if the process crashes?
+9. What happens if the machine loses power?
+10. What test actually proves this behavior?
+
+---
+
+2. COMPLETE REPOSITORY INVENTORY
+
+Before reviewing correctness, inventory the repository.
+
+Inspect:
+
+- all ".hpp"
+- all ".h"
+- all ".cpp"
+- all ".cc"
+- all ".c"
+- all CMake files
+- build scripts
+- shell scripts
+- Python tooling
+- test programs
+- fuzzers
+- stress tests
+- benchmarks
+- examples
+- documentation
+- CI workflows
+- sanitizer configurations
+- compiler configurations
+- dependency configuration
+- generated files if committed
+- configuration files
+- scripts used for release/testing
+- database format documentation
+- recovery documentation
+- concurrency documentation
+
+Do not stop after the primary header.
+
+Produce an internal map of:
+
+Public API
+    ↓
+Transaction layer
+    ↓
+MVCC / SSI
+    ↓
+B+ tree
+    ↓
+Page management
+    ↓
+Memory reclamation
+    ↓
+WAL
+    ↓
+Checkpoint
+    ↓
+Recovery
+    ↓
+Filesystem
+
+Then identify cross-layer dependencies.
+
+---
+
+3. BUILD MATRIX
+
+Determine:
+
+- supported compilers
+- supported C++ standards
+- supported operating systems
+- Linux assumptions
+- filesystem assumptions
+- architecture assumptions
+- x86 assumptions
+- ARM assumptions
+- 32-bit assumptions
+- 64-bit assumptions
+- endianness assumptions
+- page-size assumptions
+- alignment assumptions
+- atomic-width assumptions
+
+Check whether the code actually works under the environments it claims to support.
+
+Look for:
+
+- undefined compiler behavior
+- implementation-defined behavior
+- architecture-specific assumptions
+- incorrect "sizeof"
+- alignment violations
+- strict-aliasing violations
+- unaligned accesses
+- endian assumptions
+- pointer-size assumptions
+- timestamp-width assumptions
+- integer truncation
+- signed overflow
+- unsigned wraparound
+
+---
+
+4. COMPILATION AND TOOLCHAIN AUDIT
+
+Inspect:
+
+- compiler warnings
+- warning flags
+- optimization levels
+- debug/release differences
+- LTO
+- sanitizers
+- UBSan
+- ASan
+- TSan
+- MSan where relevant
+- fuzz builds
+- coverage builds
+
+Determine whether the project is actually tested under sufficiently aggressive compiler settings.
+
+Look for code whose correctness depends on:
+
+- optimization being disabled
+- debug assertions
+- object layout
+- volatile behavior
+- compiler ordering
+- undefined behavior accidentally "working"
+
+Check whether sanitizer configurations meaningfully cover the dangerous code.
+
+---
+
+5. PUBLIC API AUDIT
+
+Enumerate every public API.
+
+For each API determine:
+
+- preconditions
+- postconditions
+- ownership
+- lifetime
+- thread safety
+- transaction requirements
+- exception behavior
+- error behavior
+- persistence behavior
+- visibility semantics
+- retry semantics
+
+Inspect:
+
+- "put"
+- "get"
+- "erase"
+- transactions
+- commits
+- aborts
+- snapshots
+- scans
+- cursors
+- observers
+- batches
+- async operations
+- checkpoint
+- recovery
+- backup
+- restore
+- PITR
+- verification
+- statistics
+- health/status APIs
+- shutdown
+- destruction
+
+Search for cases where the API documentation implies stronger guarantees than the implementation actually provides.
+
+---
+
+6. OWNERSHIP AND LIFETIME AUDIT
+
+Build an ownership map.
+
+For every major object determine:
+
+- who creates it
+- who destroys it
+- who owns it
+- who borrows it
+- whether references/pointers escape
+- whether callbacks retain it
+- whether asynchronous operations retain it
+- whether worker threads access it
+- whether destruction can race with use
+
+Pay special attention to:
+
+- database objects
+- transactions
+- pages
+- cursors
+- iterators
+- WAL buffers
+- WAL records
+- io_uring requests
+- callbacks
+- observers
+- snapshots
+- epochs
+- threads
+- queues
+- futures/promises
+
+Search specifically for:
+
+- use-after-free
+- dangling references
+- dangling iterators
+- stale pointers
+- pointer reuse
+- ABA
+- double destruction
+- double close
+- ownership cycles
+- forgotten ownership
+- callbacks into destroyed objects
+
+---
+
+7. CONCURRENCY MODEL
+
+Reconstruct the complete concurrency model.
+
+Do not merely list mutexes.
+
+Determine:
+
+- every thread
+- every background worker
+- every lock
+- every atomic
+- every condition variable
+- every queue
+- every wait/notify operation
+- every lock-free structure
+- every epoch operation
+- every synchronization boundary
+
+Build a lock-order graph.
+
+Look for:
+
+- deadlocks
+- lock inversion
+- recursive locking assumptions
+- lock starvation
+- priority inversion
+- missed notifications
+- condition-variable misuse
+- waiting while holding locks
+- callbacks while holding locks
+- lock-free races
+
+For every atomic variable inspect:
+
+- writer(s)
+- reader(s)
+- memory ordering
+- synchronization relationship
+- whether relaxed ordering is sufficient
+- whether acquire/release is sufficient
+- whether seq_cst is required
+- whether a non-atomic variable is indirectly synchronized
+
+Do not accept:
+
+"it's atomic, therefore it is safe."
+
+Atomicity and synchronization are different properties.
+
+---
+
+8. MEMORY MODEL AUDIT
+
+Audit all C++ memory-model-sensitive code.
+
+Inspect:
+
+- "std::atomic"
+- atomic pointers
+- CAS loops
+- fences
+- acquire
+- release
+- acq_rel
+- relaxed
+- seq_cst
+- publication
+- reference counting
+- epoch counters
+- lock-free queues
+- state machines
+
+For every important synchronization mechanism explain:
+
+Producer:
+    write A
+    write B
+    publish flag
+
+Consumer:
+    read flag
+    read A
+    read B
+
+Determine whether the actual memory ordering guarantees the required visibility.
+
+Search for:
+
+- missing acquire
+- missing release
+- incorrectly relaxed operations
+- publication races
+- stale reads
+- load/store reordering
+- compiler reordering
+- lifetime races
+
+---
+
+9. DEADLOCK AUDIT
+
+Construct a lock graph.
+
+Find:
+
+Thread A:
+lock(A)
+lock(B)
+
+Thread B:
+lock(B)
+lock(A)
+
+Also look for indirect cycles:
+
+A → B → C → A
+
+Inspect:
+
+- transaction locks
+- page latches
+- WAL locks
+- checkpoint locks
+- GC locks
+- backup locks
+- observer locks
+- shutdown locks
+- global database locks
+
+Check error paths too.
+
+A lock that is normally released but not released on one exception/error path is a real bug.
+
+---
+
+10. STARVATION AND LIVENESS AUDIT
+
+Search for operations that can theoretically wait forever.
+
+Inspect:
+
+- condition variables
+- retries
+- CAS loops
+- transaction validation
+- epoch advancement
+- WAL flushing
+- group commit
+- checkpoint
+- backup
+- GC
+- io_uring completion
+- shutdown
+
+Look for:
+
+- infinite retry
+- starvation
+- livelock
+- unfair locks
+- progress dependent on another thread that may stop
+- shutdown deadlocks
+
+---
+
+11. TRANSACTION ENGINE AUDIT
+
+Reconstruct the complete transaction lifecycle:
+
+begin
+ ↓
+snapshot
+ ↓
+reads
+ ↓
+writes
+ ↓
+conflict registration
+ ↓
+validation
+ ↓
+commit
+ ↓
+publication
+ ↓
+visibility
+ ↓
+reclamation
+
+For each stage identify:
+
+- state transitions
+- synchronization
+- timestamps
+- transaction IDs
+- commit IDs
+- snapshot IDs
+- conflict records
+
+Check illegal state transitions.
+
+Examples:
+
+- commit twice
+- abort after commit
+- read after abort
+- write after abort
+- commit after shutdown
+- transaction outliving database
+- validation after required metadata was reclaimed
+
+---
+
+12. MVCC AUDIT
+
+Verify version visibility mathematically.
+
+For every read determine:
+
+reader snapshot
+version begin timestamp
+version end timestamp
+transaction state
+commit state
+
+Check:
+
+- own writes
+- committed writes
+- uncommitted writes
+- aborted writes
+- overwritten versions
+- deleted versions
+- concurrent commits
+- snapshot boundaries
+- transaction timestamps
+
+Construct adversarial schedules.
+
+Example:
+
+T1 starts
+T2 starts
+T1 writes X
+T2 reads X
+T1 commits
+T2 reads X again
+T2 commits
+
+Do this for every meaningful combination.
+
+---
+
+13. SSI / SERIALIZABILITY AUDIT
+
+Do not assume SSI is correct because conflict tracking exists.
+
+Verify:
+
+- rw dependencies
+- wr dependencies
+- ww dependencies
+- dangerous structures
+- pivot transactions
+- conflict edges
+- commit ordering
+- abort decisions
+- conflict cleanup
+
+Construct classic anomalies:
+
+Write skew
+
+T1 reads A
+T2 reads B
+T1 writes B
+T2 writes A
+
+Predicate anomaly
+
+T1 scans WHERE predicate
+T2 inserts matching row
+T1 commits
+
+Dangerous structure
+
+Construct:
+
+T1 →rw T2
+T2 →rw T3
+
+and determine whether the implementation correctly identifies the dangerous structure.
+
+Check false negatives AND false positives.
+
+---
+
+14. PHANTOM DETECTION AUDIT
+
+This deserves separate treatment.
+
+Inspect exactly how ranges are registered.
+
+Determine whether:
+
+range registration
++
+tree mutation
+
+are atomic with respect to each other.
+
+Construct races such as:
+
+T1 begins range scan
+
+T2 inserts key inside range
+
+T1 registers predicate
+
+T2 commits
+
+T1 validates
+
+Then reverse the order.
+
+Also test:
+
+- empty ranges
+- boundary keys
+- inclusive bounds
+- exclusive bounds
+- adjacent ranges
+- overlapping ranges
+- nested ranges
+- deleted keys
+- split pages
+- page merges
+- concurrent tree restructuring
+
+---
+
+15. STRICT SERIALIZABILITY AUDIT
+
+Identify the true linearization point of:
+
+- reads
+- writes
+- commits
+- aborts
+- scans
+- batches
+- observers
+- async operations
+
+Then test real-time ordering.
+
+Example:
+
+Client A:
+put(X, 1)
+returns success
+
+Client B:
+get(X)
+
+Can B ever observe a state inconsistent with A having completed?
+
+Repeat for:
+
+- commit
+- checkpoint
+- backup
+- restore
+- observers
+- scans
+- async operations
+
+---
+
+16. LINEARIZABILITY AUDIT
+
+For every concurrent public operation determine:
+
+1. Invocation
+2. Internal state changes
+3. Linearization point
+4. Response
+
+Check whether a valid sequential history exists.
+
+If not, construct the smallest invalid history.
+
+---
+
+17. B+ TREE AUDIT
+
+Audit the tree independently from transactions.
+
+Inspect:
+
+- root
+- internal nodes
+- leaves
+- parent pointers
+- separators
+- splits
+- merges
+- redistribution
+- insertion
+- deletion
+- search
+- lower_bound
+- upper_bound
+- range scans
+- cursors
+
+Test:
+
+- empty tree
+- one key
+- duplicate key
+- minimum key
+- maximum key
+- split at first key
+- split at last key
+- repeated splits
+- cascading splits
+- root split
+- root collapse
+- repeated deletion
+- page becoming empty
+- concurrent modification
+
+Check whether tree invariants remain true after every operation.
+
+---
+
+18. PAGE LIFETIME AUDIT
+
+Determine exactly when a page can be:
+
+- allocated
+- referenced
+- modified
+- detached
+- replaced
+- reclaimed
+- reused
+
+Find whether any reader can still access a page after reclamation.
+
+Pay special attention to:
+
+- cursors
+- range scans
+- iterators
+- background GC
+- concurrent splits
+- concurrent merges
+
+---
+
+19. EPOCH / RECLAMATION AUDIT
+
+Audit the entire reclamation system.
+
+Determine:
+
+- how readers enter epochs
+- how readers leave
+- what happens if a reader crashes
+- what happens if a thread exits
+- what happens if an exception occurs
+- how the minimum active epoch is calculated
+- when objects become reclaimable
+- when memory is reused
+
+Try to construct:
+
+Reader obtains pointer
+GC decides object is reclaimable
+GC frees object
+Reader accesses pointer
+
+If impossible, explain exactly why.
+
+If possible, provide the schedule.
+
+---
+
+20. WAL AUDIT
+
+Treat the WAL as a database in its own right.
+
+Audit:
+
+- record creation
+- headers
+- payload
+- checksum
+- LSN
+- sequence numbers
+- transaction IDs
+- commit records
+- segment boundaries
+- rotation
+- flush
+- fsync/fdatasync
+- group commit
+- truncation
+- recovery
+
+Check:
+
+- partial records
+- partial writes
+- short writes
+- corrupted records
+- truncated WAL
+- duplicate records
+- missing records
+- invalid CRC
+- incorrect LSN
+- gaps
+- duplicate LSN
+- incorrect ordering
+
+---
+
+21. DURABILITY AUDIT
+
+Distinguish:
+
+Memory durability
+
+What survives ordinary function return?
+
+Process-crash durability
+
+What survives "SIGKILL"?
+
+OS/kernel crash durability
+
+What survives a kernel failure?
+
+Power-loss durability
+
+What survives actual power loss?
+
+Do not treat:
+
+write()
+returned
+
+as equivalent to durable persistence.
+
+Verify actual ordering.
+
+---
+
+22. GROUP COMMIT AUDIT
+
+Analyze:
+
+- leader election
+- followers
+- batching
+- waiters
+- flush completion
+- error propagation
+- transaction acknowledgement
+
+Look for:
+
+- waiter never notified
+- waiter notified too early
+- waiter associated with wrong LSN
+- failed flush reported as success
+- successful transaction acknowledged before durable point
+
+---
+
+23. IO_URING AUDIT
+
+Audit every async operation.
+
+For each request determine:
+
+request allocation
+SQE preparation
+submission
+kernel ownership
+buffer lifetime
+completion
+completion processing
+request destruction
+
+Look for:
+
+- freed buffers
+- reused buffers
+- freed request objects
+- stale user_data
+- double completion
+- missed completion
+- partial writes
+- cancellation races
+- ring shutdown races
+- fd reuse
+- SQE reuse
+- CQ overflow
+- fallback inconsistencies
+
+Compare io_uring and synchronous paths for semantic equivalence.
+
+---
+
+24. CHECKPOINT AUDIT
+
+Determine:
+
+- what exactly gets checkpointed
+- what can change during checkpoint
+- how readers interact with checkpoint
+- how WAL interacts with checkpoint
+- how checkpoint boundaries are represented
+- how crash recovery chooses the checkpoint
+
+Test:
+
+write
+checkpoint
+write
+crash
+recover
+
+and every ordering permutation.
+
+---
+
+25. REBASE AUDIT
+
+If the implementation contains WAL/checkpoint rebasing or truncation, audit it extremely carefully.
+
+Check:
+
+- minimum required LSN
+- active readers
+- active snapshots
+- recovery requirements
+- backup requirements
+- PITR requirements
+- WAL segment deletion
+- metadata ordering
+
+Find any situation where required history is deleted too early.
+
+---
+
+26. BACKUP AUDIT
+
+Determine exactly what constitutes a consistent backup.
+
+Test backups during:
+
+- heavy writes
+- active transactions
+- checkpoint
+- WAL rotation
+- GC
+- shutdown
+- failed writes
+
+Check:
+
+- metadata consistency
+- WAL consistency
+- data-file consistency
+- backup marker semantics
+- partial backup detection
+- existing destination handling
+- filesystem errors
+
+---
+
+27. PITR AUDIT
+
+Treat every timestamp boundary as hostile.
+
+Test:
+
+before first commit
+exactly at commit
+immediately after commit
+between two commits
+exactly at checkpoint
+before checkpoint
+after checkpoint
+inside WAL segment
+after final WAL record
+beyond latest known timestamp
+
+Determine whether PITR:
+
+- returns the correct state
+- rejects impossible requests
+- silently produces incorrect state
+
+---
+
+28. FILESYSTEM AUDIT
+
+Check assumptions about:
+
+- rename atomicity
+- directory fsync
+- file fsync
+- fdatasync
+- file truncation
+- append semantics
+- write ordering
+- concurrent file access
+- file locking
+- temporary files
+- directory creation
+- permissions
+- disk-full behavior
+- ENOSPC
+- EINTR
+- short writes
+- EIO
+- read-only filesystem
+
+Make sure errors are handled correctly.
+
+---
+
+29. CRASH-POINT AUDIT
+
+Imagine the process can terminate immediately after every important instruction.
+
+Especially:
+
+write metadata
+write data
+flush
+fsync
+rename
+directory update
+WAL append
+WAL flush
+checkpoint
+backup marker
+manifest update
+
+For every crash point determine whether recovery produces:
+
+1. previous valid state
+2. new valid state
+3. recoverable intermediate state
+4. corrupted state
+5. falsely acknowledged state
+
+---
+
+30. ERROR-INJECTION AUDIT
+
+Search for operations where the implementation assumes success.
+
+Consider failure injection for:
+
+- malloc
+- file open
+- file read
+- file write
+- fsync
+- fdatasync
+- rename
+- mkdir
+- mmap
+- io_uring submission
+- io_uring completion
+- checksum validation
+- WAL parsing
+- allocation
+- transaction validation
+
+Determine whether every failure leaves the system in a valid state.
+
+---
+
+31. EXCEPTION SAFETY
+
+Audit every function that can throw.
+
+Classify:
+
+- no-throw guarantee
+- strong guarantee
+- basic guarantee
+- unspecified
+
+Look for:
+
+state changed
+allocation throws
+lock remains held
+epoch remains pinned
+transaction remains half-written
+
+Pay particular attention to constructors/destructors and RAII guards.
+
+---
+
+32. INTEGER / BOUNDARY AUDIT
+
+Search for:
+
+- integer overflow
+- underflow
+- narrowing
+- signed/unsigned comparisons
+- size_t conversion
+- multiplication overflow
+- offset overflow
+- length overflow
+- timestamp overflow
+- LSN overflow
+- transaction ID overflow
+- page number overflow
+
+Test huge:
+
+- keys
+- values
+- ranges
+- transactions
+- WAL records
+- page counts
+- file sizes
+
+---
+
+33. PARSING / SERIALIZATION AUDIT
+
+Audit every serialization format.
+
+Check:
+
+- malformed input
+- truncated input
+- oversized lengths
+- invalid enum values
+- invalid flags
+- checksum mismatch
+- version mismatch
+- future versions
+- unknown fields
+- duplicate fields
+- impossible combinations
+
+Never assume files are trustworthy.
+
+---
+
+34. ON-DISK FORMAT AUDIT
+
+Determine:
+
+- format version
+- page format
+- WAL format
+- metadata format
+- compatibility rules
+- migration rules
+
+Check whether an older database can accidentally be interpreted as a newer format.
+
+Look for:
+
+- missing version validation
+- incompatible structure changes
+- unsafe assumptions
+- partial upgrades
+
+---
+
+35. RECOVERY AUDIT
+
+Run recovery mentally from every possible state.
+
+Test:
+
+empty database
+normal shutdown
+crashed write
+crashed commit
+crashed checkpoint
+crashed WAL rotation
+corrupt WAL
+truncated WAL
+corrupt checkpoint
+missing WAL
+extra WAL
+duplicate WAL
+partial metadata
+
+For each state determine whether recovery:
+
+- succeeds correctly
+- rejects corruption
+- silently loses data
+- silently invents data
+- produces inconsistent indexes
+
+---
+
+36. OBSERVER / CALLBACK AUDIT
+
+Callbacks are dangerous.
+
+Check:
+
+- callback execution while holding locks
+- callback reentrancy
+- callback modifying database
+- callback destroying database
+- callback throwing
+- callback calling transaction APIs
+- callback lifetime
+- concurrent callbacks
+- callback ordering
+
+Construct reentrant scenarios.
+
+---
+
+37. ASYNC API AUDIT
+
+For every asynchronous operation determine:
+
+- when operation logically begins
+- when it becomes visible
+- when it commits
+- when completion fires
+- what completion guarantees
+- cancellation semantics
+- error semantics
+
+Check whether async APIs preserve the same consistency guarantees as synchronous APIs.
+
+---
+
+38. SHUTDOWN AUDIT
+
+Construct:
+
+write
+background WAL flush
+checkpoint
+GC
+backup
+io_uring operation
+observer callback
+transaction
+shutdown()
+
+all happening simultaneously.
+
+Look for:
+
+- deadlocks
+- use-after-free
+- lost writes
+- dropped completions
+- incomplete WAL
+- threads not joined
+- callbacks after destruction
+
+---
+
+39. TEST SUITE AUDIT
+
+Do not just read tests.
+
+For every test ask:
+
+- What invariant does it prove?
+- Could the test pass if the implementation were broken?
+- Does it exercise multiple interleavings?
+- Does it test failure paths?
+- Does it test negative cases?
+- Does it test boundaries?
+- Does it test crash recovery?
+- Does it test actual durability?
+- Does it distinguish logical correctness from implementation details?
+
+Find weak tests.
+
+---
+
+40. FUZZING AUDIT
+
+Inspect fuzzers and determine:
+
+- input space
+- state space
+- mutation strategy
+- crash simulation
+- oracle
+- coverage
+- reset behavior
+
+Find important states fuzzing cannot reach.
+
+---
+
+41. STRESS TEST AUDIT
+
+Determine whether stress tests can actually expose concurrency bugs.
+
+Check:
+
+- CPU count
+- thread count
+- iteration count
+- randomized schedules
+- deterministic seeds
+- timeout behavior
+- false-positive handling
+- false-negative possibilities
+
+A test that passes once is not proof of concurrency correctness.
+
+---
+
+42. INVARIANT EXTRACTION
+
+Extract every invariant you can find.
+
+Create a table:
+
+ID| Invariant| Where enforced| Where tested| Potential violation
+
+Examples:
+
+- B+ tree ordering
+- page ownership
+- epoch safety
+- transaction state
+- visibility
+- WAL ordering
+- commit publication
+- checkpoint consistency
+- backup consistency
+
+If an important invariant exists only in a comment, flag it.
+
+---
+
+43. INVARIANT BREAKING
+
+For each invariant, actively attempt to construct a counterexample.
+
+Do not stop at the first obvious path.
+
+Try:
+
+- concurrency
+- failure
+- restart
+- corruption
+- extreme input
+- unusual ordering
+- shutdown
+- repeated operations
+- nested operations
+- retry
+- cancellation
+
+---
+
+44. DIFFERENTIAL REASONING
+
+Where possible compare:
+
+- sync vs async
+- io_uring vs fallback
+- debug vs release
+- normal vs recovery
+- transaction vs autocommit
+- single-threaded vs multi-threaded
+- empty vs populated database
+- checkpointed vs non-checkpointed state
+
+Look for semantic differences that should not exist.
+
+---
+
+45. STATE-MACHINE AUDIT
+
+Model major components as state machines.
+
+For transactions:
+
+NEW
+ ↓
+ACTIVE
+ ↓
+VALIDATING
+ ↓
+COMMITTING
+ ↓
+COMMITTED
+
+or
+
+ACTIVE → ABORTING → ABORTED
+
+Find illegal transitions.
+
+Do the same for:
+
+- WAL
+- checkpoint
+- backup
+- restore
+- io_uring requests
+- pages
+- epochs
+
+---
+
+46. API SEQUENCE AUDIT
+
+Try hostile API sequences.
+
+Examples:
+
+begin
+commit
+commit
+
+begin
+abort
+get
+
+begin
+write
+abort
+commit
+
+backup
+shutdown
+
+shutdown
+get
+
+cursor
+destroy database
+cursor.next()
+
+transaction
+destroy database
+transaction.commit()
+
+Determine whether behavior is safe, rejected, undefined, or corrupting.
+
+---
+
+47. RESOURCE EXHAUSTION AUDIT
+
+Consider:
+
+- RAM exhaustion
+- disk exhaustion
+- file descriptor exhaustion
+- thread exhaustion
+- WAL growth
+- enormous transactions
+- enormous keys
+- enormous values
+- huge scans
+- many cursors
+- many snapshots
+
+Check whether exhaustion causes:
+
+- graceful failure
+- corruption
+- deadlock
+- permanent poisoned state
+
+---
+
+48. SECURITY-ADJACENT CORRECTNESS
+
+This is not primarily a security audit, but inspect:
+
+- path traversal in backup/restore
+- unsafe temporary files
+- symlink handling
+- permission assumptions
+- corrupted input
+- malicious database files
+- unbounded allocations from disk metadata
+- denial-of-service conditions
+
+Do not turn this into a generic web-security review.
+
+Focus on correctness and local database safety.
+
+---
+
+49. PERFORMANCE-INDUCED CORRECTNESS BUGS
+
+Do not report ordinary performance problems unless they affect correctness.
+
+However, investigate cases where optimization changes semantics.
+
+Examples:
+
+- relaxed atomics
+- lock elision
+- batching
+- deferred publication
+- asynchronous flushing
+- caching
+- object pooling
+- memory reuse
+- page reuse
+
+If an optimization creates a correctness window, report it.
+
+---
+
+50. COMMIT / PUBLICATION AUDIT
+
+This is one of the highest-priority areas.
+
+Determine the exact sequence:
+
+transaction validates
+→ commit timestamp assigned
+→ WAL record written
+→ WAL durable
+→ in-memory state published
+→ transaction becomes visible
+→ caller receives success
+
+Verify that the actual implementation follows a logically valid ordering.
+
+Search for states where:
+
+- visible before durable
+- durable before logically committed
+- acknowledged before durable
+- published before validation
+- timestamp assigned too early
+- timestamp assigned too late
+- readers observe partial commit
+
+---
+
+51. REAL-TIME CRASH SCENARIOS
+
+For every operation returning success ask:
+
+«If the machine loses power immediately after this return, what exactly is guaranteed?»
+
+Do this separately for:
+
+- put
+- erase
+- commit
+- checkpoint
+- backup
+- restore
+- PITR
+
+If the answer differs from documentation, report it.
+
+---
+
+52. BACKWARD-COMPATIBILITY AUDIT
+
+Inspect git history.
+
+Look for changes to:
+
+- structures
+- enums
+- serialized layouts
+- WAL formats
+- page formats
+- metadata
+- checkpoint format
+
+Determine whether existing databases created by older versions can still be opened safely.
+
+If migration is required but absent, report it.
+
+---
+
+53. GIT HISTORY AUDIT
+
+Use history strategically.
+
+Inspect commits around suspicious areas.
+
+Look for:
+
+- recently introduced races
+- fixes that were incomplete
+- reverted fixes
+- comments describing known bugs
+- TODOs
+- temporary workarounds
+- code that changed without tests
+- large concurrency changes
+- changes to recovery semantics
+
+Do not assume newer code is better.
+
+---
+
+54. CODE-TO-DOCUMENTATION AUDIT
+
+For every major documented guarantee compare documentation against implementation.
+
+Create:
+
+Claimed guarantee| Actual implementation| Evidence| Status
+
+Classify:
+
+- confirmed
+- partially implemented
+- incorrect
+- unproven
+
+---
+
+55. BUG VERIFICATION STANDARD
+
+Before calling something a bug, attempt to disprove it.
+
+For each suspected defect:
+
+1. Find the relevant code.
+2. Trace every caller.
+3. Find synchronization around it.
+4. Search for hidden invariants.
+5. Inspect related tests.
+6. Inspect relevant history.
+7. Construct a counterexample.
+8. Try to find why the counterexample cannot happen.
+9. Only then classify it.
+
+Use:
+
+- CONFIRMED
+- HIGH-CONFIDENCE
+- PLAUSIBLE
+- UNPROVEN
+
+Do not inflate "plausible" into "confirmed."
+
+---
+
+56. REPRODUCERS
+
+Whenever practical, create minimal reproducer designs.
+
+A good reproducer should:
+
+- use the public API where possible
+- require minimal code
+- have deterministic synchronization
+- reliably trigger the issue
+- clearly demonstrate incorrect behavior
+
+For concurrency bugs, use explicit barriers/latches rather than probabilistic sleeps.
+
+Bad:
+
+sleep_for(10ms);
+
+Better:
+
+Thread A reaches barrier
+Thread B reaches barrier
+Thread A performs operation
+Thread B performs operation
+
+---
+
+57. BUG REPORT FORMAT
+
+Every confirmed or high-confidence issue must use:
+
+[CKV-XXX] Short descriptive title
+
+Severity: Critical / High / Medium / Low
+
+Confidence: Confirmed / High-confidence / Plausible
+
+Component:
+
+Files:
+
+Functions:
+
+Approximate lines:
+
+Summary
+
+One paragraph.
+
+Root Cause
+
+Explain the exact implementation mistake.
+
+Trigger
+
+Give the smallest sequence that triggers it.
+
+Concurrent Schedule
+
+If applicable:
+
+T1:
+1.
+2.
+3.
+
+T2:
+1.
+2.
+3.
+
+Incorrect Result
+
+Exactly what goes wrong.
+
+Expected Result
+
+Exactly what should happen.
+
+Violated Invariant
+
+Name the invariant.
+
+Why Existing Protection Fails
+
+Explain locks, atomics, validation, epochs, etc.
+
+Existing Test Coverage
+
+Explain whether current tests catch it.
+
+Reproducer
+
+Provide code or pseudocode.
+
+Fix Direction
+
+Give a minimal conceptual fix.
+
+Regression Test
+
+Describe the test that should be added.
+
+---
+
+58. DO NOT REPORT THESE AS BUGS WITHOUT EVIDENCE
+
+Do not report:
+
+- "mutex might be slow"
+- "shared_ptr could be expensive"
+- "this could theoretically deadlock"
+- "atomics are complicated"
+- "fsync is platform-dependent"
+- "io_uring is dangerous"
+- "SSI is complex"
+- "there might be a race"
+- "this function is large"
+- "this should use RAII"
+- "this could be optimized"
+
+unless you can connect it to a concrete correctness failure.
+
+---
+
+59. FALSE-POSITIVE SECTION
+
+For suspicious code that initially looks dangerous but is actually safe, document it.
+
+Examples:
+
+Potential race:
+    ...
+Why it is actually safe:
+    ...
+Synchronization establishing safety:
+    ...
+
+This demonstrates that the audit is analytical rather than warning-generation.
+
+---
+
+60. PRIORITY SCORING
+
+Score every real finding:
+
+Impact
+
+1 — cosmetic
+2 — minor
+3 — significant
+4 — severe
+5 — catastrophic
+
+Likelihood
+
+1 — extremely unlikely
+2 — unusual
+3 — realistic
+4 — likely
+5 — common
+
+Detectability
+
+1 — easily detected
+2 — usually detected
+3 — sometimes detected
+4 — difficult
+5 — silent
+
+Then calculate:
+
+Risk = Impact × Likelihood × Detectability
+
+Use this to prioritize fixes.
+
+---
+
+61. FINAL REPORT
+
+The final report must contain:
+
+ChronoKV Full Adversarial Audit
+
+1. Executive Summary
+
+Include:
+
+- repository version/commit reviewed
+- approximate number of files inspected
+- major subsystems inspected
+- confirmed bugs
+- high-confidence bugs
+- plausible issues
+- important testing gaps
+- overall safety assessment
+
+Do NOT simply say "looks good."
+
+---
+
+2. Critical Findings
+
+All Critical findings.
+
+---
+
+3. High Findings
+
+All High findings.
+
+---
+
+4. Medium Findings
+
+All Medium findings.
+
+---
+
+5. Low Findings
+
+All Low findings.
+
+---
+
+6. Concurrency Findings
+
+Summarize all concurrency defects.
+
+---
+
+7. Transaction / MVCC Findings
+
+Summarize:
+
+- visibility
+- SSI
+- phantom detection
+- serializability
+- commit ordering
+
+---
+
+8. B+ Tree Findings
+
+Summarize structural and concurrent correctness.
+
+---
+
+9. Memory-Reclamation Findings
+
+Summarize epoch/lifetime/reclamation safety.
+
+---
+
+10. WAL Findings
+
+Summarize:
+
+- record correctness
+- ordering
+- durability
+- group commit
+- rotation
+- io_uring
+
+---
+
+11. Recovery Findings
+
+Summarize every recovery weakness.
+
+---
+
+12. Backup / PITR Findings
+
+Summarize:
+
+- consistency
+- crash safety
+- timestamp boundaries
+- corruption handling
+
+---
+
+13. Filesystem Findings
+
+Summarize assumptions and failure handling.
+
+---
+
+14. API Findings
+
+Summarize documentation/implementation mismatches.
+
+---
+
+15. Test Suite Findings
+
+For each major subsystem:
+
+Subsystem| Coverage| Missing cases| Risk
+
+---
+
+16. Invariant Matrix
+
+Provide the complete invariant table.
+
+---
+
+17. Documentation Accuracy
+
+List claims that are:
+
+- confirmed
+- partially confirmed
+- incorrect
+- unproven
+
+---
+
+18. False Positives
+
+List suspicious areas you investigated and determined to be safe.
+
+---
+
+19. Recommended Fix Order
+
+Provide an ordered list:
+
+1. CKV-XXX
+2. CKV-XXX
+3. CKV-XXX
+...
+
+Explain why this order is correct.
+
+---
+
+20. Required Regression Tests
+
+Provide concrete tests for every confirmed bug.
+
+---
+
+21. What Was NOT Proven
+
+This section is mandatory.
+
+Explicitly state which guarantees could not be established from static analysis/testing.
+
+Do not pretend absence of evidence is evidence of correctness.
+
+---
+
+62. FINAL VERDICT
+
+Choose exactly one:
+
+A. Production-safe
+
+Only if there is strong evidence supporting this.
+
+B. Mostly safe, but important defects remain
+
+C. Significant correctness issues remain
+
+D. Not safe for production
+
+Explain the decision.
+
+---
+
+63. IMPORTANT BEHAVIORAL REQUIREMENTS
+
+Do NOT:
+
+- stop after finding one bug
+- only inspect the main header
+- only inspect README
+- only inspect tests
+- assume tests prove correctness
+- assume comments are correct
+- invent behavior
+- invent files
+- invent line numbers
+- exaggerate speculative issues
+- recommend rewriting everything
+- spend most of the report praising the code
+
+DO:
+
+- trace execution
+- follow ownership
+- reconstruct state machines
+- construct adversarial schedules
+- inspect history
+- inspect tests
+- compare documentation with implementation
+- challenge every important invariant
+- distinguish confirmed defects from hypotheses
+- provide minimal reproducers
+- identify test gaps
+- explain why suspicious code is safe when it is safe
+
+---
+
+64. MOST IMPORTANT QUESTION
+
+At the end of the audit, answer this:
+
+«If I deliberately tried to corrupt ChronoKV through concurrency, crashes, partial I/O, transaction anomalies, recovery edge cases, memory reclamation, malformed on-disk state, and adversarial API sequences, what is the strongest concrete way I could currently break it?»
+
+Give the smallest reproducible scenario you found.
+
+If you cannot find one, explain exactly what you attempted and why the implementation resisted those attacks.
+
+Do not claim "no bugs found" merely because the review was inconclusive.
