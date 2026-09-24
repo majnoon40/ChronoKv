@@ -9620,13 +9620,46 @@ static int run_pitr_test() {
             db.close();
         } catch (const std::exception& e) { breason = e.what(); }
         check("pitr: restore at backup_cts yields the full backup state", at_ok, breason);
+        // v28 (CKV-003c) refines this leg — SAFETY contract, not a fixed
+        // outcome: below the backup's boundary cts a restore must EITHER be
+        // rejected loud (window not reconstructable — the only possible
+        // outcome pre-v28, because the backup's checkpoint silently
+        // DROPPED the recovered WAL tail and the rotation destroyed it)
+        // OR materialize the EXACT as-of state (post-v28 the backup's delta
+        // captures that tail, so the chain provably covers the window and
+        // v26.1's per-entry filtering applies: h, first written AT bcts,
+        // must be absent at bcts-1; g must be present). A silent WRONG
+        // state fails the check either way.
+        bool below_safe = false;
+        std::string below_detail;
         try {
             auto db = Database::restore_pitr(root + "/bak/wal", root + "/bak/ckpt",
                                              root + "/r_below", bcts - 1);
+            bool h_absent = !db.get("h").has_value();
+            bool g_present = db.get("g").value_or("") == "7";
+            below_safe = h_absent && g_present;
+            below_detail = below_safe
+                ? "materialized exact as-of state (h absent, g=7)"
+                : ("WRONG STATE: h_absent=" + std::to_string(h_absent) +
+                   " g_present=" + std::to_string(g_present));
             db.close();
-        } catch (const std::exception&) { below_rejected = true; }
-        check("pitr: restore BELOW backup_cts is rejected (vacuous range, documented)",
-              below_rejected);
+        } catch (const std::exception& e) {
+            below_safe = true;
+            below_detail = std::string("rejected loud: ") + e.what();
+        }
+        check("pitr: restore BELOW backup_cts is rejected OR yields the exact as-of state",
+              below_safe, below_detail);
+        // The genuinely vacuous leg stays deterministic: an as_of BELOW the
+        // chain's base cts can never be materialized (the base superseded
+        // older state) and MUST be rejected.
+        bool vacuous_rejected = false;
+        try {
+            auto db = Database::restore_pitr(root + "/bak/wal", root + "/bak/ckpt",
+                                             root + "/r_vacuous", W3 > 1 ? W3 - 1 : 1);
+            db.close();
+        } catch (const std::exception& e) { vacuous_rejected = true; breason = e.what(); }
+        check("pitr: restore below the chain BASE cts is rejected (vacuous range)",
+              vacuous_rejected, breason);
     }
 
     // (7) Argument validation.
@@ -11480,6 +11513,136 @@ static int run_remediation_tests() {
     run_child("remediation CKV-003b: index fail-stop on tree-mutation OOM; acked writes survive reopen (engine-index-failstop, invariant D4)",
               ckv003b_body, 900000,
               "post-OOM put returns OK, checkpoint truncates the WAL, acked writes lost on reopen");
+
+    // ---- CKV-003c: checkpoint dirty-coverage validation (ckpt-dirty-coverage) ----
+    // Simulated index divergence: a dirty key's entry vanishes from the
+    // serialized snapshot. Pre-fix the incremental checkpoint silently
+    // skipped it, "succeeded", rotated/truncated the WAL — and the key was
+    // permanently lost on reopen. Post-fix the checkpoint refuses BEFORE
+    // any file write, latches invariant D4, and reopen replays the intact
+    // WAL with every acked key.
+    static int (*const ckv003c_neg_body)() = +[]() -> int {
+        using namespace chronokv;
+        const std::string wd = "/tmp/ckv_ckv003c_" + std::to_string(getpid());
+        std::filesystem::remove_all(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.checkpoint_path = wd + "/ckpt.bin";
+        o.auto_start_gc = false;
+        o.durability = DurabilityMode::Sync;
+        auto db = Database::open(o);
+        char buf[64];
+        for (int i = 0; i < 200; ++i) {
+            snprintf(buf, sizeof buf, "key-%09d", i);
+            if (db.put(buf, "value") != Status::OK) return 9;
+        }
+        db.checkpoint();   // base (full)
+        for (int i = 200; i < 250; ++i) {
+            snprintf(buf, sizeof buf, "key-%09d", i);
+            if (db.put(buf, "value") != Status::OK) return 9;
+        }
+        // Simulate the divergence: drop one dirty key from the snapshot.
+        db.set_ckpt_dirty_capture_hook_for_test(
+            [](std::vector<std::tuple<std::string, uint64_t, std::string, bool>>& snap) {
+                for (auto it = snap.begin(); it != snap.end(); ++it)
+                    if (std::get<0>(*it) == "key-000000225") { snap.erase(it); return; }
+            });
+        bool threw = false;
+        try { db.checkpoint(); }
+        catch (const std::exception&) { threw = true; }
+        if (!threw) return 10;                       // pre-fix: silent skip + truncate
+        if (db.put("post-divergence", "v") != Status::Failed) return 11;   // D4 latched
+        if (db.health().level != 2) return 12;
+        db.close();
+        {
+            auto db2 = Database::open(o);
+            for (int i = 0; i < 250; ++i) {
+                snprintf(buf, sizeof buf, "key-%09d", i);
+                if (db2.get(buf).value_or("") != "value") return 13;   // pre-fix: 225 lost
+            }
+            if (db2.get("post-divergence").has_value()) return 14;
+            db2.close();
+        }
+        std::filesystem::remove_all(wd);
+        return 0;
+    };
+    run_child("remediation CKV-003c: checkpoint refuses on dirty-coverage divergence; WAL preserved (ckpt-dirty-coverage)",
+              ckv003c_neg_body, 300000,
+              "diverged dirty key silently skipped; checkpoint truncates the WAL; key lost on reopen");
+
+    // ---- CKV-003c: checkpoint-vs-WAL differential + empty-checkpoint edge ----
+    // Full lifecycle: empty-DB checkpoint (count-0 snapshot must recover),
+    // then base ckpt -> incremental ckpt -> uncheckpointed tail -> reopen
+    // reconciles checkpoint + WAL against the oracle. ALSO fail-first, for
+    // a second pre-existing defect this differential exposed: recovery
+    // never re-marked replayed WAL-tail keys as dirty, so the FIRST
+    // incremental checkpoint after a reopen captured only the post-reopen
+    // writes and its rotation then unlinked the WAL segments holding the
+    // replayed tail — silent permanent loss (pre-fix: exit 17, the
+    // pre-reopen edge keys gone). Fixed by dirty re-marking in both
+    // recovery replay loops.
+    static int (*const ckv003c_diff_body)() = +[]() -> int {
+        using namespace chronokv;
+        const std::string wd = "/tmp/ckv_ckv003cd_" + std::to_string(getpid());
+        std::filesystem::remove_all(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.checkpoint_path = wd + "/ckpt.bin";
+        o.auto_start_gc = false;
+        o.durability = DurabilityMode::Sync;
+        {
+            auto db = Database::open(o);
+            db.checkpoint();                       // empty DB, count-0 snapshot
+            char buf[64];
+            for (int i = 0; i < 5; ++i) {
+                snprintf(buf, sizeof buf, "e%d", i);
+                if (db.put(buf, "edge") != Status::OK) return 10;
+            }
+            db.close();
+        }
+        {
+            auto db = Database::open(o);
+            for (int i = 0; i < 5; ++i)
+                if (db.get("e" + std::to_string(i)).value_or("") != "edge") return 11;
+            char buf[64];
+            for (int i = 0; i < 300; ++i) {
+                snprintf(buf, sizeof buf, "key-%09d", i);
+                if (db.put(buf, "v1") != Status::OK) return 12;
+            }
+            db.checkpoint();                       // base
+            for (int i = 300; i < 500; ++i) {
+                snprintf(buf, sizeof buf, "key-%09d", i);
+                if (db.put(buf, "v1") != Status::OK) return 13;
+            }
+            for (int i = 0; i < 150; ++i) {        // updates over base keys
+                snprintf(buf, sizeof buf, "key-%09d", i);
+                if (db.put(buf, "v2") != Status::OK) return 14;
+            }
+            db.checkpoint();                       // incremental
+            for (int i = 500; i < 600; ++i) {
+                snprintf(buf, sizeof buf, "key-%09d", i);
+                if (db.put(buf, "v1") != Status::OK) return 15;
+            }
+            db.close();                            // uncheckpointed tail
+        }
+        {
+            auto db = Database::open(o);
+            char buf[64];
+            for (int i = 0; i < 600; ++i) {
+                snprintf(buf, sizeof buf, "key-%09d", i);
+                std::string want = (i < 150) ? "v2" : "v1";
+                if (db.get(buf).value_or("") != want) return 16;
+            }
+            for (int i = 0; i < 5; ++i)
+                if (db.get("e" + std::to_string(i)).value_or("") != "edge") return 17;
+            db.close();
+        }
+        std::filesystem::remove_all(wd);
+        return 0;
+    };
+    run_child("remediation CKV-003c: checkpoint-vs-WAL differential incl. empty-checkpoint edge (ckpt-wal-differential)",
+              ckv003c_diff_body, 300000,
+              "replayed WAL tail not marked dirty; first post-reopen incremental checkpoint truncates it");
 
     if (fails == 0) std::cout << "   REMEDIATION TESTS PASSED\n";
     else std::cout << "   REMEDIATION FAILURES: " << fails << "\n";

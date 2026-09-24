@@ -5003,6 +5003,16 @@ class ChronoKV {
     // depended on completeness for already-acked versions... a version
     // whose install threw was never acknowledged).
     std::atomic<bool> index_failed_{false};
+#ifdef CHRONOKV_TEST_HOOKS
+    // v28 (CKV-003c): test-only hook applied to the serialized snapshot
+    // immediately before the incremental dirty-coverage validation. Tests
+    // use it to simulate an index divergence (drop a dirty key's entry)
+    // and prove the checkpoint REFUSES instead of truncating the WAL that
+    // holds the only complete copy. Same member-hook pattern as
+    // WalSegments::leader_post_unlock_hook_.
+    std::function<void(std::vector<std::tuple<std::string, uint64_t, std::string, bool>>&)>
+        ckpt_dirty_capture_hook_;
+#endif
     mutable std::mutex order_mu_;
 
     // v25.1 M1.6: KeyEntry* ↔ tree-value encode/decode. The tree stores
@@ -5876,6 +5886,17 @@ public:
             for (auto& [k, v, d] : ws) {
                 auto [e, is_new] = ensure_index(k);
                 link_version(e, ts, v, d);
+                // v28 (CKV-003c): replayed WAL versions are dirty by
+                // definition — they exist only in the WAL, not in any
+                // checkpoint. Re-mark them so a later incremental
+                // checkpoint captures them BEFORE its rotation unlinks
+                // the WAL segments that are their only durable copy.
+                {
+                    std::lock_guard<std::mutex> dlk(dirty_mu_);
+                    auto dit = dirty_since_ckpt_.find(k);
+                    if (dit == dirty_since_ckpt_.end() || ts > dit->second)
+                        dirty_since_ckpt_[k] = ts;
+                }
             }
             diag::rec_records.fetch_add(1, std::memory_order_relaxed);
             i_rec_records.fetch_add(1, std::memory_order_relaxed);
@@ -6312,6 +6333,34 @@ public:
                          cur = cur->prev.load(std::memory_order_acquire);
                      }
                      snap.push_back({k, vts, val, deleted});
+                 }
+             }
+#ifdef CHRONOKV_TEST_HOOKS
+             if (ckpt_dirty_capture_hook_) ckpt_dirty_capture_hook_(snap);
+#endif
+             // v28 (CKV-003c): dirty-coverage validation. EVERY dirty key
+             // captured for this checkpoint snapshot must appear in the
+             // serialized snapshot: a dirty key with a commit record but no
+             // index entry means the in-memory tree diverged from the
+             // engine's own commit bookkeeping (audit CKV-003's corruption
+             // class). Pre-fix such a key was silently skipped: the
+             // checkpoint "succeeded", WAL rotation destroyed the only
+             // complete copy of the key, and the loss became permanent and
+             // invisible. Refuse loudly BEFORE any file write or rotation,
+             // and latch invariant D4 (the index can no longer be trusted).
+             {
+                 std::set<std::string> captured;
+                 for (const auto& [ck, hc, cv, cd] : snap) captured.insert(ck);
+                 std::vector<std::string> missing;
+                 for (const auto& dk : dirty_keys_to_capture)
+                     if (captured.find(dk) == captured.end()) missing.push_back(dk);
+                 if (!missing.empty()) {
+                     index_failed_.store(true, std::memory_order_release);
+                     throw std::runtime_error(
+                         "checkpoint aborted: " + std::to_string(missing.size()) +
+                         " dirty key(s) absent from the index (divergence detected; "
+                         "first missing key: " + missing.front() + "); WAL preserved, "
+                         "index fail-stop latched (invariant D4)");
                  }
              }
          } else {
@@ -7128,6 +7177,18 @@ public:
                     }
                 }
                 link_version(e, ts, v, d);
+                // v28 (CKV-003c): same dirty re-mark as recover() — the
+                // WAL tail beyond the applied chain is not covered by any
+                // checkpoint, so an incremental checkpoint after reopen
+                // must capture it before rotation can unlink its segments.
+                // Skipped for PITR opens: they are read-only and can never
+                // checkpoint (checkpoint() refuses on pitr_as_of_).
+                if (!as_of_cts) {
+                    std::lock_guard<std::mutex> dlk(dirty_mu_);
+                    auto dit = dirty_since_ckpt_.find(k);
+                    if (dit == dirty_since_ckpt_.end() || ts > dit->second)
+                        dirty_since_ckpt_[k] = ts;
+                }
             }
             diag::rec_records.fetch_add(1, std::memory_order_relaxed);
             i_rec_records.fetch_add(1, std::memory_order_relaxed);
@@ -8916,6 +8977,14 @@ public:
         auto eng = api_engine();
         if (eng->wal_) eng->wal_->leader_post_unlock_hook_ = std::move(fn);
     }
+#ifdef CHRONOKV_TEST_HOOKS
+    // v28 (CKV-003c): see ChronoKV::ckpt_dirty_capture_hook_.
+    void set_ckpt_dirty_capture_hook_for_test(
+            std::function<void(std::vector<std::tuple<std::string, uint64_t, std::string, bool>>&)> fn) {
+        auto eng = api_engine();
+        eng->ckpt_dirty_capture_hook_ = std::move(fn);
+    }
+#endif
     // v26 M0 (invariant D2): active-segment byte accounting, so a test can
     // assert a WalFailure'd batch was rolled back out of the rotation budget.
     size_t wal_active_segment_bytes_for_test() {

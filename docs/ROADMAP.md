@@ -454,7 +454,17 @@ diff against the source.
 > first, so every artifact in a backup sits at its boundary cts: PITR
 > *inside* a `backup()` copy is vacuous by construction (`as_of >= cts` =
 > normal restore; `as_of < cts` = rejected, since the base superseded older
-> state). The real PITR window is a LIVE/CRASHED database directory (or an
+> state). **[v28 correction, audit CKV-003c]** the "rejected" half was
+> subtler than recorded: the backup's incremental checkpoint silently
+> dropped the source's recovered WAL tail (recovery never re-marked it
+> dirty), so `as_of < cts` failed loud via the unreconstructable-window
+> detection — while losing data on any post-reopen checkpoint. With the
+> tail properly captured (recovery dirty re-marking), the backup chain
+> provably covers the window and `as_of < cts` materializes the EXACT
+> as-of state via v26.1 per-entry delta filtering; below the chain's BASE
+> cts remains a deterministic loud rejection. The boundary test now
+> asserts the safety contract: rejected OR exact-state, never wrong-state.
+> The real PITR window is a LIVE/CRASHED database directory (or an
 > external file-level copy of one), where the WAL extends past the last
 > checkpoint — which is what shipped. `backup_cts()` documents the boundary
 > a copy restores to.
