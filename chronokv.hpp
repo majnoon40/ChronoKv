@@ -9990,51 +9990,27 @@ public:
 
     // Insert or update a key. Returns true on insert, false on update.
     bool put(const std::string& key, const std::string& value) {
+        // v28 (CKV-002): tree-level key bound. Any leaf key can become an
+        // interior separator when its page splits, and a separator costs
+        // sizeof(InteriorSlot) + key against the same page budget — a key
+        // that could never fit as a separator (> 4052 bytes) cannot be
+        // safely stored in a multi-level tree at all. Reject at entry,
+        // before any descent or mutation. (The engine gates at its own
+        // tighter TREE_MAX_KEY_BYTES = 4048, which accounts for the
+        // 8-byte encoded-pointer value; this bound is the standalone-tree
+        // backstop.)
+        if (key.size() > MAX_STORABLE_KEY_BYTES)
+            throw PageCapacityError(
+                "key too large for the B+ tree: " + std::to_string(key.size()));
         generation_.fetch_add(1, std::memory_order_relaxed);  // M1.4: atomic (concurrent-safe)
         InsertResult r = put_recursive(root_id_.load(std::memory_order_acquire), key, value);
         if (r.split) {
-            // v28 FIX (audit CKV-001): capacity guard BEFORE the alloc and
-            // before any page mutation — the uint16 key_off computed as
-            // PAGE_SIZE - split_key.size() below wraps for separators that
-            // cannot fit a page (OOB memcpy into the pool). Throwing here
-            // leaves the committed tree reachable and searchable (root_id_
-            // is not yet moved); the engine maps PageCapacityError to
-            // Status::TooLarge, and the commit_txn key gate makes it
-            // unreachable through the public API (defense-in-depth).
-            if (sizeof(PageHeader) + sizeof(InteriorSlot) + r.split_key.size() > PAGE_SIZE)
-                throw PageCapacityError(
-                    "root-split separator does not fit a page: key=" +
-                    std::to_string(r.split_key.size()));
-            // Root split: create a new root with the split key + two children.
-            PageId new_root = pool_.alloc();
-            // v25.1 M2 FIX: acquire exclusive latch on new_root BEFORE writing
-            // to it. Without this, a concurrent reader (find_leaf_crabbing)
-            // that loads root_id_ = new_root after the relaxed store below
-            // can read new_root's bytes without synchronization — a data race
-            // caught by TSan on native hardware (higher concurrency than the
-            // 2-CPU container). The latch is released after root_id_ is
-            // stored (with release ordering) so readers that see the new
-            // root_id_ also see the fully-written page.
-            auto new_root_latch = latches_.lock_exclusive(new_root);
-            Page* rp = pool_.get(new_root);
-            std::memset(rp->bytes, 0, PAGE_SIZE);
-            PageHeader* rh = header(rp);
-            rh->is_leaf = 0;
-            rh->key_count = 1;
-            set_rightmost_child(rp, r.new_child);  // rightmost child
-            // Write the split key into the slab.
-            InteriorSlot* slots = interior_slots(rp);
-            uint16_t key_off = PAGE_SIZE - r.split_key.size();
-            std::memcpy(reinterpret_cast<uint8_t*>(rp) + key_off,
-                         r.split_key.data(), r.split_key.size());
-            slots[0].key_off = key_off;
-            slots[0].key_len = r.split_key.size();
-            slots[0].child_page_id = root_id_.load(std::memory_order_acquire);  // left child
-            update_fences_interior(rp);
-            // v25.1 M2 FIX: store with release ordering so readers that see
-            // the new root_id_ also see the fully-written page contents.
-            root_id_.store(new_root, std::memory_order_release);
-            new_root_latch.unlock();
+            // Root split: v28 (CKV-002) — k-way-capable install with
+            // plan-before-mutate and additive capacity validation (the old
+            // writer here computed uint16 key_off = PAGE_SIZE -
+            // split_key.size(), which wrapped for oversized separators —
+            // audit CKV-001 — and could only express a two-child root).
+            install_new_root(r.promotions, r.last_new_page);
         }
         return r.inserted;
     }
@@ -10052,32 +10028,14 @@ public:
             // Key exists — we're about to overwrite. Save the old value.
             *old_value = existing;
         }
+        if (key.size() > MAX_STORABLE_KEY_BYTES)   // v28 (CKV-002): same gate as put()
+            throw PageCapacityError(
+                "key too large for the B+ tree: " + std::to_string(key.size()));
         InsertResult r = put_recursive(root_id_.load(std::memory_order_acquire), key, value);
         if (r.split) {
-            // v28 FIX (audit CKV-001): capacity guard (same as put()).
-            if (sizeof(PageHeader) + sizeof(InteriorSlot) + r.split_key.size() > PAGE_SIZE)
-                throw PageCapacityError(
-                    "root-split separator does not fit a page: key=" +
-                    std::to_string(r.split_key.size()));
-            PageId new_root = pool_.alloc();
-            // v25.1 M2 FIX: latch new_root before writing (same as put()).
-            auto new_root_latch = latches_.lock_exclusive(new_root);
-            Page* rp = pool_.get(new_root);
-            std::memset(rp->bytes, 0, PAGE_SIZE);
-            PageHeader* rh = header(rp);
-            rh->is_leaf = 0;
-            rh->key_count = 1;
-            set_rightmost_child(rp, r.new_child);
-            InteriorSlot* slots = interior_slots(rp);
-            uint16_t key_off = PAGE_SIZE - r.split_key.size();
-            std::memcpy(reinterpret_cast<uint8_t*>(rp) + key_off,
-                         r.split_key.data(), r.split_key.size());
-            slots[0].key_off = key_off;
-            slots[0].key_len = r.split_key.size();
-            slots[0].child_page_id = root_id_.load(std::memory_order_acquire);
-            update_fences_interior(rp);
-            root_id_.store(new_root, std::memory_order_release);
-            new_root_latch.unlock();
+            // Root split: v28 (CKV-002) — k-way-capable install (same as
+            // put(); see install_new_root).
+            install_new_root(r.promotions, r.last_new_page);
         }
         return existed;
     }
@@ -10707,6 +10665,18 @@ private:
             return {};
         }
 
+        if (h->key_count == 0) {
+            // v28 (CKV-002): a 0-slot interior page is a legal degenerate
+            // shape ("rightmost-only" page) that byte-aware cascade can
+            // produce when the last candidate entry is promoted (the old
+            // count-based split could produce it too, in principle, for
+            // n=2). Every key routes to the rightmost child, which
+            // inherits this page's bounds. Reading slots[0] here — as the
+            // pre-v28 code did — dereferences a zeroed slot and recurses
+            // into child 0.
+            return verify_separators_recursive(get_rightmost_child(p), lo_bound, hi_bound);
+        }
+
         // Interior node: check each child's bounds.
         const InteriorSlot* slots = interior_slots(p);
         std::string prev_key;  // the key to the LEFT of the current child
@@ -10966,10 +10936,190 @@ private:
     // the split key and new child page to insert into the parent.
     struct InsertResult {
         bool inserted;       // true = new key inserted, false = existing key updated
-        bool split;          // true = child split, parent must insert split_key/new_child
-        std::string split_key;
-        PageId new_child;
+        bool split;          // true = child split; parent/root must install `promotions`
+        std::string split_key;   // == promotions[0].first (diagnostics / legacy shape)
+        PageId new_child;        // == last_new_page       (diagnostics / legacy shape)
+        // v28 (CKV-002): k-way split result. When split==true, `promotions`
+        // holds ALL (separator key, page that becomes that key's LEFT child)
+        // pairs in ascending separator order, and `last_new_page` is the
+        // rightmost resulting page — the one that inherits the splitting
+        // page's existing slot in the parent. A normal two-way split
+        // degenerates to exactly the old (split_key, new_child) contract:
+        // one promotion whose left child is the original page, plus
+        // last_new_page == new_child.
+        std::vector<std::pair<std::string, PageId>> promotions;
+        PageId last_new_page = 0;
     };
+
+    // v28 (CKV-002): byte budget available for entries (slots + slab) on
+    // one page; the 32-byte header is excluded. All capacity planning is
+    // done against this budget with ADDITIVE arithmetic only (Blocker 4:
+    // subtractive size_t checks underflow on full pages).
+    static constexpr size_t PAGE_ENTRY_BUDGET = PAGE_SIZE - sizeof(PageHeader);
+    // v28 (CKV-002): the largest key a standalone BTree may accept — it
+    // must fit as a leaf entry (slot + key + value <= budget) AND as an
+    // interior separator (slot + key <= budget), because any leaf key can
+    // be promoted when its page splits. Value-size fitness is enforced
+    // per-entry by the split planner and the insertion guards.
+    static constexpr size_t MAX_STORABLE_KEY_BYTES = PAGE_ENTRY_BUDGET - sizeof(InteriorSlot);
+
+    // v28 (CKV-002) Blocker 2: plan a BYTE-BALANCED two-way leaf split when
+    // one exists; otherwise plan the minimum cascade (greedy packing is
+    // sanctioned by RULE 5 for cascade sizing only). costs[i] is the full
+    // in-page cost of entry i (slot + key + value), each pre-validated as
+    // <= budget, so greedy packing always terminates. Returns group start
+    // indices (group 0 starts at 0; group j spans [starts[j], starts[j+1])).
+    static std::vector<size_t> plan_leaf_groups(const std::vector<size_t>& costs,
+                                                size_t budget) {
+        const size_t n = costs.size();
+        std::vector<size_t> prefix(n + 1, 0);
+        for (size_t i = 0; i < n; ++i) prefix[i + 1] = prefix[i] + costs[i];
+        const size_t total = prefix[n];
+        // Balanced two-way: left = [0..m-1], right = [m..n-1], both <= budget;
+        // among valid m, minimize |left - right| (never greedy-left-pack).
+        bool have = false;
+        size_t best_m = 0, best_imb = 0;
+        for (size_t m = 1; m < n; ++m) {
+            const size_t left = prefix[m];
+            const size_t right = total - left;
+            if (left <= budget && right <= budget) {
+                const size_t imb = left > right ? left - right : right - left;
+                if (!have || imb < best_imb) { have = true; best_imb = imb; best_m = m; }
+            }
+        }
+        if (have) return {0, best_m};
+        // Greedy minimum cascade: start a new group when the next entry
+        // would overflow the current one (i > groups.back() keeps groups
+        // non-empty; a single entry > budget is impossible — pre-validated).
+        std::vector<size_t> groups;
+        groups.push_back(0);
+        size_t cur = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (cur + costs[i] > budget && i > groups.back()) {
+                groups.push_back(i);
+                cur = 0;
+            }
+            cur += costs[i];
+        }
+        return groups;
+    }
+
+    // v28 (CKV-002) Blocker 3: same discipline for INTERIOR pages. The
+    // entry at each group boundary is PROMOTED to the parent (its key
+    // becomes the separator, its child becomes the rightmost child of the
+    // page to its left) — the exact convention the old count-based split
+    // used for its median. Balanced two-way when one exists, else greedy
+    // minimum cascade (the trailing group may be empty — a rightmost-only
+    // interior page, which count-based splits could already produce).
+    struct InteriorPlan {
+        std::vector<size_t> group_starts;   // size k
+        std::vector<size_t> promoted;       // size k-1, ascending entry indices
+    };
+    static InteriorPlan plan_interior_groups(const std::vector<size_t>& costs,
+                                             size_t budget) {
+        const size_t n = costs.size();
+        std::vector<size_t> prefix(n + 1, 0);
+        for (size_t i = 0; i < n; ++i) prefix[i + 1] = prefix[i] + costs[i];
+        const size_t total = prefix[n];
+        bool have = false;
+        size_t best_m = 0, best_imb = 0;
+        for (size_t m = 1; m < n; ++m) {
+            const size_t left = prefix[m];              // entries [0..m-1]
+            const size_t right = total - prefix[m + 1]; // entries [m+1..n-1]
+            if (left <= budget && right <= budget) {
+                const size_t imb = left > right ? left - right : right - left;
+                if (!have || imb < best_imb) { have = true; best_imb = imb; best_m = m; }
+            }
+        }
+        if (have) return {{0, best_m + 1}, {best_m}};
+        InteriorPlan plan{{0}, {}};
+        size_t cur = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (cur + costs[i] > budget) {   // cur > 0 always here (costs[i] <= budget)
+                plan.promoted.push_back(i);
+                plan.group_starts.push_back(i + 1);
+                cur = 0;
+            } else {
+                cur += costs[i];
+            }
+        }
+        return plan;
+    }
+
+    // v28 (CKV-002): install a new root level above a split root — k-way
+    // capable. The (separator, left-child) set is fit-checked ADDITIVELY
+    // for a single root page first (the common case, and the only shape
+    // pre-v28 could express). If a cascade produced more/larger separators
+    // than one page holds, the root level itself is built as a byte-aware
+    // interior cascade: plan -> allocate ALL pages of the level up front ->
+    // build bottom-up -> recurse with the promoted separators. root_id_ is
+    // moved LAST, under the v25.1 M2 latch protocol (exclusive-latch the
+    // new root while writing; release-store; unlock after the store) so a
+    // reader that observes the new root also observes every page below it.
+    // Replaces the hand-rolled root writers in put()/put_with_old whose
+    // uint16 key_off = PAGE_SIZE - split_key.size() wrapped for oversized
+    // separators (audit CKV-001).
+    void install_new_root(const std::vector<std::pair<std::string, PageId>>& promotions,
+                          PageId last_page) {
+        std::vector<std::pair<std::string, PageId>> entries = promotions;
+        PageId rightmost = last_page;
+        for (;;) {
+            size_t bytes = sizeof(PageHeader) + entries.size() * sizeof(InteriorSlot);
+            for (const auto& e : entries) {
+                if (sizeof(PageHeader) + sizeof(InteriorSlot) + e.first.size() > PAGE_SIZE)
+                    throw PageCapacityError(
+                        "root separator does not fit a page: key=" +
+                        std::to_string(e.first.size()));
+                bytes += e.first.size();
+            }
+            if (bytes <= PAGE_SIZE) break;   // single-page root — build below
+            // Cascade this level (plan + alloc-all + build; Blockers 1/6).
+            std::vector<size_t> costs(entries.size());
+            for (size_t i = 0; i < entries.size(); ++i)
+                costs[i] = sizeof(InteriorSlot) + entries[i].first.size();
+            const InteriorPlan plan = plan_interior_groups(costs, PAGE_ENTRY_BUDGET);
+            const size_t k = plan.group_starts.size();          // >= 2 here
+            std::vector<PageId> pages;
+            pages.reserve(k);
+            for (size_t j = 0; j < k; ++j) pages.push_back(pool_.alloc());
+            std::vector<std::pair<std::string, PageId>> up;
+            for (size_t j = 0; j < k; ++j) {
+                auto pl = latches_.lock_exclusive(pages[j]);
+                Page* q = pool_.get(pages[j]);
+                std::memset(q->bytes, 0, PAGE_SIZE);
+                PageHeader* qh = header(q);
+                qh->is_leaf = 0;
+                qh->key_count = 0;
+                const size_t end = (j + 1 < k) ? plan.promoted[j] : entries.size();
+                for (size_t i = plan.group_starts[j]; i < end; ++i)
+                    insert_into_interior_no_split(pages[j], entries[i].first, entries[i].second);
+                set_rightmost_child(q, (j + 1 < k) ? entries[plan.promoted[j]].second
+                                                   : rightmost);
+                if (j + 1 < k)
+                    up.push_back({entries[plan.promoted[j]].first, pages[j]});
+                pl.unlock();
+            }
+            entries = std::move(up);
+            rightmost = pages.back();
+            // entries strictly shrinks (k groups -> k-1 promotions), so this
+            // loop terminates at a single-page root.
+        }
+        PageId new_root = pool_.alloc();
+        // v25.1 M2 protocol (see comment preserved from the old writers):
+        // latch new_root exclusively while writing; store root_id_ with
+        // release ordering; unlock after the store.
+        auto new_root_latch = latches_.lock_exclusive(new_root);
+        Page* rp = pool_.get(new_root);
+        std::memset(rp->bytes, 0, PAGE_SIZE);
+        PageHeader* rh = header(rp);
+        rh->is_leaf = 0;
+        rh->key_count = 0;
+        set_rightmost_child(rp, rightmost);
+        for (const auto& e : entries)
+            insert_into_interior_no_split(new_root, e.first, e.second);
+        root_id_.store(new_root, std::memory_order_release);
+        new_root_latch.unlock();
+    }
 
     // v25.1 M1.6: Optimistic latch crabbing for the write path.
     //
@@ -11042,9 +11192,11 @@ private:
             InsertResult r = put_leaf_nolatch(leaf, key, value);
             if (r.split) {
                 leaf_excl.unlock();
-                InsertResult pr = insert_into_parent_optimistic(
-                    cur_root, r.split_key, r.new_child, leaf);
-                if (pr.split) return pr;  // root split — handled by put()
+                // v28 (CKV-002): install the (possibly k-way) split's
+                // promotions into the parent chain.
+                InsertResult pr = insert_into_parent_multi(
+                    cur_root, leaf, r.promotions, r.last_new_page);
+                if (pr.split) return pr;  // root split — handled by put()/put_with_old
                 return {r.inserted, false, "", 0};
             }
             return r;
@@ -11070,26 +11222,35 @@ private:
     // v25.1 M1.6: Insert (split_key, new_child) into the parent of `child`.
     // Re-descend to find the parent, acquire exclusive with fence re-check.
     // Returns {split: true} if the root split (caller handles).
-    InsertResult insert_into_parent_optimistic(PageId root,
-                                                const std::string& split_key,
-                                                PageId new_child,
-                                                PageId child) {
-        // Re-descend to find the parent of `child`. We descend with shared
-        // crabbing, tracking the parent. At the parent, release shared,
-        // acquire exclusive, re-check that `child` is still a child of this
-        // parent, then insert.
-        // v25.7 (review note 3): reload root_id_ per iteration (see
-        // put_recursive) — the `root` parameter is only the initial hint.
+    // v28 (CKV-002): generalized parent install for k-way splits (replaces
+    // insert_into_parent_optimistic). Same optimistic-descent protocol as
+    // before: shared-latch crabbing to find the parent of `child`, upgrade
+    // to exclusive, re-verify the child identity (the parent may have split
+    // concurrently), then install ALL promotions at once. If the parent
+    // itself splits, recurse upward with the parent's promotions. Returns
+    // split==true (with promotions/last_new_page set) only when `child` is
+    // the root — put()/put_with_old then install the new root level.
+    InsertResult insert_into_parent_multi(
+            PageId root, PageId child,
+            const std::vector<std::pair<std::string, PageId>>& promotions,
+            PageId last_page) {
         while (true) {
+            // v25.7 (review note 3): reload root_id_ per iteration — the
+            // `root` parameter is only the initial hint.
             const PageId cur_root = root_id_.load(std::memory_order_acquire);
-            // Descend to find the leaf for split_key (the split key defines
-            // which leaf the new child pointer goes into). The parent is the
-            // interior page that points to `child`.
+            // Descend with shared crabbing, tracking the parent. The first
+            // separator key routes to the subtree that contains `child`
+            // (it is the smallest key that moved right — same descent key
+            // the old single-promotion path used).
             std::shared_lock<std::shared_mutex> parent_shared;
-            PageId parent = find_parent_crabbing(cur_root, split_key, child, parent_shared);
+            PageId parent = find_parent_crabbing(cur_root, promotions.front().first,
+                                                 child, parent_shared);
             if (parent == 0) {
                 // `child` is the root — root split needed.
-                return {false, true, split_key, new_child};
+                InsertResult r{false, true, promotions.front().first, last_page};
+                r.promotions = promotions;
+                r.last_new_page = last_page;
+                return r;
             }
             parent_shared.unlock();
             auto parent_excl = latches_.lock_exclusive(parent);
@@ -11101,12 +11262,12 @@ private:
                 parent_excl.unlock();
                 continue;
             }
-            // Insert (split_key, new_child) into this parent.
-            InsertResult r = insert_into_interior_nolatch(parent, split_key, new_child);
+            InsertResult r = interior_install(parent, promotions, child, last_page);
             if (r.split) {
                 // Parent itself split — propagate up.
                 parent_excl.unlock();
-                return insert_into_parent_optimistic(root, r.split_key, r.new_child, parent);
+                return insert_into_parent_multi(root, parent, r.promotions,
+                                                r.last_new_page);
             }
             return {false, false, "", 0};
         }
@@ -11267,7 +11428,8 @@ private:
         PageHeader* h = header(p);
         LeafSlot* slots = leaf_slots(p);
 
-        // Collect all entries.
+        // Collect all entries (fully materialized in memory BEFORE any page
+        // byte is touched — v28 CKV-002 Blocker 1).
         std::vector<std::pair<std::string, std::string>> entries;
         for (uint16_t i = 0; i < h->key_count; ++i) {
             std::string k(reinterpret_cast<const char*>(p) + slots[i].key_off,
@@ -11287,51 +11449,73 @@ private:
         std::sort(entries.begin(), entries.end(),
                   [](const auto& a, const auto& b) { return a.first < b.first; });
 
-        // Split into two halves.
-        size_t mid = entries.size() / 2;
-
-        // Save the old leaf's next_leaf_id BEFORE clearing the page.
-        // The new leaf must inherit this pointer to maintain the chain.
-        // (This was the split relink-order bug: the original code cleared
-        //  h->next_leaf_id at line 544, then tried to read it at line 557
-        //  to inherit into the new page — always getting 0.)
-        PageId old_next = get_next_leaf(p);
-
-        // Rewrite the original page with the first half.
-        std::memset(p->bytes, 0, PAGE_SIZE);
-        h->is_leaf = 1;
-        h->key_count = 0;
-        h->min_key_off = h->max_key_off = 0;
-        h->min_key_len = h->max_key_len = 0;
-        // Note: set_next_leaf(p, ...) will be called after the slots are
-        // written, because the page was just memset to 0 and set_next_leaf
-        // asserts is_leaf — is_leaf is already set above, so we can call
-        // it now. But we need to set it to old_next ONLY after the new
-        // page is created and linked. For now, set it to 0; it'll be
-        // updated below to point to new_page_id.
-        set_next_leaf(p, 0);
-        for (size_t i = 0; i < mid; ++i) {
-            insert_into_leaf_no_split(page_id, entries[i].first, entries[i].second);
+        // ---- PLAN (v28 CKV-002; remediation Blockers 1, 2, 6; RULES 1-6).
+        // The complete split is decided here: per-entry byte costs, the
+        // group partition (byte-balanced two-way when one exists — never
+        // greedy-left-packed — else the minimum greedy cascade), and the
+        // allocation of ALL destination pages. Nothing below this point can
+        // fail on capacity or allocation, so no destructive rewrite can
+        // ever be abandoned halfway (the CKV-003 exception-safety posture).
+        const size_t n = entries.size();
+        std::vector<size_t> costs(n);
+        for (size_t i = 0; i < n; ++i) {
+            const size_t c = sizeof(LeafSlot) + entries[i].first.size() +
+                             entries[i].second.size();
+            if (sizeof(PageHeader) + c > PAGE_SIZE)
+                throw PageCapacityError(
+                    "leaf entry can never fit a page: key=" +
+                    std::to_string(entries[i].first.size()) + " value=" +
+                    std::to_string(entries[i].second.size()));
+            costs[i] = c;
         }
-        // Allocate a new page for the second half.
-        PageId new_page_id = pool_.alloc();
-        Page* new_p = pool_.get(new_page_id);
-        std::memset(new_p->bytes, 0, PAGE_SIZE);
-        PageHeader* new_h = header(new_p);
-        new_h->is_leaf = 1;
-        new_h->key_count = 0;
-        new_h->min_key_off = new_h->max_key_off = 0;
-        new_h->min_key_len = new_h->max_key_len = 0;
-        // New leaf inherits the old next pointer — this is the critical
-        // relink step that was broken before.
-        set_next_leaf(new_p, old_next);
-        for (size_t i = mid; i < entries.size(); ++i) {
-            insert_into_leaf_no_split(new_page_id, entries[i].first, entries[i].second);
-        }
-        // Link the original page to the new page.
-        set_next_leaf(p, new_page_id);
+        const std::vector<size_t> groups = plan_leaf_groups(costs, PAGE_ENTRY_BUDGET);
+        const size_t k = groups.size();   // >= 2: split implies over budget
+        // Allocate all k-1 destination pages UP FRONT (CKV-003a). pool_.alloc
+        // can throw — nothing has been mutated yet, so a throw leaves the
+        // tree byte-identical (the caller holds this page's exclusive latch).
+        std::vector<PageId> pages;
+        pages.reserve(k);
+        pages.push_back(page_id);   // group 0 reuses the original page
+        for (size_t j = 1; j < k; ++j) pages.push_back(pool_.alloc());
 
-        return {update ? false : true, true, entries[mid].first, new_page_id};
+        // ---- MUTATE (allocation-free from here: bounded memcpys only,
+        // every group proven to fit by the planner) ----
+        // Save the old leaf's next_leaf_id BEFORE clearing any page. The
+        // LAST new leaf inherits this pointer to maintain the chain. (This
+        // was the split relink-order bug fixed in earlier versions — the
+        // ordering is preserved here.)
+        const PageId old_next = get_next_leaf(p);
+        for (size_t j = 0; j < k; ++j) {
+            Page* q = pool_.get(pages[j]);
+            std::memset(q->bytes, 0, PAGE_SIZE);
+            PageHeader* qh = header(q);
+            qh->is_leaf = 1;
+            qh->key_count = 0;
+            qh->min_key_off = qh->max_key_off = 0;
+            qh->min_key_len = qh->max_key_len = 0;
+            // Chain: group j -> group j+1; the last group inherits old_next.
+            // Pages 1..k-1 are unreachable until the parent splice, and
+            // page 0 is under the caller's exclusive latch until the split
+            // returns — the chain is only observable once fully built.
+            set_next_leaf(q, (j + 1 < k) ? pages[j + 1] : old_next);
+            const size_t end = (j + 1 < k) ? groups[j + 1] : n;
+            for (size_t i = groups[j]; i < end; ++i)
+                insert_into_leaf_no_split(pages[j], entries[i].first, entries[i].second);
+        }
+
+        // Promotions for the parent: for each group j >= 1, its first key
+        // becomes a separator whose LEFT child is the page of group j-1;
+        // the parent's existing slot for this page is repointed to the last
+        // group's page (last_new_page).
+        InsertResult r;
+        r.inserted = !update;
+        r.split = true;
+        for (size_t j = 1; j < k; ++j)
+            r.promotions.push_back({entries[groups[j]].first, pages[j - 1]});
+        r.split_key = r.promotions.front().first;
+        r.new_child = pages.back();
+        r.last_new_page = pages.back();
+        return r;
     }
 
     void insert_into_leaf_no_split(PageId page_id, const std::string& key, const std::string& value) {
@@ -11379,260 +11563,121 @@ private:
     // Insert (split_key, new_child) into an interior page. May recursively split.
     // v25.1 M1.6: insert_into_interior_nolatch — the insert logic WITHOUT
     // latch acquisition. The caller (put_recursive_held) holds the exclusive latch.
-    InsertResult insert_into_interior_nolatch(PageId page_id, const std::string& split_key,
-                                        PageId new_child) {
+    // v28 (CKV-002, Blocker 3): install `promotions` (ascending
+    // (separator, its left page) pairs) into interior page `page_id`,
+    // repointing the existing child slot for `orig_child` to `last_page`.
+    // Caller holds page_id's EXCLUSIVE latch. The full candidate entry list
+    // is materialized in memory and its single-page fit is checked
+    // ADDITIVELY before any mutation:
+    //   fits    -> rewrite the page in place (bounded memcpys only);
+    //   !fits   -> split_interior_planned: byte-aware plan, allocate ALL
+    //              destination pages, verify, and only then mutate. Its own
+    //              promotions are returned for the caller to recurse up.
+    // Replaces the legacy insert_into_interior_nolatch (single-slot memmove
+    // insert, count-based overflow decision) + split_interior (count-based
+    // mid, memset-then-allocate) pair. The splice convention is the legacy
+    // one: slot (key, LEFT child of key); for a single promotion this
+    // reproduces exactly the old (split_key, old_child) + repoint-right
+    // layout, including the rightmost-child case.
+    InsertResult interior_install(
+            PageId page_id,
+            const std::vector<std::pair<std::string, PageId>>& promotions,
+            PageId orig_child, PageId last_page) {
         Page* p = pool_.get(page_id);
         PageHeader* h = header(p);
-        InteriorSlot* slots = interior_slots(p);
-
-        // Find insertion point.
-        size_t i = 0;
-        while (i < h->key_count) {
-            std::string k(reinterpret_cast<const char*>(p) + slots[i].key_off,
-                           slots[i].key_len);
-            if (split_key < k) break;
-            ++i;
-        }
-
-        // Check space.
-        size_t needed = sizeof(InteriorSlot) + split_key.size();
-        size_t lo = sizeof(PageHeader) + (h->key_count + 1) * sizeof(InteriorSlot);
-        // For interior pages, slab is just the keys.
-        uint16_t hi = PAGE_SIZE;
-        for (uint16_t j = 0; j < h->key_count; ++j) {
-            if (slots[j].key_off < hi) hi = slots[j].key_off;
-        }
-        if (lo + needed > hi) {
-            // Interior page is full — split it.
-            return split_interior(page_id, split_key, new_child, i);
-        }
-
-        // Shift slots to make room.
-        if (i < h->key_count) {
-            std::memmove(&slots[i + 1], &slots[i],
-                          (h->key_count - i) * sizeof(InteriorSlot));
-        }
-        uint16_t key_off = static_cast<uint16_t>(hi) - split_key.size();
-        std::memcpy(p->bytes + key_off, split_key.data(), split_key.size());
-        slots[i].key_off = key_off;
-        slots[i].key_len = split_key.size();
-        // The new child goes to the RIGHT of the split_key. The existing
-        // child at position i (now shifted to i+1) was the right child of
-        // the old slots[i].key, which is now still slots[i+1].key... wait,
-        // this needs thought.
-        //
-        // Interior page layout: slots[i] = (key_i, child_i) where child_i
-        // is the LEFT child of key_i. The rightmost child is in get_rightmost_child(p).
-        //
-        // When we insert (split_key, new_child) at position i:
-        //   - new_child is the right half of what was slots[i].child (or rightmost).
-        //   - The new slot goes at position i.
-        //   - The old child at position i (slots[i].child before the shift,
-        //     now slots[i+1].child after the shift) remains the left child
-        //     of the OLD slots[i].key.
-        //
-        // Wait, this is getting confusing. Let me think again.
-        //
-        // Before insert: slots[0..n-1], rightmost child = get_rightmost_child(p).
-        //   child_0 holds keys < slots[0].key
-        //   child_i holds slots[i-1].key <= keys < slots[i].key
-        //   rightmost holds keys >= slots[n-1].key
-        //
-        // After child split at position i (child_i split into left+right):
-        //   The new split_key is the smallest key in the right half.
-        //   We need to insert (split_key, new_child) such that:
-        //     - new_child holds keys >= split_key (the right half)
-        //     - the old child_i holds keys < split_key (the left half)
-        //
-        // In the interior layout, this means:
-        //   - The new slot at position i has key = split_key and child = child_i (the left half, unchanged).
-        //   - The slot at position i+1 (the old slot i, shifted right) has its child updated to new_child.
-        //   - Wait, no. The new slot at position i has key = split_key. Its child is the LEFT child of split_key, which is the old child_i (left half). The slot at position i+1 (the old slot i, now shifted) has its own key and child; its child should now be new_child (right half).
-        //
-        // Hmm, this is wrong. Let me re-think the layout.
-        //
-        // Standard B+ tree interior layout:
-        //   slots[0..n-1]: each slot has (key, left_child)
-        //   rightmost_child: stored separately (in get_rightmost_child(p) for us)
-        //
-        // When child_i (which is slots[i].left_child) splits:
-        //   - split_key is the smallest key in the new right half.
-        //   - new_child is the right half.
-        //   - We insert (split_key, new_child) at position i+1 (AFTER the current slot i).
-        //   - The old slots[i].left_child remains the left half (no change).
-        //
-        // Wait, I think the standard layout is:
-        //   slots[i] = (key_i, child_i)
-        //   where child_i is the child to the LEFT of key_i (keys < key_i).
-        //   The rightmost child (keys >= key_{n-1}) is stored separately.
-        //
-        // When child_i splits, the split produces (split_key, new_child):
-        //   - new_child holds keys >= split_key.
-        //   - child_i (the old one) now holds keys < split_key.
-        //   - We need to insert (split_key, ???) into the parent.
-        //
-        // The slot we insert has key = split_key. Its left child is child_i
-        // (the left half, which is already there). The right child of
-        // split_key is new_child.
-        //
-        // In the standard layout, the right child of slots[i].key is slots[i+1].child.
-        // So when we insert (split_key, child_i) at position i+1, the old slots[i].child
-        // (which was the right neighbor's left child) gets shifted to slots[i+2].child,
-        // and we need slots[i+1].child = new_child.
-        //
-        // Hmm, this is getting complicated. Let me simplify by using a different
-        // convention: each interior slot stores (key, child) where child is the
-        // RIGHT child of key (keys >= key go to child). The leftmost child
-        // (keys < slots[0].key) is stored in a separate field.
-        //
-        // No, let me just use the standard left-child convention and be careful.
-        // Let me rewrite this section.
-
-        // CORRECTED INSERT LOGIC:
-        //
-        // Convention: slots[i] = (key_i, child_i) where child_i is the LEFT child of key_i.
-        //   - child_0 holds keys < key_0
-        //   - child_i (for i > 0) holds keys in [key_{i-1}, key_i)
-        //   - rightmost child (get_rightmost_child(p)) holds keys >= key_{n-1}
-        //
-        // When the child at position i splits (producing split_key, new_child):
-        //   - If i < h->key_count: the splitting child is slots[i].child_i.
-        //     We insert (split_key, new_child) at position i+1.
-        //     The old child_i remains as slots[i].child (left half).
-        //     The new slot at i+1 has key = split_key, child = new_child.
-        //   - If i == h->key_count: the splitting child is get_rightmost_child(p) (rightmost).
-        //     We append (split_key, old_rightmost) at position h->key_count,
-        //     and set_rightmost_child(p, new_child).
-
-        if (i == h->key_count) {
-            // Splitting the rightmost child.
-            // New slot at position i: key = split_key, child = old rightmost.
-            slots[i].key_off = key_off;
-            slots[i].key_len = split_key.size();
-            slots[i].child_page_id = get_rightmost_child(p);  // old rightmost
-            set_rightmost_child(p, new_child);  // new rightmost
-            h->key_count++;
-        } else {
-            // Splitting a non-rightmost child at position i.
-            // We need to insert (split_key, new_child) at position i.
-            // But wait — the splitting child is slots[i].child_i, which is the
-            // LEFT child of slots[i].key. After split:
-            //   - slots[i].child_i stays as the left half (keys < split_key).
-            //   - new_child is the right half (keys >= split_key).
-            //   - split_key is the smallest key in new_child.
-            //
-            // So we insert a NEW slot at position i:
-            //   new_slots[i] = (split_key, child_i_left_half)
-            //   ... but child_i_left_half IS the old slots[i].child_i (unchanged).
-            //   new_slots[i+1] = (old_slots[i].key, new_child)
-            //
-            // No wait — that's not right either. The old slots[i].key was the
-            // fence for the OLD child_i. After split, the old child_i holds
-            // keys < split_key, and new_child holds keys >= split_key but < old_slots[i].key.
-            //
-            // So the new layout is:
-            //   new_slots[i] = (split_key, old_child_i)   ← old_child_i holds keys < split_key
-            //   new_slots[i+1] = (old_slots[i].key, new_child)  ← new_child holds [split_key, old_key)
-            //
-            // This means: insert (split_key, old_child_i) at position i, and
-            // change slots[i+1].child to new_child (after the shift, slots[i+1]
-            // is the old slots[i]).
-
-            // First, do the shift (already done above with memmove).
-            // Now slots[i] is the new empty slot (to be filled),
-            // and slots[i+1] is the old slots[i] (shifted right).
-
-            // The old child at slots[i] (now slots[i+1] after shift) needs to
-            // be replaced with new_child.
-            PageId old_child = slots[i + 1].child_page_id;  // the original slots[i].child
-            // Wait — after the memmove, slots[i+1] = old slots[i]. So slots[i+1].child
-            // is the OLD child that split. We need slots[i+1].child = new_child
-            // (the right half), and slots[i] = (split_key, old_child) (the left half).
-
-            slots[i].key_off = key_off;
-            slots[i].key_len = split_key.size();
-            slots[i].child_page_id = old_child;  // left half
-            slots[i + 1].child_page_id = new_child;  // right half
-            h->key_count++;
-        }
-        update_fences_interior(p);
-        return {false, false, "", 0};  // inserted into interior, no further split
-    }
-
-    InsertResult split_interior(PageId page_id, const std::string& new_key,
-                                   PageId new_child, size_t insert_pos) {
-        Page* p = pool_.get(page_id);
-        PageHeader* h = header(p);
-        InteriorSlot* slots = interior_slots(p);
-
-        // Collect all (key, child) pairs.
-        struct Entry { std::string key; PageId child; };
-        std::vector<Entry> entries;
+        const InteriorSlot* slots = interior_slots(p);
+        std::vector<std::pair<std::string, PageId>> cand;
+        cand.reserve((size_t)h->key_count + promotions.size());
+        PageId rightmost = get_rightmost_child(p);
+        bool spliced = false;
         for (uint16_t i = 0; i < h->key_count; ++i) {
             std::string k(reinterpret_cast<const char*>(p) + slots[i].key_off,
                            slots[i].key_len);
-            entries.push_back({std::move(k), slots[i].child_page_id});
+            if (!spliced && slots[i].child_page_id == orig_child) {
+                for (const auto& pr : promotions) cand.push_back(pr);
+                cand.push_back({std::move(k), last_page});
+                spliced = true;
+            } else {
+                cand.push_back({std::move(k), slots[i].child_page_id});
+            }
         }
-        PageId rightmost = get_rightmost_child(p);
-
-        // Insert the new entry at the right position.
-        // Convention: entries[i] = (key_i, child_i) where child_i is the LEFT child of key_i.
-        // When child at position insert_pos splits (producing new_key, new_child):
-        //   - The old child (entries[insert_pos].child) stays as the LEFT half.
-        //   - new_child is the RIGHT half.
-        //   - We insert (new_key, old_child) at position insert_pos.
-        //   - The old entry at insert_pos (now shifted to insert_pos+1) has its child
-        //     updated to new_child.
-        //
-        // For the rightmost case (insert_pos == entries.size()):
-        //   - The splitting child is the rightmost (stored in `rightmost`).
-        //   - We append (new_key, old_rightmost) at the end.
-        //   - rightmost becomes new_child.
-        Entry new_entry{new_key, new_child};
-        if (insert_pos >= entries.size()) {
-            // Inserting at the end — the new child becomes the new rightmost,
-            // and the old rightmost becomes the child of new_key.
-            entries.push_back({new_key, rightmost});
-            rightmost = new_child;
-        } else {
-            // Inserting in the middle. The old child at insert_pos becomes
-            // the LEFT child of new_key; new_child becomes the LEFT child
-            // of the old key (now at insert_pos+1).
-            PageId old_child = entries[insert_pos].child;
-            new_entry.child = old_child;  // (new_key, old_child = left half)
-            entries.insert(entries.begin() + insert_pos, new_entry);
-            entries[insert_pos + 1].child = new_child;  // right half
+        if (!spliced && rightmost == orig_child) {
+            for (const auto& pr : promotions) cand.push_back(pr);
+            rightmost = last_page;
+            spliced = true;
         }
-
-        // Split entries into two halves.
-        size_t mid = entries.size() / 2;
-        std::string median_key = entries[mid].key;
-
-        // Rewrite the original page with the first half.
-        std::memset(p->bytes, 0, PAGE_SIZE);
-        h->is_leaf = 0;
-        h->key_count = 0;
-        set_rightmost_child(p, 0);
-        for (size_t i = 0; i < mid; ++i) {
-            insert_into_interior_no_split(page_id, entries[i].key, entries[i].child);
+        if (!spliced)
+            throw std::runtime_error(
+                "interior_install: original child not found in parent page");
+        // Additive single-page fit check (Blocker 4 — no subtractive size_t
+        // arithmetic anywhere in the capacity decision).
+        size_t bytes = sizeof(PageHeader) + cand.size() * sizeof(InteriorSlot);
+        for (const auto& e : cand) bytes += e.first.size();
+        if (bytes <= PAGE_SIZE) {
+            const PageId rm = rightmost;
+            std::memset(p->bytes, 0, PAGE_SIZE);
+            h->is_leaf = 0;
+            h->key_count = 0;
+            set_rightmost_child(p, rm);
+            for (const auto& e : cand)
+                insert_into_interior_no_split(page_id, e.first, e.second);
+            return {false, false, "", 0};
         }
-        // The median key goes up to the parent; the child at position mid
-        // becomes the rightmost child of the left half.
-        set_rightmost_child(p, entries[mid].child);
+        return split_interior_planned(page_id, cand, rightmost);
+    }
 
-        // Allocate a new page for the second half (entries[mid+1..]).
-        PageId new_page_id = pool_.alloc();
-        Page* new_p = pool_.get(new_page_id);
-        std::memset(new_p->bytes, 0, PAGE_SIZE);
-        PageHeader* new_h = header(new_p);
-        new_h->is_leaf = 0;
-        new_h->key_count = 0;
-        set_rightmost_child(new_p, rightmost);
-        for (size_t i = mid + 1; i < entries.size(); ++i) {
-            insert_into_interior_no_split(new_page_id, entries[i].key, entries[i].child);
+    // v28 (CKV-002, Blockers 1/3/6): byte-aware interior split of a fully
+    // materialized candidate entry list (existing entries + spliced
+    // promotions). Plans (balanced two-way with a promoted median when one
+    // exists, else the minimum greedy cascade with promoted boundary
+    // entries), allocates ALL destination pages up front, and only then
+    // rewrites the original page and builds the new ones — never
+    // destroy-then-discover. Caller holds page_id's exclusive latch; the
+    // new pages are unreachable until the caller splices the returned
+    // promotions into the grandparent (happens-before via that page's
+    // latch, the same publication protocol the old split used).
+    InsertResult split_interior_planned(
+            PageId page_id,
+            const std::vector<std::pair<std::string, PageId>>& entries,
+            PageId rightmost) {
+        const size_t n = entries.size();
+        std::vector<size_t> costs(n);
+        for (size_t i = 0; i < n; ++i) {
+            costs[i] = sizeof(InteriorSlot) + entries[i].first.size();
+            if (sizeof(PageHeader) + costs[i] > PAGE_SIZE)
+                throw PageCapacityError(
+                    "interior entry can never fit a page: key=" +
+                    std::to_string(entries[i].first.size()));
         }
-
-        return {false, true, median_key, new_page_id};
+        const InteriorPlan plan = plan_interior_groups(costs, PAGE_ENTRY_BUDGET);
+        const size_t k = plan.group_starts.size();   // >= 2
+        std::vector<PageId> pages;
+        pages.reserve(k);
+        pages.push_back(page_id);   // group 0 reuses the original page
+        for (size_t j = 1; j < k; ++j) pages.push_back(pool_.alloc());
+        for (size_t j = 0; j < k; ++j) {
+            Page* q = pool_.get(pages[j]);
+            std::memset(q->bytes, 0, PAGE_SIZE);
+            PageHeader* qh = header(q);
+            qh->is_leaf = 0;
+            qh->key_count = 0;
+            const size_t end = (j + 1 < k) ? plan.promoted[j] : n;
+            for (size_t i = plan.group_starts[j]; i < end; ++i)
+                insert_into_interior_no_split(pages[j], entries[i].first, entries[i].second);
+            // The promoted boundary entry's child becomes this page's
+            // rightmost; the last page keeps the original rightmost.
+            set_rightmost_child(q, (j + 1 < k) ? entries[plan.promoted[j]].second
+                                               : rightmost);
+        }
+        InsertResult r;
+        r.inserted = false;
+        r.split = true;
+        for (size_t j = 0; j + 1 < k; ++j)
+            r.promotions.push_back({entries[plan.promoted[j]].first, pages[j]});
+        r.split_key = r.promotions.front().first;
+        r.new_child = pages.back();
+        r.last_new_page = pages.back();
+        return r;
     }
 
     void insert_into_interior_no_split(PageId page_id, const std::string& key, PageId child) {

@@ -11172,6 +11172,247 @@ static int run_remediation_tests() {
               ckv001_body, 120000,
               "put(4049..65535) accepted (not TooLarge) and the split-rebuild path corrupts memory");
 
+    // ---- CKV-002: byte-aware splitting (engine, end-to-end + recovery) ----
+    // Two ~2000-byte keys sharing a leaf plus one page-filling 4048-byte
+    // key between them: entry costs 2016 + 4064 + 2016 = 8096 against a
+    // 4064-byte per-page budget admit NO valid two-way split — the fix must
+    // plan a three-page cascade, allocate it up front, and only then
+    // mutate. Pre-fix: the count-based split puts {BIG, B} in one page;
+    // B does not fit behind BIG, and the rebuild discovers that AFTER
+    // destroying the original page (Blocker 1) — loud throw (post-CKV-001
+    // guard) or uint16-wrapped OOB memcpy (raw baseline), with the tree
+    // left half-rewritten either way.
+    static int (*const ckv002a_body)() = +[]() -> int {
+        using namespace chronokv;
+        const std::string wd = "/tmp/ckv_ckv002a_" + std::to_string(getpid());
+        std::filesystem::remove_all(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.auto_start_gc = false;
+        o.durability = DurabilityMode::Sync;
+        auto db = Database::open(o);
+        const std::string A(2000, 'a'), BIG(4048, 'm'), B(2000, 'z');
+        if (db.put(A, "va") != Status::OK) return 10;
+        if (db.put(B, "vb") != Status::OK) return 11;
+        if (db.put(BIG, "vbig") != Status::OK) return 12;   // pre-fix: throws/corrupts
+        if (db.get(A).value_or("") != "va") return 13;
+        if (db.get(BIG).value_or("") != "vbig") return 14;
+        if (db.get(B).value_or("") != "vb") return 15;
+        if (db.range_scan(A, B).size() != 3) return 16;
+        db.close();
+        {   // recovery: the cascade must survive checkpoint-free WAL replay
+            auto db2 = Database::open(o);
+            if (db2.get(A).value_or("") != "va") return 17;
+            if (db2.get(BIG).value_or("") != "vbig") return 18;
+            if (db2.get(B).value_or("") != "vb") return 19;
+            if (db2.range_scan(A, B).size() != 3) return 20;
+            db2.close();
+        }
+        std::filesystem::remove_all(wd);
+        return 0;
+    };
+    run_child("remediation CKV-002a: engine 3-page leaf cascade for mixed large keys + reopen (byte-aware-split-cascade)",
+              ckv002a_body, 120000,
+              "count-based split discovers mid-rebuild that the right half cannot fit");
+
+    // ---- CKV-002 / Blocker 3: byte-aware INTERIOR split with large separators ----
+    // Build a root-level interior page byte-full of ~100-byte separators,
+    // then promote a 4048-byte separator into it. Pre-fix: count-based
+    // mid lands the big separator together with ~half the small ones in
+    // one half — over budget — and the rebuild wraps uint16 offsets
+    // (raw baseline) or throws AFTER memsetting the original page
+    // (post-CKV-001 guard). Post-fix: the planner promotes the big entry
+    // itself (or cascades) with every page proven to fit BEFORE mutation.
+    static int (*const ckv002b_body)() = +[]() -> int {
+        using namespace chronokv_btree;
+        PagePool pool(256ULL * 1024 * 1024);
+        BTree tree(pool);
+        char buf[32];
+        const std::string pad(92, 'x');
+        int n = 0;
+        for (int leaf = 0; leaf < 40; ++leaf) {
+            for (int i = 0; i < 40; ++i) {
+                snprintf(buf, sizeof buf, "k%07d", n);
+                tree.put(std::string(buf) + pad, "v");
+                ++n;
+            }
+        }
+        auto sv = tree.verify_separator_invariants();
+        if (sv.found) return 10;
+        auto cv = tree.verify_leaf_chain();
+        if (cv.found) return 11;
+        const std::string big(4048, 'm');   // sorts after every k-key
+        tree.put(big, "big");                // promotes a 4048B separator upward
+        sv = tree.verify_separator_invariants();
+        if (sv.found) return 12;
+        cv = tree.verify_leaf_chain();
+        if (cv.found) return 13;
+        auto cc = tree.verify_chain_completeness();
+        if (cc.found) return 14;
+        std::string got;
+        if (!tree.get(big, &got) || got != "big") return 15;
+        snprintf(buf, sizeof buf, "k%07d", n / 2);
+        if (!tree.get(std::string(buf) + pad, &got) || got != "v") return 16;
+        if (tree.size() != (size_t)n + 1) return 17;
+        // a second big separator, forcing another byte-full interior split
+        const std::string big2(4048, 'n');
+        tree.put(big2, "big2");
+        sv = tree.verify_separator_invariants();
+        if (sv.found) return 18;
+        cc = tree.verify_chain_completeness();
+        if (cc.found) return 19;
+        if (!tree.get(big, &got) || got != "big") return 20;
+        if (!tree.get(big2, &got) || got != "big2") return 21;
+        return 0;
+    };
+    run_child("remediation CKV-002b: interior split with 4048-byte separators (interior-byte-aware-split)",
+              ckv002b_body, 300000,
+              "count-based interior split overflows the half containing the big separator");
+
+    // ---- CKV-002 / Blocker 1: rejection during planning leaves the tree INTACT ----
+    // A standalone-tree entry that can never fit a page must be rejected
+    // during the PLAN phase — before any page mutation. Pre-fix the
+    // rejection happens inside the half-destroyed rebuild (original page
+    // already memset to the left half): the neighbor key is LOST. This is
+    // the exception-safety contract of RULES 1/2/6.
+    static int (*const ckv002c_body)() = +[]() -> int {
+        using namespace chronokv_btree;
+        PagePool pool(16ULL * 1024 * 1024);
+        BTree tree(pool);
+        tree.put("alpha", "1");
+        tree.put("beta", "2");
+        bool threw = false;
+        try {
+            tree.put(std::string(5000, 'x'), "v");
+        } catch (const PageCapacityError&) {
+            threw = true;
+        }
+        if (!threw) return 10;
+        std::string got;
+        if (!tree.get("alpha", &got) || got != "1") return 11;   // pre-fix: LOST
+        if (!tree.get("beta", &got) || got != "2") return 12;    // pre-fix: LOST
+        auto cv = tree.verify_leaf_chain();
+        if (cv.found) return 13;
+        auto cc = tree.verify_chain_completeness();
+        if (cc.found) return 14;
+        // exact standalone boundary: any leaf key can be promoted to an
+        // interior separator (slot 12 + key <= 4064), so the tree-level
+        // key bound is 4052 — one byte more must throw with the tree
+        // intact.
+        tree.put(std::string(4052, 'y'), "v");
+        if (!tree.get(std::string(4052, 'y'), &got) || got != "v") return 15;
+        bool threw2 = false;
+        try { tree.put(std::string(4053, 'z'), "v"); }
+        catch (const PageCapacityError&) { threw2 = true; }
+        if (!threw2) return 16;
+        if (!tree.get("alpha", &got) || got != "1") return 17;
+        cv = tree.verify_leaf_chain();
+        if (cv.found) return 18;
+        return 0;
+    };
+    run_child("remediation CKV-002c: un-storable entry rejected during planning, tree intact (split-plan-atomicity)",
+              ckv002c_body, 120000,
+              "rejection fires mid-rebuild; original page already destroyed, neighbors lost");
+
+    // ---- CKV-002 / Blocker 2: ordinary splits stay BYTE-BALANCED ----
+    // Uniform keys, repeated splits: average page occupancy must stay
+    // healthy (>= 50%). A greedy maximal-left split would leave the right
+    // page nearly empty and, with the fixed non-reclaiming pool, tank
+    // capacity. NOTE: this property holds for the old count-based split
+    // too (uniform keys => count-balanced == byte-balanced) — it PASSES
+    // pre-fix BY DESIGN and exists to constrain the NEW planner (Blocker 2
+    // forbids replacing balanced two-way splits with greedy packing).
+    static int (*const ckv002d_body)() = +[]() -> int {
+        using namespace chronokv_btree;
+        PagePool pool(512ULL * 1024 * 1024);
+        BTree tree(pool);
+        char buf[32];
+        const int N = 20000;
+        const size_t entry_cost = 8 /*slot*/ + 20 /*key*/ + 20 /*value*/;
+        // Part 1 — RANDOM insertion order: byte-balanced splitting keeps
+        // average occupancy at the B+ tree's ~69%; greedy maximal-left
+        // splitting leaves near-empty right pages and drops well below.
+        std::vector<int> order(N);
+        for (int i = 0; i < N; ++i) order[i] = i;
+        std::mt19937_64 rng(0xC0FFEE);   // fixed seed — deterministic
+        std::shuffle(order.begin(), order.end(), rng);
+        for (int i = 0; i < N; ++i) {
+            snprintf(buf, sizeof buf, "uniform-key-%07d", order[i] * 2);  // evens
+            tree.put(buf, "01234567890123456789");
+        }
+        const size_t pages1 = pool.allocated() / 4096;
+        const double occ = (double)N * (double)entry_cost / ((double)pages1 * 4064.0);
+        if (occ < 0.55) return 10;
+        if (tree.size() != (size_t)N) return 11;
+        // Part 2 — the greedy pathology proper: with maximal-left splits
+        // the left page comes out ~100% full, so EVERY further insert into
+        // an established range re-splits immediately (~1 page per insert).
+        // Byte-balanced splits leave ~50% headroom, so page growth is
+        // amortized (~1 page per 40+ inserts). Insert the 19,999 odd keys
+        // between the even ones and bound the growth.
+        const size_t M = 20000;
+        for (int i = 1; i < 2 * N; i += 2) {   // odds: each lands INSIDE an established range
+            snprintf(buf, sizeof buf, "uniform-key-%07d", i);
+            tree.put(buf, "01234567890123456789");
+        }
+        const size_t pages2 = pool.allocated() / 4096;
+        const size_t growth = pages2 - pages1;
+        if (growth > M / 10) return 14;    // greedy: ~M; balanced: ~M/42
+        if (tree.size() != (size_t)2 * N) return 15;
+        auto sv = tree.verify_separator_invariants();
+        if (sv.found) return 12;
+        auto cc = tree.verify_chain_completeness();
+        if (cc.found) return 13;
+        return 0;
+    };
+    run_child("remediation CKV-002d: uniform-key splits stay byte-balanced (occupancy >= 50%) (split-balance-occupancy)",
+              ckv002d_body, 300000,
+              "n/a pre-fix (constraint on the new planner — passes by design on both)");
+
+    // ---- CKV-002: leaf split with a large key among small neighbors (PoC shape) ----
+    // The audit PoC: small keys + one large legal key. Pre-fix the right
+    // half {8 small, big} exceeds the budget and the rebuild wraps/throws
+    // after destroying the page; post-fix the balanced planner picks the
+    // only valid split (all smalls left, big right) and every verifier
+    // stays green through follow-up inserts and scans.
+    static int (*const ckv002e_body)() = +[]() -> int {
+        using namespace chronokv_btree;
+        PagePool pool(64ULL * 1024 * 1024);
+        BTree tree(pool);
+        char buf[32];
+        // 24 smalls (cost 18 each = 432) + big (cost 3911): total 4343 >
+        // 4064. The count-based mid (12) puts 12 smalls + big in the right
+        // half: 216 + 3911 = 4127 > 4064 — overflow discovered AFTER the
+        // original page was memset and rebuilt. The byte-aware planner
+        // picks the only valid balanced split (16 smalls | 8 smalls + big).
+        for (int i = 0; i < 24; ++i) {
+            snprintf(buf, sizeof buf, "before-%02d", i);
+            tree.put(buf, "x");
+        }
+        tree.put(std::string(3900, 'm'), "big");
+        for (int i = 0; i < 24; ++i) {
+            snprintf(buf, sizeof buf, "zafter-%02d", i);
+            tree.put(buf, "x");
+        }
+        auto sv = tree.verify_separator_invariants();
+        if (sv.found) return 10;
+        auto cv = tree.verify_leaf_chain();
+        if (cv.found) return 11;
+        auto cc = tree.verify_chain_completeness();
+        if (cc.found) return 12;
+        std::string got;
+        if (!tree.get(std::string(3900, 'm'), &got) || got != "big") return 13;
+        if (!tree.get("before-07", &got) || got != "x") return 14;
+        if (!tree.get("zafter-23", &got) || got != "x") return 15;
+        auto scan = tree.range_scan("before-00", "zafter-23");
+        if (scan.size() != 49) return 16;
+        if (tree.size() != 49) return 17;
+        return 0;
+    };
+    run_child("remediation CKV-002e: large legal key splits leaf among small neighbors (leaf-split-large-key)",
+              ckv002e_body, 120000,
+              "right half {smalls, big} overflows; rebuild wraps offsets / throws post-destroy");
+
     if (fails == 0) std::cout << "   REMEDIATION TESTS PASSED\n";
     else std::cout << "   REMEDIATION FAILURES: " << fails << "\n";
     return fails;
