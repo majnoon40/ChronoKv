@@ -5051,6 +5051,11 @@ class ChronoKV {
     // checkpoint, range_scan, recover_with_checkpoint.
     std::vector<std::pair<std::string, std::string>>
     tree_scan(const std::string& lo, const std::string& hi) const;
+    // v28 (CKV-005): unbounded variant for full-range internal walks —
+    // never express "all keys" as a 255x0xFF upper bound (keys above the
+    // sentinel are legal and were silently skipped).
+    std::vector<std::pair<std::string, std::string>>
+    tree_scan_all(const std::string& lo = "") const;
     size_t tree_size() const;
 
     void wake_gc() {
@@ -5104,7 +5109,7 @@ class ChronoKV {
      // same as the old entries_ walk (which checked idx >= entries_.size()).
      std::vector<KeyEntry*> all_entries;
      {
-         auto pairs = tree_scan("", std::string(255, '\xFF'));
+         auto pairs = tree_scan_all();
          all_entries.reserve(pairs.size());
          for (auto& [k, v] : pairs)
              all_entries.push_back(decode_ptr(v));
@@ -5215,7 +5220,7 @@ class ChronoKV {
 
     void free_all() {
         // v25.1 M1.6: walk the tree to free all version chains + KeyEntry objects.
-        auto pairs = tree_scan("", std::string(255, '\xFF'));
+        auto pairs = tree_scan_all();
         for (auto& [k, v] : pairs) {
             KeyEntry* e = decode_ptr(v);
             if (!e) continue;
@@ -5271,7 +5276,7 @@ public:
         // never caught. Restored explicit std:: qualification.
         SnapshotGuard pin(*this);
         // v25.1 M1.6: walk the tree instead of name2idx_ + entries_.
-        auto pairs = tree_scan("", std::string(255, '\xFF'));
+        auto pairs = tree_scan_all();
         for (auto& [k, v] : pairs) {
             KeyEntry* e = decode_ptr(v);
             if (!e) continue;
@@ -5659,7 +5664,7 @@ public:
     // GC may reclaim. v25.1 M1.6: walk the tree instead of entries_.
     bool verify_version_chains(std::string* reason = nullptr) {
         SnapshotGuard pin(*this);
-        auto pairs = tree_scan("", std::string(255, '\xFF'));
+        auto pairs = tree_scan_all();
         for (size_t i = 0; i < pairs.size(); ++i) {
             KeyEntry* e = decode_ptr(pairs[i].second);
             if (!e) continue;
@@ -6364,7 +6369,7 @@ public:
                  }
              }
          } else {
-             auto pairs = tree_scan("", std::string(255, '\xFF'));
+             auto pairs = tree_scan_all();
              for (auto& [k, v] : pairs) {
                  KeyEntry* e = decode_ptr(v);
                  if (!e) continue;
@@ -10243,11 +10248,20 @@ public:
     // modified, not if any write happened tree-wide.
     class Cursor {
     public:
-        Cursor(const BTree& tree, const std::string& lo, const std::string& hi)
-            : tree_(tree), lo_(lo), hi_(hi), gen_(tree.generation()),
+        // v28 (CKV-005): hi_unbounded skips the upper bound entirely —
+        // full-range walks MUST use this instead of passing a 255x0xFF
+        // sentinel as hi. Keys at or above the sentinel (legal up to
+        // TREE_MAX_KEY_BYTES = 4048) sort above any sentinel bound and
+        // were silently excluded from every internal walk (audit CKV-005:
+        // a 256x0xFF key vanished across checkpoint+reopen; GC and
+        // free_all never saw its versions either).
+        Cursor(const BTree& tree, const std::string& lo, const std::string& hi,
+               bool hi_unbounded = false)
+            : tree_(tree), lo_(lo), hi_(hi), hi_unbounded_(hi_unbounded),
+              gen_(tree.generation()),
               leaf_id_(0), slot_idx_(0), exhausted_(false),
               key_count_snapshot_(0) {
-            if (lo_ > hi_) {
+            if (!hi_unbounded_ && lo_ > hi_) {
                 exhausted_ = true;
                 return;
             }
@@ -10276,6 +10290,7 @@ public:
         // elision, but the type advertised a move that was unsafe.
         Cursor(Cursor&& o) noexcept
             : tree_(o.tree_), lo_(std::move(o.lo_)), hi_(std::move(o.hi_)),
+              hi_unbounded_(o.hi_unbounded_),
               gen_(o.gen_), leaf_id_(o.leaf_id_), slot_idx_(o.slot_idx_),
               cur_key_(std::move(o.cur_key_)),
               cur_value_(std::move(o.cur_value_)),
@@ -10315,6 +10330,7 @@ public:
     private:
         const BTree& tree_;
         std::string lo_, hi_;
+        bool hi_unbounded_;   // v28 (CKV-005): true = no upper bound
         uint64_t gen_;
         PageId leaf_id_;
         uint16_t slot_idx_;
@@ -10405,7 +10421,7 @@ public:
                     std::string page_min(
                         reinterpret_cast<const char*>(p) + h->min_key_off,
                         h->min_key_len);
-                    if (page_min > hi_) {
+                    if (!hi_unbounded_ && page_min > hi_) {
                         leave_leaf();
                         exhausted_ = true;
                         return false;
@@ -10425,7 +10441,7 @@ public:
                         ++slot_idx_;
                         continue;
                     }
-                    if (k > hi_) {
+                    if (!hi_unbounded_ && k > hi_) {
                         leave_leaf();
                         exhausted_ = true;
                         return false;
@@ -10457,6 +10473,22 @@ public:
 
     Cursor open_cursor(const std::string& lo, const std::string& hi) const {
         return Cursor(*this, lo, hi);
+    }
+
+    // v28 (CKV-005): unbounded cursor/scan — every key >= lo, no upper
+    // bound. Internal full-range walks use these; see the Cursor
+    // constructor note for why a 255x0xFF sentinel bound is wrong.
+    Cursor open_cursor_all(const std::string& lo) const {
+        return Cursor(*this, lo, std::string(), /*hi_unbounded=*/true);
+    }
+    std::vector<std::pair<std::string, std::string>> scan_all(const std::string& lo = "") const {
+        std::vector<std::pair<std::string, std::string>> result;
+        Cursor c = open_cursor_all(lo);
+        while (c.valid()) {
+            result.emplace_back(c.key(), c.value());
+            c.next();
+        }
+        return result;
     }
 
     // v25.1 M1.6: find_leaf_for_scan now crabs (holds parent shared latch
@@ -12113,6 +12145,12 @@ inline std::vector<std::pair<std::string, std::string>>
 ChronoKV::tree_scan(const std::string& lo, const std::string& hi) const {
     // v25.1 M1.6: no nm_ — Cursor uses shared latch crabbing internally.
     return tree_->range_scan(lo, hi);
+}
+
+// v28 (CKV-005): unbounded full-range walk (see declaration).
+inline std::vector<std::pair<std::string, std::string>>
+ChronoKV::tree_scan_all(const std::string& lo) const {
+    return tree_->scan_all(lo);
 }
 
 inline size_t ChronoKV::tree_size() const {

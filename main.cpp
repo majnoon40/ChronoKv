@@ -11644,6 +11644,68 @@ static int run_remediation_tests() {
               ckv003c_diff_body, 300000,
               "replayed WAL tail not marked dirty; first post-reopen incremental checkpoint truncates it");
 
+    // ---- CKV-005: max-representable scan boundary (sentinel-max-key) ----
+    // Pre-fix, every internal full-range walk was tree_scan("", 255x0xFF):
+    // keys AT or ABOVE the 255-byte 0xFF sentinel (legal — up to 4048
+    // bytes) sorted above the bound and were silently skipped. Audit PoC:
+    // a 256x0xFF key was lost across checkpoint+reopen (the full
+    // checkpoint never saw it, then rotation removed its WAL records);
+    // GC and free_all never saw its versions either. Post-fix the walks
+    // are unbounded (Cursor hi_unbounded / tree_scan_all).
+    static int (*const ckv005_body)() = +[]() -> int {
+        using namespace chronokv;
+        const std::string wd = "/tmp/ckv_ckv005_" + std::to_string(getpid());
+        std::filesystem::remove_all(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.checkpoint_path = wd + "/ckpt.bin";
+        o.auto_start_gc = false;
+        o.durability = DurabilityMode::Sync;
+        const std::string K254(254, '\xFF'), K255(255, '\xFF'), K256(256, '\xFF');
+        {
+            auto db = Database::open(o);
+            if (db.put("a", "1") != Status::OK) return 9;
+            if (db.put(K254, "v254") != Status::OK) return 10;
+            if (db.put(K255, "v255") != Status::OK) return 11;   // == old sentinel
+            if (db.put(K256, "v256") != Status::OK) return 12;   // > old sentinel
+            if (db.put("zz", "2") != Status::OK) return 9;
+            // in-memory visibility
+            if (db.get(K255).value_or("") != "v255") return 13;
+            if (db.get(K256).value_or("") != "v256") return 14;
+            // bounded user scans keep exact inclusive semantics
+            if (db.range_scan(K254, K256).size() != 3) return 15;
+            if (db.range_scan("a", K256).size() != 5) return 16;
+            // absent-key behavior at the boundary
+            if (db.get(std::string(257, '\xFF')).has_value()) return 17;
+            // FULL checkpoint (base) — pre-fix this walk skipped K255/K256
+            db.checkpoint();
+            db.close();
+        }
+        {   // reopen: the sentinel keys must survive checkpoint+recovery
+            auto db = Database::open(o);
+            if (db.get(K254).value_or("") != "v254") return 18;
+            if (db.get(K255).value_or("") != "v255") return 19;   // pre-fix: lost
+            if (db.get(K256).value_or("") != "v256") return 20;   // pre-fix: lost
+            if (db.get("a").value_or("") != "1") return 21;
+            if (db.range_scan(K254, K256).size() != 3) return 22;
+            // incremental checkpoint over an updated sentinel key
+            if (db.put(K256, "v256b") != Status::OK) return 23;
+            db.checkpoint();
+            db.close();
+        }
+        {   // second reopen: the update must be visible, chain consistent
+            auto db = Database::open(o);
+            if (db.get(K256).value_or("") != "v256b") return 24;
+            if (db.get(K255).value_or("") != "v255") return 25;
+            db.close();
+        }
+        std::filesystem::remove_all(wd);
+        return 0;
+    };
+    run_child("remediation CKV-005: keys at/above the 255x0xFF sentinel survive checkpoint+reopen (sentinel-max-key)",
+              ckv005_body, 300000,
+              "full-checkpoint walk skips sentinel keys; rotation then destroys their WAL records");
+
     if (fails == 0) std::cout << "   REMEDIATION TESTS PASSED\n";
     else std::cout << "   REMEDIATION FAILURES: " << fails << "\n";
     return fails;
