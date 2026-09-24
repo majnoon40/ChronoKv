@@ -235,8 +235,12 @@ g++ -std=c++20 -O2 -I. my_app.cpp -o my_app -lpthread
 | Diagnostics | `wal_stats/gc_stats/epoch_stats/health/published_watermark` | read-only snapshots of engine counters |
 
 **Status codes** (`chronokv::Status`): `OK`, `Conflict`, `TooLarge`
-(values are capped just under 1 MiB by the WAL framing), `InvalidTransaction`,
-`InvalidState`, `WalFailure`, `Failed`.
+(values are capped just under 1 MiB by the WAL framing; keys are capped at
+`TREE_MAX_KEY_BYTES` = **4048 bytes** — the B+ tree page-safe bound derived
+from the 4 KiB page layout: 4096 − 32 header − 8 leaf slot − 8 encoded-pointer
+value; the WAL framing itself would allow 64 KiB keys, but a key that
+cannot fit a page is rejected before any reservation, WAL write, or index
+mutation), `InvalidTransaction`, `InvalidState`, `WalFailure`, `Failed`.
 
 **Exceptions**: recoverable conditions return `Status`; unrecoverable ones
 throw — `CorruptionError` (on-disk data), `LifecycleError` (closed DB /

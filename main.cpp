@@ -570,6 +570,7 @@ static int run_backup_test();         // v26 M3 online backup
 static int run_pitr_test();           // v26 M4 point-in-time restore
 static int run_lincheck_test();       // v27 M1 strict-serializability checker
 static int run_dst_test();            // v27 M0 deterministic-scheduler harness
+static int run_remediation_tests();   // v28: CKV-001..021 audit regression battery
 static int run_m16_phase1_test();
 static int run_m2_phase1_test();
 static int run_m2_phase2_test();
@@ -1841,6 +1842,16 @@ return 0;
     if (getenv("CKV_ONLY_DST")) {
         crc_init();
         int f = run_dst_test();
+        std::cout.flush();
+        return f == 0 ? 0 : 1;
+    }
+
+    // v28 (audit remediation): CKV_ONLY_REMEDIATION=1 runs just the
+    // CKV-001..021 regression battery — every test here FAILED on the
+    // audited commit 8c77a7c by construction (fail-first discipline).
+    if (getenv("CKV_ONLY_REMEDIATION")) {
+        crc_init();
+        int f = run_remediation_tests();
         std::cout.flush();
         return f == 0 ? 0 : 1;
     }
@@ -7156,6 +7167,7 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     fails += run_pitr_test();
     fails += run_lincheck_test();
     fails += run_dst_test();
+    fails += run_remediation_tests();
     // async benchmark (skips under sanitizer anyway)
     fails += run_async_benchmark();
 
@@ -11030,6 +11042,139 @@ static int run_dst_test() {
     else std::cout << "   DST FAILURES: " << fails << "\n";
     return fails;
 #endif
+}
+
+// =====================================================================
+// v28 — audit remediation regression battery (CKV-001..CKV-021).
+//
+// Every test in this function is fail-first against the audited commit
+// 8c77a7c: it asserts the INVARIANT the audit found violated (not merely
+// "no crash"), and each was verified failing before its fix landed. Tests
+// whose pre-fix failure mode is memory corruption or process death run in
+// forked children (the crash-fuzz pattern) so a regression FAILS the check
+// instead of taking the suite down.
+// =====================================================================
+static int run_remediation_tests() {
+    using namespace chronokv;
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) {
+            ++fails;
+            if (!detail.empty()) std::cout << "      (" << detail << ")\n";
+        }
+    };
+    // Forked-child runner with a parent-side deadline: the child returns 0
+    // on success; anything else (nonzero exit, signal, deadline) is a FAIL
+    // with the classification in the detail string. Pre-fix children die by
+    // corruption — that is the fail-first evidence, safely contained.
+    auto run_child = [&](const char* name, int (*body)(), int deadline_ms,
+                         const std::string& expect_note) {
+        std::cout.flush();
+        pid_t child = fork();
+        if (child < 0) { check(name, false, std::string("fork failed: ") + strerror(errno)); return; }
+        if (child == 0) {
+            int rc = 3;
+            try { rc = body(); }
+            catch (const std::exception& e) { fprintf(stderr, "child exception: %s\n", e.what()); rc = 5; }
+            catch (...) { rc = 5; }
+            fflush(stderr);
+            _exit(rc);
+        }
+        int wst = 0;
+        bool reaped = false;
+        auto t0 = std::chrono::steady_clock::now();
+        while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - t0).count() < deadline_ms) {
+            pid_t r = waitpid(child, &wst, WNOHANG);
+            if (r == child) { reaped = true; break; }
+            if (r < 0) { reaped = true; wst = 0; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        std::string fr;
+        bool ok;
+        if (!reaped) {
+            kill(child, SIGKILL);
+            waitpid(child, &wst, 0);
+            ok = false; fr = "child HUNG (deadline " + std::to_string(deadline_ms) + "ms)";
+        } else if (WIFSIGNALED(wst)) {
+            ok = false; fr = "child died on signal " + std::to_string(WTERMSIG(wst));
+        } else if (WEXITSTATUS(wst) != 0) {
+            ok = false; fr = "child exit " + std::to_string(WEXITSTATUS(wst));
+        } else {
+            ok = true;
+        }
+        if (!ok) fr += " — expected pre-fix: " + expect_note;
+        check(name, ok, fr);
+    };
+
+    // ---- CKV-001: tree-oversized-key-rejection ----
+    // Invariant: a key that cannot physically fit a B+ tree page is
+    // rejected with Status::TooLarge BEFORE any reservation/WAL/index
+    // mutation, and the tree stays verifiably healthy. Pre-fix: keys in
+    // (4044, 65535] passed the WAL-framing gate and wrapped the uint16
+    // slab offsets in the split-rebuild writers — a 60,000-byte key
+    // memcpy'd ~55 KB past its 4 KiB page (audit PoC: SEGV / silent
+    // cross-page corruption from ONE legal put).
+    static int (*const ckv001_body)() = +[]() -> int {
+        using namespace chronokv;
+        const std::string wd = "/tmp/ckv_ckv001_" + std::to_string(getpid());
+        std::filesystem::remove_all(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.auto_start_gc = false;
+        o.durability = DurabilityMode::Sync;
+        auto db = Database::open(o);
+        // (a) boundary-legal key (exactly TREE_MAX_KEY_BYTES = 4096-32-8-8):
+        // accepted and byte-exact round-trip.
+        const std::string k4048(4048, 'K');
+        if (db.put(k4048, "v") != Status::OK) return 10;
+        if (db.get(k4048).value_or("") != "v") return 11;
+        // (b) over-bound matrix: TooLarge, zero mutation (get stays absent).
+        for (size_t sz : {(size_t)4049, (size_t)4090, (size_t)4096, (size_t)60000, (size_t)65535}) {
+            const std::string k(sz, 'X');
+            Status st = db.put(k, "v");
+            if (st != Status::TooLarge) return 12;
+            if (db.get(k).has_value()) return 13;
+        }
+        // (c) same gate through Transaction and Batch.
+        {
+            auto t = db.begin();
+            t.put(std::string(5000, 'Y'), "v");
+            if (t.commit() != Status::TooLarge) return 14;
+        }
+        {
+            auto b = db.create_batch();
+            b.put(std::string(5000, 'Z'), "v");
+            if (b.commit() != Status::TooLarge) return 15;
+        }
+        // (d) tree health after the rejections: another boundary-ish key
+        //     inserts, range_scan sees both survivors, and the state
+        //     persists across close+reopen (recovery replays the WAL).
+        const std::string k4000(4000, 'B');
+        if (db.put(k4000, "b") != Status::OK) return 16;
+        {
+            auto scan = db.range_scan(std::string(4000, 'A'), std::string(4048, 'Z'));
+            if (scan.size() != 2) return 17;
+        }
+        db.close();
+        {
+            auto db2 = Database::open(o);
+            if (db2.get(k4048).value_or("") != "v") return 18;
+            if (db2.get(k4000).value_or("") != "b") return 19;
+            if (db2.get(std::string(60000, 'X')).has_value()) return 20;
+            db2.close();
+        }
+        std::filesystem::remove_all(wd);
+        return 0;
+    };
+    run_child("remediation CKV-001: oversized keys rejected TooLarge, zero mutation, tree healthy (tree-oversized-key-rejection)",
+              ckv001_body, 120000,
+              "put(4049..65535) accepted (not TooLarge) and the split-rebuild path corrupts memory");
+
+    if (fails == 0) std::cout << "   REMEDIATION TESTS PASSED\n";
+    else std::cout << "   REMEDIATION FAILURES: " << fails << "\n";
+    return fails;
 }
 
 // =====================================================================

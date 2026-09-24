@@ -2064,6 +2064,38 @@ static bool checked_rename(const std::string& from, const std::string& to) {
 static constexpr size_t MAX_KEY_BYTES   = 65535;        // serialized as u16
 static constexpr size_t MAX_VALUE_BYTES = (1u << 20) - 256;  // < 1 MiB - framing overhead
 static constexpr size_t WAL_MAX_RECORD  = 1u << 20;     // hard cap on a serialized record (incl. header)
+// v28 FIX (audit CKV-001): the B+ tree PAGE-SAFE key bound. A leaf entry
+// costs PageHeader(32) + LeafSlot(12) + key + value against the 4096-byte
+// page, and the engine's tree value is the 8-byte encoded KeyEntry pointer
+// (encode_ptr), so the largest physically storable engine key is
+//   4096 - 32 - 8 - 8 = 4048 bytes.
+// (The audit quoted 4044 from a wrong 12-byte LeafSlot; the actual struct
+// is 4 x uint16 = 8 bytes under the pack(1) region, and the static_assert
+// next to the layout pins the derivation to the real sizeof()s.)
+// MAX_KEY_BYTES above is the WAL FRAMING limit (u16 key length); keys in
+// (4048, 65535] serialize fine but cannot fit a page — pre-v28 they were
+// accepted and wrapped the uint16 slab offsets in the split-rebuild
+// writers (a 60,000-byte key memcpy'd ~55 KB past its page from ONE legal
+// Database::put). commit_txn rejects k.size() > TREE_MAX_KEY_BYTES with
+// TooLarge before any reservation/WAL/index mutation; the tree carries its
+// own additive-form capacity guards (chronokv_btree::PageCapacityError) as
+// defense-in-depth for standalone-BTree use. Do NOT conflate the two
+// limits: the v24 Fix Group-1 rationale above is about WAL framing.
+// The static_asserts pinning this derivation live next to the page-layout
+// structs in namespace chronokv_btree.
+static constexpr size_t TREE_MAX_KEY_BYTES = 4048;
+
+// v28 (audit CKV-001): typed refusal for entries that can never fit a
+// page. Thrown BEFORE any page mutation, so a throw leaves the tree
+// structurally unchanged. The engine's commit_txn key gate makes this
+// unreachable through the public API; it guards standalone-BTree use and
+// any future caller (defense-in-depth). Mapped to Status::TooLarge at the
+// API layer. Declared here (global scope, next to the limits it enforces)
+// because the btree namespace is defined after the Database wrappers that
+// catch it.
+struct PageCapacityError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 using WriteSet = std::vector<std::tuple<std::string, std::string, bool>>;
 
@@ -5882,7 +5914,13 @@ public:
      // values before locking, index creation, or WAL serialization. The
      // serialization-layer throw remains as a defense-in-depth backstop.
      for (auto& [k, v, d] : ws) {
-         if (k.size() > MAX_KEY_BYTES || v.size() > MAX_VALUE_BYTES)
+         // v28 FIX (audit CKV-001): TREE_MAX_KEY_BYTES (4044) is the page-
+         // safe storage bound; MAX_KEY_BYTES (65535) is only the WAL u16
+         // framing limit. Rejecting here is pre-lock, pre-reservation,
+         // pre-WAL and pre-index — nothing to burn or roll back, and the
+         // transaction stays retryable with a smaller key.
+         if (k.size() > TREE_MAX_KEY_BYTES || k.size() > MAX_KEY_BYTES ||
+             v.size() > MAX_VALUE_BYTES)
              return TxnResult::TooLarge;
      }
 
@@ -8537,6 +8575,8 @@ public:
             }
 #endif
             return status;
+        } catch (const PageCapacityError&) {
+            return Status::TooLarge;   // v28 (audit CKV-001): page-safe bound
         } catch (const std::exception& e) {
             throw Error(std::string("put failed: ") + e.what());
         }
@@ -8568,6 +8608,8 @@ public:
             }
 #endif
             return status;
+        } catch (const PageCapacityError&) {
+            return Status::TooLarge;   // v28 (audit CKV-001): page-safe bound
         } catch (const std::exception& e) {
             throw Error(std::string("erase failed: ") + e.what());
         }
@@ -9775,6 +9817,18 @@ struct InteriorSlot {
 };
 #pragma pack(pop)
 
+// v28 (audit CKV-001): pin the page layout the global TREE_MAX_KEY_BYTES
+// (= 4044, declared with the WAL framing limits) is derived from. If any
+// of these sizes change, the bound must be recomputed — these asserts are
+// the tripwire (spec: "mandatory, not decorative").
+static_assert(sizeof(PageHeader) == 32, "TREE_MAX_KEY_BYTES derivation");
+static_assert(sizeof(LeafSlot) == 8, "TREE_MAX_KEY_BYTES derivation");
+static_assert(sizeof(InteriorSlot) == 12, "TREE_MAX_KEY_BYTES derivation");
+static_assert(::TREE_MAX_KEY_BYTES ==
+                  PAGE_SIZE - sizeof(PageHeader) - sizeof(LeafSlot) - 8,
+              "TREE_MAX_KEY_BYTES must equal the page-safe leaf key bound "
+              "(8 = the engine's encoded KeyEntry pointer value)");
+
 // The free-space gap is between (header + slots) and (slab start).
 //   free_lo = sizeof(PageHeader) + key_count * sizeof(slot)
 //   free_hi = slab_start = the lowest offset currently used by the slab
@@ -9939,6 +9993,18 @@ public:
         generation_.fetch_add(1, std::memory_order_relaxed);  // M1.4: atomic (concurrent-safe)
         InsertResult r = put_recursive(root_id_.load(std::memory_order_acquire), key, value);
         if (r.split) {
+            // v28 FIX (audit CKV-001): capacity guard BEFORE the alloc and
+            // before any page mutation — the uint16 key_off computed as
+            // PAGE_SIZE - split_key.size() below wraps for separators that
+            // cannot fit a page (OOB memcpy into the pool). Throwing here
+            // leaves the committed tree reachable and searchable (root_id_
+            // is not yet moved); the engine maps PageCapacityError to
+            // Status::TooLarge, and the commit_txn key gate makes it
+            // unreachable through the public API (defense-in-depth).
+            if (sizeof(PageHeader) + sizeof(InteriorSlot) + r.split_key.size() > PAGE_SIZE)
+                throw PageCapacityError(
+                    "root-split separator does not fit a page: key=" +
+                    std::to_string(r.split_key.size()));
             // Root split: create a new root with the split key + two children.
             PageId new_root = pool_.alloc();
             // v25.1 M2 FIX: acquire exclusive latch on new_root BEFORE writing
@@ -9988,6 +10054,11 @@ public:
         }
         InsertResult r = put_recursive(root_id_.load(std::memory_order_acquire), key, value);
         if (r.split) {
+            // v28 FIX (audit CKV-001): capacity guard (same as put()).
+            if (sizeof(PageHeader) + sizeof(InteriorSlot) + r.split_key.size() > PAGE_SIZE)
+                throw PageCapacityError(
+                    "root-split separator does not fit a page: key=" +
+                    std::to_string(r.split_key.size()));
             PageId new_root = pool_.alloc();
             // v25.1 M2 FIX: latch new_root before writing (same as put()).
             auto new_root_latch = latches_.lock_exclusive(new_root);
@@ -11266,6 +11337,20 @@ private:
     void insert_into_leaf_no_split(PageId page_id, const std::string& key, const std::string& value) {
         Page* p = pool_.get(page_id);
         PageHeader* h = header(p);
+        // v28 FIX (audit CKV-001, remediation Blocker 4): ADDITIVE-form
+        // capacity guard — never key.size() > slab_top - used_bytes, whose
+        // size_t subtraction underflows on a full page and turns "does not
+        // fit" into a huge value that passes. Split callers pre-validate
+        // the whole plan; this backstop makes the uint16 offset wrap
+        // (value_off/key_off below) unreachable for ANY caller: a loud
+        // PageCapacityError before the memcpy instead of an OOB write.
+        if (free_lo(p) + sizeof(LeafSlot) + key.size() + value.size() >
+            (size_t)free_hi(p)) {
+            throw PageCapacityError(
+                "leaf entry does not fit its page: key=" + std::to_string(key.size()) +
+                " value=" + std::to_string(value.size()) +
+                " (page-safe key bound is TREE_MAX_KEY_BYTES)");
+        }
         LeafSlot* slots = leaf_slots(p);
 
         size_t i = 0;
@@ -11576,6 +11661,13 @@ private:
         uint16_t slab_top = PAGE_SIZE;
         for (uint16_t j = 0; j < h->key_count; ++j) {
             if (slots[j].key_off < slab_top) slab_top = slots[j].key_off;
+        }
+        // v28 FIX (audit CKV-001, Blocker 4): additive-form guard against
+        // the uint16 wrap in key_off_new = slab_top - key.size() below.
+        if (sizeof(PageHeader) + ((size_t)h->key_count + 1) * sizeof(InteriorSlot) +
+                key.size() > (size_t)slab_top) {
+            throw PageCapacityError(
+                "interior separator does not fit its page: key=" + std::to_string(key.size()));
         }
         // After the memmove, slots[i] is the new empty slot.
         // The slot at i+1 (if exists) is the old slot i.
