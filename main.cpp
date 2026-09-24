@@ -11413,6 +11413,74 @@ static int run_remediation_tests() {
               ckv002e_body, 120000,
               "right half {smalls, big} overflows; rebuild wraps offsets / throws post-destroy");
 
+    // ---- CKV-003b: index fail-stop, invariant D4 (engine-index-failstop) ----
+    // The audit probe14 chain, end to end: bounded page pool -> many acked
+    // Sync commits -> pool exhaustion throws bad_alloc out of ensure_index
+    // DURING a commit. Pre-fix the engine stayed "healthy": the next put
+    // returned OK against the diverged index, checkpoint() persisted the
+    // diverged tree and TRUNCATED THE WAL, and every acknowledged write was
+    // permanently lost on reopen (19,677 commits in the audit PoC).
+    // Post-fix (D4): the failure latches index_failed_ -> health() level 2,
+    // subsequent commits return Failed, checkpoint() throws, and reopen
+    // replays the intact WAL with every acked key present.
+    static int (*const ckv003b_body)() = +[]() -> int {
+        using namespace chronokv;
+        const std::string wd = "/tmp/ckv_ckv003b_" + std::to_string(getpid());
+        std::filesystem::remove_all(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.checkpoint_path = wd + "/ckpt.bin";
+        o.auto_start_gc = false;
+        o.durability = DurabilityMode::Sync;
+        o.page_pool_bytes = 1ULL * 1024 * 1024;   // bounded: exhausts mid-ensure_index
+        auto db = Database::open(o);
+        std::vector<std::string> acked_keys;
+        char buf[64];
+        bool saw_failure = false;
+        for (int i = 0; i < 12000 && !saw_failure; ++i) {
+            snprintf(buf, sizeof buf, "key-%08d", i);
+            std::string k(buf);
+            if (i % 50 == 49) k += std::string(1900, 'p');   // burn pages via splits
+            try {
+                if (db.put(k, "value") != Status::OK) return 10;
+                acked_keys.push_back(k);
+            } catch (const std::exception&) {
+                saw_failure = true;   // pool exhaustion -> bad_alloc from the tree
+            }
+        }
+        if (!saw_failure) return 11;             // pool not small enough — test vacuous
+        if (db.health().level != 2) return 12;   // (a) fail-stop must be reported
+        {   // (b) subsequent commits must NOT succeed (pre-fix: returned OK
+            // against the diverged index)
+            Status st = Status::OK;
+            try { st = db.put("post-oom", "v"); }
+            catch (const std::exception&) { st = Status::Failed; }
+            if (st != Status::Failed) return 13;
+        }
+        {   // (c) checkpoint must be REFUSED (pre-fix: succeeded and
+            // truncated the WAL — the loss event)
+            bool ckpt_threw = false;
+            try { db.checkpoint(); }
+            catch (const std::exception&) { ckpt_threw = true; }
+            if (!ckpt_threw) return 14;
+        }
+        db.close();
+        {   // (d) reopen: every acknowledged write must be present
+            Options o2 = o;
+            o2.page_pool_bytes = 64ULL * 1024 * 1024;   // replay headroom
+            auto db2 = Database::open(o2);
+            for (const auto& k : acked_keys)
+                if (db2.get(k).value_or("") != "value") return 15;
+            if (db2.get("post-oom").has_value()) return 16;
+            db2.close();
+        }
+        std::filesystem::remove_all(wd);
+        return 0;
+    };
+    run_child("remediation CKV-003b: index fail-stop on tree-mutation OOM; acked writes survive reopen (engine-index-failstop, invariant D4)",
+              ckv003b_body, 900000,
+              "post-OOM put returns OK, checkpoint truncates the WAL, acked writes lost on reopen");
+
     if (fails == 0) std::cout << "   REMEDIATION TESTS PASSED\n";
     else std::cout << "   REMEDIATION FAILURES: " << fails << "\n";
     return fails;

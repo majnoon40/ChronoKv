@@ -4991,6 +4991,18 @@ class ChronoKV {
     // v18: incremental checkpoint dirty-key tracking.
     std::unordered_map<std::string, uint64_t> dirty_since_ckpt_;  // v18.2: key -> max dirty cts
     std::mutex dirty_mu_;
+    // v28 (CKV-003b) — canonical invariant D4 (index fail-stop): if a tree/
+    // index mutation throws during a commit (ensure_index or version
+    // install), the in-memory index may diverge from the WAL. The WAL is
+    // then the ONLY complete truth, so the engine latches this flag:
+    // subsequent commits return DatabaseFailed, checkpoint()/backup()
+    // throw (persisting the diverged tree would truncate the WAL and lose
+    // every acknowledged write — audit probe14 lost 19,677 commits that
+    // way), and health() reports level 2. Recovery is reopen: WAL replay
+    // rebuilds a consistent index. Reads are unaffected (they never
+    // depended on completeness for already-acked versions... a version
+    // whose install threw was never acknowledged).
+    std::atomic<bool> index_failed_{false};
     mutable std::mutex order_mu_;
 
     // v25.1 M1.6: KeyEntry* ↔ tree-value encode/decode. The tree stores
@@ -5440,6 +5452,13 @@ public:
         if (wal_ && wal_->is_failed()) {
             h.level = 2;
             h.reasons.push_back("wal fail-stop mode active");
+            return h;
+        }
+        if (index_failed_.load(std::memory_order_acquire)) {
+            // v28 (CKV-003b, invariant D4): terminal for writes/checkpoints
+            // until reopen; reads still serve the last consistent state.
+            h.level = 2;
+            h.reasons.push_back("index fail-stop mode active (tree mutation failed during commit; reopen to recover)");
             return h;
         }
         auto w = wal_stats();
@@ -5960,6 +5979,12 @@ public:
 
         std::shared_lock ckpt_lk(checkpoint_mu_);
         if (wal_ && wal_->is_failed()) return TxnResult::DatabaseFailed;
+        // v28 (CKV-003b, invariant D4): index fail-stop latch — see the
+        // member declaration. Pre-fix, a commit whose ensure_index hit
+        // bad_alloc left the engine "healthy": the NEXT put returned OK,
+        // checkpoint() persisted the diverged tree and truncated the WAL,
+        // and every acknowledged write was lost on reopen.
+        if (index_failed_.load(std::memory_order_acquire)) return TxnResult::DatabaseFailed;
 
         std::vector<std::tuple<KeyEntry*, std::string, std::string, bool>> witems;
         std::set<std::string> new_keys;
@@ -5970,19 +5995,30 @@ public:
         for (auto& [k, v, d] : ws) {
             if (!new_keys.insert(k).second) return TxnResult::InvalidTransaction;
         }
-        for (auto& [k, v, d] : ws) {
-            auto [e, is_new] = ensure_index(k);
-            witems.emplace_back(e, k, v, d);
-        }
-
-        // v25.1 M1.6: lock ordering by KeyEntry* address (deterministic, avoids
-        // deadlock). Replaces the old int-index ordering (all_idx sorted ints).
-        // KeyEntry* is stable (heap-allocated, engine-owned, deferred reclamation).
+        // v28 (CKV-003b, invariant D4): any throw from the index-mutation
+        // phase (tree put / KeyEntry allocation — bad_alloc under pool
+        // pressure is the audit's trigger) latches the fail-stop. Nothing
+        // has been reserved or written yet at this point, so THIS commit
+        // is atomic by itself; the latch protects every FUTURE commit and
+        // the checkpoint path from trusting a possibly-diverged index.
         std::set<KeyEntry*> all_entries;
-        for (auto& [e, k, v, d] : witems) all_entries.insert(e);
-        for (auto& k : rs) {
-            auto [e, dummy] = ensure_index(k);
-            all_entries.insert(e);
+        try {
+            for (auto& [k, v, d] : ws) {
+                auto [e, is_new] = ensure_index(k);
+                witems.emplace_back(e, k, v, d);
+            }
+
+            // v25.1 M1.6: lock ordering by KeyEntry* address (deterministic, avoids
+            // deadlock). Replaces the old int-index ordering (all_idx sorted ints).
+            // KeyEntry* is stable (heap-allocated, engine-owned, deferred reclamation).
+            for (auto& [e, k, v, d] : witems) all_entries.insert(e);
+            for (auto& k : rs) {
+                auto [e, dummy] = ensure_index(k);
+                all_entries.insert(e);
+            }
+        } catch (...) {
+            index_failed_.store(true, std::memory_order_release);
+            throw;
         }
 
         // v25.1 M1.6: the stress_point("after_ensure_index") guard is now MOOT.
@@ -6137,6 +6173,15 @@ public:
                     }
             }
         } catch (...) {
+            // v28 (CKV-003b, invariant D4): the WAL record for cts is
+            // durable but the in-memory install is incomplete — a
+            // permanent WAL-vs-index divergence (the record was never
+            // acknowledged: the throw reaches the caller as a failure).
+            // Burn keeps the publication prefix moving (v27 M1); the
+            // latch ensures the diverged tree can never reach a
+            // checkpoint, which would truncate the WAL that holds the
+            // complete truth. Reopen rebuilds a consistent index.
+            index_failed_.store(true, std::memory_order_release);
             pub_.burn(cts);
             throw;
         }
@@ -6199,6 +6244,17 @@ public:
             ~WorkTimer() { out = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(); }
         };
         WorkTimer ckpt_work(last_ckpt_work_ms_);
+
+        // v28 (CKV-003b, invariant D4): never persist a diverged index.
+        // A successful checkpoint rotates/truncates the WAL — with the
+        // fail-stop latched, the WAL is the only complete record of
+        // acknowledged writes, so checkpointing would destroy the very
+        // data recovery needs (audit probe14). Covers backup_to() too
+        // (it calls checkpoint_locked under the same mutex).
+        if (index_failed_.load(std::memory_order_acquire))
+            throw std::runtime_error(
+                "checkpoint refused: index fail-stop latched (a tree mutation failed "
+                "during a previous commit — invariant D4); reopen to recover from the WAL");
 
         // Wait for any in-progress GC to finish, then register a reader
         // slot so future GC cannot reclaim versions visible at cts.
