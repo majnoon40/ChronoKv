@@ -1667,6 +1667,78 @@ static int run_review_regression_tests() {
         report("review H1: HP registry bounded by concurrency, not by scan count", ok, fr);
     }
 
+#ifdef CHRONOKV_STRESS
+    // ---- Review (lincheck flake root cause): the range_scan snapshot must
+    // ---- be resolved AT the guard pin, never before it ----
+    //
+    // Live bug (~2%/seed in the mixed-API lincheck workload; the engine
+    // silently dropped live keys from concurrent range scans): range_scan
+    // captured effective_ts = published() BEFORE acquiring its
+    // SnapshotGuard. A thread stalled in that gap — preemption, or the
+    // recording wrapper's work around the call — got a reader slot pinning
+    // published()+1, NEWER than its own effective_ts, so gc_threshold()
+    // (min over slots) was not constrained by the scan's true snapshot. A
+    // GC pass could then anchor on a version newer than effective_ts and
+    // sever the version the scan was about to read: the head walk skipped
+    // the newer version, hit prev==nullptr, and the key vanished from the
+    // result (checker: scan-missing-key on exactly the keys whose
+    // superseding commits were in flight).
+    //
+    // Deterministic replay: thread A blocks at the capture→pin gap hook;
+    // the main thread publishes v2 over v1 and runs a synchronous GC pass
+    // (pre-fix: no slot constrains the threshold → anchor at v2 → v1
+    // severed); then A resumes and scans. Pre-fix A misses the key at its
+    // stale snapshot; post-fix the pin precedes the gap, the threshold is
+    // ≤ the snapshot, and v1 survives.
+    {
+        bool ok = true;
+        std::string fr;
+        try {
+            ChronoKV kv;   // no WAL needed (same as the SSI tests)
+            (void)kv.commit("K", "v1");
+
+            std::mutex mu;
+            std::condition_variable cv;
+            bool at_gap = false, release = false;
+            std::atomic<bool> fired{false};
+            stress::gap_callback_scan = [&]() {
+                if (fired.exchange(true)) return;   // one-shot
+                std::unique_lock<std::mutex> lk(mu);
+                at_gap = true;
+                cv.notify_all();
+                cv.wait(lk, [&]{ return release; });
+            };
+            stress::gap_hook.store(true, std::memory_order_release);
+
+            std::vector<std::pair<std::string, std::string>> res;
+            uint64_t eff = 0;
+            std::thread ta([&] {
+                res = kv.range_scan(UINT64_MAX, "A", "Z", &eff);
+            });
+
+            { std::unique_lock<std::mutex> lk(mu); cv.wait(lk, [&]{ return at_gap; }); }
+            (void)kv.commit("K", "v2");   // published advances past A's snapshot
+            kv.gc_pass_for_test();        // pre-fix: severs v1 (no pin visible)
+            { std::unique_lock<std::mutex> lk(mu); release = true; }
+            cv.notify_all();
+            ta.join();
+
+            stress::gap_hook.store(false, std::memory_order_release);
+            stress::gap_callback_scan = nullptr;
+
+            if (res.size() != 1 || res[0].first != "K" || res[0].second != "v1") {
+                ok = false;
+                fr = "scan lost a live key across the capture\u2192pin gap: n=" +
+                     std::to_string(res.size()) +
+                     (res.empty() ? std::string() : (" first=" + res[0].first + "=" + res[0].second));
+            }
+        } catch (const std::exception& e) {
+            ok = false; fr = std::string("exception: ") + e.what();
+        }
+        report("review: range_scan snapshot resolves at the guard pin (GC cannot sever it)", ok, fr);
+    }
+#endif  // CHRONOKV_STRESS
+
     std::cout << (fails == 0 ? "   REVIEW REGRESSION TESTS PASSED\n"
                              : "   REVIEW REGRESSION FAILURES: " + std::to_string(fails) + "\n");
     return fails;

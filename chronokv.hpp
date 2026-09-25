@@ -1497,6 +1497,11 @@ namespace stress {
     inline std::atomic<bool> gap_hook{false};
     inline std::function<void()> gap_callback_put_leaf{nullptr};
     inline std::function<void()> gap_callback_ensure{nullptr};
+    // Review fix (lincheck scan-missing-key flake): fires at the
+    // capture→pin gap in ChronoKV::range_scan. Invoked DIRECTLY (not via
+    // stress_point) and only while gap_hook is armed, so dst scheduling and
+    // the probabilistic yield are untouched.
+    inline std::function<void()> gap_callback_scan{nullptr};
 }
 
 // ===================== v27 M0: deterministic scheduler =====================
@@ -7312,14 +7317,44 @@ public:
         // v19 M2 FIX: register a reader snapshot to protect versions from
         // GC during the scan. Without this, gc_once() can reclaim a Version
         // node that range_scan is still reading (use-after-free).
-        // v19 M2 FIX: register a reader slot for GC protection, but read at
-        // the original read_ts (clamped to published). The slot's snapshot is
-        // set to pub_.published()+1 by acquire_slot, which protects reads at
-        // the current published timestamp. For historical reads (read_ts <
-        // published), the slot still prevents GC from running concurrently.
-        uint64_t effective_ts = std::min(read_ts, pub_.published());
-        if (eff_ts_out) *eff_ts_out = effective_ts;   // v27 M1: scan recording
+        //
+        // Review fix (lincheck scan-missing-key flake): the pin MUST be
+        // acquired BEFORE the snapshot is resolved. The old order captured
+        // effective_ts = published() first and acquired the SnapshotGuard
+        // second; a thread stalled in that gap (preemption, or the recording
+        // wrapper's work around the call) got a reader slot pinning
+        // published()+1 — NEWER than its own effective_ts — so gc_threshold()
+        // (min over active slots) was not constrained by the snapshot the
+        // scan actually resolved at. A concurrent gc_once() pass could then
+        // anchor on a version newer than effective_ts and sever the version
+        // the scan was about to read: the head walk skipped the newer
+        // version, hit prev==nullptr, and a LIVE key silently vanished from
+        // the result (observed live at ~2%/seed in the mixed-API lincheck
+        // workload: scan-missing-key on exactly the keys whose superseding
+        // commits were in flight). Resolution now reads the guard's own
+        // snapshot — effective_ts ≤ slot−1 always — which is exactly the
+        // pattern ChronoKVRangeScanCursorState (stream API) has always used:
+        // guard member initialized before effective_ts. Callers passing an
+        // explicit historical read_ts keep the pre-existing contract: their
+        // OWN pin (the RWT's begin-time slot, or a caller-held
+        // SnapshotGuard) constrains GC — gc_threshold() takes the min over
+        // ALL slots, so an external pin at read_ts protects the walk.
         SnapshotGuard sg(*this);  // v20.1 (#11): RAII slot, exception-safe
+#ifdef CHRONOKV_STRESS
+        // Deterministic gap hook (review: scan-snapshot pinning regression).
+        // Invoked directly — not via stress_point — so dst scheduling and
+        // the probabilistic yield are untouched; fires only while a gap
+        // test has armed stress::gap_hook (same contract as the v25.1
+        // put_leaf/ensure_index hooks). Positioned at the OLD capture→pin
+        // gap: pre-fix it separated effective_ts from the guard; post-fix
+        // the guard is already held here, which is what the regression
+        // test asserts (a publish+GC pass landing at this point must NOT
+        // sever the version visible at the resolved snapshot).
+        if (stress::gap_hook.load(std::memory_order_acquire) && stress::gap_callback_scan)
+            stress::gap_callback_scan();
+#endif
+        uint64_t effective_ts = std::min(read_ts, sg.read_ts());
+        if (eff_ts_out) *eff_ts_out = effective_ts;   // v27 M1: scan recording
         // v27 M0 (dst): the scan side of the GC-vs-scan race: the pin is
         // live from here, and gc_once()/reclaim_retired() consult it. The
         // scheduler can now interleave the pass against the pinned scan.
