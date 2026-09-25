@@ -2842,17 +2842,85 @@ return 0;
         report("async: fsync-fail after Committed stays present on restart (fixed contract)",
                live_ok && restart_ok && (exposed_after > exposed_before));
     }
-    // short write -> write_all's retry loop completes it; commit succeeds.
+    // CKV-018 (de-vacuated): this test used to arm WriteShort around a WAL
+    // commit — but commits never reach write_all (WAL data goes through
+    // io_uring or the pwrite_all fallback), so the charge NEVER fired:
+    // mutation-proven vacuous (delete write_all's retry loop and the suite
+    // still passed). Both legs below assert the charge fired
+    // (fault::remaining == 0) — the repo's own anti-vacuity discipline.
     {
+        // Leg 1 — write_all's retry loop through a genuine caller
+        // (checkpoint/MANIFEST): the original coverage claim, now with a
+        // fired-proof instead of a vacuous pass.
         const std::string wd = "/tmp/v16_fi_short";
+        const std::string cp = "/tmp/v16_fi_short.ckpt";
         std::filesystem::remove_all(wd);
-        ChronoKV kv(wd); kv.start_gc();
-        fault::arm(fault::Kind::WriteShort, 1);
-        TxnResult r = kv.commit("a", "a value long enough to span several bytes");
-        fault::disarm();
-        bool a_ok = kv.read("a") && *kv.read("a") == "a value long enough to span several bytes";
-        report("fault-inj: short write handled by write_all retry loop",
-               (r == TxnResult::Committed) && a_ok);
+        unlink(cp.c_str());
+        bool ckpt_ok = false, fired1 = false;
+        {
+            ChronoKV kv(wd); kv.start_gc();
+            kv.set_durability(DurabilityMode::Sync);
+            (void)kv.commit("a", "a value long enough to span several bytes");
+            fault::arm(fault::Kind::WriteShort, 1);
+            try { kv.checkpoint(cp); ckpt_ok = true; } catch (...) {}
+            fired1 = fault::remaining.load() == 0;   // sample BEFORE disarm — disarm() zeroes remaining
+            fault::disarm();
+        }
+        report("fault-inj: short write handled by write_all retry loop (checkpoint path, charge fired)",
+               ckpt_ok && fired1);
+
+        // Leg 2 — the WAL data path: pwrite_all, where every non-uring WAL
+        // write converges (io_uring-disabled builds AND the io_uring
+        // remediation re-route). Exercised only where the build forces the
+        // sync fallback; native-uring builds get an honest SKIP (a real-
+        // kernel CQE fault hook is explicitly deferred by the remediation
+        // spec) — never a vacuous pass.
+#ifdef CKV_IOURING_DISABLED
+        const std::string w2 = "/tmp/v16_fi_short_wal";
+        std::filesystem::remove_all(w2);
+        bool short_ok = false, short_fired = false, fail_ok = false, fail_fired = false;
+        {
+            ChronoKV kv(w2); kv.start_gc();
+            kv.set_durability(DurabilityMode::Sync);
+            // Warm-up commit: segment creation + MANIFEST are lazy, and
+            // write_manifest is a write_all caller — without this the
+            // armed charge would be consumed by the MANIFEST write and
+            // never reach the WAL data path this leg targets.
+            (void)kv.commit("warm", "w");
+            // WriteShort: the commit succeeds — pwrite_all's retry loop
+            // consumes the short write — and the key survives reopen
+            // (real durability, not just "no crash").
+            fault::arm(fault::Kind::WriteShort, 1);
+            TxnResult r1 = kv.commit("k1", "k1 value long enough to span several bytes");
+            short_fired = fault::remaining.load() == 0;   // sample BEFORE disarm
+            fault::disarm();
+            short_ok = (r1 == TxnResult::Committed) &&
+                       kv.read("k1") && *kv.read("k1") == "k1 value long enough to span several bytes";
+            // WriteFail: the positioned write fails outright — the commit
+            // must report WalFailure and the key must be absent (the
+            // rollback truncation keeps the WAL consistent with the
+            // reported outcome — the contract CKV-004 polices).
+            fault::arm(fault::Kind::WriteFail, 1);
+            TxnResult r2 = kv.commit("k2", "k2 value");
+            fail_fired = fault::remaining.load() == 0;   // sample BEFORE disarm
+            fault::disarm();
+            fail_ok = (r2 == TxnResult::WalFailure) && !kv.read("k2").has_value();
+        }
+        {   // Reopen: durability matches the reported outcomes.
+            ChronoKV kv2(w2); kv2.recover(w2);
+            auto v1 = kv2.read("k1");
+            auto v2 = kv2.read("k2");
+            short_ok = short_ok && v1 && *v1 == "k1 value long enough to span several bytes";
+            fail_ok = fail_ok && !v2.has_value();
+        }
+        report("fault-inj: short write handled by pwrite_all retry loop on the WAL path (de-vacuated)",
+               short_ok && short_fired);
+        report("fault-inj: WAL write failure reports WalFailure and the key is absent after reopen",
+               fail_ok && fail_fired);
+#else
+        std::cout << "   fault-inj: WAL-path pwrite_all legs: SKIPPED (native io_uring build; "
+                     "CQE fault hook deferred per remediation spec)\n";
+#endif
     }
 #else
     std::cout << "   fault-injection: SKIPPED (build without -DCHRONOKV_FAULT_INJECTION)\n";

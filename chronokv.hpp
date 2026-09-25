@@ -3100,7 +3100,30 @@ private:
 
 // pwrite_all: positioned write (not append). Used by the fallback path.
 static bool pwrite_all(int fd, const uint8_t* d, size_t n, off_t offset) {
+#ifdef CHRONOKV_FAULT_INJECTION
+    // CKV-018: the WAL data path (the io_uring-disabled fallback AND the
+    // io_uring remediation re-route at 3917-3928 — every non-uring write
+    // converges here) had ZERO fault coverage: WriteFail/WriteShort charges
+    // armed around a commit never fired because the commit path never calls
+    // write_all. Mirror write_all's pattern exactly: WriteFail at entry
+    // simulates a full positioned-write failure (errno=EIO; the caller's
+    // existing io_ok=false path handles it), WriteShort performs a GENUINE
+    // partial pwrite (len/2, min 1 byte) so the retry loop completes the
+    // tail — genuine, not pretend-advanced, so the file stays durable and
+    // the read-back assertion tests the real contract.
+    if (fault::fire(fault::Kind::WriteFail)) { errno = EIO; return false; }
+#endif
     while (n > 0) {
+#ifdef CHRONOKV_FAULT_INJECTION
+        if (fault::fire(fault::Kind::WriteShort)) {
+            size_t half = n / 2;
+            if (half == 0) half = 1;
+            ssize_t sw = ::pwrite(fd, d, half, offset);
+            if (sw < 0) { if (errno == EINTR) continue; return false; }
+            if (sw == 0) return false;
+            d += sw; n -= static_cast<size_t>(sw); offset += sw; continue;
+        }
+#endif
         ssize_t w = ::pwrite(fd, d, n, offset);
         if (w < 0) { if (errno == EINTR) continue; return false; }
         if (w == 0) return false;
