@@ -11836,6 +11836,72 @@ static int run_remediation_tests() {
               ckv003b_body, 900000,
               "post-OOM put returns OK, checkpoint truncates the WAL, acked writes lost on reopen");
 
+    // ---- CKV-012: burn-on-throw in group_append's reservation window ----
+    // (wal-reserve-burn-on-throw, publication-prefix progress). Pre-fix, an
+    // exception escaping the window between the cts reservation and the
+    // record enqueue (OOM-class: records.push_back / make_shared bad_alloc)
+    // left the cts neither completed nor burned. The published prefix then
+    // stalled below it forever, and the v27 strict-serializability barrier
+    // (await_published) hangs EVERY later commit — a permanent silent wedge.
+    // Injection: the AllocFail fault kind (§12's chosen mechanism) throws
+    // bad_alloc at the enqueue site. Thread A's commit must surface as a
+    // failure; thread B's later commit must complete within a bounded wait
+    // (the burned hole advanced the prefix). Pre-fix — with the injection
+    // point present but the burn missing (the mutation variant) — B blocks
+    // forever and the bounded wait fails the test; without the injection
+    // point the leg cannot arm (charge-fired assertion fails).
+    static int (*const ckv012_body)() = +[]() -> int {
+        using namespace chronokv;
+        const std::string wd = "/tmp/ckv_ckv012_" + std::to_string(getpid());
+        std::filesystem::remove_all(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.durability = DurabilityMode::Sync;
+        o.auto_start_gc = false;
+        auto db = Database::open(o);
+        if (db.put("seed", "v") != Status::OK) return 10;
+
+        fault::arm(fault::Kind::AllocFail, 1);
+        Status st_a = Status::OK;
+        try { st_a = db.put("a-key", "av"); } catch (const std::exception&) { st_a = Status::Failed; }
+        bool fired = fault::remaining.load() == 0;   // sample BEFORE disarm
+        fault::disarm();
+        if (!fired) return 11;                       // injection never reached — vacuous
+        if (st_a == Status::OK) return 12;           // the throwing commit must NOT ack
+
+        // Thread B: a LATER commit on a different key. Pre-fix it wedges at
+        // await_published (prefix stalled below A's orphaned cts); the wait
+        // is bounded at 5s, matching the lincheck barrier convention.
+        std::atomic<bool> b_done{false}, b_ok{false};
+        std::thread tb([&] {
+            Status st = Status::OK;
+            try { st = db.put("b-key", "bv"); } catch (const std::exception&) { st = Status::Failed; }
+            b_ok.store(st == Status::OK);
+            b_done.store(true);
+        });
+        for (int i = 0; i < 500 && !b_done.load(std::memory_order_acquire); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (!b_done.load()) { tb.detach(); return 13; }   // WEDGED: later commit hangs
+        tb.join();
+        if (!b_ok.load()) return 14;
+
+        // NOTE: no reopen leg, deliberately. The burn leaves an INTERIOR
+        // cts hole with no WAL frame (a noop frame — the contiguity device
+        // the validation-conflict burn uses — is exactly what an OOM-class
+        // throw cannot safely write), and recovery's interior-gap check
+        // (v26.1 WAL-contiguity invariant) rejects such a WAL loudly on
+        // the next open: fail-stop, not silent replay. Asserting either
+        // reopen behaviour is outside this finding's specified contract
+        // (A non-OK + B completes bounded); the consequence is documented
+        // in the commit message.
+        db.close();
+        std::filesystem::remove_all(wd);
+        return 0;
+    };
+    run_child("remediation CKV-012: reservation-window throw burns the cts; later commits do not wedge (wal-reserve-burn-on-throw)",
+              ckv012_body, 60000,
+              "orphaned cts stalls the published prefix; every later commit hangs at the barrier");
+
     // ---- CKV-003c: checkpoint dirty-coverage validation (ckpt-dirty-coverage) ----
     // Simulated index divergence: a dirty key's entry vanishes from the
     // serialized snapshot. Pre-fix the incremental checkpoint silently

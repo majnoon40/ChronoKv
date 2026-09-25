@@ -1311,7 +1311,15 @@ namespace fault {
                             // the data IS durable but the kernel reported an
                             // error. Distinct from FsyncFail (which skips the
                             // real fsync, so nothing was persisted).
-                            FsyncFailAfterPersist };
+                            FsyncFailAfterPersist,
+                            // CKV-012: OOM-class injection inside the
+                            // group_append reservation window (throws
+                            // bad_alloc at the record-enqueue site) — the
+                            // trigger class for the burn-on-throw contract
+                            // (publication-prefix progress). §12 chose the
+                            // fault kind over a mirror test hook: one
+                            // mechanism, not both.
+                            AllocFail };
     inline std::atomic<int> armed{0};
     inline std::atomic<int> remaining{0};
 
@@ -1373,6 +1381,7 @@ namespace fault {
             {"OpenFail", Kind::OpenFail},
             {"DirFsyncFail", Kind::DirFsyncFail},
             {"SegOpenFail", Kind::SegOpenFail},
+            {"AllocFail", Kind::AllocFail},
             {"FsyncFailAfterPersist", Kind::FsyncFailAfterPersist},
         };
         for (const auto& [name, k] : tbl)
@@ -3737,11 +3746,37 @@ public:
     // Returns {success, assigned_ts}. If !success and ts > 0, caller must burn ts.
     std::pair<int, uint64_t> group_append(std::atomic<uint64_t>& clock, const WriteSet& ws,
                                    DurabilityMode mode,
-                                   const std::function<bool(uint64_t)>& on_reserve) {
+                                   const std::function<bool(uint64_t)>& on_reserve,
+                                   const std::function<void(uint64_t)>& on_abandon) {
     std::unique_lock<std::mutex> lk(batch_mu_);
     if (failed_) return {1, 0};
 
-    uint64_t ts = clock.fetch_add(1, std::memory_order_seq_cst);
+    // CKV-012 (publication-prefix progress): everything from the cts
+    // reservation through the record's enqueue into my_batch runs inside
+    // the try below. Pre-fix, an exception escaping that window (on_reserve
+    // re-throwing; wal_ser, make_shared<Batch> or records.push_back
+    // throwing bad_alloc — a single transient OOM suffices) propagated with
+    // the cts reserved but neither completed nor burned: the published
+    // prefix stalled below it forever, and because the v27 strict-
+    // serializability barrier (commit_txn's await_published) blocks every
+    // later commit until the prefix covers its own cts, EVERY subsequent
+    // commit hung — a permanent, silent engine wedge while holding its
+    // KeyEntry commit mutexes. WalSegments has no access to the engine's
+    // PublicationTracker, so the burn is delegated back via on_abandon
+    // (mirroring on_reserve); commit_txn passes pub_.burn. The window ends
+    // at the has_async store: from the waiter loop on, the leader/waiter
+    // machinery guarantees either a batch outcome or the existing leader-
+    // exception fail-stop (waiters burn via the WalFailure path) — no
+    // double-burn. Lock order: on_abandon runs while holding batch_mu_;
+    // the publication mutex is a leaf (acquires nothing else) and no path
+    // takes it before batch_mu_ (await_published waits on the publication
+    // cv WITHOUT batch_mu_), so the new batch_mu_ -> pub edge is acyclic.
+    const bool i_am_async = (mode == DurabilityMode::Async);
+    uint64_t ts = 0;
+    bool reserve_conflict = false;
+    std::shared_ptr<Batch> my_batch;
+    try {
+    ts = clock.fetch_add(1, std::memory_order_seq_cst);
     diag::store_max(diag::pub_allocated, ts);
     diag::store_max(i_pub_allocated_max, ts);
     stress_point("after_cts_reserve");
@@ -3758,7 +3793,6 @@ public:
     // no-op record. This preserves WAL timestamp contiguity. The caller burns
     // the timestamp in the publication tracker, so the no-op has no visible
     // MVCC effect.
-    bool reserve_conflict = false;
     if (on_reserve && !on_reserve(ts)) reserve_conflict = true;
 
     WriteSet noop_ws;
@@ -3776,7 +3810,6 @@ public:
     // If a new caller's mode differs from cur_batch_'s class, we flush
     // cur_batch_ (set to nullptr so the next leader iteration creates a
     // fresh one) and start a new batch of the caller's class.
-    const bool i_am_async = (mode == DurabilityMode::Async);
     if (cur_batch_ &&
         cur_batch_->has_async.load(std::memory_order_relaxed) != i_am_async) {
         // v24 FIX (Group 1, Fix 4): a batch must contain EITHER async
@@ -3804,10 +3837,22 @@ public:
         cur_batch_ = std::make_shared<Batch>();
         pending_.push_back(cur_batch_);
     }
-    auto my_batch = cur_batch_;
+    my_batch = cur_batch_;
+#ifdef CHRONOKV_FAULT_INJECTION
+    // CKV-012: the OOM-class trigger for the reservation window.
+    if (fault::fire(fault::Kind::AllocFail)) throw std::bad_alloc();
+#endif
     my_batch->records.push_back({ts, rec});
     if (i_am_async)
         my_batch->has_async.store(true, std::memory_order_relaxed);
+    } catch (...) {
+        // The reservation is the window's FIRST statement, so ts is valid
+        // in every catch here. Burn first — the published prefix must be
+        // able to advance past this hole — then rethrow; commit_txn
+        // surfaces the exception as WalFailure.
+        if (ts != 0 && on_abandon) on_abandon(ts);
+        throw;
+    }
 
     const bool need_fsync = !i_am_async;
     while ((need_fsync ? !my_batch->done : !my_batch->written.load(std::memory_order_acquire)) && !my_batch->failed) {
@@ -6169,25 +6214,33 @@ public:
      bool phantom_conflict = false;
 
      if (wal_) {
-         // v24 FIX (Group 1, Fix 1b): group_append reserves cts via
-         // clock.fetch_add(1) BEFORE doing anything that can throw
-         // (wal_ser, push_back, on_reserve). Group 1, Fix 2 (below)
-         // makes group_append itself burn-on-throw. HERE, we catch
-         // any exception that escapes group_append and surface it as
-         // WalFailure so the caller doesn't see a stale cts leak.
-         // (We cannot burn cts here because we don't know whether
-         // fetch_add was reached; group_append's internal catch
-         // handles that.)
+         // v24 FIX (Group 1, Fix 1b), corrected by CKV-012: group_append
+         // reserves cts via clock.fetch_add(1) BEFORE doing anything that
+         // can throw (on_reserve, wal_ser, make_shared<Batch>, push_back).
+         // This comment used to claim "group_append itself burns on
+         // throw" — but that catch only ever wrapped the LEADER's unlocked
+         // I/O section; the pre-leader reservation window had no handler,
+         // and an exception escaping it (OOM-class) orphaned the cts and
+         // wedged every later commit at the publication barrier. Actual
+         // mechanism now: the reservation window burns via the on_abandon
+         // callback (delegated because WalSegments cannot see pub_) and
+         // rethrows; the leader section's own catch fails the batch, whose
+         // waiters burn via the WalFailure path. HERE, we only translate
+         // the escaped exception into WalFailure.
          uint64_t ts = 0;
          int status = 0;
          try {
              auto [s, t] = wal_->group_append(clock_, ws, durability_.load(std::memory_order_relaxed),
-                              on_reserve);
+                              on_reserve,
+                              [this](uint64_t burned) { pub_.burn(burned); });
              status = s;
              ts = t;
          } catch (...) {
-             // group_append's own internal catch (Group 1, Fix 2)
-             // guarantees any ts it reserved was already burned.
+             // CKV-012: guaranteed by group_append — a reservation-window
+             // exception burned its ts via on_abandon before rethrowing; a
+             // leader-section exception failed the batch (its waiters'
+             // burns go through the WalFailure path). Nothing to burn here
+             // (and we still cannot know whether fetch_add was reached).
              return TxnResult::WalFailure;
          }
          cts = ts;
