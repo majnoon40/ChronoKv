@@ -2363,7 +2363,12 @@ enum class DurabilityMode : uint8_t { Sync, Group, Async };
 struct Batch {
     std::atomic<bool> has_async{false};
     std::vector<std::pair<uint64_t, std::vector<uint8_t>>> records;
-    bool written = false;  // item 8: records are in the page cache (pre-fsync)
+    // item 8: records are in the page cache (pre-fsync). CKV-004: atomic —
+    // the rollback gate reads it OUTSIDE batch_mu_ to distinguish the
+    // WRITE-stage failure (written never published: no caller can have
+    // acked, truncate) from the FSYNC-stage failure (written published:
+    // async waiters already returned Committed).
+    std::atomic<bool> written{false};
     bool done = false;     // records are fsynced (durable vs power loss)
     bool failed = false;
 };
@@ -3805,7 +3810,7 @@ public:
         my_batch->has_async.store(true, std::memory_order_relaxed);
 
     const bool need_fsync = !i_am_async;
-    while ((need_fsync ? !my_batch->done : !my_batch->written) && !my_batch->failed) {
+    while ((need_fsync ? !my_batch->done : !my_batch->written.load(std::memory_order_acquire)) && !my_batch->failed) {
         if (!leader_active_) {
             leader_active_ = true;
             lk.unlock();
@@ -3848,20 +3853,20 @@ public:
             // Without this, a single bad_alloc would leave leader_active_=true
             // and cur_batch_=nullptr, deadlocking every subsequent commit.
             //
-            // v24 FIX (Group 1, Fix 4): mixed-durability batch truncation.
-            // The previous code skipped the ftruncate if the batch contained
-            // ANY async record (has_async). That meant Sync/Group records
-            // in the same batch survived the failed fsync and would be
-            // replayed on recovery -- a durability-contract violation
-            // (caller saw WalFailure but data was silently durable). The
-            // fix: ALWAYS truncate the batch on fsync failure, AND count
-            // any async records as "lost" (since they accepted silent loss
-            // at commit time). The has_async flag is no longer used to
-            // gate truncation; it is only used to debit the
-            // async_committed_then_lost counter for the async subset.
-            // Tracking per-record durability mode would be cleaner but
-            // requires changing Batch::records; the always-truncate
-            // approach is the simpler correct fix the spec requested.
+            // v24 FIX (Group 1, Fix 4), corrected by CKV-004: rollback
+            // truncation policy. This block previously claimed "the
+            // has_async flag is no longer used to gate truncation" while
+            // the rollback below keyed on exactly has_async — a stale
+            // comment contradicting the code, which is how the D2
+            // violation it describes stayed invisible. The ACTUAL policy
+            // (the rollback site carries the full rationale): truncate
+            // whenever no caller can have acked — any WRITE-stage failure
+            // (`written` never published) of ANY class, and any failure of
+            // a Sync/Group batch; the single no-truncate branch is a
+            // published-written ASYNC batch that failed at the FSYNC
+            // stage, whose waiters already returned Committed under the
+            // documented silent-loss contract (records kept; the loss is
+            // debited to async_committed_then_lost).
             bool leader_threw = false;
             std::exception_ptr leader_ep = nullptr;
             off_t batch_start = 0;
@@ -3990,7 +3995,7 @@ public:
 
                 CKV_CRASH_POINT("wal_after_write");
                 lk.lock();
-                if (io_ok) { batch->written = true; batch_cv_.notify_all(); }
+                if (io_ok) { batch->written.store(true, std::memory_order_release); batch_cv_.notify_all(); }
                 lk.unlock();
 
                 // v25.1 M2: if io_uring was used (write+fsync as a chain),
@@ -4049,20 +4054,50 @@ public:
                 // is documented where it is implemented.
                 CKV_CRASH_POINT("wal_before_rollback");
                 if (!io_ok && batch_start >= 0) {
-                    if (batch->has_async.load(std::memory_order_relaxed)) {
-                        // All records in this batch are Async. Per the
-                        // documented contract, async commits that
-                        // returned Committed MUST stay present after
-                        // restart (they accepted silent loss at commit
-                        // time). Do NOT truncate. Debit the loss
-                        // counter for diagnostics.
+                    // CKV-004 (invariant D2): gate the rollback on the
+                    // failure STAGE, not the durability CLASS. `written`
+                    // is published right after a successful WRITE stage;
+                    // async waiters are released on it and return
+                    // Committed before the fsync even runs. So
+                    // `written && has_async` is exactly the set of cases
+                    // in which some caller may have ACKED this batch —
+                    // the only case where truncation would violate the
+                    // documented silent-loss contract. The old gate
+                    // keyed on has_async alone: on a WRITE-stage failure
+                    // of an async batch (written never published), every
+                    // waiter — async ones included — exited with
+                    // WalFailure and had its cts burned, yet the
+                    // (partially) written frames survived in the file
+                    // and recovery replayed every CRC-valid one:
+                    // transactions whose callers observed WalFailure
+                    // silently resurrected on the next open (D2
+                    // violated; the audit PoC drove it with an
+                    // RLIMIT_FSIZE EFBIG mid-batch), and the diagnostic
+                    // debit counted never-acknowledged records as
+                    // async_committed_then_lost.
+                    if (batch->written.load(std::memory_order_acquire) &&
+                        batch->has_async.load(std::memory_order_relaxed)) {
+                        // FSYNC-stage failure after async acks: records
+                        // MUST stay present after restart (the callers
+                        // accepted silent loss at commit time). Do NOT
+                        // truncate; debit the loss counter for
+                        // diagnostics. Batches are single-class (the XOR
+                        // separation at batch selection), so has_async
+                        // implies every record is async — the
+                        // whole-batch debit is exact.
                         diag::async_committed_then_lost.fetch_add(batch->records.size(),
                                                                   std::memory_order_relaxed);
                         i_async_lost.fetch_add(batch->records.size(), std::memory_order_relaxed);
                     } else {
-                        // All records in this batch are Sync/Group.
-                        // Truncate to remove the failed batch from the
-                        // WAL so it doesn't resurrect on recovery.
+                        // WRITE-stage failure (written never published —
+                        // no caller can have acked, REGARDLESS of class:
+                        // async waiters gate on `written` too), or an
+                        // FSYNC-stage failure of a Sync/Group batch
+                        // (waiters block on `done` and are never
+                        // released by `written`): every caller observes
+                        // WalFailure. Truncate to remove the failed
+                        // batch from the WAL so it doesn't resurrect on
+                        // recovery.
                         diag::wal_truncations.fetch_add(1, std::memory_order_relaxed);
                         i_wal_truncations.fetch_add(1, std::memory_order_relaxed);
                         if (ftruncate(active_fd_, batch_start) != 0) {
@@ -4191,7 +4226,7 @@ public:
     }
 
     bool ok = need_fsync ? (my_batch->done && !my_batch->failed)
-                         : my_batch->written;
+                         : my_batch->written.load(std::memory_order_acquire);
 
     if (!ok) return {1, ts};
     return {reserve_conflict ? 2 : 0, ts};

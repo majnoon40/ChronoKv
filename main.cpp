@@ -729,6 +729,188 @@ static int run_v26_durability_tests() {
         report("v26 M0 / D2b: WalFailure'd batch absent after unclean process death", ok, fr);
     }
 
+#ifdef CKV_IOURING_DISABLED
+    // ---- d2-async-write-stage (CKV-004): an async batch that fails at the
+    // ---- WRITE stage must truncate exactly like the sync path ----
+    //
+    // The old rollback gate keyed on has_async — a durability CLASS marker.
+    // On a write-stage failure (the pwrite/io_uring write fails; `written`
+    // is never published) EVERY waiter of an async batch — async ones
+    // included — exits with WalFailure and has its cts burned, yet the gate
+    // skipped the truncation: surviving CRC-valid frames replayed on the
+    // next open, resurrecting transactions whose callers observed
+    // WalFailure (invariant D2 violated), and the diagnostic debit counted
+    // never-acknowledged records as async_committed_then_lost. The fixed
+    // gate keys on the failure STAGE (written && has_async).
+    //
+    // Legs 1 and 3 inject WriteFail, which fires in the pwrite_all WAL
+    // fallback (CKV-018 hooks) — hence the CKV_IOURING_DISABLED guard: on
+    // native-uring builds the charge cannot reach the uring write path (a
+    // real-kernel CQE hook is deferred per the remediation spec), and the
+    // legs print an honest SKIP instead of passing vacuously.
+    //
+    // Leg 1 (write stage, ASYNC): 8 threads × one distinct key. Expected
+    // post-fix: every WalFailure'd key ABSENT after close+reopen; every
+    // PRESENT key returned Committed; the rollback truncated
+    // (wal_truncations delta >= 1); async_committed_then_lost NOT debited
+    // (nothing was acknowledged). Pre-fix the debit and the missing
+    // truncation each fail the leg — fail-first on the two adjacent
+    // defects even when the injected failure writes zero bytes.
+    {
+        const std::string wd = "/tmp/ckv_v28_d2aws_write";
+        std::filesystem::remove_all(wd);
+        bool ok = true;
+        std::string fr;
+        const uint64_t lost0 = diag::async_committed_then_lost.load();
+        const uint64_t trunc0 = diag::wal_truncations.load();
+        std::vector<TxnResult> res(8, TxnResult::InvalidState);
+        int wal_failures = 0;
+        {
+            ChronoKV kv(wd); kv.start_gc();
+            kv.set_durability(DurabilityMode::Async);
+            (void)kv.commit("warm", "w");   // lazy segment/MANIFEST creation —
+                                            // a write_all caller that must not
+                                            // consume the WAL-path charge
+            std::atomic<bool> go{false};
+            std::vector<std::thread> ths;
+            fault::arm(fault::Kind::WriteFail, 1);
+            for (int t = 0; t < 8; ++t) ths.emplace_back([&, t] {
+                while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+                res[t] = kv.commit("k" + std::to_string(t), "v" + std::to_string(t));
+            });
+            go.store(true, std::memory_order_release);
+            for (auto& th : ths) th.join();
+            bool fired = fault::remaining.load() == 0;   // sample BEFORE disarm
+            fault::disarm();
+            if (!fired) { ok = false; fr = "WriteFail charge never fired (vacuous leg)"; }
+        }
+        for (auto r : res) if (r == TxnResult::WalFailure) ++wal_failures;
+        if (wal_failures == 0 && ok) { ok = false; fr = "no WalFailure observed"; }
+        {
+            ChronoKV kv2(wd); kv2.recover(wd);
+            for (int t = 0; t < 8; ++t) {
+                auto v = kv2.read("k" + std::to_string(t));
+                if (res[t] == TxnResult::WalFailure && v) {
+                    ok = false;
+                    fr = "RESURRECTED: k" + std::to_string(t) +
+                         " returned WalFailure but is present after reopen";
+                }
+                if (res[t] == TxnResult::Committed && (!v || *v != "v" + std::to_string(t))) {
+                    ok = false;
+                    fr = "acked key k" + std::to_string(t) + " lost on reopen";
+                }
+            }
+        }
+        const uint64_t lost_d = diag::async_committed_then_lost.load() - lost0;
+        const uint64_t trunc_d = diag::wal_truncations.load() - trunc0;
+        if (lost_d != 0 && ok) {
+            ok = false;
+            fr = "async_committed_then_lost debited " + std::to_string(lost_d) +
+                 " for never-acknowledged records";
+        }
+        if (trunc_d == 0 && ok) { ok = false; fr = "write-stage rollback did not truncate"; }
+        report("v28 / d2-async-write-stage: async WRITE-stage failure truncates (no resurrection, no lost-debit)", ok, fr);
+    }
+    // Leg 2 (fsync stage, ASYNC — companion contract, UNCHANGED by the fix):
+    // async waiters are released on `written` BEFORE the fsync runs, so they
+    // return Committed; the records must be KEPT (the documented silent-loss
+    // contract — D2a's async sibling), present after a clean reopen, and the
+    // loss debited to async_committed_then_lost for the failed batch.
+    {
+        const std::string wd = "/tmp/ckv_v28_d2aws_fsync";
+        std::filesystem::remove_all(wd);
+        bool ok = true;
+        std::string fr;
+        const uint64_t lost0 = diag::async_committed_then_lost.load();
+        std::vector<TxnResult> res(8, TxnResult::InvalidState);
+        {
+            ChronoKV kv(wd); kv.start_gc();
+            kv.set_durability(DurabilityMode::Async);
+            (void)kv.commit("warm", "w");
+            std::atomic<bool> go{false};
+            std::vector<std::thread> ths;
+            fault::arm(fault::Kind::FsyncFail, 1);
+            for (int t = 0; t < 8; ++t) ths.emplace_back([&, t] {
+                while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+                res[t] = kv.commit("k" + std::to_string(t), "v" + std::to_string(t));
+            });
+            go.store(true, std::memory_order_release);
+            for (auto& th : ths) th.join();
+            bool fired = fault::remaining.load() == 0;   // sample BEFORE disarm
+            fault::disarm();
+            if (!fired) { ok = false; fr = "FsyncFail charge never fired (vacuous leg)"; }
+        }
+        int acks = 0;
+        for (auto r : res) if (r == TxnResult::Committed) ++acks;
+        if (acks == 0 && ok) { ok = false; fr = "no async commit was acknowledged"; }
+        {
+            ChronoKV kv2(wd); kv2.recover(wd);
+            for (int t = 0; t < 8; ++t) {
+                auto v = kv2.read("k" + std::to_string(t));
+                if (res[t] == TxnResult::Committed && (!v || *v != "v" + std::to_string(t))) {
+                    ok = false;
+                    fr = "ACKED key k" + std::to_string(t) + " absent after reopen (silent-loss contract broken)";
+                }
+            }
+        }
+        const uint64_t lost_d = diag::async_committed_then_lost.load() - lost0;
+        if (lost_d == 0 && ok) { ok = false; fr = "fsync-stage async loss was not debited"; }
+        report("v28 / d2-async-write-stage (fsync companion): acked async records kept and debited on FSYNC-stage failure", ok, fr);
+    }
+    // Leg 3 (sync control): identical write-stage injection under Sync
+    // durability — the truncation behaviour leg 1 demands symmetry with
+    // (and the pre-fix baseline that proved the asymmetry was exactly the
+    // has_async gate): WalFailure'd keys absent, truncation fires, zero
+    // resurrections.
+    {
+        const std::string wd = "/tmp/ckv_v28_d2aws_sync";
+        std::filesystem::remove_all(wd);
+        bool ok = true;
+        std::string fr;
+        const uint64_t trunc0 = diag::wal_truncations.load();
+        std::vector<TxnResult> res(8, TxnResult::InvalidState);
+        int wal_failures = 0;
+        {
+            ChronoKV kv(wd); kv.start_gc();
+            kv.set_durability(DurabilityMode::Sync);
+            (void)kv.commit("warm", "w");
+            std::atomic<bool> go{false};
+            std::vector<std::thread> ths;
+            fault::arm(fault::Kind::WriteFail, 1);
+            for (int t = 0; t < 8; ++t) ths.emplace_back([&, t] {
+                while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+                res[t] = kv.commit("k" + std::to_string(t), "v" + std::to_string(t));
+            });
+            go.store(true, std::memory_order_release);
+            for (auto& th : ths) th.join();
+            bool fired = fault::remaining.load() == 0;   // sample BEFORE disarm
+            fault::disarm();
+            if (!fired) { ok = false; fr = "WriteFail charge never fired (vacuous leg)"; }
+        }
+        for (auto r : res) if (r == TxnResult::WalFailure) ++wal_failures;
+        if (wal_failures == 0 && ok) { ok = false; fr = "no WalFailure observed"; }
+        {
+            ChronoKV kv2(wd); kv2.recover(wd);
+            for (int t = 0; t < 8; ++t) {
+                auto v = kv2.read("k" + std::to_string(t));
+                if (res[t] == TxnResult::WalFailure && v) {
+                    ok = false;
+                    fr = "RESURRECTED: k" + std::to_string(t) + " (sync control)";
+                }
+                if (res[t] == TxnResult::Committed && (!v || *v != "v" + std::to_string(t))) {
+                    ok = false;
+                    fr = "acked key k" + std::to_string(t) + " lost on reopen (sync control)";
+                }
+            }
+        }
+        const uint64_t trunc_d = diag::wal_truncations.load() - trunc0;
+        if (trunc_d == 0 && ok) { ok = false; fr = "sync write-stage rollback did not truncate"; }
+        report("v28 / d2-async-write-stage (sync control): write-stage failure truncates, zero resurrections", ok, fr);
+    }
+#else
+    std::cout << "   d2-async-write-stage: SKIPPED (native io_uring build; WAL-write CQE fault hook deferred per remediation spec)\n";
+#endif  // CKV_IOURING_DISABLED
+
     // ---- D3: every durability result on the rotation path must fail-stop ----
     //
     // DETECTORS. maybe_rotate_segment() discarded four durability results
