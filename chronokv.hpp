@@ -11755,7 +11755,17 @@ private:
                 cand.push_back({std::move(k), last_page});
                 spliced = true;
             } else {
-                cand.push_back({std::move(k), slots[i].child_page_id});
+                // Copy the packed child id into an aligned local BEFORE
+                // building the pair: std::pair's converting ctor binds a
+                // const PageId& to its argument, and InteriorSlot is
+                // #pragma pack(1) — child_page_id (uint64 at slot offset 4)
+                // sits at 4-mod-8 for even i, so binding a reference to it
+                // is alignment UB. Harmless at runtime on x86, fatal under
+                // the asan+ubsan job's -fno-sanitize-recover=undefined
+                // (run #31). By-value reads/writes of the packed member
+                // are fine; only reference binding is not.
+                const PageId cid = slots[i].child_page_id;
+                cand.push_back({std::move(k), cid});
             }
         }
         if (!spliced && rightmost == orig_child) {
