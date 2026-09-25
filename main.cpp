@@ -11902,6 +11902,104 @@ static int run_remediation_tests() {
               ckv012_body, 60000,
               "orphaned cts stalls the published prefix; every later commit hangs at the barrier");
 
+    // ---- CKV-006: stream truncated at the first tombstone ----
+    // (stream-tombstone-differential). ChronoKVRangeScanCursorState cached
+    // exactly one (key, value) pair; a key invisible at the stream's
+    // snapshot (tombstone — and tree_->erase is never called, so
+    // tombstones are permanent) landed in the cache as (key, nullopt),
+    // and stream_has_next read that as end-of-stream: every key after the
+    // first deleted one in the range was silently dropped, while the
+    // vector range_scan skipped invisible keys correctly — the two public
+    // scan surfaces disagreed. Differential test: stream output ==
+    // vector output == the visible set computed independently from the
+    // operation log, over ranges shaped to hit each truncation mode:
+    // (a) first key deleted, (b) all-tombstone range, (c) mid-range
+    // tombstone, (d) empty and full-universe ranges.
+    static int (*const ckv006_body)() = +[]() -> int {
+        using namespace chronokv;
+        const std::string wd = "/tmp/ckv_ckv006_" + std::to_string(getpid());
+        uint64_t s = 0x5EED06ULL;   // fixed seed
+        auto lcg = [&] { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return s >> 33; };
+        auto keyname = [](int i) { char b[8]; snprintf(b, sizeof b, "k%02d", i); return std::string(b); };
+        const std::pair<const char*, const char*> ranges[] = {
+            {"k10", "k20"},   // (a) first key deleted
+            {"k30", "k35"},   // (b) entirely tombstones
+            {"k40", "k50"},   // (c) tombstone in the middle
+            {"k99", "k99"},   // (d) empty range
+            {"k00", "k63"},   // (d) full universe
+            {"k21", "k29"},   // random-content control
+        };
+        for (int iter = 0; iter < 5; ++iter) {
+            std::filesystem::remove_all(wd);
+            Options o;
+            o.wal_dir = wd;
+            o.auto_start_gc = false;
+            auto db = Database::open(o);
+            std::map<std::string, std::optional<std::string>> logv;   // op log -> expected
+            std::vector<bool> present(64, false);
+            // Forced keys so every range shape exists, then random fill to
+            // a 20-50-key set.
+            for (int i = 10; i <= 20; ++i) present[i] = true;
+            for (int i = 30; i <= 35; ++i) present[i] = true;
+            for (int i = 40; i <= 50; ++i) present[i] = true;
+            int target = 28 + (int)(lcg() % 23);           // 28..50
+            int have = 28;
+            while (have < target) {
+                int i = (int)(lcg() % 64);
+                if (present[i]) continue;
+                present[i] = true;
+                ++have;
+            }
+            for (int i = 0; i < 64; ++i) {
+                if (!present[i]) continue;
+                std::string k = keyname(i), v = "v" + std::to_string(iter) + "_" + std::to_string(i);
+                if (db.put(k, v) != Status::OK) { db.close(); return 10; }
+                logv[k] = v;
+            }
+            // Forced tombstones for the shapes + a random 25% erase.
+            auto do_erase = [&](const std::string& k) { (void)db.erase(k); logv[k] = std::nullopt; };
+            do_erase(keyname(10));                          // (a)
+            for (int i = 30; i <= 35; ++i) do_erase(keyname(i));   // (b)
+            do_erase(keyname(42));                          // (c)
+            for (int i = 0; i < 64; ++i) {
+                if (!present[i] || !logv[keyname(i)].has_value()) continue;
+                if (lcg() % 4 == 0) do_erase(keyname(i));
+            }
+            // Differentials, quiesced (both surfaces resolve the same snapshot).
+            for (auto& [lo, hi] : ranges) {
+                std::vector<std::pair<std::string, std::string>> expected;
+                for (auto& [k, v] : logv)
+                    if (v.has_value() && k >= lo && k <= hi) expected.emplace_back(k, *v);
+                auto vec = db.range_scan(lo, hi);
+                if (vec != expected) {
+                    fprintf(stderr, "iter %d range %s..%s: vector scan diverged (%zu vs %zu)\n",
+                            iter, lo, hi, vec.size(), expected.size());
+                    db.close(); return 11;
+                }
+                Database::RangeScanStream st(db, lo, hi);
+                std::vector<std::pair<std::string, std::string>> streamed;
+                while (st.has_next()) streamed.push_back(st.next());
+                if (streamed != expected) {
+                    fprintf(stderr, "iter %d range %s..%s: STREAM diverged (%zu vs %zu",
+                            iter, lo, hi, streamed.size(), expected.size());
+                    if (!streamed.empty() && !expected.empty())
+                        fprintf(stderr, ", stream last=%s expected last=%s",
+                                streamed.back().first.c_str(), expected.back().first.c_str());
+                    fprintf(stderr, ")\n");
+                    db.close(); return 12;
+                }
+                for (size_t i = 1; i < streamed.size(); ++i)
+                    if (!(streamed[i - 1].first < streamed[i].first)) { db.close(); return 13; }
+            }
+            db.close();
+        }
+        std::filesystem::remove_all(wd);
+        return 0;
+    };
+    run_child("remediation CKV-006: stream skips tombstones — stream == vector == snapshot-visible set (stream-tombstone-differential)",
+              ckv006_body, 120000,
+              "stream truncates at the first tombstone; every later key in the range is silently dropped");
+
     // ---- CKV-003c: checkpoint dirty-coverage validation (ckpt-dirty-coverage) ----
     // Simulated index divergence: a dirty key's entry vanishes from the
     // serialized snapshot. Pre-fix the incremental checkpoint silently

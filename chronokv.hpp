@@ -12362,15 +12362,31 @@ struct ChronoKVRangeScanCursorState {
     }
 
     void advance() {
-        if (cursor.valid()) {
+        // CKV-006: SKIP invisible entries instead of caching them as
+        // (key, nullopt). The one-shot cache-and-step left a tombstone (or
+        // any key not visible at effective_ts) in the cache with
+        // cached_val == nullopt, and stream_has_next's
+        // `cached_valid && cached_val.has_value()` read that as
+        // end-of-stream: iteration stopped at the first deleted key and
+        // EVERY later key in [lo, hi] was silently dropped. Because
+        // tree_->erase is never called (no page reclamation — README
+        // limitation), tombstones accumulate forever, so any range
+        // containing a deleted key truncated its stream. This loop
+        // consumes invisible keys without surfacing them and returns only
+        // when a visible entry is cached or the cursor is exhausted —
+        // aligning the stream with the vector range_scan's pre-existing
+        // skip semantics (the de-facto contract of the shared scan
+        // surface). A null decode also yields nullopt and is skipped by
+        // the same loop — no special case.
+        while (cursor.valid()) {
             cached_key = cursor.key();
             KeyEntry* e = ChronoKV::decode_ptr(cursor.value());
             cached_val = kv.read_at_idx(effective_ts, e);
             cached_valid = true;
             cursor.next();
-        } else {
-            cached_valid = false;
+            if (cached_val.has_value()) return;
         }
+        cached_valid = false;
     }
 };
 
