@@ -9326,6 +9326,23 @@ public:
         Status commit() {
             auto eng = db_.api_engine();   // v25.8: race-free vs close()
             if (entries_.empty()) return Status::OK;
+            // v28 CKV-014: deterministic duplicate-key semantics. commit_txn
+            // rejects duplicate keys with InvalidTransaction and ZERO
+            // mutation, but this method used to clear entries_
+            // unconditionally after the attempt — silently consuming the
+            // rejected batch (an immediate second commit() then returned OK
+            // as an empty no-op). Pre-validate here: InvalidTransaction is
+            // returned with the batch LEFT INTACT so the caller can
+            // inspect/correct/clear() it. An ATTEMPTED commit (one that
+            // reaches the engine) consumes the batch regardless of its
+            // result — the pre-existing consume-on-attempt contract, now the
+            // only one.
+            {
+                std::set<std::string> seen;
+                for (const auto& e : entries_)
+                    if (!seen.insert(e.key).second)
+                        return Status::InvalidTransaction;
+            }
 #ifdef CHRONOKV_TEST_HOOKS
             // v27 M1 (batch recording): a Batch commit is a SYNCHRONOUS
             // multi-key write-only txn — recorded as Stage* + Commit under

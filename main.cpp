@@ -12282,6 +12282,40 @@ static int run_remediation_tests() {
         db.close();
     }
 
+    // ---- CKV-014: Batch duplicate-key validation is deterministic and non-consuming ----
+    // Invariant: a Batch whose write-set contains duplicate keys is rejected
+    // with Status::InvalidTransaction with ZERO mutation, and the batch is
+    // left INTACT for the caller to inspect/correct/clear — a failed
+    // validation must not silently consume it. Pre-fix: Batch::commit
+    // cleared entries_ unconditionally after the commit_txn attempt, so a
+    // rejected duplicate batch came back EMPTY and an immediate second
+    // commit() "succeeded" as a no-op — the API silently swallowed its own
+    // validation error.
+    {
+        Options o;
+        o.auto_start_gc = false;   // in-memory: the WAL is not involved
+        auto db = Database::open(o);
+        auto b = db.create_batch();
+        b.put("dup", "v1");
+        b.put("other", "vo");
+        b.put("dup", "v2");                   // duplicate key
+        Status s = b.commit();
+        check("remediation CKV-014: duplicate-key batch rejected with InvalidTransaction (batch-duplicate-deterministic)",
+              s == Status::InvalidTransaction);
+        check("remediation CKV-014: rejected batch is left INTACT (not silently consumed)",
+              b.size() == 3, "size=" + std::to_string(b.size()));
+        bool nothing_written = !db.get("dup").has_value() && !db.get("other").has_value();
+        check("remediation CKV-014: rejected batch mutated nothing", nothing_written);
+        // The intact batch stays usable: clear() then a valid commit on the
+        // SAME object must work.
+        b.clear();
+        b.put("dup", "v1");
+        b.put("other", "vo");
+        check("remediation CKV-014: after clear(), the same Batch object commits cleanly",
+              b.commit() == Status::OK && db.get("dup").value_or("") == "v1");
+        db.close();
+    }
+
     if (fails == 0) std::cout << "   REMEDIATION TESTS PASSED\n";
     else std::cout << "   REMEDIATION FAILURES: " << fails << "\n";
     return fails;
