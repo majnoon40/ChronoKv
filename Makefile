@@ -1,4 +1,5 @@
-# ChronoKV v25 build matrix — two-file project (chronokv.hpp + main.cpp).
+# ChronoKV build matrix — two-file project (chronokv.hpp + main.cpp).
+# (v28 doc fix: header said "v25" while the product shipped 0.27+.)
 # v25.1 M2 close: io_uring wrapper merged into chronokv.hpp at
 # [SECTION_2B_IO_URING]; chronokv_iouring.hpp no longer exists.
 #

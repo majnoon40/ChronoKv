@@ -2,8 +2,12 @@
 // tests/main.cpp — test executable for chronokv.
 //
 // Only this file is compiled. It pulls in the engine via chronokv.hpp.
-// chrono_kv_v20.cpp (the frozen v20 baseline) is NEVER compiled into
-// this target; the CMakeLists.txt enforces this with an ODR check.
+// This is a two-file project (chronokv.hpp + main.cpp) built by the
+// Makefile; there is no CMakeLists.txt. (v28 doc fix: the frozen
+// chrono_kv_v20.cpp baseline referenced here no longer exists in the
+// repository, and no second build target compiles it — the old
+// "CMakeLists ODR check" sentence described infrastructure that was
+// never in-tree.)
 //
 // BUILD MODES (v25 Step 0 integration):
 //   hooks-on  (-DCHRONOKV_TEST_HOOKS): full internal test suite runs.

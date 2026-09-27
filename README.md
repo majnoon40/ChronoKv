@@ -48,8 +48,9 @@ before the DST harness is green") is met.
   by reintroducing both historical bugs on scratch trees: the harness
   caught the C1 hang and the H3 SEGV every run.
 - **Crash-safe WAL** — CRC-checked, segmented (64 MiB) WAL with torn-tail
-  truncation, batch group-commit, and strict LSN gap/duplicate detection
-  on recovery.
+  truncation (interior corruption fails loud instead of being silently
+  cut), batch group-commit, per-segment LSN continuity validation, and
+  strict commit-timestamp gap/duplicate detection on replay.
 - **Three durability modes** — `Sync` (fsync per commit), `Group`
   (default; batched fsync, durable against power loss), `Async`
   (durable against process crash only).
@@ -258,8 +259,11 @@ inactive transaction), `Error` (engine failures), `NotYetImplementedError`.
 
 - Opening the same `wal_dir` twice concurrently throws (advisory `flock`
   inter-process guard).
-- Recovery verifies CRCs, truncates torn WAL tails, rejects LSN
-  gaps/duplicates, and validates the checkpoint chain.
+- Recovery verifies CRCs, truncates torn WAL tails (a tail of garbage at
+  EOF only — an interior hole with parseable records after it is CORRUPT
+  and fails loud, never silently truncated), validates per-segment LSN
+  continuity, rejects commit-timestamp gaps/duplicates on replay, and
+  validates the checkpoint chain.
 - Invariant **D2**: a batch for which any caller observed `WalFailure` is
   absent from the WAL after *any* crash, not merely after a clean restart —
   the rollback truncation is itself fsynced, so it cannot be undone by a

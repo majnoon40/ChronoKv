@@ -98,14 +98,24 @@
 //   Review's other notes: DST steal semantics — acknowledged as the
 //       documented bounded-patience limit (counted, logged); no change.
 //       await_published under shared checkpoint_mu_ — re-verified against
-//       current code: the barrier waits in the install tail with the
-//       per-key commit mutexes RELEASED (commit_locks RAII scope ends
-//       before before_publish) while checkpoint_mu_ is still held SHARED
-//       (commit_txn's outer ckpt_lk). Deadlock-freedom vs the writer-
-//       preferring rwlock is the v26.1 argument, intact at 4388: every
-//       thread holding a reserved cts acquired the shared lock BEFORE
-//       reserving, so a queued checkpoint writer can never block the
-//       lower-cts completions the barrier waits for. (The reviewer's note
+//       current code (v28 CKV-021: this description was STALE — it claimed
+//       the per-key commit mutexes were released before the barrier; they
+//       are NOT): the barrier waits in the install tail holding BOTH
+//       checkpoint_mu_ SHARED (commit_txn's outer ckpt_lk) AND the per-key
+//       commit mutexes (commit_locks' RAII scope spans the whole function).
+//       Deadlock-freedom rests on lock-before-reserve ordering: a thread
+//       acquires ALL of its key mutexes and the shared checkpoint lock
+//       BEFORE reserving its cts, and acquires no further locks after.
+//       For a waiter W (cts_W) and any thread T it waits for (cts_T <
+//       cts_W): T reserved before W, and had T and W held intersecting key
+//       sets, whichever acquired the shared key second would have blocked
+//       BEFORE its own reservation — impossible once both cts values
+//       exist in that order. Their held sets are therefore disjoint, T
+//       never blocks on W, and T's completion releases the barrier. Vs the
+//       writer-preferring rwlock: every thread holding a reserved cts
+//       already holds checkpoint_mu_ SHARED, so a queued exclusive
+//       checkpoint writer can never block the lower-cts completions the
+//       barrier waits for. (The reviewer's note
 //       was cut off mid-sentence and claimed no defect.)
 //
 // v26.3 SHIPPED (v27 M0 deterministic scheduler + v27 M1 completion):
@@ -4780,11 +4790,18 @@ public:
     // Cost is bounded: cts order = WAL order (group_append reserves under
     // batch_mu_), so by the time OUR records are durable every lower cts
     // is past its own WAL I/O and only its in-memory install/complete can
-    // be outstanding. No engine lock is held while waiting (mu_ is the
-    // cv's own mutex); deadlock-freedom vs checkpoint_mu_: every thread
-    // holding a reserved cts already holds checkpoint_mu_ SHARED
-    // (commit_txn acquires it before group_append), so no waiter can
-    // depend on a thread that a pending exclusive checkpoint blocks.
+    // be outstanding. Locks held while waiting (v28 CKV-021 — the old
+    // "no engine lock is held" claim was false): mu_ is only the cv's own
+    // mutex, but the CALLER (commit_txn's install tail) still holds
+    // checkpoint_mu_ SHARED and its per-key commit mutexes. Deadlock-
+    // freedom: (1) vs checkpoint_mu_ — every thread holding a reserved
+    // cts acquired the shared lock BEFORE reserving, so a queued exclusive
+    // checkpoint writer can never block the lower-cts completions this
+    // barrier waits for; (2) vs the per-key mutexes — lock-before-reserve
+    // ordering makes the held key sets of a waiter and any lower-cts thread
+    // it waits for DISJOINT (an intersecting acquisition would have blocked
+    // before the second reserver's cts existed), so no waited-for thread
+    // can block on the waiter's locks. Full argument in the header block.
     void await_published(uint64_t ts) {
         std::unique_lock<std::mutex> lk(mu_);
         cv_.wait(lk, [&] { return published_.load(std::memory_order_relaxed) >= ts; });
