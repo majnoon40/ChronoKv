@@ -1,5 +1,30 @@
 // chronokv.hpp — ChronoKV engine and public C++ API.
 //
+// v28.0 SHIPPED (v28 AUDIT REMEDIATION COMPLETE — the docs/request.txt
+// adversarial audit's CKV-001..021 findings plus the external review's
+// two platform defects): CKV-001/002/003/005/006/012/018 shipped as
+// individual fix commits over 0.27.0; this arc adds CKV-007 (observer
+// exceptions contained, never invert a commit result), CKV-008 (leaf
+// mutation epoch makes the OLC fence exact — Blocker 5's unambiguous
+// combined-epoch expression), CKV-009+CKV-015 (traced verification +
+// contract tests, no defect), CKV-010 (restore_pitr refuses dirty
+// destinations), CKV-011 (PITR opens strictly read-only on the source:
+// no lock file, no flock, no torn-tail repair, no .tmp sweep, backup
+// refused), CKV-013 (registered-file slot keyed on (dev,ino) — fd-number
+// reuse across rotation no longer targets the sealed segment), CKV-014
+// (duplicate-key batch rejected intact, not silently consumed), CKV-016
+// (async futures resolve to Status, never rethrow), CKV-017/021 (doc
+// truth: LSN claims, commit_locks/await_published locking), CKV-019
+// (interior-hole segments fail loud — no silent truncation of post-hole
+// records, no LSN reseed), CKV-020 (close called exactly once — no EINTR
+// retry fd-reuse hazard), review-F1 (io_uring availability = I/O ops
+// work: shared deep probe for the e2e SKIP gate + permanent degradation
+// after 3 consecutive CQE-level write failures), review-F2 (nested
+// wal_dir created recursively; uncreatable dirs report the real cause —
+// the README quick-start runs verbatim). Every fix ships with a
+// fail-first regression test in the remediation battery
+// (CKV_ONLY_REMEDIATION=1). See docs/CHANGELOG.md.
+//
 // v27.0 SHIPPED (v27 M3 — coverage aimed at error paths; THE V27 ARC IS
 // COMPLETE: M0 0.26.3, M1 start 0.26.1 / completion 0.26.3, M2 0.26.2,
 // M3 here):
@@ -8689,9 +8714,9 @@ namespace chronokv {
 // CKV_STRESS_SEED and the CKV_ONLY_CRASHFUZZ gate ship in main.cpp. No
 // engine changes; the dst runner swaps to the M0 deterministic scheduler
 // when M0 ships.
-static constexpr const char* CHRONOKV_VERSION = "0.27.0";
+static constexpr const char* CHRONOKV_VERSION = "0.28.0";
 static constexpr int CHRONOKV_VERSION_MAJOR = 0;
-static constexpr int CHRONOKV_VERSION_MINOR = 27;
+static constexpr int CHRONOKV_VERSION_MINOR = 28;
 // v25.7: PATCH was stale (said 2 while the string said 0.25.6). Kept in
 // lockstep with CHRONOKV_VERSION from here on.
 static constexpr int CHRONOKV_VERSION_PATCH = 0;

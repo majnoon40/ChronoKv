@@ -10,8 +10,18 @@ transactions with phantom detection, a paged B+ tree index, and
 io_uring-accelerated WAL writes — all in one header with no external
 dependencies.
 
-Current version: **0.27.0** (`CHRONOKV_VERSION` in `chronokv.hpp`) — the
-**v27 arc is complete**. The version's MINOR tracks the roadmap arc: the
+Current version: **0.28.0** (`CHRONOKV_VERSION` in `chronokv.hpp`) — the
+**v28 audit-remediation arc is complete**: all 21 findings of the
+`docs/request.txt` adversarial audit (CKV-001…CKV-021) plus the external
+review's two platform defects are resolved or verified-with-tests, each
+with a fail-first regression test in the remediation battery
+(`CKV_ONLY_REMEDIATION=1 ./build/release/test`). Highlights of the arc:
+byte-aware plan-before-mutate B+ tree splits with exact OLC mutation-epoch
+fences, loud failure on interior-hole WAL segments (no silent truncation,
+no LSN reseed), strictly read-only PITR opens, (dev,ino)-keyed io_uring
+registered files, contained observer/async exceptions, and an io_uring
+availability definition that matches reality on blocked-ops kernels. The
+**v27 arc** (0.27.0) shipped coverage aimed at error paths. The version's MINOR tracks the roadmap arc: the
 v26 arc (M0–M4) shipped across 0.25.4–0.25.8 plus patches 0.26.1–0.26.3,
 which also carried v27 M0–M2 (the `929cb00`/`6d8a13d` review responses,
 the deterministic scheduler with proven C1/H3 catch, the completed
@@ -230,7 +240,7 @@ g++ -std=c++20 -O2 -I. my_app.cpp -o my_app -lpthread
 | Batch | `create_batch()` → `put/erase/commit` | atomic write-set commit, cheaper than a transaction |
 | Async | `put_async/get_async/erase_async` | `std::future`-based; errors via `Result<T>` / `Status` |
 | Streams | `RangeScanStream::has_next/next` | incremental B+ tree cursor; per-page snapshot consistency |
-| Observers | `observe(prefix, callback)` | inline callbacks on the committing thread; fired by `put/erase/Batch::commit` **and `Transaction::commit`** (v25.7); `old_val` is always `nullopt` |
+| Observers | `observe(prefix, callback)` | inline callbacks on the committing thread; fired by `put/erase/Batch::commit` **and `Transaction::commit`** (v25.7); `old_val` is always `nullopt`; a throwing callback is **contained** (counted in diagnostics) and never inverts the commit result (v28 CKV-007) |
 | Backup | `backup(dest_dir)` / `verify_backup(dest_dir, reason*)` / `backup_cts(dest_dir)` | v26 M3; requires `checkpoint_path`; restore by opening `Options` against the copy |
 | PITR | `Options::pitr_as_of_cts` / `restore_pitr(src_wal, src_ckpt, dest, as_of)` | v26 M4; PITR opens are read-only; `restore_pitr` materializes a writable as-of DB in a fresh directory |
 | Diagnostics | `wal_stats/gc_stats/epoch_stats/health/published_watermark` | read-only snapshots of engine counters |
@@ -295,8 +305,14 @@ inactive transaction), `Error` (engine failures), `NotYetImplementedError`.
   reports level 1 with the mode — the WAL still holds records newer than
   the boundary, and appending after them would collide on cts. Use
   `restore_pitr()` to obtain a writable as-of database. A PITR open does
-  not modify the source directory at all (not even stale-delta cleanup —
-  that is left to a normal open).
+  not modify the source directory at all (v28 CKV-011: no lock file, no
+  writer flock, no torn-tail repair, no orphan-.tmp sweep, no stale-delta
+  cleanup — mutations are left to a normal open). Consequently an as-of
+  open does NOT serialize against the source's writer; opening a view of a
+  *live* directory races the writer's rotation and fails loud (never
+  silently wrong) if a segment disappears mid-replay — restore from a
+  backup copy or a quiesced directory. `restore_pitr` refuses a non-empty
+  destination (v28 CKV-010).
 - **PITR mid-window reconstructability (v26.1, review rank-1 fix)**:
   for `as_of` strictly between checkpoint boundaries, recovery applies the
   base plus every delta whose header cts `<= as_of` in full, then applies
