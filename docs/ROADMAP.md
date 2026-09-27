@@ -1,3 +1,823 @@
+# ChronoKV roadmap — v29 → v30: challenge the real databases
+
+Written 2026-09-27 against `main @ 3161c77` (**0.28.0**, the complete audit
+remediation arc, tagged). This document **supersedes** the previous v28/v29/v30
+sections of `docs/ROADMAP.md` (written 2026-09-17 against v25.3, *before* the
+adversarial audit). The v26/v27 history from that plan is preserved in the
+appendix at the end of this file. Every old-arc item is accounted for in the
+disposition table — nothing was silently dropped, which is itself a rule now
+(process overhaul, rule 3).
+
+**Revision 3 (2026-09-27).** Post-review citation-precision pass (external
+review round 2 — verdict *adopt after four one-line fixes*): the baseline
+hardware is correctly attributed (external-review dev sandbox on an
+io_uring-blocked 4.19 kernel, **not** a CI runner — rule 9); M3's pool-default
+cite is relabeled to the constructor parameter it quotes, cross-referencing
+the `Options` field; M5's handshake cite becomes a member-name anchor (the
+document's own rot rule); the `docs/` inventory sentence is corrected (the
+roadmap and changelog ARE in-tree); and the recovery re-insert estimate is
+tightened to uncontended-path arithmetic (conclusion unchanged: the
+sorted-build prerequisite stands). Adoption mechanics applied: the v26/v27
+history of the 2026-09-17 plan is preserved as this file's appendix. No
+structural changes; the revision-2 review-disposition table stands.
+
+**Revision 2 (2026-09-27).** The draft was externally reviewed — verdict
+*adopt after edits*. Every item of that review is accepted and incorporated:
+eight factual corrections (A1–A8), six technical-gap items (B1–B6), four
+feasibility items (C1–C4), four coherence items (D1–D4), plus the reviewer's
+suggestion to name the order-triple identity in M5's acceptance. The
+review-disposition table at the end maps every item to where it landed — rule 4
+applied to this document's own review.
+
+Adopting this document is itself a commit with mechanics: replace the old
+v28/v29/v30 sections **and** the in-tree progress row that still reads "v28
+M0–M4 (writer thread) / v29 / v30 | not started" (added with the 0.28.0
+release commit), keep the v26/v27 history, add the CHANGELOG entry in the same
+commit (rule 3), and link the disposition table from the README's Roadmap
+paragraph so "nothing was silently dropped" is discoverable, not merely true.
+
+Companion documents, in dependency order — **not yet in the tree** (of the
+audit-era documents `docs/` holds only `request.txt`, the original prompt,
+alongside the roadmap and changelog); committing them is v29 M0's
+deliverable zero:
+
+- **ChronoKV Full Adversarial Audit** (2026-09-23) — 21 findings, verdict D.
+  The event that re-prioritized the previous arc.
+- **ChronoKV Remediation Specification** (2026-09-24) — the 20-commit, 5-wave
+  fail-first fix plan. **Executed in full and shipped as 0.28.0.**
+- **This roadmap** — what "done being broken" buys: the structural overhaul
+  (v29) and a run at the incumbents (v30, 1.0.0).
+
+---
+
+## The challenge, stated honestly
+
+ChronoKV is a zero-dependency, single-header, single-process embedded
+key-value store. That niche has incumbents, and they are not soft targets:
+
+| | SQLite | LMDB | RocksDB | ChronoKV today (0.28.0) |
+| --- | --- | --- | --- | --- |
+| Deployment scale | billions | hundreds of millions | industry standard server-side | hobby/evaluation |
+| Correctness proof | TH3 + OSS-Fuzz + astronomical field exposure | long field history, simple core | huge field history, battle-tested | adversarial audit + fail-first battery + 4-config sanitizer matrix — *deep but young* |
+| Transactions | WAL mode: snapshot isolation; writers serialized | MVCC, single writer at a time | write-batch atomicity; SI via pessimistic/optimistic `TransactionDB` — not serializable | **SSI — serializable, write-skew-safe, multi-writer** |
+| Durability I/O | pwrite + fsync (portable) | mmap + msync | pwrite + fsync (pluggable env; io_uring on read paths) | **default-path io_uring write→fdatasync chains** — kernel deadline (`LINK_TIMEOUT`), registered-buffer/file ladder, 3-strike pwrite fallback |
+| Recoverable to a point in time | no (backup only) | no | yes (WAL + backups) | **yes — PITR is a first-class API** |
+| Memory at scale | page cache, transparent | virtual, sparse | block cache + memtables, tuned | **256 MiB monotonic pool — the credibility gap** |
+| Form factor | amalgamation, ubiquitous | small C lib | large library suite | **one header, zero dependencies** |
+
+Read that table twice and the strategy writes itself. ChronoKV will not
+out-test SQLite's field exposure in a decade, will not out-feature RocksDB's
+tuning surface in two, and should not try. What it can do — what this arc
+does — is close the one front where today it is not credible (memory and
+steady-state behavior at real scale), press the two fronts where it is
+already ahead of every incumbent in its class (transactional semantics and
+durability I/O), and convert the front nobody else publishes on (adversarial
+verification) from an event into a permanent, machine-checked property.
+
+Four fronts, four claims:
+
+1. **Trust, by construction.** SQLite proves correctness by volume of
+   testing and exposure. ChronoKV proves it by *construction*: every
+   canonical invariant machine-checked in CI, every audit published in-tree,
+   every fix born fail-first, power-loss semantics tested against a block
+   layer that actually lies. At 1.0: the most *verifiably* correct embedded
+   KV store, not the most *field-proven* one — the claim is checkable, and
+   the check ships with the product.
+2. **Serializable by default.** Every incumbent in the class stops short of
+   serializable: SQLite's WAL mode and LMDB serialize their writers, and
+   RocksDB's `TransactionDB` (pessimistic or optimistic) tops out at snapshot
+   isolation — SI, not SSI; write skew is not prevented. ChronoKV runs
+   concurrent serializable (SSI) transactions and, by v29's end, proves them
+   with a write-skew checker in CI.
+3. **fsync-per-commit at group-commit prices.** io_uring is not unique in
+   the class — RocksDB's POSIX env uses it on read paths — but no embedded KV
+   makes it the **default** WAL durability path. ChronoKV's is a hard-linked
+   write→fdatasync chain with a kernel-enforced deadline (`LINK_TIMEOUT`), a
+   registered-buffer/file ladder, and a runtime-degrading offset-pinned
+   pwrite fallback (0.28.0: deep availability probe + 3-strike CQE
+   degradation). With the v29 writer-thread rewrite, chained write+fsync
+   plus adaptive group commit is the throughput story: durable writes that
+   don't serialize the committers.
+4. **Real scale, bounded memory.** 100 million keys in bounded *memory* at
+   steady state — tree pool, version heap and reader slack, all three
+   budgeted: `page_pool_bytes` alone bounds only the B+ tree, while values
+   live in `Version` chains on the regular heap — with recovery in tens of
+   seconds and numbers published — or the other three claims don't matter,
+   because nobody who needs a *database* can deploy a monotonic memory
+   ceiling.
+
+What this roadmap does **not** claim, equally on purpose: no SQL, no
+multi-process, no replication, no cross-platform, no third-party compression,
+no bindings. The deferral table at the end survives the rewrite; "single
+header, zero dependencies, verifiably correct" is the product. The challenge
+is to make that product *competitive*, not to make it *bigger*.
+
+---
+
+## Where the project actually stands (0.28.0)
+
+The remediation arc is **complete**. All 21 audit findings are closed —
+17 fixed with fail-first regression tests, CKV-009 and CKV-015 traced and
+verified as non-defects with contract tests pinning the traced behavior,
+CKV-017/021 documentation corrected to match the code. Two platform defects
+from the external repository review (F1: io_uring availability probing,
+F2: nested `wal_dir` creation) landed alongside. The version identity
+defect the previous roadmap flagged as "the cautionary tale" is fixed the
+right way:
+
+```cpp
+// chronokv.hpp:8779 (0.28.0)
+static constexpr const char* CHRONOKV_VERSION = "0.28.0";
+```
+
+And the changelog that the header had referenced since the v22 arc but that
+never existed in-tree now exists, seeded with the full 0.28.0 entry plus
+backfilled history:
+
+```text
+// docs/CHANGELOG.md (0.28.0 entry, opening)
+The 21 findings of the docs/request.txt adversarial audit (CKV-001..021)
+plus the two platform defects from the external repository review (F1/F2).
+Every fix shipped with a fail-first regression test in the remediation
+battery (CKV_ONLY_REMEDIATION=1); "verified" findings ship contract tests
+that pin the traced behavior. No on-disk format changes anywhere in the arc.
+```
+
+Worth recording because it shapes v29: the implementer did not blindly
+transcribe the specification. CKV-004's fix re-scoped the rollback gate to
+the *failure stage* rather than the spec's durability-class predicate, with
+a documented silent-loss contract for the one surviving case (a published
+async batch failing at FSYNC keeps its records, counted in
+`async_committed_then_lost`). CKV-012 gained a Phase-2 hardening the spec
+implied but did not spell out (the burned cts also latches the WAL
+fail-stop, so an unrecoverable interior hole can never be written past).
+CKV-013 was fixed with `(st_dev, st_ino)` identity keying where the spec had
+recommended dead-path deletion — a strictly stronger outcome. This is what a
+healthy implementer looks like: the spec is the floor, review is the judge.
+
+What 0.28.0 did *not* do, and v29 inherits:
+
+- **The re-audit never ran.** The remediation is self-verified (its own
+  battery), not independently verified. `docs/audits/` does not exist yet.
+  v29 M0.
+- **The suite still carries vacuous tests** the audit enumerated beyond the
+  arc's scope (v17 GC-boundedness, v18 LSN-contiguity, `m2_phase1`'s
+  size-rotation admission, the 30 s soak's missing oracle). Partially
+  de-vacuated during the arc; not systematically. v29 M1.
+- **The structural debt is untouched**: the monotonic page pool
+  (`Options::page_pool_bytes`, 256 MiB default), `PagePool::free()` with no
+  *engine* callers (only the unit tests exercise it — `main.cpp:7580`,
+  `7602` — which keeps it compiling, not used), `is_hazardous()` with no
+  callers at all, no merge/rebalance, GC sweeps at O(N²/256), the
+  leader-election handshake in the WAL committer, one ~27k-line translation
+  unit — `chronokv.hpp` 13,178 + `main.cpp` 14,231 = 27,409 lines in a
+  single TU, and the README's and Makefile's "~17k" counts are stale too
+  (v30 M2 fixes all three) — that OOMs a 1 GiB container at `-O2`.
+- **The README's only performance number is an indictment — but the tree is
+  not as numberless as the README makes it look.** The suite's Phase-3
+  item-12 harness (`main.cpp:3344+`) prints *and gates* performance
+  baselines on every run: commit throughput at 1 and 4 threads, read latency
+  under writes, recovery rates — the last full run during the external
+  review, on a 2-CPU / 1 GiB **dev sandbox** (not a CI runner) whose 4.19
+  kernel blocked io_uring writes, at `-O1`: 21,083 / 42,719 commits/s,
+  838 ns mean read latency, 19.8 ms per 1k records recovered. Two caveats ride every table
+  v29 publishes: those numbers measure the **pwrite fallback** path — the
+  io_uring backend has never been benchmarked by the suite on this class of
+  machine — and the README publishes none of it. The async API at
+  **0.256× sync** (thread-per-op) remains the README's lone number. "You
+  preach measurement and publish no numbers" — the previous roadmap's own
+  words, still true of the README, no longer excusable by the tree.
+
+### Progress
+
+| Milestone | Status | Shipped as |
+| --- | --- | --- |
+| Adversarial audit (21 findings, verdict D) | **DONE** | 2026-09-23 report |
+| Remediation specification (5 waves, 20 commits) | **DONE** | 2026-09-24 report |
+| Wave 1 — CKV-001, 002, 003a/b/c, 005 | **DONE** | `9016918`…`f2843d0` |
+| Waves 2–5 — CKV-004…021 + F1/F2 + 012R | **DONE** | `1fe98b0`…`3161c77` |
+| 0.28.0 release (version + CHANGELOG + tag) | **DONE** | `ced3806`, tag `v0.28.0` |
+| v29 M0 — independent re-audit | not started | — |
+| v29 M1–M7 — overhaul + benchmark arena | not started | — |
+| v30 M0–M5 — the challenge, 1.0.0 | not started | — |
+
+---
+
+## Reading rules (kept, plus one new)
+
+The previous roadmap's rules were good rules; the audit proved their worth in
+the negative (its findings were, almost uniformly, code drifting from a
+documented claim — a "12 bytes" comment over an 8-byte struct, a sentinel
+documented as covering all keys). They are restated because the plan is
+weaker without them:
+
+- **No speculative work.** Each item is anchored to a measurement in-tree,
+  a README known limitation, a landed defect, or an incumbent's shipped
+  behavior. The arena items are anchored to the *absence* of numbers, which
+  is a measurement of a kind.
+- **Every fix ships with a test verified to fail against the unfixed code.**
+  Fail-first is now proven at arc scale — stated precisely: the battery is
+  ~25 scenarios / ~69 checks; every *defect-asserting* check was
+  fail-first-verified (two of them by temporary mutation: CKV-008's epoch
+  comparison, CKV-004R's rollback gate), while the deliberate controls
+  (torn-tail, outside-range phantom, fresh/empty-destination legs,
+  fresh-fence baseline) and the CKV-009/015 traced-verification contract
+  tests pass pre-fix *by design*, as their commits say.
+- **New invariants get canonical IDs**, extending R/I/D/E/P/B/T. v29 adds
+  P1; v30 M0 machine-checks the whole set.
+- **On-disk format changes require a documented migration rule before
+  implementation.** v29 M6 carries the arc's first (multi-version PITR
+  deltas).
+- **NEW — measured claims only.** No performance claim appears in the README
+  without a methodology, a hardware note, and a reproduction path. Numbers
+  that cannot be re-run do not get published. Regression gates beat
+  point-in-time victories: a number is a *budget*, not a trophy.
+
+Sizes are T-shirt guesses, not commitments: **S** ≈ days, **M** ≈ 1–2 weeks,
+**L** ≈ 3–6 weeks, **XL** ≈ a quarter. At those sizes the arithmetic is: v29
+≈ 7–9 serial months (M4 is the XL), v30 ≈ 5–6 more — **1.0.0 in roughly
+12–15 months, at the pace that shipped the 21-finding arc in five weeks**.
+That pace assumption is stated out loud so "ambitious" does not silently
+become "aspirational" around month four; if the pace halves, the plan
+re-sequences its milestones, it does not renegotiate its gates.
+
+Citations in this document prefer function-scope anchors over line numbers
+and carry an "as of 0.28.0" tag, because this repo proved three times in one
+arc that line-number citations rot (CKV-004's stale comment masked a
+durability bug; CKV-021 fixed two more).
+
+### Load-bearing constraints
+
+1. **The re-audit (v29 M0) lands before any rewrite.** v29 rewrites the most
+   concurrency-sensitive code in the engine. Doing that on self-verified —
+   not independently verified — remediation is the same gamble the audit
+   already collected on once.
+2. **The arena (v29 M1) lands before the rewrites it measures.** Their own
+   old rule, restated as constraint: *measure before predict*. The writer
+   thread, reclamation, and merge milestones each publish before/after
+   numbers against the same harness, or they didn't happen.
+3. **Catcher hardening (v29 M2) lands before the rewrites it guards.** The
+   v25.3 lesson: never validate a rewrite of race-hazard code with a harness
+   that cannot catch the bug class the rewrite creates.
+4. **The 1.0.0 gate is not negotiable.** 1.0.0 ships only on a clean
+   independent adversarial audit (verdict A/B+) *and* published benchmark
+   tables *and* the scale soak. A new Critical holds the release — that is
+   what the number is for.
+5. **Composition over duration.** Widen the composition of existing regimes
+   (crash-fuzz plans, DST scenarios, fault kinds) before inventing new
+   harnesses.
+
+---
+
+# v29 — The overhaul (0.29.0)
+
+Theme: close the credibility gap. Every structural weakness a real database
+would laugh at — the monotonic pool, the missing merge, the leader handshake,
+the O(N²) GC, the invisible benchmarks — gets closed or measured, in an
+order where each rewrite is guarded by catchers written before it and
+measured by an arena built before it. Three of the four subsystems are
+touched (page lifecycle, delete path, WAL committer); the verified-sound list
+(SSI validation ordering, group-commit semantics, epoch reclamation E1–E16,
+close-race lifecycle, PITR boundaries) is preserved, not redesigned.
+
+## M0 — Independent re-audit  **[S] [GATE]**
+
+**Anchor.** The audit's exit condition: verdict D was issued with a
+remediation path; the path's end must be verified, not assumed. 0.28.0's
+verification is self-verification (the battery it shipped with).
+
+**Work.** Deliverable zero, before the commission: commit the two companion
+documents this roadmap leans on — the audit report and the remediation
+specification — under `docs/audits/`. Neither is in the tree today (of the
+audit-era documents, `docs/` holds only `request.txt`, the input prompt),
+yet the 14-row invariant matrix, rule 8's probe
+IDs, and "verdict D" all cite them; until they land, a new contributor
+cannot verify half this document's references — a documentation-integrity
+failure of exactly the class the reading rules were written against. Then:
+commission an independent adversarial re-audit of 0.28.0 at the original's
+depth (code-read + PoC + verify, not checklist), with the remediation
+specification and its status table handed over as the map. Report committed
+under `docs/audits/2026-10-re-audit.md`. Any finding it produces is fixed
+fail-first *before* M3 starts — defects first, rewrites never.
+
+**Acceptance.** Zero Critical/High findings, verdict B or better. A Critical
+or High loops back to remediation before any rewrite milestone begins.
+
+## M1 — The benchmark arena  **[M] [MEASURE FIRST]**
+
+**Anchor.** The README contains no performance numbers — but the arena does
+not start from zero: the suite's Phase-3 item-12 harness (`main.cpp:3344+`)
+already prints and gates commit throughput, read latency under writes, and
+recovery rates on every run. The arena *extends an existing in-tree
+harness*. The caveat that rides every published table: current numbers
+measure the pwrite fallback path; the io_uring backend has never been
+benchmarked by the suite on this class of machine. Old-arc v30 M1's line
+still lands — "you preach measurement and publish no numbers" — but it
+indicts the README, not the tree.
+
+**Work.**
+1. `bench/arena.cpp` — a db_bench-style micro suite: fill sequential /
+   fill random, point read (random + zipfian), overwrite, short and long
+   range scans, delete-heavy churn, checkpoint-under-load, cold open /
+   recovery, memory-per-key at steady state. `fillseq`/`fillrandom`
+   deliberately isolate the **new-key rate** — every new key takes the
+   single global mutex in `ensure_index`'s slow path (`nm_`), the same
+   serialization the 100M-key soak and cold recovery will drive straight
+   through; the arena measures that bottleneck before the soak hits it, and
+   the `nm_` sharding decision is taken on its numbers. Memory-per-key is
+   measured at the **RSS level** — tree pool + version heap + reader slack,
+   not pool-only — because `page_pool_bytes` bounds only the B+ tree while
+   values live in `Version` chains on the regular heap, reclaimed by epoch
+   GC against the watermark and the oldest reader: nothing to do with the
+   pool.
+2. YCSB-style workloads A–F (workload mixes, not the framework): the same
+   six mixes re-expressed against the arena harness with the documented
+   record/request distributions.
+3. Vendored baselines, same harness, same hardware, methodology written
+   down once and applied identically: **SQLite** (WAL mode;
+   `synchronous=FULL` and `=NORMAL`), **LMDB** (defaults), **RocksDB**
+   (defaults + one tuned config) — each **version-pinned and build-cached**:
+   a cold vendored RocksDB build costs 10–20 minutes per CI run, and pinning
+   plus caching is what keeps the ledger's comparisons reproducible across
+   runner images. Baselines are benchmarks, not dependencies — they live
+   under `bench/third_party/`, never in the engine's include path.
+4. CI: nightly arena run on a fixed-spec runner, results appended to a
+   tracked `bench/results/` ledger; p50/p99/throughput deltas beyond noise
+   fail the job. The noise gate gets a statistical protocol, budgeted into
+   this milestone: per-metric noise bands calibrated from repeated baseline
+   runs, N-iteration medians, and an explicit re-run policy — otherwise the
+   first flaky red on a shared runner teaches the team to ignore the ledger,
+   and the ledger is the deliverable. This milestone also **names the soak
+   vehicle** — self-hosted runner, rolling chain of nightlies with persisted
+   state + aggregate verdict, or an offline rig with committed logs — that
+   M4 and v30 M1 depend on: GitHub Actions kills jobs at 6 h, and the
+   existing nightly DST already shards 8× to fit 4 h after runner variance
+   bit it once. The regression gate is the deliverable — the tables are
+   its output.
+
+**Acceptance.** `make arena` produces the six-table comparison; the README's
+performance section exists and links the methodology; the nightly ledger
+shows one full green week. No engine changes in this milestone — the
+yardstick is built before anything is measured against it.
+
+## M2 — Catcher hardening  **[M]**
+
+**Anchor.** Remediation spec §11: "lincheck's SSI blindness (no
+anti-dependency checker) … the checker itself is ROADMAP material." Plus the
+remaining audit-enumerated vacuous tests.
+
+**Work.**
+1. lincheck gains the SSI anti-dependency (write-skew) checker and a
+   synthetic write-skew anomaly battery — the checker that proves claim 2.
+2. The DST plan grammar grows merge/rebalance/cascade and
+   reclamation-retirement scenarios *before that code exists* — scenarios
+   written against the design; the implementation must survive them.
+3. De-vacuate the remainder: v17 GC-boundedness, v18 LSN-contiguity,
+   `m2_phase1` size-rotation, the 30 s soak's oracle. Each upgraded test
+   proven once by temporary reversion in a scratch build.
+4. The crash-fuzz plan grammar composes GC sweeps, checkpoint, rotation and
+   merge windows (the v25.7 lesson, applied to the new surface).
+
+**Acceptance.** A synthetic write-skew history fails the new checker; every
+de-vacuated test fails against a reintroduction of its defect class; the
+merge/reclaim DST scenarios run green against the current (merge-free) tree.
+
+## M3 — Page reclamation  **[L]**
+
+**Anchor.** README known limitation #1 — `PagePool::free()` has no
+*engine* callers (the unit tests at `main.cpp:7580`, `7602` keep it
+compiling — the README limitation entry gets the same one-word fix when M3
+lands); `is_hazardous()` has no callers at all; the pool is a monotonic
+ceiling:
+
+```cpp
+// The engine-side ceiling: ChronoKV's constructor default parameter
+// (chronokv.hpp:5656, as of 0.28.0); the public Options::page_pool_bytes
+// field mirrors it at chronokv.hpp:8886.
+size_t page_pool_bytes = 256ULL * 1024 * 1024,   // 256 MiB default
+
+// the admission, as of 0.28.0 (chronokv.hpp:742)
+// is_hazardous() had zero call sites, so it protected nothing.
+```
+
+**Work.** Wire `PagePool::free()` and give the hazard-pointer machinery its
+consumers; retired pages return through the existing epoch reclaimer or
+generation-tagged page ids — the ABA (HP4) decision is made **before**
+implementation, per the old roadmap's own rule. CKV-008's page mutation
+epoch (landed in 0.28.0) is the stale-descent net for **live** pages: it
+detects in-place mutation of a still-valid page during fence validation. It
+does *not* by itself make page **reuse** safe — a freed and re-allocated
+PageId restarts its epoch near zero, so a pre-free captured fence can alias,
+which is exactly the ABA the HP4 decision exists for. Reuse safety comes
+from the hazard-pointer consumer plus generation-tagged page ids, decided
+before implementation (as this milestone already requires). Pool exhaustion
+surfaces through the 0.28.0 D4 latch semantics — one health model, not two;
+`stats()` gains pool utilization and high-water mark, `health()` degrades at
+80 % and fails at 95 %.
+
+**Acceptance.** Delete-then-reinsert workload: high-water mark stabilizes
+instead of ratcheting; TSan-clean; no use-after-free under ASan with reuse
+enabled; arena delete-churn table shows bounded memory.
+
+## M4 — Leaf merge and rebalance  **[XL]**
+
+**Anchor.** The same README limitation. Feasible *now* because 0.28.0 landed
+the plan-before-mutate byte-aware split planner — merges are its mirror
+image, sharing the capacity model.
+
+**Work.** Crabbing with exclusive latches on the delete path; sibling borrow
+vs. merge; interior key deletion; root collapse. The fence-recheck
+machinery already exists for splits.
+
+**New invariant.**
+> **P1** — under a sustained delete-heavy workload the page pool reaches
+> steady state with bounded utilization, with no use-after-free and no ABA.
+
+**Acceptance.** P1 under a 7-day soak (ASan/TSan interleaved) **on the soak
+vehicle named in M1** — GitHub Actions kills jobs at 6 h, so a literal
+7-day hosted job is not a thing that can exist: self-hosted runner, rolling
+nightly chain with persisted state + aggregate verdict, or offline rig
+with committed logs; concurrent cursor + concurrent merge clean under TSan
+*and* M2's DST scenarios; the differential-vs-`std::map` test passes with
+merges active; the arena's delete-churn and space-amplification tables
+move.
+
+## M5 — WAL writer thread  **[L]**
+
+**Anchor.** The most bug-dense concurrency code in the engine exists only
+because the leader role migrates between committer threads — the code that
+produced C1 and H3:
+
+```cpp
+// WalSegments' leader-election member block — the handshake's entire
+// state, verbatim (as of 0.28.0; the adjacent pending_/leader_active_
+// pair in WalSegments' private members — function-scope anchor per the
+// reading rules, line numbers deliberately not cited)
+std::deque<std::shared_ptr<Batch>> pending_;
+bool leader_active_ = false;
+```
+
+**Work.**
+1. The M1 arena baseline is the "before" column: throughput and
+   p50/p99/max at 1/2/4/8/16/32 committers, per durability mode.
+2. Dedicated writer thread + bounded MPSC queue; committers enqueue batch
+   descriptors and wait on per-batch completion. **Deletes**
+   `leader_active_`, the shared `cur_batch_` mutation, the
+   leader/follower handshake and the `pending_` FIFO — the code stops
+   existing; it does not get rewritten more carefully.
+3. Unlock what the handshake made illegal: `SINGLE_ISSUER`,
+   `DEFER_TASKRUN`, and `SQPOLL` worth its kernel thread; queue depth > 1
+   pipelines batches.
+4. Adaptive group-commit linger (`group_commit_linger_us`, default 0),
+   auto-tuned under load.
+5. Old path one release behind a compile flag, then deleted; the full
+   DST + crash-fuzz + fault matrix re-runs against the new path first.
+
+**Acceptance.** Arena "after" tables: no regression at any concurrency;
+measurable win at 8+ committers (the claim-3 gate: fsync-per-commit at
+group-commit prices); C1/H3-class reversion probes fail loudly; crash-fuzz
+green; dead code gone. The full matrix re-run that precedes deletion
+re-proves the triple identity **cts-order == WAL-order == phantom-order** —
+named explicitly here because it is the invariant most likely to break under
+a writer thread.
+
+## M6 — Space and steady state  **[M]**
+
+**Anchor.** README known limitations: GC sweep O(N²/256); observer
+reentrancy deadlock; incremental-checkpoint garbage. The v26.1 review's
+deferred direction 3; the old v30 M4 (WAL delta-encoding); the async API
+at 0.256× sync.
+
+**Work.**
+1. GC: persistent incremental tree cursor — a full sweep becomes O(N/256)
+   scan work, not O(N²/256).
+2. Incremental-checkpoint garbage: slab compaction reuse with a measured
+   space-amplification budget, published and tracked across releases.
+3. WAL delta-encoding (dependency-free), measured against that budget — in
+   only if it pays.
+4. Multi-version PITR deltas (v26.1 direction 3): every `(key, cts, value)`
+   version of the checkpoint window retained, making mid-window `as_of`
+   reconstructable after rotation. **The arc's first deliberate on-disk
+   format change**: delta format version bump + documented migration rule
+   before implementation — and the **GC coupling is in scope from day one**:
+   window versions must survive epoch GC to checkpoint time, a
+   GC-watermark interaction that is precisely why direction 3 was
+   deliberately not smuggled into a review-response commit. Format change,
+   migration rule, and GC coupling ship together or the item does not ship.
+5. Streaming recovery parse: `recover_all` currently slurps whole 64 MiB
+   segments into memory and sorts all records; the soak's open-after-kill
+   with a large WAL window multiplies that RAM spike. A small item with a
+   large worst-case payoff — measured at the soak's WAL-window sizes.
+6. Checkpoint stall at scale, measure-then-decide: `checkpoint_mu_`
+   exclusivity (the writer-preferring rwlock stalls commit reservation for
+   the checkpoint's duration) and the full-tree-walk base/rebase snapshot
+   (`tree_scan_all` when no dirty set) — at 100M keys the walk alone is
+   minutes, during which rotation cannot proceed and the recovery window
+   grows. The arena's checkpoint-under-load table decides: concurrent
+   checkpoint or bounded-walk deltas.
+7. Observer notification thread: callbacks leave the inline-under-lock
+   path (also the permanent home of the 0.28.0 observer-containment
+   semantics).
+8. Async API: worker pool **or removal** — decided by an arena table, not
+   taste. Shipping an async API slower than sync is a trap.
+
+**Acceptance.** Sweep cost linear at 10 M keys; space-amplification number
+published and within budget; the PITR format change carries its migration
+test; the async decision is an executed commit, not a discussion.
+
+## M7 — Release 0.29.0  **[S]**
+
+**Gate.** Delta re-audit (reclamation, merge, writer thread, format change)
+clean; P1 proven; arena tables re-run with no unexplained regressions;
+changelog complete; CHANGELOG/README/version all updated in the same
+commits they describe.
+
+---
+
+# v30 — The challenge (1.0.0)
+
+Theme: convert the overhauled engine into a *defensible* product: every
+property the audits verified by hand becomes machine-checked; every
+performance claim becomes a published, regression-gated table; the scale
+story gets a number a database person respects; and the version number
+means what it says.
+
+## M0 — Invariant machine-checking  **[M]**
+
+**Anchor.** The remediation specification ships a 14-row
+invariant-preservation matrix; the README documents the R/I/D/E/P/B/T sets.
+Today those are *argued*; at 1.0 they must be *checked*.
+
+**Work.** Every canonical invariant ID gets one of: a runtime checker, a CI
+job, or a reviewed checked-by-construction argument. The spec's matrix
+becomes a living test-plan document; the v27 M3 untested-error-lines ledger
+is driven to zero for the durability path; the docs gain the
+invariant→checker→job mapping table.
+
+**Acceptance.** Intentionally breaking any invariant in a scratch build
+fails at least one CI gate — proven once per invariant, recorded in the
+audit trail. This is claim 1 (trust by construction) made mechanical.
+
+## M1 — The scale soak  **[L]**
+
+**Anchor.** Front 4 of the challenge declaration. Real databases are
+deployed on multi-GB datasets; 0.28.0's README has never shown a workload
+above the suite's key counts.
+
+**Work.**
+1. **100 million keys** (16-byte keys, mixed 100 B/1 KiB values, ~11 TiB of
+   logical writes through churn): sustained insert + overwrite + delete mix
+   at pool sizes from 4 GiB to 64 GiB; publish the pool-high-water curve,
+   memory-per-key at the **RSS level** (tree pool + version heap + reader
+   slack — a pool-only number would be discounted by any database reviewer
+   the moment they read it), and steady-state space amplification.
+2. **Cold recovery**: open-after-kill at 10 M / 50 M / 100 M keys; recovery
+   throughput published; target ≤ 30 s at 100 M keys (regression-gated) — a
+   target that is **unreachable without a bulk-load / sorted-build recovery
+   path**: cold recovery re-inserts every checkpoint entry through
+   `ensure_index`'s slow path, taking the global `nm_` mutex per new key.
+   Even at optimistic uncontended rates — recovery inserts skip the WAL,
+   fsync and publication barrier that the 21k commits/s anchor pays —
+   100 M re-inserts are minutes-to-tens-of-minutes, not 30 seconds. The sorted-build path (checkpoint + WAL replay into a
+   pre-sized tree) is a *prerequisite* of this target, not an optimization,
+   and is listed here so the acceptance criterion cannot be silently
+   renegotiated mid-soak; the `nm_` sharding decision is measured by v29
+   M1's fill workloads and taken before this milestone ends.
+3. **24-hour arena soak** + 7-day steady-state variant under the nightly
+   ledger **on the soak vehicle named in v29 M1** (hosted CI jobs die at
+   6 h: self-hosted runner, rolling nightly chain with persisted state +
+   aggregate verdict, or offline rig with committed logs); p99 drift beyond
+   noise fails the job.
+4. Read-side budgets: point-read p50/p99 within 2× LMDB at 1 M keys
+   (regression-gated), single-writer commit throughput ≥ SQLite
+   `synchronous=FULL`, concurrent-commit throughput ≥ 2× SQLite WAL at 8
+   committers. Absolute parity is not the gate — *published, regressing
+   loudly when touched* is the gate. The tables decide where ChronoKV
+   genuinely stands, which is the point.
+
+**Acceptance.** The README performance section carries the 100 M-key table,
+the recovery table, and the three head-to-head tables with methodology;
+each is wired to the nightly ledger.
+
+## M2 — Build and release engineering  **[M]**
+
+**Anchor.** README known limitation: one ~27k-line translation unit —
+`chronokv.hpp` 13,178 + `main.cpp` 14,231 = 27,409 lines in a single TU;
+`-O2` needs >1 GiB RSS and is OOM-killed below that. (The README's and
+Makefile's "~17k" counts are stale; this milestone corrects all three.)
+
+**Work.** Split the sources and fix every line-count claim that touches
+them (README, Makefile, prior plans); generate the amalgamated single header
+as a *release artifact* (zero-dependency property preserved for embedders,
+repo buildable on small containers); reproducible builds (`sha256`-stable
+for a given commit); signed tags and release tarballs; the vendored
+baselines stay out of the artifact.
+
+**Acceptance.** A 1 GiB container builds the split repo at `-O2`; the
+amalgamated artifact passes the full suite including the arena smoke leg.
+
+## M3 — Power-loss truth  **[L]**
+
+**Anchor.** README known limitation, the audit agreed: "crash testing is
+not power-loss testing" — `_exit()` leaves the kernel page cache intact, so
+every crash-fuzz result validates the recovery state machine, not
+durability against a lying block layer.
+
+**Work.** A `dm-flakey`-based fault-injecting block layer wrapping the real
+database directory; crash-fuzz plan grammar extended with fsync-lies and
+device-lose-flush events; the D-invariant set finally tested against a
+layer that can actually violate it. `dm-flakey` needs root (fine — the
+runners have passwordless sudo) but loop devices + `dmsetup` on shared or
+nested-virt hosted runners are historically flaky-to-unavailable, so the
+**plan B is named in the milestone, not discovered mid-flight**:
+`scsi-debug` error injection, or a documented local VM rig with published
+logs plus a reduced CI leg; whichever vehicle runs, the
+fail-first-at-the-block-layer acceptance survives. This is the trust
+claim's missing leg: SQLite has TH3 and the field; ChronoKV will have
+*auditable hardware-level fault injection*.
+
+**Acceptance.** D2/D3/D4 detectors run against injected flush-loss; a
+deliberately weakened fsync fails the harness (fail-first, at the block
+layer); results published in the docs.
+
+## M4 — Documentation overhaul  **[M]**
+
+**Work.** A user guide beyond the README (open/close, transactions, PITR,
+backup, health, sizing the pool — the operator questions the audit raised);
+a failure-mode catalog — every `Status` and `health()` level with meaning
+and operator action; the safety-properties page updated to
+post-remediation, post-v29 truth; **the head-to-head page**: an honest
+"ChronoKV vs SQLite vs LMDB vs RocksDB" comparison maintained from the
+arena tables, strengths *and* losses, because a comparison page that only
+wins is marketing and everyone knows it.
+
+**Acceptance.** Docs build in CI; every public API symbol documented; every
+`Status` value in the catalog; the comparison page generated from the
+ledger, not hand-edited.
+
+## M5 — The 1.0.0 gate  **[S]**
+
+**Work.** The final independent adversarial audit, full depth, published
+in-tree. API/ABI freeze and the LTS policy (what gets backported, for how
+long). Semantic versioning from here forward — no more unbumped arcs, ever.
+
+**Acceptance (release gate).** Audit verdict **A or B+**; benchmark tables
+published and regression-gated (M1); every invariant machine-checked (M0);
+the failure-mode catalog complete (M4); the gate signed off in the
+changelog. A verdict below B+ holds the release — that is what the number
+is for.
+
+---
+
+# Old-arc disposition
+
+Every item of the previous v28/v29/v30 sections, accounted for:
+
+| Old item | New home | Note |
+| --- | --- | --- |
+| v28 (old) M0 — committer baseline | v29 M5 step 1 | Still first; now the arena's "before" column |
+| v28 (old) M1 — writer thread + MPSC | v29 M5 | Unchanged in substance |
+| v28 (old) M2 — io_uring unlock | v29 M5 | Rides single-issuer |
+| v28 (old) M3 — adaptive linger | v29 M5 | Measured post-rewrite |
+| v28 (old) M4 — delete old path | v29 M5 | One release behind a flag, matrix first |
+| v29 (old) M0 — surface the ceiling | v29 M3 | Exhaustion flows through the D4 latch |
+| v29 (old) M1 — merge & rebalance | v29 M4 | On 0.28.0's byte-aware planner |
+| v29 (old) M2 — HP consumers | v29 M3 | With reclamation |
+| v29 (old) M3 — ABA / HP4 | v29 M3 | Decide-before-build kept |
+| v30 (old) M0 — visitor scan | **PARKED** | Real, but below the challenge line; revisit post-1.0 |
+| v30 (old) M1 — bench in CI + numbers | v29 M1 + M4 | The arena, then the docs page |
+| v30 (old) M2 — async pool or remove | v29 M6 | Decided by an arena table |
+| v30 (old) M3 — rollback-on-destroy opt-in | **PARKED** | Reverses a documented deliberate decision; needs maintainer sign-off |
+| v30 (old) M4 — WAL delta-encoding | v29 M6 | Against the space-amp budget |
+| v30 (old) M5 — source split + amalgamation | v30 M2 | The 1 GiB OOM anchor kept |
+| v26.1 direction 3 — multi-version deltas | v29 M6 | First format change; migration rule |
+| (audit) lincheck SSI checker | v29 M2 | Before the rewrites it guards |
+| (audit) vacuous-test de-vacuation | v29 M2 | Systematic pass, remainder beyond the arc |
+| (this roadmap, prior draft) re-audit gate | v29 M0 | Promoted to the arc's first gate |
+| (new) YCSB / db_bench arena | v29 M1 | The challenge's yardstick |
+
+# Explicitly out of scope (kept)
+
+The previous deferrals survive the rewrite because they were correct:
+**Raft/replication** (a multi-version project of its own), **language
+bindings** (conflicts with single-header purity), **encryption at rest**
+(the embedder's filesystem layer), **multi-process / non-Linux**
+(documented limitations with real architectural cost), **third-party
+compression** (breaks the zero-dependency differentiator; delta-encoding
+gets most of the win), **SQL** (a different product; the comparison page
+says so plainly).
+
+One genuine strength to keep protecting: `cts` is a monotonic counter, not
+wall-clock — the entire clock-skew bug class does not apply. Do not
+introduce a wall-clock dependency anywhere in the durability path; it would
+open a bug class the project currently does not have.
+
+# Process overhaul (permanent rules)
+
+The audit's meta-finding, made policy — rules 1–8 proven by the 0.28.0 arc,
+9–10 new for the challenge arc:
+
+1. **Fail-first or it didn't happen.** Every fix ships with a test verified
+   to fail against the unfixed code.
+2. **Version identity.** Comments and `CHRONOKV_VERSION` ship in the same
+   commit. An arc that exists only in comments does not exist. 0.28.0
+   itself only acquired its identity at `ced3806` — roughly ten behavior
+   commits, some API-visible, had already landed before the version, tag
+   and changelog did. That is the incident this rule encodes; it is stated
+   here because the rule reads as preachy unless it owns the violation.
+3. **Changelog at merge time, not release time.** `docs/CHANGELOG.md`,
+   updated in the commit it describes. Superseded-roadmap items get a
+   disposition entry, never a silent drop.
+4. **Every accepted external finding gets an ID** — finding → spec →
+   commit → test, traceable end to end.
+5. **The reviewer checklist** (every PR): fail-first test present? Version
+   bumped if the arc advanced? Unrelated changes in the diff? Invariant
+   matrix updated? Changelog entry present? Known-limitations still true?
+6. **Composition over duration.** Widen existing regimes before inventing
+   new harnesses.
+7. **Known-limitation entries are written before the fix exists.** The
+   honest-docs culture the audit explicitly praised.
+8. **Refuted probes stay in the suite.** Of the audit's probes, only
+   **probe14** is referenced in-tree (the CKV-003b/D4 chain:
+   `chronokv.hpp:5353`, `6664`; `main.cpp:11806`); probe9 and probe15 live
+   in the audit report, which is exactly why M0's deliverable zero commits
+   it under `docs/audits/` — the probe-ID → shipped-test mapping must be
+   checkable from the tree, not from memory. A "fix" that makes a refuted
+   probe fail is reverting correctness.
+9. **Measured claims only.** No README performance claim without
+   methodology + hardware + reproduction path; regression-gated, published
+   in the ledger. Numbers are budgets, not trophies.
+10. **Baselines are benchmarks, not dependencies.** Vendored comparisons
+    live under `bench/third_party/`, never in the engine's include path;
+    the zero-dependency property is the product and survives the challenge.
+
+# Suggested first commit
+
+**v29 M0, the re-audit commission.** Zero code; maximal leverage. First
+commit the audit report and the remediation specification under
+`docs/audits/` (deliverable zero — it also makes this roadmap's probe-ID and
+verdict references checkable from the tree). Then hand an independent
+reviewer the 0.28.0 tag, the original audit, and the remediation
+specification's status table, and get the verdict that says the foundation
+is what the changelog claims — *before* a single line of the engine is
+rewritten on top of it. In the same window, stand up the arena skeleton
+(M1 step 1) so the yardstick exists before the first rewrite starts.
+Everything else in this arc is gated behind one of those two.
+
+---
+
+# External review disposition (revision 2)
+
+The draft was reviewed externally on 2026-09-27; verdict *adopt after
+edits*. Rule 4 applies to this document's own review: every accepted
+finding gets an ID and a traceable disposition. All items accepted, none
+rejected — and the review's "what is right — do not dilute" list (the
+ordering discipline, the delete-don't-rewrite posture for the leader
+handshake, the disposition table, the honest non-claims, rules 9–10, the
+1.0.0 hold) is preserved untouched by construction: the edits below
+tighten claims, they do not soften ambition.
+
+| ID | Finding (abridged) | Disposition in this revision |
+| --- | --- | --- |
+| A1 | RocksDB cell false — TransactionDB ships SI | Cell rewritten: "SI via pessimistic/optimistic TransactionDB — not serializable"; claim 2 restated to match |
+| A2 | "unique in class" overclaims io_uring | Cell + claim 3 now mechanism-specific: default-path write→fdatasync chains, `LINK_TIMEOUT` deadline, registered ladder, 3-strike fallback |
+| A3 | "~13k-line TU" undercounts 2× | 27,409 lines (13,178 + 14,231) stated; stale "~17k" README/Makefile counts assigned to v30 M2 |
+| A4 | "only performance number in the tree" false | Reframed: item-12 harness credited (21,083 / 42,719 commits/s, 838 ns, 19.8 ms/1k on the 2-CPU/1 GiB `-O1` box); fallback-path caveat carried into M1's anchor |
+| A5 | "24 battery tests, all fail-first" overstates | Precise wording: ~25 scenarios / ~69 checks; defect-asserting checks fail-first (two by mutation); controls + CKV-009/015 contract tests pass by design |
+| A6 | Rule 8 cites uncommitted probe IDs | Rule 8 rewritten around in-tree probe14 with line cites; audit committed as M0 deliverable zero |
+| A7 | Line-number citations rot | Function-scope anchors + "as of 0.28.0" tags throughout; rot rule added to the reading rules |
+| A8 | "PagePool::free() no callers" false literally | "No *engine* callers" + unit-test cites (`main.cpp:7580`, `7602`); README one-word fix noted for M3 |
+| B1 | `nm_` serialization unassigned; ≤ 30 s unreachable | New-key rate isolated in v29 M1 (`fillseq`/`fillrandom`); bulk-load / sorted-build recovery added as v30 M1 prerequisite; `nm_` sharding decision added |
+| B2 | "Bounded memory" bounds the wrong half | RSS-level budget (tree pool + version heap + reader slack) in claim 4, v29 M1 methodology, and v30 M1 item 1 |
+| B3 | M3 epoch sentence claims the wrong mechanism | Corrected: epoch = stale-descent net for live pages; reuse safety = HP consumer + generation-tagged ids (HP4), decided before implementation |
+| B4 | Checkpoint stall at scale never addressed | M6 item 6: measure-then-decide on `checkpoint_mu_` exclusivity + full-tree-walk base snapshot |
+| B5 | Recovery RAM spike unassigned | M6 item 5: streaming recovery parse, measured at the soak's WAL-window sizes |
+| B6 | M6.4 omits its hardest coupling | GC-watermark coupling in scope from day one; format change + migration rule + GC coupling ship together |
+| C1 | 6 h job limit vs 24 h / 7-day soaks | Soak vehicle named in v29 M1 item 4, cited by M4's and v30 M1's acceptance |
+| C2 | `dm-flakey` flaky on hosted runners | Plan B named in v30 M3: `scsi-debug` or local VM rig + published logs + reduced CI leg; fail-first acceptance kept |
+| C3 | Arena noise gates will flap | Statistical protocol in v29 M1 item 4: calibrated bands, N-iteration medians, re-run policy |
+| C4 | Vendored RocksDB build cost | Version-pinned + build-cached, in v29 M1 item 3 |
+| D1 | Companion docs load-bearing but not in repo | M0 deliverable zero commits audit + spec under `docs/audits/`; flagged in the header and the companion list |
+| D2 | Rule 2 should own 0.28.0's own violation | Incident sentence added: identity arrived at `ced3806`, ~10 behavior commits late |
+| D3 | ROADMAP.md integration mechanics unspecified | Adoption mechanics in the header: old sections + progress row replaced, v26/v27 kept, CHANGELOG entry in the same commit, README links the disposition table |
+| D4 | Pace assumption unstated | 12–15 months to 1.0.0 at the 5-week-arc pace, stated with the T-shirt sizes |
+| E2 | Name the order-triple in M5's acceptance | **cts-order == WAL-order == phantom-order** named in M5's acceptance |
+| E* | "What is right — do not dilute" | Ordering, delete-don't-rewrite, disposition table, non-claims, cts-monotonicity line, rules 9–10, 1.0.0 hold — all preserved verbatim in spirit |
+
+---
+
+# Appendix — the superseded 2026-09-17 plan (v26 → v27 history)
+
+> Kept verbatim per the active plan's adoption mechanics ("the v26/v27
+> history from that plan is preserved in the appendix at the end of this
+> file"). This plan's **v28/v29/v30 sections were superseded on
+> 2026-09-27** by the active plan above; every one of their items is
+> accounted for in the active plan's Old-arc disposition table (rule 3:
+> nothing is silently dropped), so those sections are not reproduced here.
+> The progress-table row for them is marked SUPERSEDED in place; everything
+> else below is unmodified history, including the v25.7 "load-bearing
+> constraint" note the active plan's ordering rules generalize.
+
 # ChronoKV roadmap — v26 → v30
 
 Written 2026-09-17 against `main @ 3929d25` (v25.3), following an external code
@@ -22,7 +842,7 @@ Progress:
 | adversarial review of `6d8a13d` (v26.3), **no version bump** (maintainer directive): **MEDIUM–HIGH** residual PITR hole — a key rewritten inside the mid-window whose WAL a later checkpoint rotated away reads absent-or-older at `as_of` (silently wrong; the v26.1 "documented residual limit" ranked as a defect). Fixed per the review's direction 1/2: filtered skips over an uncovered window now fail LOUD ("not reconstructable" + remedies) instead of serving a best-effort snapshot; the v26.1 fully-rotated-window open capability is deliberately traded away (indistinguishable on disk from the hole — both reviews accept loud failure over silent loss). Direction 3 (multi-version deltas) tracked below as the sound capability-recovery path | **DONE** | see below, `0.26.3` (unbumped) |
 | v27 M3 — coverage aimed at error paths: **DONE** — gcov build (`make coverage`), `CKV_COVERAGE_FAULT` forcing (per-kind, whole-run, independent of test-local arm/disarm; budget-bounded; fire counts echoed so vacuity is visible), `scripts/fault_coverage.py` publishing per-kind error-path coverage + UNIQUE per-kind contributions + the ledger of error-path lines NO run reaches; CI `coverage` job folded into `ci-passed` (PR vehicle: review gate per kind; nightly: full suite per kind + unforced headline run). First measurement already exposes the anchor's point: OpenFail/DirFsyncFail fire 0 times under the gate vehicle | **DONE** | see below, `0.27.0` |
 | v28 — AUDIT REMEDIATION (docs/request.txt adversarial audit, CKV-001..021) + external-review platform defects (F1 io_uring availability, F2 nested wal_dir): **DONE** — CKV-001/002(+Blockers 1-4)/003a-c/005/006/012/018 as individual fix commits over 0.27.0; CKV-007/008(+Blocker 5)/010/011/013/014/016/019/020 + F1/F2 fixed with fail-first tests; CKV-009/015 traced-verified with contract tests (no defect); CKV-017/021 documentation corrected. Shipped as `0.28.0` | see docs/CHANGELOG.md |
-| v28 M0–M4 (writer thread) / v29 / v30 | not started | — |
+| v28 M0–M4 (writer thread) / v29 / v30 | **SUPERSEDED 2026-09-27** by the active plan above | see its Old-arc disposition table |
 
 > **v25.7 note (the load-bearing constraint, re-confirmed).** H1 and H2 were
 > found by an outside reviewer *reading code and writing three-line repros* —
@@ -827,141 +1647,3 @@ is an untested line, and that is exactly where the last four bugs were.
 > the error paths it replaces.
 
 ---
-
-# v28 — Remove the leader-election handshake
-
-Theme: the most bug-dense code in the file exists only because the WAL leader role
-migrates between committer threads. Your own io_uring comment already names the fix.
-
-**Gated on v27.** Do not start before the DST harness is green.
-
-## M0 — Measure first  **[S]**
-
-Your own rule: measure before predict. Publish commit throughput and p50/p99/max latency
-at 1/2/4/8/16/32 concurrent committers, per durability mode, on the existing path.
-Without this baseline you cannot claim the rewrite helped, and you cannot detect a
-regression in it.
-
-## M1 — Dedicated writer thread + bounded MPSC queue  **[L]**
-
-Committers enqueue a batch descriptor and wait on a per-batch completion signal. One
-thread owns the ring for its lifetime. This **deletes** `leader_active_`, the shared
-`cur_batch_` mutation, the leader/follower handshake and the `pending_` FIFO — i.e. the
-exact code that produced C1 and H3. It does not get more careful; it stops existing.
-
-## M2 — Unlock the io_uring features you had to reject  **[M]**
-
-`SINGLE_ISSUER` and `DEFER_TASKRUN` become legal with one issuer; `SQPOLL` becomes
-worth its kernel thread because submits stop costing a syscall each. The ring is already
-sized 64/128, and queue depth > 1 finally lets you pipeline batches instead of waiting
-per batch.
-
-## M3 — Adaptive group-commit linger  **[M]**
-
-`group_commit_linger_us` (default 0 = no added latency), auto-tuned under load. Probably
-the largest throughput win available under concurrency, and trivial once one thread owns
-batching.
-
-## M4 — Delete the old path  **[S]**
-
-Keep it behind a compile flag for exactly one release, then remove. Re-run the *entire*
-DST + crash-fuzz + fault matrix against the new path before deleting anything.
-
----
-
-# v29 — Close the memory ceiling
-
-Theme: the binding constraint on real use. Pages are `aligned_alloc` RAM and never touch
-disk; `PagePool::free()` has no callers; the pool grows monotonically to `bad_alloc`.
-
-## M0 — Surface it before it is fatal  **[S]**
-
-Pool utilization and high-water mark into `stats()`; `health()` → degraded at 80%,
-failing at 95%; a clear `Status`/exception naming the cause instead of a bare
-`bad_alloc` from inside a `put()`. Cheap, and immediately useful even if M1 slips.
-
-## M1 — Leaf merge and rebalance  **[XL]**
-
-The real work. Crabbing with exclusive latches on the delete path, sibling borrow vs.
-merge, interior key deletion, root collapse. The fence-recheck machinery and latch
-crabbing already exist for splits — merges are the mirror image, which is the reason
-this is feasible at all.
-
-## M2 — Give the hazard pointers a consumer  **[M]**
-
-`HPRegistry::is_hazardous()` still has no caller, and `PagePool::free()` and
-`LatchTable::erase()` still have none. As of v25.3 the slots are bounded and per-tree, so
-the scaffolding is finally in a state worth wiring up. M1 produces retired pages; M2
-decides when they are safe to reuse.
-
-## M3 — ABA safety  **[M]**
-
-Your own comment names this as *specified but not implemented*: "HP4 — the free-list
-reuse is tagged or Version allocations are never reused." Free-list reuse plus hazard
-pointers is the classic ABA setup. Either tag page ids with a generation counter, or
-route reuse through the epoch reclaimer you already have for version chains. Decide
-before M2, not during.
-
-**New invariant.**
-> **P1** — under a sustained delete-heavy workload the page pool reaches steady state
-> with bounded utilization, with no use-after-free and no ABA.
-
-**Acceptance.** Delete-heavy soak at steady state; concurrent cursor + concurrent merge
-clean under TSan *and* the v27 DST harness; the existing differential-vs-`std::map` test
-still passes with merges active.
-
----
-
-# v30 — Ergonomics and measured performance
-
-Independent of the spine; can be done in pieces at any time.
-
-| # | Item | Size | Anchor |
-| --- | --- | --- | --- |
-| M0 | Visitor scan `for_each_in_range(lo,hi,fn)` + `get_into(key,out)` | S | `range_scan` materializes `vector<pair<string,string>>` — two heap allocations per entry; `get()` copies |
-| M1 | Un-gate `CHRONOKV_BENCH`, run in CI, publish a numbers table in README | S | Your own lesson: *"bench-gated tests are invisible to the sanitizer matrix."* You preach measurement and publish no numbers |
-| M2 | Async API: back it with a worker pool **or remove it** | M | Measured at **0.256× sync** (thread-per-op). Shipping an async API slower than sync is a trap |
-| M3 | `Transaction` rollback-on-destroy behind an opt-in strict flag | S | Needs your sign-off — reverses a documented decision and the `abort-on-drop` test |
-| M4 | Delta-encode WAL values against their previous version | M | Dependency-free, fits the existing version chain. Measure WAL volume before/after |
-| M5 | Split sources + generate the amalgamated header as a release artifact | M | `-O2` on one ~17k-line TU needs >1 GiB RSS and is OOM-killed below that |
-
----
-
-## Explicitly out of scope
-
-| Item | Why not |
-| --- | --- |
-| **Raft / replication** | The *only* thing that would make Jepsen applicable. A multi-version project in its own right, correctly deferred already |
-| **Language bindings** (GAP-EF1) | Conflicts with single-header purity. Your own note says defer until a milestone needs it |
-| **Encryption at rest** | Different product; belongs in the embedder's filesystem layer |
-| **Multi-process / non-Linux** | Documented limitations with real architectural cost |
-| **Third-party compression** | Breaks the zero-dependency property, which is the differentiator. M4/v30 gets most of the win without it |
-
-Your deferrals here are correct. "Single header, zero dependencies, verifiably correct"
-is the actual product; each of the above dilutes it.
-
----
-
-## On Jepsen specifically
-
-**Not reachable, and not a quality judgement.** Jepsen needs a distributed system:
-multiple nodes, a network API, replication, and a client protocol it can drive while
-partitioning the network and pausing processes. ChronoKV is single-process by design —
-`flock` actively fails fast on a second opener. There is nothing for Jepsen to connect to.
-
-What Jepsen *represents* — adversarial fault injection plus history checking against a
-consistency model — is fully reachable, and for a single-node store the equivalent bug
-class is crashes and fsync lying rather than partitions. That is v26 M1/M2 and v27 M1.
-
-One genuine strength to keep: **cts is a monotonic counter, not wall-clock**, so the
-entire clock-skew bug class does not apply. Do not introduce a wall-clock dependency
-anywhere in the durability path; it would open a bug class you currently do not have.
-
----
-
-## Suggested first commit
-
-**v26 M0 alone.** It is a confirmed live durability defect, roughly ten lines, and it
-comes with a crash test that fails before the fix and passes after. Shipping it first
-establishes the crash-test harness (fork + `_exit` + raw-segment inspection) that M1 and
-M2 then build on, so the small fix pays for infrastructure the rest of the plan needs.
