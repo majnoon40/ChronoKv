@@ -10280,17 +10280,44 @@ struct PageHeader {
     uint8_t  is_leaf;        // 1 = leaf, 0 = interior
     uint8_t  reserved[3];
     uint16_t key_count;      // number of slots in use
-    uint16_t reserved2;
+    // v28 CKV-008: leaf mutation epoch, low half (was reserved2). Bumped on
+    // every leaf-content mutation under the page's exclusive latch. The two
+    // 16-bit halves are combined by page_mut_epoch() — ONE explicit
+    // expression, no precedence ambiguity (Blocker 5). In-memory format
+    // only: pages are zeroed on alloc/rebuild and checkpoints serialize
+    // logical entries, so sizeof/layout (32 B) and every derivation from it
+    // are unchanged.
+    uint16_t mut_epoch_lo;
     uint32_t next_leaf_id;       // LEAF ONLY: PageId of next leaf (for range scans)
     uint32_t rightmost_child_id; // INTERIOR ONLY: PageId of rightmost child
     uint32_t min_key_off;        // offset of the page's minimum key (for fence pruning)
     uint16_t min_key_len;
-    uint16_t reserved3;
+    uint16_t mut_epoch_hi;   // v28 CKV-008: leaf mutation epoch, high half (was reserved3)
     uint32_t max_key_off;        // offset of the page's maximum key (for fence pruning)
     uint16_t max_key_len;
     uint16_t reserved4;
 };
 static_assert(sizeof(PageHeader) == 32, "PageHeader must be 32 bytes");
+
+// v28 CKV-008: leaf mutation epoch accessors. The epoch is stored in the
+// header's two former reserved uint16 halves and ALWAYS combined/set through
+// these helpers — one explicit widen-then-shift expression (Blocker 5: no
+// packed-field precedence traps, no truncation). A full 32-bit epoch cannot
+// realistically wrap on a single leaf between a fence capture and its
+// validation. Interior pages never carry a LeafFence; their reserved halves
+// stay zero and are not bumped.
+static inline uint32_t page_mut_epoch(const PageHeader* h) {
+    const uint32_t hi = static_cast<uint32_t>(h->mut_epoch_hi);
+    const uint32_t lo = static_cast<uint32_t>(h->mut_epoch_lo);
+    return (hi << 16) | lo;
+}
+static inline void page_set_mut_epoch(PageHeader* h, uint32_t epoch) {
+    h->mut_epoch_lo = static_cast<uint16_t>(epoch & 0xFFFFu);
+    h->mut_epoch_hi = static_cast<uint16_t>((epoch >> 16) & 0xFFFFu);
+}
+static inline void page_bump_mut_epoch(PageHeader* h) {
+    page_set_mut_epoch(h, page_mut_epoch(h) + 1u);
+}
 
 // Leaf slot: columnar (key_off, key_len, value_off, value_len) — 12 bytes.
 // (The v25.1 §3 spec includes commit_ts in the slot — that's deferred to
@@ -10482,6 +10509,45 @@ public:
         h->min_key_off = h->max_key_off = 0;
         h->min_key_len = h->max_key_len = 0;
     }
+
+#ifdef CHRONOKV_TEST_HOOKS
+    // v28 CKV-008: direct window into the OLC leaf fence for the
+    // regression test — capture under a shared latch and validate exactly
+    // like the put/erase re-check does. LeafFence stays private; the
+    // wrappers hand out an opaque holder.
+    struct TestFence {
+        std::string min_key, max_key;
+        uint16_t key_count = 0;
+        uint32_t mut_epoch = 0;
+    };
+    TestFence capture_leaf_fence_for_test(PageId id) const {
+        TestFence tf;
+        auto lk = latches_.lock_shared(id);
+        const Page* p = pool_.get(id);
+        const PageHeader* h = header(p);
+        if (h->min_key_len > 0) {
+            tf.min_key.assign(reinterpret_cast<const char*>(p) + h->min_key_off, h->min_key_len);
+            tf.max_key.assign(reinterpret_cast<const char*>(p) + h->max_key_off, h->max_key_len);
+        }
+        tf.key_count = h->key_count;
+        tf.mut_epoch = page_mut_epoch(h);
+        return tf;
+    }
+    bool leaf_fence_unchanged_for_test(PageId id, const TestFence& tf) const {
+        auto lk = latches_.lock_shared(id);
+        LeafFence f;                 // body context: LeafFence is complete here
+        f.min_key = tf.min_key;
+        f.max_key = tf.max_key;
+        f.key_count = tf.key_count;
+        f.mut_epoch = tf.mut_epoch;
+        const Page* p = pool_.get(id);
+        return fence_unchanged(p, header(p), f);
+    }
+    PageId find_leaf_for_test(const std::string& key) const {
+        std::shared_lock<std::shared_mutex> held;
+        return find_leaf_crabbing(root_id_.load(std::memory_order_acquire), key, held);
+    }
+#endif
 
     // Insert or update a key. Returns true on insert, false on update.
     bool put(const std::string& key, const std::string& value) {
@@ -11868,6 +11934,7 @@ private:
                 if (slots[i].value_len >= value.size()) {
                     std::memcpy(p->bytes + slots[i].value_off, value.data(), value.size());
                     slots[i].value_len = value.size();
+                    page_bump_mut_epoch(h);   // v28 CKV-008: in-place value change is a mutation
                     return {false, false, "", 0};
                 }
                 // Otherwise: write the new value at the top of the slab,
@@ -11882,6 +11949,7 @@ private:
                         std::memcpy(p->bytes + new_off, value.data(), value.size());
                         slots[i].value_off = new_off;
                         slots[i].value_len = value.size();
+                        page_bump_mut_epoch(h);   // v28 CKV-008
                         return {false, false, "", 0};
                     }
                 }
@@ -11892,6 +11960,7 @@ private:
                     std::memcpy(p->bytes + new_off, value.data(), value.size());
                     slots[i].value_off = new_off;
                     slots[i].value_len = value.size();
+                    page_bump_mut_epoch(h);   // v28 CKV-008
                     return {false, false, "", 0};
                 }
                 // Still not enough — split.
@@ -11932,6 +12001,7 @@ private:
         slots[i].value_off = value_off;
         slots[i].value_len = value.size();
         h->key_count++;
+        page_bump_mut_epoch(h);   // v28 CKV-008: leaf content changed under our exclusive latch
         update_fences_leaf(p);
         return {true, false, "", 0};
     }
@@ -12007,6 +12077,7 @@ private:
         // was the split relink-order bug fixed in earlier versions — the
         // ordering is preserved here.)
         const PageId old_next = get_next_leaf(p);
+        const uint32_t old_epoch = page_mut_epoch(h);   // v28 CKV-008: the rebuild must not look "unchanged"
         for (size_t j = 0; j < k; ++j) {
             Page* q = pool_.get(pages[j]);
             std::memset(q->bytes, 0, PAGE_SIZE);
@@ -12015,6 +12086,12 @@ private:
             qh->key_count = 0;
             qh->min_key_off = qh->max_key_off = 0;
             qh->min_key_len = qh->max_key_len = 0;
+            // v28 CKV-008: page 0 (the page any pre-split fence was
+            // captured on) resumes ABOVE its old epoch so that fence fails
+            // validation; fresh pages start at 1 — they were unreachable
+            // before the parent splice, so no captured fence can reference
+            // them. The rebuild inserts below bump every page further.
+            page_set_mut_epoch(qh, (j == 0) ? (old_epoch + 1u) : 1u);
             // Chain: group j -> group j+1; the last group inherits old_next.
             // Pages 1..k-1 are unreachable until the parent splice, and
             // page 0 is under the caller's exclusive latch until the split
@@ -12079,6 +12156,7 @@ private:
         slots[i].value_off = value_off;
         slots[i].value_len = value.size();
         h->key_count++;
+        page_bump_mut_epoch(h);   // v28 CKV-008 (also covers every split-rebuild insert)
         update_fences_leaf(p);
     }
 
@@ -12307,6 +12385,10 @@ private:
         std::string min_key;
         std::string max_key;
         uint16_t key_count;
+        // v28 CKV-008: leaf mutation epoch at capture time — the primary
+        // validity field (see fence_unchanged for why count/min/max alone
+        // cannot answer "was this leaf mutated").
+        uint32_t mut_epoch = 0;
     };
     PageId find_leaf_crabbing_with_fence(PageId root, const std::string& key,
                                           std::shared_lock<std::shared_mutex>& held_latch,
@@ -12324,6 +12406,7 @@ private:
                     fence.max_key.assign(reinterpret_cast<const char*>(p) + h->max_key_off, h->max_key_len);
                 }
                 fence.key_count = h->key_count;
+                fence.mut_epoch = page_mut_epoch(h);   // v28 CKV-008
                 return id;
             }
             const InteriorSlot* slots = interior_slots(p);
@@ -12350,6 +12433,19 @@ private:
     // against the fence captured at descent time. If any field changed, a
     // concurrent writer modified this leaf (split or insert) → re-descend.
     bool fence_unchanged(const Page* p, const PageHeader* h, const LeafFence& desc_fence) const {
+        // v28 CKV-008 (remediation Blocker 5): the mutation epoch is the
+        // PRIMARY fence field — one plain uint32 on each side and one
+        // unambiguous != comparison: no packed hi/lo halves, no
+        // operator-precedence traps, no truncation. key_count/min/max alone
+        // cannot answer "was this leaf mutated": a concurrent delete+insert
+        // of a DIFFERENT interior key preserves all three. Today's put/erase
+        // re-search positions under the exclusive latch, so such a miss is
+        // latent rather than live — but the fence's contract is "unchanged
+        // since descent", and the v29 merge/rebalance consumers will rely on
+        // it literally. The count/min/max checks stay as a redundant
+        // fast-fail.
+        const uint32_t cur_epoch = page_mut_epoch(h);
+        if (cur_epoch != desc_fence.mut_epoch) return false;
         if (h->key_count != desc_fence.key_count) return false;
         if (h->min_key_len > 0) {
             std::string cur_min(reinterpret_cast<const char*>(p) + h->min_key_off, h->min_key_len);
@@ -12451,6 +12547,7 @@ private:
                                       (h->key_count - i - 1) * sizeof(LeafSlot));
                     }
                     h->key_count--;
+                    page_bump_mut_epoch(h);   // v28 CKV-008: leaf content changed under our exclusive latch
                     update_fences_leaf(p);
                     return true;
                 }

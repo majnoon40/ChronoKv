@@ -12748,6 +12748,51 @@ static int run_remediation_tests() {
         }
     }
 
+    // ---- CKV-008: OLC leaf fence detects count/min/max-preserving mutation ----
+    // Invariant: fence_unchanged answers "was this leaf mutated since the
+    // descent captured it". The (key_count, min, max) triple ALONE cannot
+    // answer that: a delete+insert of a DIFFERENT interior key preserves all
+    // three. The leaf mutation epoch (PageHeader::mut_epoch, bumped on every
+    // leaf mutation under the exclusive latch — inserts, in-place updates,
+    // erases, split rebuilds) is the fence's PRIMARY field, compared as one
+    // plain uint32 (Blocker 5: no packed hi/lo halves, no precedence
+    // ambiguity, no truncation). Pages are never reclaimed, so a page id
+    // stays valid and a stale fence can never be validated by id reuse.
+    {
+        chronokv_page::PagePool pool(64 * 4096);
+        chronokv_btree::BTree bt(pool);
+        bt.put("a", "1");
+        bt.put("b", "2");
+        bt.put("c", "3");
+        const auto leaf = bt.find_leaf_for_test("b");
+        auto fence = bt.capture_leaf_fence_for_test(leaf);
+        check("remediation CKV-008: a fresh fence validates UNCHANGED (baseline)",
+              bt.leaf_fence_unchanged_for_test(leaf, fence));
+        // Count/min/max-preserving mutation: erase an interior key, insert a
+        // different interior key (count 3->2->3, min "a" / max "c" identical).
+        bt.erase("b");
+        bt.put("bb", "22");
+        check("remediation CKV-008: fence detects a count/min/max-preserving delete+insert (mutation-epoch fence)",
+              !bt.leaf_fence_unchanged_for_test(leaf, fence),
+              "fence still 'unchanged' after erase(b)+put(bb) — epoch missing or not bumped");
+        // An in-place value update must bump too (the fence answers "was this
+        // leaf touched", not "did its shape change").
+        auto fence2 = bt.capture_leaf_fence_for_test(leaf);
+        bt.put("a", "999");
+        check("remediation CKV-008: fence detects an in-place value update",
+              !bt.leaf_fence_unchanged_for_test(leaf, fence2));
+        // A split must resume the rebuilt original page above its old epoch
+        // (a fence captured pre-split must not validate post-split).
+        auto fence3 = bt.capture_leaf_fence_for_test(leaf);
+        for (int i = 0; i < 300; ++i) {
+            char kb[8];
+            snprintf(kb, sizeof kb, "%03d", i);
+            bt.put(std::string("aa") + kb, std::string(60, 'v'));  // lands between "a" and "bb"
+        }
+        check("remediation CKV-008: fence detects a split-rebuild of the captured page",
+              !bt.leaf_fence_unchanged_for_test(leaf, fence3));
+    }
+
     if (fails == 0) std::cout << "   REMEDIATION TESTS PASSED\n";
     else std::cout << "   REMEDIATION FAILURES: " << fails << "\n";
     return fails;
