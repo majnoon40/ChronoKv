@@ -12793,6 +12793,129 @@ static int run_remediation_tests() {
               !bt.leaf_fence_unchanged_for_test(leaf, fence3));
     }
 
+    // ---- CKV-009: authoritative commit-time conflict validation (VERIFICATION) ----
+    // Traced, per the remediation directive to verify rather than invent:
+    //   * EVERY public write path (put/erase/Batch::commit/Transaction::
+    //     commit) funnels through commit_txn, whose on_reserve callback
+    //     records existence transitions in the phantom tracker UNDER the
+    //     reserved cts (commit-ts order == phantom order), on both the WAL
+    //     and no-WAL paths; replay_records (the v18 replication spike) is
+    //     not reachable from the public API.
+    //   * Point reads are validated authoritatively at commit:
+    //     Transaction::read registers the key in rs_, and commit_txn checks
+    //     last_write_ts > read_ts for EVERY read-set entry under the
+    //     per-key commit locks — so a point-read/write skew conflicts even
+    //     when the writer's commit touches a disjoint key.
+    // No engine defect found; these deterministic tests pin the contract
+    // (they pass pre-fix and post-fix — verification, not a fix).
+    {
+        Options o;
+        o.auto_start_gc = false;   // in-memory, fully deterministic
+        auto db = Database::open(o);
+        // (a) point-read/write skew over disjoint write keys
+        {
+            auto a = db.begin();
+            const bool x_absent = !a.get("x").has_value();
+            {
+                auto b = db.begin();
+                b.put("x", "1");
+                if (b.commit() != Status::OK) check("CKV-009 setup B", false);
+            }
+            a.put("y", "1");                       // writes a DIFFERENT key
+            const Status sa = a.commit();
+            check("remediation CKV-009: point-read/write skew over disjoint write keys conflicts (rs_ validation)",
+                  x_absent && sa == Status::Conflict,
+                  "status=" + std::to_string((int)sa));
+        }
+        // (b) a BATCH insert into a txn's scanned range is phantom-detected
+        {
+            auto a = db.begin();
+            auto scan = a.range_scan("g", "k");    // registers RangeRead [g,k]
+            (void)scan;
+            {
+                auto batch = db.create_batch();
+                batch.put("h", "inserted-by-batch");
+                if (batch.commit() != Status::OK) check("CKV-009 setup batch", false);
+            }
+            a.put("z", "1");
+            const Status sa = a.commit();
+            check("remediation CKV-009: a BATCH insert into a scanned range is phantom-detected at commit",
+                  sa == Status::Conflict, "status=" + std::to_string((int)sa));
+        }
+        // (c) CONTROL: the same shape with the insert OUTSIDE the range
+        {
+            auto a = db.begin();
+            auto scan = a.range_scan("g", "k");
+            (void)scan;
+            {
+                auto batch = db.create_batch();
+                batch.put("q", "outside");
+                if (batch.commit() != Status::OK) check("CKV-009 setup batch2", false);
+            }
+            a.put("z2", "1");
+            check("remediation CKV-009: CONTROL — an insert outside the scanned range does not conflict",
+                  a.commit() == Status::OK);
+        }
+        db.close();
+    }
+
+    // ---- CKV-015: abandoned-transaction engine lifetime/pinning (VERIFICATION) ----
+    // Traced: a public Transaction holds (1) a shared_ptr ENGINE KEEPALIVE,
+    // so ~ChronoKV (GC join, free_all, flock release) cannot run while the
+    // transaction lives, and (2) a weak_ptr into the Database liveness flag;
+    // every operation gates on check_active(), which throws LifecycleError
+    // once the Database is closed OR destroyed. ~Transaction calls
+    // std::abort() only when the transaction is active AND the engine is
+    // still live (a true abandonment); with the Database gone, the
+    // destructor and ~ReadWriteTransaction skip kv_ cleanup via the same
+    // flag. close() moves the engine out under close_mu_, deferring teardown
+    // to the last keepalive. No defect found; these tests pin the contract.
+    {
+        Options o;
+        o.auto_start_gc = false;
+        auto db = Database::open(o);
+        if (db.put("k", "v0") != Status::OK) check("CKV-015 setup", false);
+        auto txn = db.begin();
+        txn.put("k", "v1");                 // staged write, txn active
+        db.close();                          // close UNDER the live transaction
+        bool get_threw = false;
+        try { (void)txn.get("k"); }
+        catch (const chronokv::LifecycleError&) { get_threw = true; }
+        catch (...) {}
+        check("remediation CKV-015: ops on a transaction whose Database closed throw LifecycleError (no UAF)",
+              get_threw);
+        bool abort_ok = true;
+        try { txn.abort(); } catch (...) { abort_ok = false; }
+        check("remediation CKV-015: abort() after Database::close() completes cleanly", abort_ok);
+        // txn (now inactive) is destroyed at scope exit: destructor takes the
+        // engine-gone path — no std::abort. Reaching the next check IS the
+        // assertion that the destructor survived.
+    }
+    check("remediation CKV-015: destroying a closed-database transaction did not abort the process", true);
+    {
+        // A transaction outliving the DATABASE OBJECT ITSELF (destroyed
+        // without close()): the keepalive pins the engine; the liveness flag
+        // expires with the Database.
+        std::optional<chronokv::Transaction> held;
+        {
+            Options o;
+            o.auto_start_gc = false;
+            auto db = Database::open(o);
+            if (db.put("k", "v") != Status::OK) check("CKV-015 setup2", false);
+            held.emplace(db.begin());
+        }   // ~Database here — no close() call
+        bool threw = false;
+        try { (void)held->get("k"); }
+        catch (const chronokv::LifecycleError&) { threw = true; }
+        catch (...) {}
+        check("remediation CKV-015: a transaction outliving its Database object fails cleanly (keepalive prevents UAF)",
+              threw);
+        try { held->abort(); } catch (...) {}
+        held.reset();   // destructor with an expired flag: no process abort
+        check("remediation CKV-015: destroying the abandoned transaction after its Database died does not abort",
+              true);
+    }
+
     if (fails == 0) std::cout << "   REMEDIATION TESTS PASSED\n";
     else std::cout << "   REMEDIATION FAILURES: " << fails << "\n";
     return fails;
