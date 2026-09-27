@@ -20,6 +20,23 @@ version history; 0.28.0 is recorded in full.
   recorded here rather than papered over). No engine changes;
   `CHRONOKV_VERSION` stays **0.28.0** — versions track shipped code, and
   v29 releases 0.29.0 at its M7 gate.
+- **bench (v29 M1, start):** `bench/arena.cpp` skeleton — the engine-side
+  micro suite over the hooks-OFF consumer build (rule: the arena measures
+  the product's real face): `fillseq`/`fillrandom` (isolating the new-key
+  `nm_` path), `readrandom`, `overwrite`, `rangescan` 100/10k,
+  `deletechurn` (P1's before-column), `ckptload` (checkpoint-under-load
+  wall time), `coldrecovery` (WAL-only reopen — the v30-M1 bulk-load
+  prerequisite anchor) and `memory` (RSS-level bytes/key: tree pool +
+  version heap + slack). Every run prints a rule-9 methodology header
+  before the TSV results. `make arena` target + `bench/README.md`.
+  YCSB mixes, vendored baselines and the CI ledger follow in M1 steps 2–4.
+  First sandbox run (100k keys, async, -O1, 2-CPU/1 GiB, 4.19 kernel):
+  fillseq 31.9k/s · fillrandom 41.4k/s · readrandom 105k/s (p50 10 µs,
+  p99 26 µs) · cold recovery 28.5k records/s — the recovery rate
+  empirically confirms the roadmap's bulk-load prerequisite (100M records
+  ≈ tens of minutes ≫ the 30 s target) — and `ckptload` caught the
+  checkpoint stall live (writers completed 4 ops during a 91 ms
+  checkpoint), the first datapoint for M6 item 6.
 
 ## 0.28.0 — v28 audit remediation (complete)
 

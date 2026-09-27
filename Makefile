@@ -73,12 +73,28 @@ STRESS_FLAGS  = -O2 -g -DCHRONOKV_STRESS
 BIN_DIR = build
 TSAN_BIN = $(BIN_DIR)/tsan/test
 
+# ---- v29 M1: benchmark arena (bench/arena.cpp — hooks-OFF consumer build;
+# the arena measures the product's real face: public API only, no test
+# hooks. Override ARENA_FLAGS on small containers, e.g. ARENA_FLAGS="-O1".)
+empty :=
+space := $(empty) $(empty)
+ARENA_FLAGS ?= -O2 -g
+ARENA_INFO  := $(subst $(space),_,$(CXX) $(CXXSTD) $(ARENA_FLAGS))
+
 # ---- hooks-on targets ----
 release: $(BIN_DIR)/release/test
 asan:    $(BIN_DIR)/asan/test
 tsan:    $(TSAN_BIN)
 stress:  $(BIN_DIR)/stress/test
 coverage: $(BIN_DIR)/coverage/test
+
+# ---- arena target (v29 M1) ----
+arena: $(BIN_DIR)/arena/arena
+
+$(BIN_DIR)/arena/arena: bench/arena.cpp chronokv.hpp | $(BIN_DIR)/arena
+	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(CKV_EXTRA_DEFS) \
+	    -DARENA_BUILD_INFO=\"$(ARENA_INFO)\" $(ARENA_FLAGS) \
+	    bench/arena.cpp -o $@ -lpthread
 
 # ---- hooks-off targets ----
 smoke_off_release: $(BIN_DIR)/smoke_off/release/test
@@ -132,6 +148,7 @@ $(BIN_DIR)/smoke_off/stress/test: main.cpp chronokv.hpp | $(BIN_DIR)/smoke_off/s
 
 # ---- dirs ----
 $(BIN_DIR)/release $(BIN_DIR)/asan $(BIN_DIR)/tsan $(BIN_DIR)/stress $(BIN_DIR)/coverage \
+$(BIN_DIR)/arena \
 $(BIN_DIR)/smoke_off/release $(BIN_DIR)/smoke_off/asan \
 $(BIN_DIR)/smoke_off/tsan $(BIN_DIR)/smoke_off/stress:
 	mkdir -p $@
@@ -139,6 +156,6 @@ $(BIN_DIR)/smoke_off/tsan $(BIN_DIR)/smoke_off/stress:
 clean:
 	rm -rf $(BIN_DIR)
 
-.PHONY: release asan tsan stress coverage \
+.PHONY: release asan tsan stress coverage arena \
 	smoke_off_release smoke_off_asan smoke_off_tsan smoke_off_stress \
 	all clean
