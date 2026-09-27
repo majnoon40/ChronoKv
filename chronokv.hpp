@@ -2692,6 +2692,26 @@ public:
         return ret;
     }
 
+    // v28 review-F1: consecutive CQE-level write-failure degradation.
+    // enter_with_timeout latches available_=false only when the ENTER
+    // SYSCALL fails. Platforms exist where setup AND enter succeed but every
+    // WRITE completes with an error at CQE level (seccomp-blocked I/O ops;
+    // a 4.19-generation backport kernel measured during the external review:
+    // every IORING_OP_WRITE returned -EINVAL) — there, the ring never
+    // degraded and every batch paid the SQE-chain build + enter + drain
+    // before taking the pwrite fallback, forever. Call with the batch's
+    // io_uring write outcome; after 3 consecutive failures the ring
+    // permanently degrades to the (always-correct) sync fallback. Called
+    // only from the serialized WAL leader, so the plain counters need no
+    // atomics; a success resets the run.
+    void note_write_outcome(bool ok) {
+        if (ok) { consec_write_failures_ = 0; return; }
+        if (++consec_write_failures_ >= 3 && available_) {
+            available_ = false;
+            description_ += " degraded=1(3 consecutive CQE-level write failures)";
+        }
+    }
+
     // Pop the next LOGICAL CQE. Sentinel LINK_TIMEOUT CQEs (timer
     // disarm/cancel completions) are consumed and skipped transparently,
     // so callers still see exactly the write and fsync CQEs.
@@ -2770,6 +2790,7 @@ protected:
     static constexpr unsigned long long SENTINEL_UD = 0x7C7C7C7C7C7C7C7Cull;
     unsigned pending_sqes_ = 0;      // SQEs appended since the last enter
     unsigned pending_sentinels_ = 0; // of those, LINK_TIMEOUT sentinels
+    unsigned consec_write_failures_ = 0;   // v28 review-F1: CQE-level degradation run
     CkvTimespec ts_{};               // deadline timespec for the live chain
     std::string description_;
     int probe_wr_ = -999;            // raw LINK_TIMEOUT probe results, for
@@ -4125,6 +4146,10 @@ public:
                                 // from THIS batch lingers into the next one.
                                 iouring_->drain_cqes();
                             }
+                            // v28 review-F1: feed the CQE-level degradation
+                            // tracker (3 consecutive failed batches latch the
+                            // ring off; see IoUring::note_write_outcome).
+                            iouring_->note_write_outcome(used_iouring);
                         } else {
                             used_iouring = false;  // timeout/error → fallback
                             // v25.2: a failed enter permanently degrades the

@@ -1952,6 +1952,75 @@ extern "C" { __attribute__((weak)) void __gcov_dump(void); }
 #endif
 #endif
 
+// v28 review-F1: the deep io_uring availability probe, shared by the startup
+// banner and the iouring-real e2e test. io_uring_setup success is NOT
+// availability: platforms exist (seccomp-restricted containers; a
+// 4.19-generation backport kernel measured during the external review —
+// setup OK, enter OK, every IORING_OP_WRITE completing -EINVAL) where only a
+// REAL write op proves the I/O path works. The banner always probed this
+// deep; the e2e test used to gate its SKIP on IoUring::available() (setup
+// only) and therefore FAILED on exactly the platforms where the banner had
+// just printed "will SKIP (not fail)". One definition, one helper.
+// Returns true iff a real WRITE completed with res >= 0; *setup_ok_out
+// reports whether the ring itself could be created.
+static bool iouring_io_ops_available(bool* setup_ok_out) {
+    if (setup_ok_out) *setup_ok_out = false;
+#ifdef CKV_IOURING_DISABLED
+    return false;
+#else
+    struct io_uring_params p;
+    memset(&p, 0, sizeof(p));
+    int ring_fd = syscall(__NR_io_uring_setup, 4, &p);
+    if (ring_fd < 0) return false;
+    if (setup_ok_out) *setup_ok_out = true;
+    bool io_ok = false;
+    void *sq_mmap = mmap(NULL, p.sq_off.array + p.sq_entries * sizeof(unsigned),
+                         PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, ring_fd, IORING_OFF_SQ_RING);
+    struct io_uring_sqe *sqes = (struct io_uring_sqe*)mmap(NULL,
+                         p.sq_entries * sizeof(struct io_uring_sqe),
+                         PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, ring_fd, IORING_OFF_SQES);
+    void *cq_mmap = mmap(NULL, p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe),
+                         PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, ring_fd, IORING_OFF_CQ_RING);
+    if (sq_mmap != MAP_FAILED && sqes != MAP_FAILED && cq_mmap != MAP_FAILED) {
+        unsigned *sq_tail = (unsigned*)((char*)sq_mmap + p.sq_off.tail);
+        unsigned *sq_mask = (unsigned*)((char*)sq_mmap + p.sq_off.ring_mask);
+        unsigned *sq_array = (unsigned*)((char*)sq_mmap + p.sq_off.array);
+        unsigned tail = *sq_tail;
+        unsigned idx = tail & *sq_mask;
+        int test_fd = ::open("/tmp/chronokv_iouring_probe.tmp", O_CREAT|O_WRONLY|O_TRUNC, 0644);
+        if (test_fd >= 0) {
+            memset(&sqes[idx], 0, sizeof(struct io_uring_sqe));
+            sqes[idx].opcode = IORING_OP_WRITE;
+            sqes[idx].fd = test_fd;
+            sqes[idx].addr = (unsigned long)"x";
+            sqes[idx].len = 1;
+            sqes[idx].off = 0;
+            sqes[idx].user_data = 42;
+            sq_array[idx] = idx;
+            __atomic_store_n(sq_tail, tail + 1, __ATOMIC_RELEASE);
+            int ret = syscall(__NR_io_uring_enter, ring_fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+            if (ret > 0) {
+                unsigned *cq_head = (unsigned*)((char*)cq_mmap + p.cq_off.head);
+                unsigned *cq_tail_ptr = (unsigned*)((char*)cq_mmap + p.cq_off.tail);
+                unsigned *cq_mask_ptr = (unsigned*)((char*)cq_mmap + p.cq_off.ring_mask);
+                struct io_uring_cqe *cqes = (struct io_uring_cqe*)((char*)cq_mmap + p.cq_off.cqes);
+                if (*cq_head != *cq_tail_ptr) {
+                    unsigned cqe_idx = *cq_head & *cq_mask_ptr;
+                    io_ok = (cqes[cqe_idx].res >= 0);
+                }
+            }
+            close(test_fd);
+            unlink("/tmp/chronokv_iouring_probe.tmp");
+        }
+    }
+    if (sq_mmap != MAP_FAILED) munmap(sq_mmap, p.sq_off.array + p.sq_entries * sizeof(unsigned));
+    if (sqes != MAP_FAILED) munmap(sqes, p.sq_entries * sizeof(struct io_uring_sqe));
+    if (cq_mmap != MAP_FAILED) munmap(cq_mmap, p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe));
+    close(ring_fd);
+    return io_ok;
+#endif
+}
+
 int main() {
 #ifdef CHRONOKV_BENCH
     run_bench();
@@ -2163,59 +2232,11 @@ return 0;
             else
                 std::cout << "  io_uring: ring setup failed (sync fallback)\n";
         }
-        struct io_uring_params p;
-        memset(&p, 0, sizeof(p));
-        int ring_fd = syscall(__NR_io_uring_setup, 4, &p);
-        bool setup_ok = (ring_fd >= 0);
-        bool io_ok = false;
-        if (setup_ok) {
-            // Map rings and submit a NOP (no file I/O needed).
-            void *sq_mmap = mmap(NULL, p.sq_off.array + p.sq_entries * sizeof(unsigned),
-                                PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, ring_fd, IORING_OFF_SQ_RING);
-            struct io_uring_sqe *sqes = (struct io_uring_sqe*)mmap(NULL,
-                                p.sq_entries * sizeof(struct io_uring_sqe),
-                                PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, ring_fd, IORING_OFF_SQES);
-            void *cq_mmap = mmap(NULL, p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe),
-                                PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, ring_fd, IORING_OFF_CQ_RING);
-            if (sq_mmap != MAP_FAILED && sqes != MAP_FAILED && cq_mmap != MAP_FAILED) {
-                unsigned *sq_tail = (unsigned*)((char*)sq_mmap + p.sq_off.tail);
-                unsigned *sq_mask = (unsigned*)((char*)sq_mmap + p.sq_off.ring_mask);
-                unsigned *sq_array = (unsigned*)((char*)sq_mmap + p.sq_off.array);
-                unsigned tail = *sq_tail;
-                unsigned idx = tail & *sq_mask;
-                // v25.1 M2: test a real I/O op (IORING_OP_WRITE), not just NOP.
-                // NOP may succeed even when file I/O ops are blocked by seccomp.
-                int test_fd = ::open("/tmp/chronokv_iouring_test.tmp", O_CREAT|O_WRONLY|O_TRUNC, 0644);
-                if (test_fd >= 0) {
-                    memset(&sqes[idx], 0, sizeof(struct io_uring_sqe));
-                    sqes[idx].opcode = IORING_OP_WRITE;
-                    sqes[idx].fd = test_fd;
-                    sqes[idx].addr = (unsigned long)"x";
-                    sqes[idx].len = 1;
-                    sqes[idx].off = 0;
-                    sqes[idx].user_data = 42;
-                    sq_array[idx] = idx;
-                    __atomic_store_n(sq_tail, tail + 1, __ATOMIC_RELEASE);
-                    int ret = syscall(__NR_io_uring_enter, ring_fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
-                    if (ret > 0) {
-                        unsigned *cq_head = (unsigned*)((char*)cq_mmap + p.cq_off.head);
-                        unsigned *cq_tail_ptr = (unsigned*)((char*)cq_mmap + p.cq_off.tail);
-                        unsigned *cq_mask_ptr = (unsigned*)((char*)cq_mmap + p.cq_off.ring_mask);
-                        struct io_uring_cqe *cqes = (struct io_uring_cqe*)((char*)cq_mmap + p.cq_off.cqes);
-                        if (*cq_head != *cq_tail_ptr) {
-                            unsigned cqe_idx = *cq_head & *cq_mask_ptr;
-                            io_ok = (cqes[cqe_idx].res >= 0);
-                        }
-                    }
-                    close(test_fd);
-                    unlink("/tmp/chronokv_iouring_test.tmp");
-                }
-            }
-            if (sq_mmap && sq_mmap != MAP_FAILED) munmap(sq_mmap, p.sq_off.array + p.sq_entries * sizeof(unsigned));
-            if (sqes && sqes != MAP_FAILED) munmap(sqes, p.sq_entries * sizeof(struct io_uring_sqe));
-            if (cq_mmap && cq_mmap != MAP_FAILED) munmap(cq_mmap, p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe));
-            close(ring_fd);
-        }
+        // v28 review-F1: the deep probe now lives in ONE shared helper —
+        // the iouring-real e2e test gates its SKIP on the same definition
+        // of availability this banner prints (setup OK is NOT I/O OK).
+        bool setup_ok = false;
+        const bool io_ok = iouring_io_ops_available(&setup_ok);
         std::cout << "  io_uring_setup: " << (setup_ok ? "OK" : "FAILED")
                   << "  io_uring I/O ops: " << (io_ok ? "AVAILABLE (real io_uring will be used)"
                                                        : "BLOCKED (sync pwrite fallback will be used)")
@@ -8644,9 +8665,15 @@ static int run_m2_phase2_test() {
     // io_uring is unavailable/blocked the test SKIPS (prints SKIP, no
     // fail) — CI runs it for real on Linux 5.15/6.x runners.
     {
-        chronokv_iouring::IoUring availability_probe;
-        if (!availability_probe.available()) {
-            std::cout << "   iouring-real: SKIP (io_uring unavailable on this platform)\n";
+        // v28 review-F1: gate the SKIP on the SAME deep probe the startup
+        // banner prints. IoUring::available() (setup-only) made this test
+        // FAIL — not SKIP as the banner promised — on platforms where the
+        // ring sets up but every write CQE fails.
+        bool t5_setup_ok = false;
+        if (!iouring_io_ops_available(&t5_setup_ok)) {
+            std::cout << "   iouring-real: SKIP (io_uring I/O ops unavailable on this platform"
+                      << (t5_setup_ok ? "; ring sets up but writes fail at CQE level)" : ")")
+                      << "\n";
         } else {
             const std::string wd = "/tmp/v25_m2_iouring_real";
             std::filesystem::remove_all(wd);
@@ -12914,6 +12941,52 @@ static int run_remediation_tests() {
         held.reset();   // destructor with an expired flag: no process abort
         check("remediation CKV-015: destroying the abandoned transaction after its Database died does not abort",
               true);
+    }
+
+    // ---- Review F1b: a ring whose WRITE CQEs keep failing must degrade permanently ----
+    // Invariant: io_uring "availability" means I/O OPS work, not merely that
+    // the ring sets up. Real platforms exist (seccomp-restricted containers;
+    // a 4.19-generation backport kernel measured during the external review:
+    // io_uring_setup OK, io_uring_enter OK, every IORING_OP_WRITE completes
+    // with -EINVAL) where enter_with_timeout's "failed enter degrades the
+    // ring" latch never fires, so EVERY durability batch built the SQE
+    // chain, entered, drained failing CQEs, and then did the pwrite+fsync
+    // fallback anyway — forever. The engine must degrade to the fallback
+    // after repeated CQE-level write failures. (MOCK_FAILURE models exactly
+    // this shape: enter succeeds, the write CQE reports -1, data lands via
+    // the internal pwrite so durability is preserved.)
+    {
+        const std::string wd = "/tmp/ckv_f1_degrade_" + std::to_string(getpid());
+        std::filesystem::remove_all(wd);
+        std::filesystem::create_directories(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.auto_start_gc = false;
+        o.recover_on_open = false;
+        auto db = Database::open(o);
+        auto mock = std::make_unique<chronokv_iouring::MockIoUring>(
+            chronokv_iouring::MockIoUring::MOCK_FAILURE);
+        chronokv_iouring::MockIoUring* mp = mock.get();
+        db.inject_iouring_for_test(std::move(mock));
+        bool all_ok = true;
+        for (int i = 0; i < 6; ++i)
+            all_ok = all_ok && (db.put("k" + std::to_string(i), "v") == Status::OK);
+        check("remediation F1b: writes stay durable via the fallback while every write CQE fails",
+              all_ok && !db.last_batch_used_iouring());
+        check("remediation F1b: the ring PERMANENTLY DEGRADES after repeated CQE-level write failures (iouring-cqe-degradation)",
+              !mp->available(),
+              "ring still 'available' after 6 failed-CQE batches — every future batch would keep paying the io_uring attempt");
+        db.close();
+        o.recover_on_open = true;
+        bool rec = true;
+        {
+            auto db2 = Database::open(o);
+            for (int i = 0; i < 6; ++i)
+                rec = rec && db2.get("k" + std::to_string(i)).has_value();
+            db2.close();
+        }
+        check("remediation F1b: recovery sees every record written under the failing ring", rec);
+        std::filesystem::remove_all(wd);
     }
 
     if (fails == 0) std::cout << "   REMEDIATION TESTS PASSED\n";
