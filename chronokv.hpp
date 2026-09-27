@@ -2583,6 +2583,14 @@ public:
 
     virtual bool available() const { return available_; }
 
+#ifdef CHRONOKV_TEST_HOOKS
+    // v28 CKV-013: test window into the lazy registered-file slot (the
+    // registered-file-identity regression test drives the real private
+    // helper and observes real (re)registration counts through it).
+    bool ensure_file_registered_for_test(int fd) { return ensure_file_registered(fd); }
+    uint64_t reg_updates_for_test() const { return reg_updates_.load(std::memory_order_relaxed); }
+#endif
+
     // v25.2: one-line feature summary for diagnostics. The library itself
     // stays silent; the test suite prints this in its availability check.
     // Example: "io_uring: sq=64 cq=128 coop_taskrun=0 fixed_buf=64K
@@ -2743,6 +2751,14 @@ protected:
     bool coop_taskrun_ = false;   // IORING_SETUP_COOP_TASKRUN active
     bool fixed_buf_ = false;      // registered bounce buffer active
     bool fixed_files_ = false;    // registered file slot 0 active
+    // v28 CKV-013: identity of the file currently occupying slot 0. The fd
+    // NUMBER alone is not identity — segment rotation closes the old fd and
+    // the new open almost always gets the SAME number back.
+    uint64_t reg_dev_ = 0;        // st_dev of the registered file
+    uint64_t reg_ino_ = 0;        // st_ino of the registered file
+#ifdef CHRONOKV_TEST_HOOKS
+    std::atomic<uint64_t> reg_updates_{0};   // successful (re)registrations
+#endif
     bool link_timeout_ = false;   // LINK_TIMEOUT deadlines active
     unsigned lto_len_ = 0;        // count-field layout the kernel accepted
     size_t bounce_sz_ = 0;
@@ -2945,13 +2961,42 @@ private:
     // the WAL rotates segments. Returns false if the (re)registration
     // failed and the caller should drop to plain-fd SQEs.
     bool ensure_file_registered(int fd) {
-        if (fd == reg_fd_) return true;
+        // v28 CKV-013: the fd NUMBER is not file identity. Segment rotation
+        // closes the old fd and opens the new segment — the kernel hands the
+        // SAME number back (lowest free), and the pre-fix `fd == reg_fd_`
+        // short-circuit kept slot 0 pointed at the SEALED old inode (closed,
+        // but still kernel-referenced via the registered-files table): every
+        // WRITE_FIXED after a rotation would silently append acknowledged
+        // records to the WRONG segment — unrecoverable at reopen (the new
+        // segment stays empty → cts gap) while the sealed file grows past
+        // its MANIFEST horizon. Identity is (st_dev, st_ino); the extra
+        // fstat is one cheap syscall on a path that ends in fsync anyway.
+        struct stat st;
+        if (::fstat(fd, &st) != 0) return false;
+        const uint64_t dev = static_cast<uint64_t>(st.st_dev);
+        const uint64_t ino = static_cast<uint64_t>(st.st_ino);
+        if (fd == reg_fd_ && dev == reg_dev_ && ino == reg_ino_) return true;
         if (reg_fd_ >= 0)
             (void)syscall(__NR_io_uring_register, ring_fd_, CKV_UNREG_FILES, NULL, 0);
         int fds[1] = { fd };
-        if (syscall(__NR_io_uring_register, ring_fd_, CKV_REG_FILES, fds, 1) != 0)
+        if (syscall(__NR_io_uring_register, ring_fd_, CKV_REG_FILES, fds, 1) != 0) {
+            // The slot was just unregistered (or never held): drop the cached
+            // identity so a later call RETRIES registration instead of
+            // short-circuiting on a stale reg_fd_ whose slot is empty —
+            // pre-fix hazard #2 (a failed re-registration left reg_fd_ set,
+            // so fixed-file SQEs would target an unregistered slot: EINVAL
+            // on every subsequent batch).
+            reg_fd_ = -1;
+            reg_dev_ = 0;
+            reg_ino_ = 0;
             return false;
+        }
         reg_fd_ = fd;
+        reg_dev_ = dev;
+        reg_ino_ = ino;
+#ifdef CHRONOKV_TEST_HOOKS
+        reg_updates_.fetch_add(1, std::memory_order_relaxed);
+#endif
         return true;
     }
 

@@ -12697,6 +12697,57 @@ static int run_remediation_tests() {
               calls == 1 && !r2, "calls=" + std::to_string(calls));
     }
 
+    // ---- CKV-013: registered-file slot identity must survive fd-number reuse ----
+    // WAL segment rotation closes the old fd and opens the new segment; the
+    // kernel hands back the SAME fd number (lowest free). Pre-fix,
+    // ensure_file_registered short-circuited on fd-number equality, leaving
+    // io_uring file slot 0 pointed at the SEALED old inode (closed, but still
+    // kernel-referenced through the registered-files table): every
+    // WRITE_FIXED after a rotation would silently append acknowledged
+    // records to the WRONG segment — the new segment stays empty (cts gap at
+    // recovery) while the sealed file grows past its MANIFEST horizon.
+    // Identity must be (st_dev, st_ino), not the fd number.
+    {
+        chronokv_iouring::IoUring ring;
+        if (!ring.available()) {
+            std::cout << "   remediation CKV-013: SKIP (io_uring ring unavailable on this platform)\n";
+        } else {
+            const std::string base = "/tmp/ckv_ckv013_" + std::to_string(getpid());
+            std::filesystem::remove_all(base);
+            std::filesystem::create_directories(base);
+            int fdA = ::open((base + "/segA").c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+            bool regA = fdA >= 0 && ring.ensure_file_registered_for_test(fdA);
+            if (!regA) {
+                std::cout << "   remediation CKV-013: SKIP (IORING_REGISTER_FILES unsupported on this kernel)\n";
+                if (fdA >= 0) ::close(fdA);
+            } else {
+                const uint64_t after_first = ring.reg_updates_for_test();
+                ::close(fdA);
+                int fdB = ::open((base + "/segB").c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+                if (fdB != fdA) {
+                    // The hazard needs fd-number reuse; a quiet test process
+                    // gets it essentially always (lowest free fd). If not,
+                    // say so instead of passing vacuously.
+                    check("remediation CKV-013: precondition — kernel reused the fd number",
+                          false, "fdA=" + std::to_string(fdA) + " fdB=" + std::to_string(fdB));
+                } else {
+                    bool regB = ring.ensure_file_registered_for_test(fdB);
+                    const uint64_t after_second = ring.reg_updates_for_test();
+                    check("remediation CKV-013: same fd NUMBER over a different file re-registers the slot (registered-file-identity)",
+                          regB && after_second == after_first + 1,
+                          "updates " + std::to_string(after_first) + " -> " + std::to_string(after_second) +
+                          " (expected +1: slot must move to the new inode)");
+                    // Same file, same fd: the no-syscall fast path must stay.
+                    bool regB2 = ring.ensure_file_registered_for_test(fdB);
+                    check("remediation CKV-013: unchanged identity keeps the no-syscall fast path",
+                          regB2 && ring.reg_updates_for_test() == after_second);
+                }
+                ::close(fdB);
+            }
+            std::filesystem::remove_all(base);
+        }
+    }
+
     if (fails == 0) std::cout << "   REMEDIATION TESTS PASSED\n";
     else std::cout << "   REMEDIATION FAILURES: " << fails << "\n";
     return fails;
