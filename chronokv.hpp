@@ -1915,6 +1915,7 @@ namespace diag {
     inline std::atomic<uint64_t> rec_pitr_filtered{0}; // v26.1: delta entries beyond the PITR boundary, skipped per-entry
     inline std::atomic<uint64_t> rec_pitr_wal_skipped{0}; // v26.1: WAL records superseded/duplicated by filtered delta entries
     inline std::atomic<uint64_t> epoch_entries{0}, epoch_oldest{0}, epoch_newest{0};
+    inline std::atomic<uint64_t> observer_exceptions{0}; // v28 CKV-007: contained observer-callback throws
 
     inline void dump() {
         uint64_t created = gc_created.load(), retired = gc_retired.load(),
@@ -1946,7 +1947,8 @@ namespace diag {
             << " pitr_filtered=" << rec_pitr_filtered.load()
             << " pitr_wal_skipped=" << rec_pitr_wal_skipped.load() << "\n"
             << "epoch:    entries=" << epoch_entries.load()
-            << " oldest=" << epoch_oldest.load() << " newest=" << epoch_newest.load() << "\n";
+            << " oldest=" << epoch_oldest.load() << " newest=" << epoch_newest.load() << "\n"
+            << "observer: contained_exceptions=" << observer_exceptions.load() << "\n";
     }
 }
 
@@ -9181,6 +9183,14 @@ public:
         return std::async(std::launch::async, [eng, w, self, rec_t0,
                           key = std::move(key), value = std::move(value)]() {
             if (auto sp = w.lock(); !sp || !*sp) return Status::Failed;
+            // v28 CKV-016: the public async contract is "errors via
+            // Result<T> / Status" — an engine exception (bad_alloc from a
+            // bounded pool via the CKV-003b latch-and-rethrow path, or any
+            // other escape) must resolve the future with Status::Failed,
+            // NEVER ride it as a rethrow at get() (which also made
+            // unattended futures a std::terminate escape point under the
+            // forced-coverage runs).
+            try {
             WriteSet ws = {{key, value, false}};
             uint64_t cts = 0;
             auto r = eng->commit_txn(UINT64_MAX, ws, {}, {}, &cts);
@@ -9204,6 +9214,9 @@ public:
             }
 #endif
             return status;
+            } catch (...) {
+                return Status::Failed;
+            }
         });
     }
 
@@ -9258,6 +9271,10 @@ public:
 #endif
         return std::async(std::launch::async, [eng, w, self, rec_t0, key = std::move(key)]() {
             if (auto sp = w.lock(); !sp || !*sp) return Status::Failed;
+            // v28 CKV-016: same containment contract as put_async — engine
+            // exceptions resolve the future with Status::Failed, never as a
+            // rethrow at get().
+            try {
             WriteSet ws = {{key, "", true}};
             uint64_t cts = 0;
             auto r = eng->commit_txn(UINT64_MAX, ws, {}, {}, &cts);
@@ -9281,6 +9298,9 @@ public:
             }
 #endif
             return status;
+            } catch (...) {
+                return Status::Failed;
+            }
         });
     }
 
@@ -9510,7 +9530,18 @@ private:
                     std::optional<std::string> new_val = deleted
                         ? std::nullopt
                         : std::optional<std::string>(value);
-                    obs.callback(key, old_val, new_val);
+                    // v28 CKV-007: CONTAIN callback exceptions. The commit is
+                    // already durable and installed by the time observers run;
+                    // a throwing callback must never invert that success into
+                    // an exception at the committing caller (sync paths) or a
+                    // rethrown future (async paths — CKV-016). Counted in
+                    // diag::observer_exceptions for observability; delivery
+                    // continues to the remaining observers.
+                    try {
+                        obs.callback(key, old_val, new_val);
+                    } catch (...) {
+                        diag::observer_exceptions.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             }
         }

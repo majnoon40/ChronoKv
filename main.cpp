@@ -12192,6 +12192,96 @@ static int run_remediation_tests() {
               ckv005_body, 300000,
               "full-checkpoint walk skips sentinel keys; rotation then destroys their WAL records");
 
+    // ---- CKV-007: observer exceptions must not invert a committed result ----
+    // Invariant: an observer callback is a best-effort notification. A
+    // throwing callback is contained (and counted in diag); put() /
+    // Batch::commit() / Transaction::commit() report the TRUE result of the
+    // already-completed commit. Pre-fix: the exception from notify_observers
+    // propagated to the committing caller AFTER the write was durable — a
+    // successful commit surfaced as an exception (and, on the async path,
+    // as a rethrown future — CKV-016).
+    {
+        const std::string wd = "/tmp/ckv_ckv007_" + std::to_string(getpid());
+        std::filesystem::remove_all(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.auto_start_gc = false;
+        auto db = Database::open(o);
+        auto h = db.observe("w:", [](const std::string&,
+                                     const std::optional<std::string>&,
+                                     const std::optional<std::string>&) {
+            throw std::runtime_error("observer boom (CKV-007 test)");
+        });
+        bool put_ok = false; std::string d1;
+        try { put_ok = (db.put("w:k1", "v1") == Status::OK); }
+        catch (const std::exception& e) { d1 = e.what(); }
+        check("remediation CKV-007: sync put reports the true (OK) result despite a throwing observer (observer-exception-containment)",
+              put_ok, d1);
+        bool durable = false;
+        try { auto v = db.get("w:k1"); durable = v.has_value() && *v == "v1"; } catch (...) {}
+        check("remediation CKV-007: the committed write is durable even though the observer threw", durable);
+        bool batch_ok = false; std::string d2;
+        try {
+            auto b = db.create_batch();
+            b.put("w:k2", "v2");
+            batch_ok = (b.commit() == Status::OK);
+        } catch (const std::exception& e) { d2 = e.what(); }
+        check("remediation CKV-007: Batch::commit reports OK despite a throwing observer", batch_ok, d2);
+        bool txn_ok = false; std::string d3;
+        try {
+            auto t = db.begin();
+            t.put("w:k3", "v3");
+            txn_ok = (t.commit() == Status::OK);
+        } catch (const std::exception& e) { d3 = e.what(); }
+        check("remediation CKV-007: Transaction::commit reports OK despite a throwing observer", txn_ok, d3);
+        bool async_ok = false; std::string d4;
+        try {
+            auto f = db.put_async("w:k4", "v4");
+            async_ok = (f.get() == Status::OK);
+        } catch (const std::exception& e) { d4 = std::string("future rethrew: ") + e.what(); }
+        check("remediation CKV-016: put_async resolves to Status::OK despite a throwing observer (commit result never inverted)",
+              async_ok, d4);
+        db.close();
+        std::filesystem::remove_all(wd);
+    }
+
+    // ---- CKV-016: async futures report engine failures as Status, never rethrow ----
+    // Invariant: put_async/erase_async futures resolve to a Status for ANY
+    // engine failure (public contract: "errors via Result<T> / Status").
+    // Pre-fix: an exception thrown out of commit_txn (std::bad_alloc from an
+    // exhausted bounded page pool — the CKV-003b trigger, which latches the
+    // D4 index fail-stop and RETHROWS) was captured by the std::async future
+    // and rethrown at get(), breaking the contract. This was also one of the
+    // two std::terminate escape points the forced-coverage runs died on
+    // ("async get() rethrows" — 0.27.0 hardening notes).
+    {
+        Options o;                       // in-memory: the WAL is not involved
+        o.auto_start_gc = false;
+        o.page_pool_bytes = 4 * 4096;    // bounded pool -> deterministic exhaustion
+        auto db = Database::open(o);
+        bool rethrew = false; std::string what;
+        bool saw_failure = false;
+        try {
+            for (int round = 0; round < 20 && !saw_failure; ++round) {
+                std::vector<std::future<Status>> fs;
+                for (int i = 0; i < 10; ++i) {
+                    const int n = round * 10 + i;
+                    fs.push_back(db.put_async(std::string(160, 'k') + std::to_string(n),
+                                              std::string(160, 'v')));
+                }
+                for (auto& f : fs) {
+                    Status s = f.get();      // pre-fix: rethrows bad_alloc at exhaustion
+                    if (s != Status::OK) saw_failure = true;
+                }
+            }
+        } catch (const std::exception& e) { rethrew = true; what = e.what(); }
+        check("remediation CKV-016: put_async futures never rethrow engine exceptions (pool exhaustion surfaces as Status)",
+              !rethrew, what);
+        check("remediation CKV-016: exhaustion is reported as a failure Status (test non-vacuous)",
+              saw_failure && !rethrew);
+        db.close();
+    }
+
     if (fails == 0) std::cout << "   REMEDIATION TESTS PASSED\n";
     else std::cout << "   REMEDIATION FAILURES: " << fails << "\n";
     return fails;
