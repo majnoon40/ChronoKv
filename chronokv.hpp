@@ -5410,14 +5410,27 @@ public:
 
 public:
     explicit ChronoKV(const std::string& wal_dir = "",
-                      size_t page_pool_bytes = 256ULL * 1024 * 1024) {
+                      size_t page_pool_bytes = 256ULL * 1024 * 1024,
+                      bool wal_read_only = false) {
          wal_dir_ = wal_dir;
         // v25.1 M1.6: initialize the B+ tree index. Pool size is configurable
         // (default 256 MiB for production; tests pass a smaller size via
         // Options::page_pool_bytes to avoid VM pressure on the 2-CPU test VM).
         pool_ = std::make_unique<chronokv_page::PagePool>(page_pool_bytes);
         tree_ = std::make_unique<chronokv_btree::BTree>(*pool_);
-        if (!wal_dir.empty()) {
+        // v28 CKV-011: wal_read_only (PITR as-of opens) skips the WAL
+        // machinery ENTIRELY. Constructing WalSegments on the source would
+        // mkdir, CREATE .chronokv.lock when absent, take the writer flock
+        // (locking out — or colliding with — the source's real owner), and
+        // open the active segment with torn-tail repair (an ftruncate on the
+        // source). The as-of open contract is "does not modify the source
+        // directory at all": replay runs through the read-only static
+        // WalSegments::recover_all() in recover_with_checkpoint(), and the
+        // pitr_as_of_ guards refuse every write/checkpoint/backup path
+        // (commit_txn, checkpoint_locked). wal_ stays null; every consumer
+        // of wal_ already null-checks (commit_txn, wal_stats, health,
+        // checkpoint rotate) or is test-hook-guarded below.
+        if (!wal_dir.empty() && !wal_read_only) {
             wal_ = std::make_unique<WalSegments>(wal_dir);
             // v24 FIX (Group 2, Fix 5): seed clock_ from existing WAL
             // contents so the first commit doesn't reserve cts=1 and
@@ -6400,6 +6413,19 @@ public:
                 "checkpoint refused: index fail-stop latched (a tree mutation failed "
                 "during a previous commit — invariant D4); reopen to recover from the WAL");
 
+        // v28 CKV-011: refuse ANY source-rewriting checkpoint on a PITR
+        // read-only open — including the backup_to() path, which calls this
+        // directly (checkpoint() has its own friendlier guard). Pre-fix,
+        // Database::backup() on an as-of view happily rewrote the source's
+        // checkpoint chain AND rotated/truncated the source WAL.
+        // export_checkpoint_no_rotate() passes rotate_wal=false and remains
+        // the sanctioned restore_pitr export (it writes to the DEST path).
+        if (pitr_as_of_ && rotate_wal)
+            throw std::runtime_error(
+                "checkpoint/backup refused on a PITR read-only open: the source "
+                "directory is immutable (CKV-011); use Database::restore_pitr() "
+                "to materialize a writable as-of database");
+
         // Wait for any in-progress GC to finish, then register a reader
         // slot so future GC cannot reclaim versions visible at cts.
         std::lock_guard<std::mutex> gc_act(gc_active_mu_);
@@ -6975,7 +7001,12 @@ public:
         // delta.1.tmp and delta.3.tmp exist but delta.2.tmp is missing,
         // delta.3.tmp was never deleted). Now we directory-scan for any
         // file matching "<base>.delta.<digits>.tmp" and remove them all.
-        {
+        // v28 CKV-011: NOT under a PITR as-of open — the read-only contract
+        // covers the WHOLE source directory, orphan .tmp files included
+        // (deleting them is a mutation, and a crashed writer's residue is
+        // evidence the as-of view must preserve). A normal open reclaims
+        // them, exactly like the stale-delta deletion below.
+        if (!as_of_cts) {
             std::error_code tec;
             std::filesystem::remove(ckpt_path + ".tmp", tec);
             // Directory scan for orphaned delta .tmp files.
@@ -8708,20 +8739,25 @@ class Database {
 public:
     // Factory: constructs engine, recovers (if configured), starts GC
     static Database open(const Options& opts) {
-        std::shared_ptr<ChronoKV> engine;
-        try {
-            engine = std::make_shared<ChronoKV>(opts.wal_dir, opts.page_pool_bytes);
-        } catch (const std::exception& e) {
-            throw LifecycleError(std::string("cannot open database: ") + e.what());
-        }
-        
         // v26 M4: PITR is a recovery mode — reject configurations where it
-        // would silently do nothing.
+        // would silently do nothing. (v28 CKV-011: validated BEFORE engine
+        // construction — the flag decides whether the engine builds any WAL
+        // machinery on the source at all.)
         if (opts.pitr_as_of_cts != 0) {
             if (!opts.recover_on_open)
                 throw LifecycleError("pitr_as_of_cts requires recover_on_open=true");
             if (opts.wal_dir.empty() && opts.checkpoint_path.empty())
                 throw LifecycleError("pitr_as_of_cts requires a wal_dir or checkpoint_path to recover from");
+        }
+        std::shared_ptr<ChronoKV> engine;
+        try {
+            // v28 CKV-011: a PITR open must not touch the source directory —
+            // no lock file, no writer flock, no torn-tail repair. Replay is
+            // read-only (recover_all); writes/checkpoints are refused.
+            engine = std::make_shared<ChronoKV>(opts.wal_dir, opts.page_pool_bytes,
+                                                /*wal_read_only=*/opts.pitr_as_of_cts != 0);
+        } catch (const std::exception& e) {
+            throw LifecycleError(std::string("cannot open database: ") + e.what());
         }
         if (opts.recover_on_open && (!opts.wal_dir.empty() || !opts.checkpoint_path.empty())) {
             try {
@@ -9000,6 +9036,28 @@ public:
             throw LifecycleError("restore_pitr: as_of_cts must be non-zero");
         if (dest_dir.empty())
             throw LifecycleError("restore_pitr: empty dest_dir");
+        // v28 CKV-010: the contract is "materializes a WRITABLE as-of
+        // database into a FRESH directory". Pre-fix, a dirty destination was
+        // silently accepted: the export wrote dest/ckpt while the subsequent
+        // open adopted whatever already sat in dest/wal (e.g. segments of an
+        // unrelated database) — a hybrid of the PITR state and pre-existing
+        // state, with no error. Refuse non-empty existing destinations;
+        // nonexistent or empty directories are accepted.
+        {
+            std::error_code dec;
+            if (std::filesystem::exists(dest_dir, dec)) {
+                bool non_empty = true;
+                if (std::filesystem::is_directory(dest_dir, dec)) {
+                    auto it = std::filesystem::directory_iterator(dest_dir, dec);
+                    non_empty = !dec && it != std::filesystem::directory_iterator{};
+                }
+                if (non_empty)
+                    throw LifecycleError(
+                        "restore_pitr: destination '" + dest_dir + "' exists and is "
+                        "not empty — refusing to mix a PITR restore with pre-existing "
+                        "state; choose a fresh directory");
+            }
+        }
         if (src_wal_dir.empty() && src_ckpt_path.empty())
             throw LifecycleError("restore_pitr: no source (wal_dir and checkpoint_path both empty)");
         Options src;
@@ -9107,10 +9165,15 @@ public:
     // v25.1 M2 Phase 2: test-only io_uring mock injection.
     void inject_iouring_for_test(std::unique_ptr<chronokv_iouring::IoUring> mock) {
         auto eng = api_engine();
+        // v28 CKV-011: wal_ is null on PITR read-only opens (no WAL machinery
+        // on the source) — fail cleanly instead of dereferencing null.
+        if (!eng->wal_)
+            throw LifecycleError("inject_iouring_for_test: handle has no WAL (PITR/in-memory open)");
         eng->wal_->inject_iouring_for_test(std::move(mock));
     }
     bool last_batch_used_iouring() const {
-        return api_engine()->wal_->last_batch_used_iouring_.load();
+        auto eng = api_engine();
+        return eng->wal_ ? eng->wal_->last_batch_used_iouring_.load() : false;
     }
 #ifdef CHRONOKV_TEST_HOOKS
     // Review fix C1: test hooks for the WAL leader exception path.

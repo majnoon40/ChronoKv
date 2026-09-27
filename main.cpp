@@ -12316,6 +12316,196 @@ static int run_remediation_tests() {
         db.close();
     }
 
+    // ---- CKV-010: restore_pitr refuses a dirty/non-empty destination ----
+    // Invariant (documented contract): restore_pitr MATERIALIZES the as-of
+    // database into a FRESH directory. Pre-fix an existing non-empty
+    // dest_dir was silently accepted: the export wrote dest/ckpt while the
+    // subsequent open adopted whatever already sat in dest/wal (e.g.
+    // segments of an unrelated database) — a hybrid of the PITR state and
+    // the pre-existing state, with no error.
+    {
+        const std::string src = "/tmp/ckv_ckv010_src_" + std::to_string(getpid());
+        const std::string dst = "/tmp/ckv_ckv010_dst_" + std::to_string(getpid());
+        std::filesystem::remove_all(src);
+        std::filesystem::remove_all(dst);
+        std::filesystem::create_directories(src + "/wal");   // engine mkdir is single-level today (F2)
+        uint64_t as_of = 0;
+        {
+            Options o;
+            o.wal_dir = src + "/wal";
+            o.checkpoint_path = src + "/ckpt";
+            o.auto_start_gc = false;
+            auto db = Database::open(o);
+            if (db.put("p1", "v1") != Status::OK) { check("CKV-010 setup", false); }
+            db.checkpoint();
+            as_of = db.published_watermark();
+            if (db.put("p2", "v2") != Status::OK) { check("CKV-010 setup2", false); }
+            db.close();
+        }
+        // Dirty destination: a pre-existing file AND a stale wal directory.
+        std::filesystem::create_directories(dst + "/wal");
+        { std::ofstream f(dst + "/preexisting.txt"); f << "do not touch"; }
+        bool threw = false; std::string what;
+        try {
+            auto db = Database::restore_pitr(src + "/wal", src + "/ckpt", dst, as_of);
+            db.close();
+        } catch (const std::exception& e) { threw = true; what = e.what(); }
+        check("remediation CKV-010: restore_pitr into a dirty destination throws (pitr-dirty-dest)",
+              threw, threw ? what : std::string("restore silently proceeded into a dirty dest"));
+        check("remediation CKV-010: the refused restore left the pre-existing file alone",
+              std::filesystem::exists(dst + "/preexisting.txt"));
+        // Fresh (nonexistent) destination still works and is writable.
+        const std::string dst2 = dst + "_fresh";
+        std::filesystem::remove_all(dst2);
+        bool ok_fresh = false;
+        try {
+            auto db = Database::restore_pitr(src + "/wal", src + "/ckpt", dst2, as_of);
+            ok_fresh = db.get("p1").value_or("") == "v1" && !db.get("p2").has_value();
+            if (db.put("p3", "v3") == Status::OK)
+                ok_fresh = ok_fresh && db.get("p3").value_or("") == "v3";
+            db.close();
+        } catch (const std::exception& e) { what = e.what(); ok_fresh = false; }
+        check("remediation CKV-010: restore_pitr into a fresh directory still materializes a writable as-of db",
+              ok_fresh, what);
+        // An existing but EMPTY destination directory is accepted.
+        const std::string dst3 = dst + "_empty";
+        std::filesystem::remove_all(dst3);
+        std::filesystem::create_directories(dst3);
+        bool ok_empty = false;
+        try {
+            auto db = Database::restore_pitr(src + "/wal", src + "/ckpt", dst3, as_of);
+            ok_empty = db.get("p1").value_or("") == "v1";
+            db.close();
+        } catch (const std::exception& e) { what = e.what(); ok_empty = false; }
+        check("remediation CKV-010: restore_pitr into an existing EMPTY directory is accepted",
+              ok_empty, what);
+        std::filesystem::remove_all(src);
+        std::filesystem::remove_all(dst);
+        std::filesystem::remove_all(dst2);
+        std::filesystem::remove_all(dst3);
+    }
+
+    // ---- CKV-011: a PITR open is strictly read-only on the SOURCE ----
+    // Invariant (README Safety properties): "A PITR open does not modify the
+    // source directory at all." Pre-fix the open violated it three ways:
+    //   (1) the engine built full WAL machinery on the source — creating
+    //       .chronokv.lock when absent and taking the WRITER flock (which
+    //       also made as-of views of a live/locked source impossible);
+    //   (2) open_segment()'s torn-tail repair ftruncate'd the source's
+    //       active segment;
+    //   (3) recover_with_checkpoint() deleted orphaned .tmp checkpoint files
+    //       (the stale-delta cleanup was already guarded in v26.1; the
+    //       .tmp sweep was not).
+    {
+        const std::string src = "/tmp/ckv_ckv011_" + std::to_string(getpid());
+        std::filesystem::remove_all(src);
+        std::filesystem::create_directories(src + "/wal");   // engine mkdir is single-level today (F2)
+        const std::string wal = src + "/wal", ckpt = src + "/ckpt";
+        uint64_t as_of = 0;
+        {
+            Options o;
+            o.wal_dir = wal;
+            o.checkpoint_path = ckpt;
+            o.auto_start_gc = false;
+            auto db = Database::open(o);
+            if (db.put("s1", "v1") != Status::OK) { check("CKV-011 setup", false); }
+            db.checkpoint();
+            as_of = db.published_watermark();
+            if (db.put("s2", "v2") != Status::OK) { check("CKV-011 setup2", false); }
+            db.close();
+        }
+        // Crash residue: a torn tail on the ACTIVE (highest) segment, orphan
+        // .tmp files, and a missing lock file (as in a backup copy).
+        std::string active_seg;
+        for (auto& e : std::filesystem::directory_iterator(wal)) {
+            std::string fn = e.path().filename().string();
+            if (fn.rfind("wal_", 0) == 0 && fn.size() > 4 && fn.compare(fn.size() - 4, 4, ".log") == 0)
+                if (active_seg.empty() || fn > std::filesystem::path(active_seg).filename().string())
+                    active_seg = e.path().string();
+        }
+        if (active_seg.empty()) { check("CKV-011 setup: found active segment", false); }
+        else {
+            std::ofstream f(active_seg, std::ios::binary | std::ios::app);
+            uint32_t bogus_len = 24;                    // plausible frame length
+            uint32_t bogus_crc = 0xDEADBEEF;            // wrong CRC -> parse fail
+            f.write(reinterpret_cast<const char*>(&bogus_len), 4);
+            f.write(reinterpret_cast<const char*>(&bogus_crc), 4);
+            const std::string junk(24, '\xA5');
+            f.write(junk.data(), (std::streamsize)junk.size());
+        }
+        { std::ofstream f(ckpt + ".tmp"); f << "orphan"; }
+        { std::ofstream f(ckpt + ".delta.9.tmp"); f << "orphan"; }
+        std::error_code rmec;
+        std::filesystem::remove(wal + "/.chronokv.lock", rmec);
+
+        auto snapshot = [](const std::string& root) {
+            std::map<std::string, std::string> out;
+            for (auto& e : std::filesystem::recursive_directory_iterator(root)) {
+                if (!e.is_regular_file()) continue;
+                std::ifstream f(e.path(), std::ios::binary);
+                out[std::filesystem::relative(e.path(), root).string()] =
+                    std::string((std::istreambuf_iterator<char>(f)),
+                                 std::istreambuf_iterator<char>());
+            }
+            return out;
+        };
+        auto before = snapshot(src);
+        {
+            Options po;
+            po.wal_dir = wal;
+            po.checkpoint_path = ckpt;
+            po.pitr_as_of_cts = as_of;
+            po.auto_start_gc = false;
+            auto view = Database::open(po);
+            check("remediation CKV-011: as-of view serves the boundary state (s1 yes, s2 no)",
+                  view.get("s1").value_or("") == "v1" && !view.get("s2").has_value());
+            bool write_refused = false;
+            try { write_refused = (view.put("s3", "v3") == Status::Failed); } catch (...) {}
+            check("remediation CKV-011: writes are refused on the PITR open", write_refused);
+            bool ckpt_refused = false;
+            try { view.checkpoint(); } catch (const std::exception&) { ckpt_refused = true; }
+            check("remediation CKV-011: checkpoint() is refused on the PITR open", ckpt_refused);
+            bool backup_refused = false;
+            try { view.backup(src + "_bk_attempt"); } catch (const std::exception&) { backup_refused = true; }
+            check("remediation CKV-011: backup() is refused on the PITR open (it would rewrite the source ckpt)",
+                  backup_refused);
+            view.close();
+        }
+        auto after = snapshot(src);
+        bool identical = (before == after);
+        std::string diff;
+        if (!identical) {
+            for (auto& [k, v] : before) {
+                auto it = after.find(k);
+                if (it == after.end()) { diff = "removed: " + k; break; }
+                if (it->second != v) {
+                    diff = "modified: " + k + " (" + std::to_string(v.size()) +
+                           " -> " + std::to_string(it->second.size()) + " bytes)";
+                    break;
+                }
+            }
+            if (diff.empty())
+                for (auto& [k, v] : after)
+                    if (before.find(k) == before.end()) { diff = "created: " + k; break; }
+        }
+        check("remediation CKV-011: PITR open left the source tree byte-identical (pitr-source-immutability)",
+              identical, diff);
+        // A later NORMAL open still recovers everything (it may now repair
+        // the torn tail and sweep the orphans — that is a normal open's job).
+        {
+            Options o;
+            o.wal_dir = wal;
+            o.checkpoint_path = ckpt;
+            o.auto_start_gc = false;
+            auto db = Database::open(o);
+            check("remediation CKV-011: a later normal open still recovers the full state",
+                  db.get("s1").value_or("") == "v1" && db.get("s2").value_or("") == "v2");
+            db.close();
+        }
+        std::filesystem::remove_all(src);
+        std::filesystem::remove_all(src + "_bk_attempt");
+    }
+
     if (fails == 0) std::cout << "   REMEDIATION TESTS PASSED\n";
     else std::cout << "   REMEDIATION FAILURES: " << fails << "\n";
     return fails;
