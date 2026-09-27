@@ -1967,7 +1967,10 @@ extern "C" { __attribute__((weak)) void __gcov_dump(void); }
 // just printed "will SKIP (not fail)". One definition, one helper.
 // Returns true iff a real WRITE completed with res >= 0; *setup_ok_out
 // reports whether the ring itself could be created.
-static bool iouring_io_ops_available(bool* setup_ok_out) {
+// [[maybe_unused]]: both callers (the startup banner and the iouring-real
+// e2e test) live in hooks-on sections; the hooks-off smoke build compiles
+// neither.
+[[maybe_unused]] static bool iouring_io_ops_available(bool* setup_ok_out) {
     if (setup_ok_out) *setup_ok_out = false;
 #ifdef CKV_IOURING_DISABLED
     return false;
