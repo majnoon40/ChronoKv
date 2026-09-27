@@ -12658,6 +12658,45 @@ static int run_remediation_tests() {
         std::filesystem::remove_all(dir);
     }
 
+    // ---- CKV-020: close() is called EXACTLY once — no EINTR retry, no fd-reuse hazard ----
+    // On Linux a close() that returned EINTR has ALREADY released the
+    // descriptor (close(2) NOTES: "it is unspecified whether the descriptor
+    // is closed" is resolved by Linux as closed); retrying the close closes
+    // whatever fd NUMBER the kernel handed another thread in the meantime —
+    // the classic fd-reuse hazard (the pre-fix loop did exactly that). The
+    // single-close contract: report the failure (callers fail-stop per D3),
+    // relinquish ownership unconditionally (callers null their handle), and
+    // never call close() twice for one descriptor.
+    {
+        int calls = 0;
+        const std::string tf = "/tmp/ckv_ckv020_" + std::to_string(getpid());
+        int real_fd = ::open(tf.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+        ckv_close_hook_for_test() = [&](int) -> int {
+            ++calls;
+            errno = (calls == 1) ? EINTR : EIO;
+            return -1;
+        };
+        bool result = checked_close(real_fd);   // hook stands in; no real close
+        ckv_close_hook_for_test() = nullptr;
+        ::close(real_fd);                        // release for real
+        std::filesystem::remove(tf);
+        check("remediation CKV-020: checked_close calls close() EXACTLY once (EINTR is not retried; no fd-reuse hazard)",
+              calls == 1, "close() calls=" + std::to_string(calls));
+        check("remediation CKV-020: a failed close is still reported (fail-stop signal preserved)",
+              result == false);
+        // A failed close on an already-closed fd: reported false, once, no hang.
+        calls = 0;
+        const std::string tf2 = "/tmp/ckv_ckv020b_" + std::to_string(getpid());
+        int fd2 = ::open(tf2.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+        ::close(fd2);
+        ckv_close_hook_for_test() = [&](int) -> int { ++calls; errno = EBADF; return -1; };
+        bool r2 = checked_close(fd2);
+        ckv_close_hook_for_test() = nullptr;
+        std::filesystem::remove(tf2);
+        check("remediation CKV-020: a failed close on an invalid fd reports false exactly once",
+              calls == 1 && !r2, "calls=" + std::to_string(calls));
+    }
+
     if (fails == 0) std::cout << "   REMEDIATION TESTS PASSED\n";
     else std::cout << "   REMEDIATION FAILURES: " << fails << "\n";
     return fails;

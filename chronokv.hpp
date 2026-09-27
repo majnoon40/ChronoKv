@@ -2024,9 +2024,38 @@ static bool checked_fsync(int fd) {
     return true;
 }
 
+#ifdef CHRONOKV_TEST_HOOKS
+// v28 CKV-020: test seam for close() semantics — when set, it stands in for
+// the raw ::close call inside checked_close (the single-close/no-EINTR-retry
+// regression test observes call counts through it). Tests MUST clear it
+// immediately after use; the window is tiny and no engine I/O runs
+// concurrently inside the battery.
+inline std::function<int(int)>& ckv_close_hook_for_test() {
+    static std::function<int(int)> h;
+    return h;
+}
+#endif
+
 static bool checked_close(int fd) {
-    while (::close(fd) != 0) { if (errno == EINTR) continue; return false; }
-    return true;
+#ifdef CHRONOKV_TEST_HOOKS
+    auto do_close = [&](int f) -> int {
+        if (auto& h = ckv_close_hook_for_test(); h) return h(f);
+        return ::close(f);
+    };
+#else
+    auto do_close = [&](int f) -> int { return ::close(f); };
+#endif
+    // v28 CKV-020: close() is called EXACTLY ONCE. The previous loop —
+    // `while (::close(fd) != 0) { if (errno == EINTR) continue; ... }` —
+    // retried an EINTR close, which on Linux is an fd-reuse hazard: the
+    // interrupted close has ALREADY released the descriptor (close(2)
+    // NOTES), and the retry closes whatever fd number the kernel handed
+    // another thread in the meantime (this engine is multi-threaded: WAL
+    // leader, GC, async workers all open/close descriptors). Failure is
+    // still reported so callers keep their fail-stop behavior (D3), and
+    // ownership is relinquished on ANY return — callers must null their
+    // handle (they do) and never close it again.
+    return do_close(fd) == 0;
 }
 
 static bool fsync_dir(const std::string& path) {
