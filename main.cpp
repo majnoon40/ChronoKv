@@ -12506,6 +12506,158 @@ static int run_remediation_tests() {
         std::filesystem::remove_all(src + "_bk_attempt");
     }
 
+    // ---- CKV-019: a corrupt segment (interior hole) must fail LOUD, never be ----
+    // ---- silently repaired, truncated, or LSN-reseeded                      ----
+    // Invariant (D1 recovery policy): wal_recover_buf classifies "unparseable
+    // bytes with a PARSEABLE record after them" as CORRUPT (an interior hole —
+    // the power-loss zero-fill shape whose trailing frames may be
+    // ACKNOWLEDGED commits), distinct from TORN_TAIL (garbage to EOF).
+    // Pre-fix, the append path destroyed that distinction three ways:
+    //   (1) open_segment()'s truncate_torn_tail cut the active segment at the
+    //       first invalid frame — DELETING the valid frames after the hole
+    //       (silent loss of acknowledged writes) before recovery could see
+    //       CORRUPT;
+    //   (2) the truncation result was ignored ((void)truncate_torn_tail), so
+    //       even an I/O-failed repair proceeded to append after garbage;
+    //   (3) find_max_lsn_in_segment() mapped CORRUPT to 0 — reseeding the LSN
+    //       counter below the segment's real max, re-issuing LSNs that later
+    //       recovery rejects as duplicates (bricking the database).
+    {
+        const std::string dir = "/tmp/ckv_ckv019_" + std::to_string(getpid());
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+        {
+            Options o; o.wal_dir = dir; o.auto_start_gc = false; o.recover_on_open = false;
+            auto db = Database::open(o);
+            if (db.put("k1", "v1") != Status::OK) { check("CKV-019 setup1", false); }
+            if (db.put("k2", "v2") != Status::OK) { check("CKV-019 setup2", false); }
+            db.close();
+        }
+        // Locate the active segment and append: [bad-CRC frame with a valid
+        // length field][fully valid frame lsn=3 cts=3] — the interior-hole
+        // shape wal_recover_buf classifies as CORRUPT (valid_after == true).
+        std::string seg;
+        for (auto& e : std::filesystem::directory_iterator(dir)) {
+            std::string fn = e.path().filename().string();
+            if (fn.rfind("wal_", 0) == 0 && fn.compare(fn.size() - 4, 4, ".log") == 0)
+                seg = e.path().string();
+        }
+        if (seg.empty()) { check("CKV-019 setup: found segment", false); }
+        const auto orig_bytes = [] (const std::string& p) {
+            std::ifstream f(p, std::ios::binary);
+            return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        }(seg);
+        {
+            std::ofstream f(seg, std::ios::binary | std::ios::app);
+            WriteSet ws3 = {{"k3", "v3", false}};
+            auto valid3 = wal_make_record(3, 3, ws3);          // [len][crc][payload]
+            uint32_t hole_len = 24;                            // plausible payload len
+            uint32_t hole_crc = 0xDEADBEEF;                    // wrong CRC -> parse fail
+            f.write(reinterpret_cast<const char*>(&hole_len), 4);
+            f.write(reinterpret_cast<const char*>(&hole_crc), 4);
+            const std::string junk(24, '\xA5');
+            f.write(junk.data(), (std::streamsize)junk.size());
+            f.write(reinterpret_cast<const char*>(valid3.data()), (std::streamsize)valid3.size());
+        }
+        const std::string planted = orig_bytes + [] {
+            std::string s; uint32_t l = 24, c = 0xDEADBEEF;
+            s.append(reinterpret_cast<const char*>(&l), 4);
+            s.append(reinterpret_cast<const char*>(&c), 4);
+            s.append(24, '\xA5');
+            WriteSet ws3 = {{"k3", "v3", false}};
+            auto v = wal_make_record(3, 3, ws3);
+            s.append(reinterpret_cast<const char*>(v.data()), v.size());
+            return s;
+        }();
+
+        // (B) recovery open must fail LOUD (CorruptionError), not open a
+        //     silently-truncated view missing the post-hole record.
+        bool threw = false; std::string what;
+        {
+            Options o; o.wal_dir = dir; o.auto_start_gc = false; o.recover_on_open = true;
+            try {
+                auto db = Database::open(o);
+                (void)db.get("k1");
+                db.close();
+            } catch (const std::exception& e) { threw = true; what = e.what(); }
+        }
+        check("remediation CKV-019: recovery open over an interior-hole segment throws (corrupt-segment-loud)",
+              threw, threw ? what : std::string("open succeeded — hole was silently repaired"));
+        // (C) the failed open must leave the segment byte-identical (no
+        //     destructive repair behind the loud failure).
+        const std::string after_open = [] (const std::string& p) {
+            std::ifstream f(p, std::ios::binary);
+            return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        }(seg);
+        check("remediation CKV-019: the segment survives the failed open byte-identical (no silent truncation)",
+              after_open == planted,
+              "size " + std::to_string(planted.size()) + " -> " + std::to_string(after_open.size()));
+
+        // (A) append-only open (recover_on_open=false): fail-stop handle —
+        //     writes refused, no LSN reseed, file untouched.
+        {
+            Options o; o.wal_dir = dir; o.auto_start_gc = false; o.recover_on_open = false;
+            bool open_threw = false; Status put_status = Status::OK; int level = 0;
+            try {
+                auto db = Database::open(o);
+                put_status = db.put("k4", "v4");
+                level = db.health().level;
+                db.close();
+            } catch (const std::exception& e) { open_threw = true; what = e.what(); }
+            check("remediation CKV-019: append-only open over a corrupt segment fail-stops (writes refused, health degraded)",
+                  open_threw || (put_status == Status::Failed && level >= 1),
+                  open_threw ? what : "put=" + std::to_string((int)put_status) + " health=" + std::to_string(level));
+        }
+        const std::string after_append_open = [] (const std::string& p) {
+            std::ifstream f(p, std::ios::binary);
+            return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        }(seg);
+        check("remediation CKV-019: the append-only open left the corrupt segment untouched",
+              after_append_open == planted);
+
+        // (D) CONTROL — a PURE torn tail (garbage to EOF, nothing parseable
+        //     after it) is still repaired silently and recovers: the fix must
+        //     not break legitimate torn-tail recovery.
+        {
+            const std::string dir2 = "/tmp/ckv_ckv019b_" + std::to_string(getpid());
+            std::filesystem::remove_all(dir2);
+            std::filesystem::create_directories(dir2);
+            {
+                Options o; o.wal_dir = dir2; o.auto_start_gc = false; o.recover_on_open = false;
+                auto db = Database::open(o);
+                if (db.put("t1", "v1") != Status::OK) { check("CKV-019 control setup", false); }
+                db.close();
+            }
+            std::string seg2;
+            for (auto& e : std::filesystem::directory_iterator(dir2)) {
+                std::string fn = e.path().filename().string();
+                if (fn.rfind("wal_", 0) == 0 && fn.compare(fn.size() - 4, 4, ".log") == 0)
+                    seg2 = e.path().string();
+            }
+            {
+                std::ofstream f(seg2, std::ios::binary | std::ios::app);
+                uint32_t l = 24, c = 0xDEADBEEF;
+                f.write(reinterpret_cast<const char*>(&l), 4);
+                f.write(reinterpret_cast<const char*>(&c), 4);
+                const std::string junk(24, '\xA5');
+                f.write(junk.data(), (std::streamsize)junk.size());   // garbage to EOF: TORN
+            }
+            bool ok = false;
+            try {
+                Options o; o.wal_dir = dir2; o.auto_start_gc = false; o.recover_on_open = true;
+                auto db = Database::open(o);
+                ok = db.get("t1").value_or("") == "v1";
+                if (db.put("t2", "v2") == Status::OK)     // append-after-repair works
+                    ok = ok && db.get("t2").value_or("") == "v2";
+                db.close();
+            } catch (const std::exception& e) { what = e.what(); }
+            check("remediation CKV-019: CONTROL — a pure torn tail is still repaired and the db appends after it",
+                  ok, what);
+            std::filesystem::remove_all(dir2);
+        }
+        std::filesystem::remove_all(dir);
+    }
+
     if (fails == 0) std::cout << "   REMEDIATION TESTS PASSED\n";
     else std::cout << "   REMEDIATION FAILURES: " << fails << "\n";
     return fails;

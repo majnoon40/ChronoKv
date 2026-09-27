@@ -3479,7 +3479,19 @@ private:
     uint64_t find_max_lsn_in_segment(uint64_t id) {
         std::string p = seg_path(id);
         auto [status, records] = wal_recover_file(p);
-        if (status == WalStatus::CORRUPT || records.empty()) return 0;
+        // v28 CKV-019: never map CORRUPT to 0 — reseeding the LSN counter
+        // below the segment's real max re-issues LSNs that later recovery
+        // rejects as duplicates/gaps, bricking the database (and the records
+        // after the hole may be acknowledged). Established policy (D1):
+        // corruption fails loud at open. With the truncate_torn_tail refusal
+        // + open_segment propagation, a corrupt ACTIVE segment already fails
+        // before this scan; this guard covers SEALED segments, which
+        // open_segment never touches.
+        if (status == WalStatus::CORRUPT)
+            throw std::runtime_error(
+                "WAL segment corrupt (interior hole: valid records after invalid "
+                "bytes): " + p + " — refusing to resume LSNs from it");
+        if (records.empty()) return 0;
         // The last record has the max LSN (records are in file order, LSNs increase)
         // We need to re-parse to get the LSN, since wal_recover_file only returns (cts, ws)
         std::ifstream f(p, std::ios::binary);
@@ -3526,7 +3538,13 @@ private:
         std::string p = seg_path(id);
 
         // v24 FIX (Group 1, Fix 3): torn-tail repair before append.
-        (void)truncate_torn_tail(p);
+        // v28 CKV-019: a FAILED repair is now fatal to the open — the old
+        // (void)-cast appended after an unrepaired torn tail (interleaving
+        // fresh records with garbage) or after an interior hole the repair
+        // refused to cut (the CORRUPT refusal). Either way the segment would
+        // no longer be recoverable; fail the open instead (constructor
+        // latches failed_; a recovery open gets recover_all's loud verdict).
+        if (!truncate_torn_tail(p)) return false;
 
         // v25.1 M2 Phase 2: O_WRONLY (not O_APPEND) so pwrite works for the
         // fallback path. lseek(SEEK_END) before writes positions at the end.
@@ -3610,6 +3628,22 @@ private:
         f.close();
 
         if (buf.empty()) return true;  // empty file: nothing to repair
+
+        // v28 CKV-019: classify BEFORE repairing, via the authoritative
+        // recovery parser. A torn tail (garbage to EOF) is repaired by
+        // truncation, as always. An INTERIOR HOLE — unparseable bytes with a
+        // PARSEABLE record after them (wal_recover_buf's CORRUPT) — must NOT
+        // be truncated: the frames after the hole can be acknowledged commits
+        // (the power-loss zero-fill shape the CORRUPT classification exists
+        // for), and cutting them is silent data loss. Refuse the repair
+        // (false): open_segment now propagates that as a failed open, and a
+        // recovery open gets the loud CORRUPT verdict from recover_all on the
+        // UNTOUCHED file.
+        {
+            auto [st, recs] = wal_recover_buf(buf);
+            (void)recs;
+            if (st == WalStatus::CORRUPT) return false;
+        }
 
         // Walk frames using the same parsing logic as wal_recover_buf.
         // We don't reuse wal_recover_buf directly because we need the
