@@ -36,10 +36,17 @@ Shipped as individual commits over 0.27.0 (pre-0.28.0-stamp):
   longer invisible to checkpoint/GC/free walks.
 - **CKV-006** — streaming range scans skip tombstones instead of
   truncating at the first deleted key (stream == vector == visible set).
-- **CKV-012** — burn-on-throw for the `group_append` reservation window:
-  an OOM-class exception between cts reservation and batch entry burns the
-  cts via `on_abandon` and rethrows; no orphaned hole can wedge the
-  publication barrier.
+- **CKV-012 (+012R)** — burn-on-throw for the `group_append` reservation
+  window: an OOM-class exception between cts reservation and batch entry
+  burns the cts via `on_abandon` and rethrows; no orphaned hole can wedge
+  the publication barrier. **012R (Phase 2 follow-up):** the burn now also
+  latches the WAL fail-stop — the burned cts has no WAL frame (the noop
+  contiguity device is exactly what an OOM-class throw cannot safely
+  write), so allowing later commits would write higher cts values past an
+  unrecoverable interior hole and the next open would reject the whole
+  directory (every later ACKED write unreachable). With the latch the
+  on-disk WAL stays a contiguous prefix, reopen recovers everything acked
+  before the throw, and the fresh instance is writable again.
 - **CKV-018** — `pwrite_all` fault hooks: WriteShort/WriteFail reach the
   production WAL write path (de-vacuated under `CKV_IOURING_DISABLED`).
 
