@@ -3923,6 +3923,22 @@ public:
 
     bool is_failed() const { return failed_; }
 
+    // v28 CKV-012R (Phase 2): latch the D3 fail-stop after a reservation-
+    // window throw. The burn advanced the in-memory published prefix, but
+    // the burned cts has NO WAL frame — the noop-frame contiguity device
+    // the validation-conflict path uses is exactly what an OOM-class throw
+    // cannot safely write (it would itself have to allocate). Without the
+    // latch, later commits wrote HIGHER cts values past that hole and
+    // recovery's interior-gap check rejected the WHOLE directory at the
+    // next open: a transient OOM silently doomed the database and every
+    // later ACKED write became unreachable. With it, no higher cts is ever
+    // written: the on-disk WAL stays a contiguous prefix, reopen recovers
+    // everything acked before the throw, and the fresh instance is writable
+    // again. Reads keep serving (D3 model); health() reports the fail-stop.
+    void fail_stop_for_reservation_throw() {
+        failed_.store(true, std::memory_order_release);
+    }
+
     // Timestamp is reserved INSIDE batch_mu_ so that cts assignment order
     // matches WAL-batch entry order. This prevents interior gaps in the WAL
     // after a crash: no thread can reserve cts=N+1 and enter the batch before
@@ -6449,6 +6465,18 @@ public:
              // leader-section exception failed the batch (its waiters'
              // burns go through the WalFailure path). Nothing to burn here
              // (and we still cannot know whether fetch_add was reached).
+             //
+             // v28 CKV-012R (Phase 2): latch the WAL fail-stop (D3). The
+             // burned cts carries no WAL frame; if later commits were
+             // allowed to proceed they would write HIGHER cts values past
+             // an unrecoverable interior hole — recovery's contiguity
+             // check rejects the whole directory at the next open, turning
+             // a transient OOM into a permanently unopenable database
+             // whose later ACKED writes are unreachable. After the latch:
+             // no higher cts is ever written, the on-disk WAL stays a
+             // contiguous prefix, reopen recovers every earlier acked
+             // write, and the fresh instance is writable again.
+             wal_->fail_stop_for_reservation_throw();
              return TxnResult::WalFailure;
          }
          cts = ts;

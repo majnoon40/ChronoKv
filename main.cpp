@@ -11903,38 +11903,62 @@ static int run_remediation_tests() {
         if (!fired) return 11;                       // injection never reached — vacuous
         if (st_a == Status::OK) return 12;           // the throwing commit must NOT ack
 
-        // Thread B: a LATER commit on a different key. Pre-fix it wedges at
-        // await_published (prefix stalled below A's orphaned cts); the wait
-        // is bounded at 5s, matching the lincheck barrier convention.
-        std::atomic<bool> b_done{false}, b_ok{false};
+        // Thread B: a LATER commit on a different key. Pre-CKV-012 it
+        // wedged at await_published (prefix stalled below A's orphaned
+        // cts); the wait is bounded at 5s, matching the lincheck barrier
+        // convention.
+        // v28 CKV-012R (Phase 2): B must complete bounded BUT FAIL — the
+        // reservation-window throw now latches the WAL fail-stop (D3
+        // model). The burn leaves an INTERIOR cts hole with NO WAL frame
+        // (the noop-frame contiguity device the validation-conflict burn
+        // uses is exactly what an OOM-class throw cannot safely write — it
+        // would itself have to allocate). Letting later commits proceed
+        // wrote HIGHER cts values past that hole, and recovery's
+        // interior-gap check rejected the WHOLE directory at the next
+        // open: a transient OOM silently doomed the database and every
+        // later ACKED write became unreachable — a durability-contract
+        // violation the old NOTE below documented but did not fix. With
+        // the latch, no higher cts is ever written: the on-disk WAL stays
+        // a contiguous prefix, reopen recovers everything acked before the
+        // OOM, and the fresh instance is writable again.
+        std::atomic<bool> b_done{false};
+        std::atomic<int> b_status{0};
         std::thread tb([&] {
             Status st = Status::OK;
             try { st = db.put("b-key", "bv"); } catch (const std::exception&) { st = Status::Failed; }
-            b_ok.store(st == Status::OK);
+            b_status.store((int)st);
             b_done.store(true);
         });
         for (int i = 0; i < 500 && !b_done.load(std::memory_order_acquire); ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         if (!b_done.load()) { tb.detach(); return 13; }   // WEDGED: later commit hangs
         tb.join();
-        if (!b_ok.load()) return 14;
+        if (b_status.load() == (int)Status::OK) return 14;   // fail-stop NOT latched: B wrote past the hole
+        if (b_status.load() != (int)Status::Failed) return 15; // expected DatabaseFailed -> Failed
+        if (db.health().level < 1) return 20;               // fail-stop must be observable
 
-        // NOTE: no reopen leg, deliberately. The burn leaves an INTERIOR
-        // cts hole with no WAL frame (a noop frame — the contiguity device
-        // the validation-conflict burn uses — is exactly what an OOM-class
-        // throw cannot safely write), and recovery's interior-gap check
-        // (v26.1 WAL-contiguity invariant) rejects such a WAL loudly on
-        // the next open: fail-stop, not silent replay. Asserting either
-        // reopen behaviour is outside this finding's specified contract
-        // (A non-OK + B completes bounded); the consequence is documented
-        // in the commit message.
+        // Reopen leg (new in CKV-012R — the old NOTE deliberately skipped
+        // it): the directory must open CLEANLY (the WAL is a contiguous
+        // prefix — nothing was written past the frameless hole), everything
+        // acked before the OOM is recovered, nothing unacked appears, and
+        // the fresh instance is writable.
         db.close();
+        {
+            Options o2 = o;
+            auto db2 = Database::open(o2);
+            if (db2.get("seed").value_or("") != "v") return 16;   // acked pre-OOM: recovered
+            if (db2.get("a-key").has_value()) return 17;          // A never acked: absent
+            if (db2.get("b-key").has_value()) return 18;          // B never acked: absent
+            if (db2.put("c-key", "cv") != Status::OK) return 19;  // writable again
+            if (db2.get("c-key").value_or("") != "cv") return 19;
+            db2.close();
+        }
         std::filesystem::remove_all(wd);
         return 0;
     };
-    run_child("remediation CKV-012: reservation-window throw burns the cts; later commits do not wedge (wal-reserve-burn-on-throw)",
+    run_child("remediation CKV-012(+R): reservation-window throw burns the cts, later commits neither wedge nor write past the hole, reopen is clean (wal-reserve-burn-on-throw)",
               ckv012_body, 60000,
-              "orphaned cts stalls the published prefix; every later commit hangs at the barrier");
+              "pre-CKV-012: orphaned cts wedges every later commit at the barrier; pre-CKV-012R: a later commit SUCCEEDS past the frameless hole, dooming the directory at reopen");
 
     // ---- CKV-006: stream truncated at the first tombstone ----
     // (stream-tombstone-differential). ChronoKVRangeScanCursorState cached
