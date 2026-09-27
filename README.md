@@ -523,12 +523,25 @@ E1–E16 safety argument and the v24 fix log at the top of the file).
 
 ## Roadmap
 
-[`docs/ROADMAP.md`](docs/ROADMAP.md) — the v26 → v30 plan: durability hardening
-(adversarial fsync semantics, randomized crash-point fuzzing), deterministic
-simulation testing, the dedicated WAL writer thread, B+ tree page reclamation,
-and API ergonomics. Each item carries its anchor, size, acceptance criteria and
-any new canonical invariant; the document also records where the plan itself
-turned out to be wrong.
+[`docs/ROADMAP.md`](docs/ROADMAP.md) — the 2026-09-27 plan (v29 → v30,
+*"challenge the real databases"*). **v29 — the overhaul:** an independent
+re-audit gate, a benchmark arena with vendored version-pinned baselines
+(SQLite / LMDB / RocksDB) and a regression-gated results ledger, page
+reclamation with hazard-pointer consumers, leaf merge/rebalance (new
+invariant P1), the WAL writer-thread rewrite (the leader handshake gets
+deleted, not rewritten), and space/steady-state work (linear GC sweeps,
+streaming recovery parse, multi-version PITR deltas). **v30 — 1.0.0:**
+machine-checked invariants, the 100M-key scale soak with RSS-level memory
+budgets and a bulk-load recovery prerequisite, power-loss truth via a
+fault-injecting block layer, the source split with an amalgamated release
+artifact, an honest head-to-head comparison page generated from the ledger,
+and a release gate an audit verdict can hold. Each item carries its anchor,
+size, acceptance criteria and any new canonical invariant; sizes are
+T-shirt guesses and the pace assumption is stated. The plan supersedes the
+2026-09-17 roadmap's v28–v30 sections with a full
+[old-arc disposition table](docs/ROADMAP.md#old-arc-disposition) — every
+item mapped to a new home or explicitly PARKED, nothing silently dropped —
+and preserves the completed v26/v27 history as its appendix.
 
 Canonical invariants are defined in `chronokv.hpp`'s header comment and
 referenced by ID throughout the roadmap (R1, I2, I3, I6, D1, D2, D3, R-REBASE,

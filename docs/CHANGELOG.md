@@ -5,6 +5,22 @@ since the v22 arc while the file was never in-tree (fixed in 0.28.0).
 Entries below 0.28.0 are backfilled from `docs/ROADMAP.md` and the header's
 version history; 0.28.0 is recorded in full.
 
+## Unreleased
+
+- **docs:** `docs/ROADMAP.md` replaced by the 2026-09-27 challenge roadmap
+  (v29 → v30, revision 3 — two external review rounds; all 22 review items
+  plus five citation-precision fixes incorporated, each mapped in the
+  plan's own review-disposition table). The 2026-09-17 plan's v28–v30
+  sections are superseded via the new plan's Old-arc disposition table
+  (nothing silently dropped); its completed v26/v27 history is preserved as
+  the file's appendix, with the superseded progress row marked in place.
+  README Roadmap paragraph rewritten to match (this entry and it complete
+  the adoption mechanics `843f01d` described; that commit's ROADMAP
+  replacement landed before them because its README anchor mismatched —
+  recorded here rather than papered over). No engine changes;
+  `CHRONOKV_VERSION` stays **0.28.0** — versions track shipped code, and
+  v29 releases 0.29.0 at its M7 gate.
+
 ## 0.28.0 — v28 audit remediation (complete)
 
 The 21 findings of the `docs/request.txt` adversarial audit (CKV-001…021)
