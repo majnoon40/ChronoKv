@@ -12732,7 +12732,19 @@ inline std::pair<KeyEntry*, bool> ChronoKV::ensure_index(const std::string& k) {
     // removed from put_recursive (it caused deadlock when nm_ was held
     // during the gap hook). The fence re-check is tested via the
     // concurrent-puts approach (Test 5) without the deterministic hook.
-    KeyEntry* e = new KeyEntry();
+    //
+    // v28 (ASan CI, run #43): the entry is owned by a unique_ptr until the
+    // tree takes ownership. tree_->put can THROW — bad_alloc from pool_
+    // .alloc() during split planning (the CKV-003b bounded-pool trigger;
+    // plan-before-mutate leaves the tree unchanged, so nothing else needs
+    // unwinding) or PageCapacityError from the key-size backstop — and the
+    // pre-fix raw `new` leaked the 56-byte KeyEntry on that path (exactly
+    // one leak per exhaustion: the D4 index fail-stop latch makes every
+    // later commit short-circuit before ensure_index). The in-process
+    // CKV-016 async-contract test surfaced it; the forked CKV-003b child
+    // had always hidden it (_exit skips LeakSanitizer).
+    std::unique_ptr<KeyEntry> owner(new KeyEntry());
+    KeyEntry* e = owner.get();
     // v25.1 M1.6: stress_point for the double-allocation race test.
     // This is OUTSIDE nm_ — the test hooks here to block thread A before
     // it takes nm_. Thread B (which also reaches here) then takes nm_,
@@ -12743,13 +12755,16 @@ inline std::pair<KeyEntry*, bool> ChronoKV::ensure_index(const std::string& k) {
     if (tree_->get(k, &buf)) {
         KeyEntry* winner = decode_ptr(buf);
         if (winner != e) {
-            delete e;  // we lost the race, use the winner
+            // we lost the race, use the winner — owner deletes our entry
+            // exactly as the pre-fix `delete e` did.
             tree_->ensure_index_loser_deletes_.fetch_add(1, std::memory_order_relaxed);
             return {winner, true};
         }
+        owner.release();
         return {e, true};  // winner == e (already inserted by us — shouldn't happen)
     }
-    tree_->put(k, encode_ptr(e));
+    tree_->put(k, encode_ptr(e));   // throws -> owner frees e (tree unchanged)
+    owner.release();                // the tree now owns e
     return {e, true};
 }
 
