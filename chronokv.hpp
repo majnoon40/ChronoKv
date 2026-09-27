@@ -3245,7 +3245,41 @@ private:
 };
 
 // pwrite_all: positioned write (not append). Used by the fallback path.
+#ifdef CHRONOKV_TEST_HOOKS
+// v28 CKV-004R (Phase 3): deterministic partial-write injector for the
+// production WAL data path. When armed with n >= 0, the NEXT pwrite_all
+// call writes exactly n bytes FOR REAL (a chosen prefix — e.g. one or more
+// COMPLETE CRC-valid frames, sized from the actual wal_make_record
+// framing) and then fails with EIO, preserving the written prefix on disk.
+// One-shot (exchanged to -1 when consumed). This is the deterministic
+// equivalent of the audit PoC's RLIMIT_FSIZE EFBIG mid-batch, and it fills
+// the exact coverage gap Phase 3 identified: WriteFail fails BEFORE any
+// byte is written (proves nothing about partial content) and WriteShort's
+// retry loop always COMPLETES the write (never fails with a prefix on
+// disk).
+inline std::atomic<int64_t>& pwrite_fail_after_bytes_for_test() {
+    static std::atomic<int64_t> v{-1};
+    return v;
+}
+#endif
+
 static bool pwrite_all(int fd, const uint8_t* d, size_t n, off_t offset) {
+#ifdef CHRONOKV_TEST_HOOKS
+    {
+        const int64_t budget = pwrite_fail_after_bytes_for_test().exchange(-1);
+        if (budget >= 0) {
+            size_t remain = static_cast<size_t>(std::min<int64_t>(budget, static_cast<int64_t>(n)));
+            while (remain > 0) {
+                ssize_t w = ::pwrite(fd, d, remain, offset);
+                if (w < 0) { if (errno == EINTR) continue; return false; }
+                if (w == 0) { errno = EIO; return false; }
+                d += w; remain -= static_cast<size_t>(w); offset += w;
+            }
+            errno = EIO;
+            return false;   // prefix on disk, call failed — the Phase-3 shape
+        }
+    }
+#endif
 #ifdef CHRONOKV_FAULT_INJECTION
     // CKV-018: the WAL data path (the io_uring-disabled fallback AND the
     // io_uring remediation re-route at 3917-3928 — every non-uring write

@@ -13075,6 +13075,69 @@ static int run_remediation_tests() {
         std::filesystem::remove_all(root);
     }
 
+    // ---- CKV-004R (Phase 3): complete frame on disk + reported write failure — no resurrection ----
+    // Phase 3 judged the pre-existing CKV-004 coverage VACUOUS for the
+    // partial-write shape: WriteFail fails BEFORE any byte is written, and
+    // a one-byte prefix is just a torn tail. The resurrection hazard needs
+    // at least one COMPLETE, CRC-valid frame on disk while the write call
+    // reports failure — deterministically produced here by the
+    // pwrite_fail_after_bytes injector (the audit PoC drove it with
+    // RLIMIT_FSIZE EFBIG mid-batch). Scenario (async durability, MOCK_FAILURE
+    // ring so the production pwrite_all path runs on EVERY platform):
+    // put_async -> the batch's single frame is fully written -> EIO ->
+    // WRITE-stage failure: `written` was never published, so the waiter
+    // exits WalFailure (never acked). The CKV-004 gate (`written &&
+    // has_async` is the ONLY keep-case) must TRUNCATE: the pre-CKV-004 gate
+    // keyed on has_async alone, so the complete frame survived and recovery
+    // replayed it — a transaction whose caller observed failure
+    // RESURRECTED at the next open (invariant D2 violated).
+    {
+        const std::string wd = "/tmp/ckv_ckv004r_" + std::to_string(getpid());
+        std::filesystem::remove_all(wd);
+        std::filesystem::create_directories(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.durability = DurabilityMode::Async;
+        o.auto_start_gc = false;
+        o.recover_on_open = false;
+        auto db = Database::open(o);
+        if (db.put("seed", "s") != Status::OK) check("CKV-004R setup", false);
+        // Derive the EXACT frame size from the real framing (lsn/cts are
+        // fixed-width; only write-set content determines the length).
+        WriteSet probe_ws = {{"rr", "vv", false}};
+        const size_t frame_sz = wal_make_record(1, 1, probe_ws).size();
+        // Force the production pwrite path on every platform, then arm:
+        // let exactly one COMPLETE frame land, then fail the call.
+        db.inject_iouring_for_test(
+            std::make_unique<chronokv_iouring::MockIoUring>(
+                chronokv_iouring::MockIoUring::MOCK_FAILURE));
+        chronokv_iouring::pwrite_fail_after_bytes_for_test().store((int64_t)frame_sz);
+        Status st = Status::OK;
+        try {
+            auto f = db.put_async("rr", "vv");
+            st = f.get();     // WRITE-stage failure: `written` never published -> WalFailure
+        } catch (const std::exception&) { st = Status::Failed; }
+        chronokv_iouring::pwrite_fail_after_bytes_for_test().store(-1);  // one-shot; belt
+        check("remediation CKV-004R: the async committer observes the write failure (never acked)",
+              st != Status::OK, "status=" + std::to_string((int)st));
+        db.close();
+        {   // Reopen: the failed frame must NOT resurrect; the earlier acked
+            // write must survive; the database must be writable again.
+            Options o2 = o;
+            o2.recover_on_open = true;
+            auto db2 = Database::open(o2);
+            const bool no_resurrect = !db2.get("rr").has_value();
+            const bool seed_ok = db2.get("seed").value_or("") == "s";
+            const bool writable = (db2.put("after", "x") == Status::OK);
+            check("remediation CKV-004R: a COMPLETE CRC-valid frame of an unacked async batch does not resurrect on recovery (wal-partial-frame-no-resurrection)",
+                  no_resurrect, "'rr' present after reopen — the failed batch's frame was not truncated away");
+            check("remediation CKV-004R: the earlier acknowledged write survives", seed_ok);
+            check("remediation CKV-004R: the database is writable after the failed batch", writable);
+            db2.close();
+        }
+        std::filesystem::remove_all(wd);
+    }
+
     if (fails == 0) std::cout << "   REMEDIATION TESTS PASSED\n";
     else std::cout << "   REMEDIATION FAILURES: " << fails << "\n";
     return fails;
