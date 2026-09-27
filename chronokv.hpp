@@ -3787,7 +3787,21 @@ private:
 
 public:
     explicit WalSegments(const std::string& dir) : dir_(dir) {
-        ::mkdir(dir.c_str(), 0755);
+        // v28 review-F2: create wal_dir RECURSIVELY, and fail with the real
+        // cause. The old single-level ::mkdir (return ignored) could not
+        // create a nested path — the documented README quick-start
+        // (wal_dir = "/tmp/mydb/wal") aborted on a fresh machine with a
+        // misleading "inter-process lock: cannot open .../.chronokv.lock"
+        // LifecycleError, because the ACTUAL failure (the directory did not
+        // exist and was never created) surfaced one step later at the lock
+        // file. Every in-suite test pre-created its directories, so CI
+        // never exercised the fresh-machine path.
+        {
+            std::error_code dec;
+            std::filesystem::create_directories(dir, dec);
+            if (dec)
+                throw std::runtime_error("cannot create wal_dir '" + dir + "': " + dec.message());
+        }
         // v22.1 M4: inter-process guard via advisory flock. Fail loud if this
         // wal_dir is already open in another process (or another live connection
         // in this process). v24: FdGuard releases the fd (and thus the flock)
@@ -3796,7 +3810,11 @@ public:
             std::string lock_path = dir + "/.chronokv.lock";
             lock_fd_.fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0644);
             if (lock_fd_.fd < 0) {
-                throw std::runtime_error("inter-process lock: cannot open " + lock_path);
+                // v28 review-F2: name the errno — "cannot open" alone sent
+                // fresh-machine users hunting for a phantom second process.
+                const int lerrno = errno;
+                throw std::runtime_error("inter-process lock: cannot open " + lock_path +
+                                         ": " + strerror(lerrno));
             }
             if (::flock(lock_fd_.fd, LOCK_EX | LOCK_NB) != 0) {
                 int saved_errno = errno;

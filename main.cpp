@@ -12989,6 +12989,61 @@ static int run_remediation_tests() {
         std::filesystem::remove_all(wd);
     }
 
+    // ---- Review F2: a nested, nonexistent wal_dir is created at open ----
+    // The README quick-start (wal_dir = "/tmp/mydb/wal") aborted on a fresh
+    // machine: the engine's single-level ::mkdir could not create the nested
+    // path, its failure was ignored, and the error surfaced as a misleading
+    // "inter-process lock: cannot open .../.chronokv.lock" LifecycleError.
+    // Every in-suite test pre-created its directories, so CI never saw it.
+    {
+        const std::string root = "/tmp/ckv_f2_" + std::to_string(getpid());
+        std::filesystem::remove_all(root);
+        bool opened = false; std::string what;
+        {
+            Options o;
+            o.wal_dir = root + "/nested/deeper/wal";   // parents do NOT exist
+            o.checkpoint_path = root + "/nested/ckpt";
+            o.auto_start_gc = false;
+            try {
+                auto db = Database::open(o);
+                opened = (db.put("k", "v") == Status::OK);
+                db.checkpoint();
+                db.close();
+            } catch (const std::exception& e) { what = e.what(); }
+        }
+        check("remediation F2: open() creates a nested wal_dir — the README quick-start runs verbatim (nested-waldir-create)",
+              opened, what);
+        bool recovered = false;
+        try {
+            Options o;
+            o.wal_dir = root + "/nested/deeper/wal";
+            o.checkpoint_path = root + "/nested/ckpt";
+            o.auto_start_gc = false;
+            auto db = Database::open(o);
+            recovered = db.get("k").value_or("") == "v";
+            db.close();
+        } catch (const std::exception& e) { what = e.what(); }
+        check("remediation F2: data survives close+reopen of the created tree", recovered, what);
+        // A genuinely uncreatable wal_dir must name the REAL cause.
+        bool msg_ok = false;
+        const std::string blocker = root + "/blocker_file";
+        { std::ofstream f(blocker); f << "x"; }        // a regular FILE as parent
+        try {
+            Options o;
+            o.wal_dir = blocker + "/wal";
+            o.auto_start_gc = false;
+            o.recover_on_open = false;
+            auto db = Database::open(o);
+            db.close();
+        } catch (const std::exception& e) {
+            what = e.what();
+            msg_ok = what.find("cannot create wal_dir") != std::string::npos;
+        }
+        check("remediation F2: an uncreatable wal_dir reports the real cause (not the lock file)",
+              msg_ok, what);
+        std::filesystem::remove_all(root);
+    }
+
     if (fails == 0) std::cout << "   REMEDIATION TESTS PASSED\n";
     else std::cout << "   REMEDIATION FAILURES: " << fails << "\n";
     return fails;
