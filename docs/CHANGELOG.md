@@ -7,6 +7,27 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **bench (v29 M1 step 3, start):** `bench/baselines.cpp` — baseline
+  adapters for SQLite (WAL; `synchronous=FULL` and `=NORMAL`), LMDB
+  (defaults) and RocksDB (`sync=true` defaults + one documented tuned
+  config) under the arena's identical methodology, geometry, seeds and
+  distribution code; `make arena-baselines` (header-presence detection —
+  a missing library omits that engine); `bench/third_party/README.md`
+  (rule-10 pinning/vendoring policy + the durability-class mapping table).
+  Workload subset: fillseq/fillrandom/readrandom/overwrite/ycsb_a/b/c
+  (D/E/F adapters follow). Three adapter defects found and fixed during
+  validation, each a fairness issue rather than a flake: LMDB dbi-0
+  priming (EINVAL otherwise), RocksDB nested-dir creation + hollow-engine
+  propagation (segfault on first put otherwise), and the SQLite WAL
+  read-snapshot trap (an unreset SELECT keeps the connection's snapshot
+  open; the next BEGIN IMMEDIATE on the same connection then returns
+  SQLITE_BUSY immediately without invoking the busy handler — and a failed
+  BEGIN deflates update latencies). Validated: all five configs clean over
+  the subset at 20k keys (zero failed ops across repeats), plus ChronoKV
+  group/async at the same geometry — the six-way table is the harness
+  proof; the numbers themselves are sandbox-validation only (unclassified
+  backing fs), not ledger material.
+
 - **docs:** `docs/ROADMAP.md` replaced by the 2026-09-27 challenge roadmap
   (v29 → v30, revision 3 — two external review rounds; all 22 review items
   plus five citation-precision fixes incorporated, each mapped in the

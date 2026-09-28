@@ -96,6 +96,33 @@ $(BIN_DIR)/arena/arena: bench/arena.cpp chronokv.hpp | $(BIN_DIR)/arena
 	    -DARENA_BUILD_INFO=\"$(ARENA_INFO)\" $(ARENA_FLAGS) \
 	    bench/arena.cpp -o $@ -lpthread
 
+# ---- v29 M1 step 3: baseline adapters (bench/baselines.cpp) ----
+# Rule 10: baselines are BENCHMARKS, NOT DEPENDENCIES — detection is by
+# header presence; a missing library omits that engine from the binary.
+# bench/baselines.cpp is the ONLY file in the repo that includes a
+# third-party storage header. Pinning policy: bench/third_party/README.md.
+BASE_DEFS :=
+BASE_LIBS :=
+ifneq ($(wildcard /usr/include/sqlite3.h),)
+BASE_DEFS += -DCKV_BASE_SQLITE=1
+BASE_LIBS += -lsqlite3
+endif
+ifneq ($(wildcard /usr/include/lmdb.h),)
+BASE_DEFS += -DCKV_BASE_LMDB=1
+BASE_LIBS += -llmdb
+endif
+ifneq ($(wildcard /usr/include/rocksdb/db.h),)
+BASE_DEFS += -DCKV_BASE_ROCKSDB=1
+BASE_LIBS += -lrocksdb
+endif
+
+arena-baselines: $(BIN_DIR)/arena/baselines
+
+$(BIN_DIR)/arena/baselines: bench/baselines.cpp | $(BIN_DIR)/arena
+	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(BASE_DEFS) \
+	    -DARENA_BUILD_INFO=\"$(ARENA_INFO)\" $(ARENA_FLAGS) \
+	    bench/baselines.cpp -o $@ $(BASE_LIBS) -lpthread
+
 # ---- hooks-off targets ----
 smoke_off_release: $(BIN_DIR)/smoke_off/release/test
 smoke_off_asan:    $(BIN_DIR)/smoke_off/asan/test
@@ -156,6 +183,6 @@ $(BIN_DIR)/smoke_off/tsan $(BIN_DIR)/smoke_off/stress:
 clean:
 	rm -rf $(BIN_DIR)
 
-.PHONY: release asan tsan stress coverage arena \
+.PHONY: release asan tsan stress coverage arena arena-baselines \
 	smoke_off_release smoke_off_asan smoke_off_tsan smoke_off_stress \
 	all clean
