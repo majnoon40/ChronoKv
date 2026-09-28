@@ -486,6 +486,90 @@ jobs:
             cov/*/run.log
           if-no-files-found: ignore
 
+  # ---- v29 M1 step 4 (start): nightly arena ledger vehicle ---------------
+  # Runs the arena (ChronoKV, both durability classes) and the five baseline
+  # configs over a FIXED geometry on a fixed-spec runner, and uploads the
+  # TSVs (each carries its rule-9 methodology header: hardware, engine
+  # versions, geometry, seed, durability class) as an artifact.
+  #
+  # INFORMATIONAL BY DESIGN until the noise protocol is calibrated: the M1
+  # acceptance is "the nightly ledger shows one full green week" BEFORE
+  # deltas-beyond-noise start failing the job, so this job is NOT in
+  # ci-passed's needs — a flaky shared runner must never block a PR, and
+  # the gate must never learn to be ignored (the lesson the DST resharding
+  # history already paid for). Enabling the regression gate = adding
+  # `arena` to ci-passed needs + committing the calibrated noise bands,
+  # after the green week.
+  #
+  # Ledger tracking: results are artifacts for now. Promoting them into a
+  # committed bench/results/ ledger needs either a contents:write workflow
+  # token or a bot commit — a deliberate permissions decision, deferred
+  # with the calibration (roadmap M1 step 4).
+  arena:
+    name: arena (nightly ledger, informational)
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Fixed ledger geometry (calibration stage): 200k keys, 100 B values,
+      # 4 threads, seed 42. Geometry changes are ledger-format changes —
+      # bump the ledger spec, never silently mix geometries.
+      ARENA_KEYS: "200000"
+      ARENA_OPS: "200000"
+      ARENA_THREADS: "4"
+      ARENA_SEED: "42"
+      ARENA_VALSIZE: "100"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install baseline libraries (distro versions; the methodology header records them per run)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev liblmdb-dev librocksdb-dev
+
+      - name: Build arena + baselines
+        run: make arena arena-baselines
+
+      - name: Run arena — ChronoKV (group + async)
+        run: |
+          mkdir -p bench/results
+          for dur in group async; do
+            ./build/arena/arena \
+              --keys "$ARENA_KEYS" --ops "$ARENA_OPS" --threads "$ARENA_THREADS" \
+              --seed "$ARENA_SEED" --valsize "$ARENA_VALSIZE" --durability "$dur" \
+              --dir /tmp/ckv_ledger_"$dur" \
+              > "bench/results/chronokv-$dur.tsv" 2>&1 || \
+              echo "::warning::arena run chronokv-$dur exited nonzero (informational job)"
+          done
+
+      - name: Run baselines (five configs, identical geometry)
+        run: |
+          for eng in sqlite-full sqlite-normal lmdb rocksdb-sync rocksdb-tuned; do
+            ./build/arena/baselines \
+              --engine "$eng" \
+              --keys "$ARENA_KEYS" --ops "$ARENA_OPS" --threads "$ARENA_THREADS" \
+              --seed "$ARENA_SEED" --valsize "$ARENA_VALSIZE" \
+              --dir /tmp/ckv_ledger_base \
+              > "bench/results/$eng.tsv" 2>&1 || \
+              echo "::warning::baseline run $eng exited nonzero (informational job)"
+          done
+
+      - name: Ledger digest (throughput-only summary in the job log)
+        if: always()
+        run: |
+          for f in bench/results/*.tsv; do
+            echo "== $f"
+            grep -vE '^#' "$f" | awk -F'\t' '{printf "  %-22s %12s ops/s  p50=%-6s p99=%s\n", $1, $4, $5, $6}'
+          done
+
+      - name: Upload ledger artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arena-ledger-${{ github.run_id }}
+          path: bench/results/
+          if-no-files-found: warn
+
   # ---- gate: single aggregate check for branch protection ----------------
   ci-passed:
     name: ci-passed

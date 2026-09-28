@@ -198,7 +198,7 @@ What 0.28.0 did *not* do, and v29 inherits:
 | Waves 2–5 — CKV-004…021 + F1/F2 + 012R | **DONE** | `1fe98b0`…`3161c77` |
 | 0.28.0 release (version + CHANGELOG + tag) | **DONE** | `ced3806`, tag `v0.28.0` |
 | v29 M0 — independent re-audit | not started — deliverable zero awaits the maintainer's copies of the audit report + remediation specification | — |
-| v29 M1 — benchmark arena | **STARTED** — steps 1–3(start): engine-side workloads + YCSB A–F mixes + SQLite/LMDB/RocksDB adapters under identical methodology (six-way table validated); remaining: D/E/F baseline adapters, version pinning/vendoring, CI nightly ledger + noise protocol (step 4) | `bench/arena.cpp`, `bench/baselines.cpp` |
+| v29 M1 — benchmark arena | **STARTED** — steps 1–4(start): engine-side workloads + YCSB A–F mixes + SQLite/LMDB/RocksDB adapters (six-way table validated) + nightly informational ledger vehicle in CI (fixed 200k-key geometry, artifacts; NOT gating until the calibrated green week per M1 acceptance). Remaining: D/E/F baseline adapters, version pinning/vendoring, noise-band calibration + gate enablement, ledger-promotion decision | `bench/arena.cpp`, `bench/baselines.cpp`, ci.yml `arena` |
 | v29 M2–M7 — catcher hardening + the overhaul | not started | — |
 | v30 M0–M5 — the challenge, 1.0.0 | not started | — |
 

@@ -7,6 +7,20 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **ci (v29 M1 step 4, start):** nightly `arena` ledger vehicle —
+  schedule/dispatch-only job running the arena (ChronoKV group + async) and
+  all five baseline configs over a FIXED calibration geometry (200k keys,
+  100 B values, 4 threads, seed 42), uploading the TSVs (each with its
+  rule-9 methodology header) as `arena-ledger-<run_id>` artifacts plus a
+  throughput digest in the job log. **Informational by design**: NOT in
+  `ci-passed` needs — the M1 acceptance requires one green ledger week
+  before deltas-beyond-noise may fail anything, and a flaky shared runner
+  must never block a PR. Gate enablement (= adding `arena` to ci-passed +
+  committing calibrated noise bands) and the ledger-promotion decision
+  (committed `bench/results/` needs a contents:write token or a bot
+  commit) are the remaining step-4 work, both documented in the job
+  header. actionlint clean.
+
 - **bench (v29 M1 step 3, start):** `bench/baselines.cpp` — baseline
   adapters for SQLite (WAL; `synchronous=FULL` and `=NORMAL`), LMDB
   (defaults) and RocksDB (`sync=true` defaults + one documented tuned
