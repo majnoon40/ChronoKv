@@ -7,6 +7,17 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **docs (v29 M0, deliverable zero):** the two companion documents the
+  roadmap leaned on but that never existed in-tree are committed under
+  `docs/audits/`: the Full Adversarial Audit (2026-09-23 — 21 findings,
+  verdict D, the probe9/probe15 re-verifications rule 8 cites, and the
+  invariant matrix) and the Remediation Specification (2026-09-24 — the
+  5-wave/20-commit plan executed as 0.28.0, including the 4044-byte
+  page-safe key-bound derivation and the split_interior inclusion the
+  audit itself missed). Every probe-ID, matrix and verdict reference in
+  the roadmap is now checkable from the tree. M0's re-audit commission
+  remains pending.
+
 - **ci (v29 M1 step 4, start):** nightly `arena` ledger vehicle —
   schedule/dispatch-only job running the arena (ChronoKV group + async) and
   all five baseline configs over a FIXED calibration geometry (200k keys,
