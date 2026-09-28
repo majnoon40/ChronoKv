@@ -5,7 +5,7 @@ measures (load-bearing constraint 2 — *measure before predict*). Everything
 here is a hooks-OFF consumer build: the public API only, exactly what an
 embedder compiles.
 
-## Status: SKELETON (M1 step 1, engine-side)
+## Status: M1 steps 1–2 (engine-side + YCSB mixes)
 
 `arena.cpp` ships the engine-side micro suite: `fillseq` / `fillrandom`
 (the new-key `nm_`-path isolation workloads), `readrandom`, `overwrite`,
@@ -16,10 +16,21 @@ heap + slack, per the roadmap's B2 discipline). Every run prints a rule-9
 methodology header (kernel, CPUs, RAM, CPU model, build flags, version,
 durability, geometry, seed) before the TSV results.
 
-Not yet here (subsequent M1 steps): YCSB-style mixes A–F (step 2), the
-vendored version-pinned baselines under `bench/third_party/` — SQLite /
-LMDB / RocksDB, never in the engine's include path (step 3, rule 10), and
-the CI nightly ledger with the calibrated noise protocol (step 4).
+**Step 2 (shipped):** YCSB-style mixes `ycsb_a` … `ycsb_f` — the six
+standard operation mixes (A 50/50 read/update, B 95/5, C read-only,
+D read-latest/insert, E scan/insert with len 1–100, F read + RMW) over
+zipfian(θ=0.99). Documented deviations (rule 9): the zipfian is a
+precomputed-CDF variant (same shape, different index sequence than YCSB's
+hashed generator — identical for every engine in the harness, which is what
+the ledger compares); D's read-latest is a geometric tail over the inserted
+prefix; the CDF is O(n) memory — the 100M-key soak needs the CDF-free
+inverse-transform variant first (flagged in the source). `--ops` sets the
+per-mix operation count (default: keys).
+
+Not yet here: the vendored version-pinned baselines under
+`bench/third_party/` (step 3 — adapters are in progress in
+`bench/baselines.cpp`; vendoring + pinning lands with the CI ledger) and
+the nightly ledger with the calibrated noise protocol (step 4).
 
 ## Usage
 

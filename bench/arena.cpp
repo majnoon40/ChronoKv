@@ -69,7 +69,8 @@ struct Config {
     std::string durability = "group";
     std::string workloads =
         "fillseq,fillrandom,readrandom,overwrite,rangescan,deletechurn,"
-        "ckptload,coldrecovery,memory";
+        "ckptload,coldrecovery,memory,ycsb_a,ycsb_b,ycsb_c,ycsb_d,ycsb_e,ycsb_f";
+    size_t ops = 0;   // YCSB op count per mix; 0 -> keys
     bool keep = false;
 };
 
@@ -184,6 +185,61 @@ bool prep_fill(Database& db, const Config& c, size_t n, std::mt19937_64& rng,
             return false;
     return true;
 }
+
+// ---------- distributions (v29 M1 step 2) ----------
+
+// zipfian(theta=0.99) over a closed universe [0,n), implemented as a
+// precomputed CDF + binary search: deterministic and exactly reproducible
+// from (n, theta, seed). DEVIATION, documented per rule 9: YCSB's Java
+// generator uses a scrambled/hashed variant without a CDF; the SHAPE
+// (theta 0.99 hot-head) matches, the per-draw index sequence does not.
+// Same generator for every engine in the harness — fairness is
+// within-arena, which is what the ledger compares. SKELETON LIMIT: the
+// CDF is O(n) memory (~8 bytes/key); the v30 soak (n = 100M) needs the
+// CDF-free inverse-transform variant — flagged here so the soak cannot
+// inherit the 800 MB table silently.
+class Zipfian {
+    std::vector<double> cdf_;
+public:
+    explicit Zipfian(size_t n, double theta = 0.99) {
+        if (n == 0) return;
+        cdf_.resize(n);
+        double sum = 0.0, acc = 0.0;
+        for (size_t i = 0; i < n; ++i)
+            sum += 1.0 / std::pow(static_cast<double>(i + 1), theta);
+        for (size_t i = 0; i < n; ++i) {
+            acc += 1.0 / std::pow(static_cast<double>(i + 1), theta);
+            cdf_[i] = acc / sum;
+        }
+    }
+    size_t next(std::mt19937_64& rng) const {
+        if (cdf_.empty()) return 0;
+        const double u = std::generate_canonical<double, 53>(rng);
+        auto it = std::lower_bound(cdf_.begin(), cdf_.end(), u);
+        if (it == cdf_.end()) --it;
+        return static_cast<size_t>(it - cdf_.begin());
+    }
+};
+
+// YCSB-style mixes (M1 step 2): the six standard operation mixes expressed
+// against this harness (workload mixes, not the framework — per the
+// roadmap). Percentages are per-issued-op draws from one rng.
+struct YcsbSpec {
+    char name;
+    unsigned read_pct, update_pct, insert_pct, scan_pct, rmw_pct;
+};
+// A: 50/50 read/update (zipfian)      B: 95/5 read/update (zipfian)
+// C: 100% read (zipfian)               D: 95/5 read/insert (read-latest)
+// E: 95/5 scan/insert (zipfian start, len 1..100)
+// F: 50/50 read/read-modify-write (zipfian)
+static const YcsbSpec kYcsb[] = {
+    {'a', 50, 50, 0, 0, 0},
+    {'b', 95,  5, 0, 0, 0},
+    {'c',100,  0, 0, 0, 0},
+    {'d', 95,  0, 5, 0, 0},
+    {'e',  0,  0, 5,95, 0},
+    {'f', 50,  0, 0, 0,50},
+};
 
 // ---------- workloads ----------
 
@@ -418,6 +474,126 @@ Result w_memory(const Config& c) {
     return r;
 }
 
+// Runs one YCSB mix; emits one TSV row per op type actually issued.
+// Multi-threaded (c.threads), each thread with its own rng/recorders;
+// inserts extend the keyspace past the prep range via a shared counter
+// (D's "latest" reads sample a geometric tail over the inserted prefix —
+// documented deviation from YCSB's exact latest-generator, same shape).
+void w_ycsb(const Config& c, const YcsbSpec& spec) {
+    const std::string wl = std::string("ycsb_") + spec.name;
+    reset_dir(c.dir + "/" + wl);
+    auto db = Database::open(base_options(c, wl));
+    std::mt19937_64 rng(c.seed);
+    if (!prep_fill(db, c, c.keys, rng, false)) {
+        Result r; r.workload = wl; r.note = "ABORTED: prep failed"; emit(r); return;
+    }
+    const size_t ops = c.ops ? c.ops : c.keys;
+    const size_t per_thread = std::max<size_t>(100, ops / c.threads);
+    const Zipfian zipf(c.keys);
+
+    struct ThreadState {
+        Recorder read, update, insert, scan, rmw;
+        size_t   scan_rows = 0;
+        uint64_t fails = 0;
+    };
+    std::vector<ThreadState> st(c.threads);
+    std::atomic<size_t> next_insert{0};
+    std::atomic<bool> failed{false};
+
+    const auto t0 = Clock::now();
+    std::vector<std::thread> ts;
+    for (unsigned t = 0; t < c.threads; ++t) ts.emplace_back([&, t] {
+        std::mt19937_64 lrng(c.seed * 7919 + t);
+        ThreadState& s = st[t];
+        for (size_t i = 0; i < per_thread; ++i) {
+            const unsigned roll = (unsigned)(lrng() % 100);
+            unsigned acc = 0;
+            const auto pick = [&](unsigned pct) { acc += pct; return roll < acc; };
+            const auto s0 = Clock::now();
+            const auto us = [&]() {
+                return std::chrono::duration<double, std::micro>(Clock::now() - s0).count();
+            };
+            if (spec.read_pct && pick(spec.read_pct)) {
+                size_t k;
+                if (spec.name == 'd') {   // read-latest: geometric tail over inserted prefix
+                    const size_t total = c.keys + next_insert.load(std::memory_order_relaxed);
+                    std::geometric_distribution<size_t> geo(0.001);
+                    size_t back = std::min(geo(lrng), total - 1);
+                    k = total - 1 - back;
+                } else {
+                    k = zipf.next(lrng);
+                }
+                if (!db.get(key16(k))) s.fails++;   // miss counted, not fatal
+                s.read.record(us());
+            } else if (spec.update_pct && pick(spec.update_pct)) {
+                const size_t k = zipf.next(lrng);
+                if (db.put(key16(k), make_value(lrng, c.valsize)) != Status::OK)
+                    failed.store(true);
+                s.update.record(us());
+            } else if (spec.rmw_pct && pick(spec.rmw_pct)) {
+                const size_t k = zipf.next(lrng);
+                auto v = db.get(key16(k));
+                if (db.put(key16(k), v ? *v : make_value(lrng, c.valsize)) != Status::OK)
+                    failed.store(true);
+                s.rmw.record(us());                        // combined R+W latency (YCSB F)
+            } else if (spec.scan_pct && pick(spec.scan_pct)) {
+                const size_t start = zipf.next(lrng);
+                const size_t len = 1 + (size_t)(lrng() % 100);   // YCSB maxscanlength=100
+                const size_t hi = start + len;
+                auto rows = db.range_scan(key16(start), key16(hi));
+                s.scan_rows += rows.size();
+                s.scan.record(us());
+            } else {                                        // insert (D and E)
+                const size_t k = c.keys + next_insert.fetch_add(1, std::memory_order_relaxed);
+                if (db.put(key16(k), make_value(lrng, c.valsize)) != Status::OK)
+                    failed.store(true);
+                s.insert.record(us());
+            }
+        }
+    });
+    for (auto& th : ts) th.join();
+    const double wall = elapsed_s(t0);
+
+    ThreadState merged;
+    uint64_t fails = 0;
+    for (auto& s : st) {
+        merged.read.merge(std::move(s.read));
+        merged.update.merge(std::move(s.update));
+        merged.insert.merge(std::move(s.insert));
+        merged.scan.merge(std::move(s.scan));
+        merged.rmw.merge(std::move(s.rmw));
+        merged.scan_rows += s.scan_rows;
+        fails += s.fails;
+    }
+    const std::string base_note =
+        std::string("zipfian(0.99)-cdf threads=") + std::to_string(c.threads) +
+        (failed.load() ? " FAILED-PUTS" : "") +
+        (fails ? " misses=" + std::to_string(fails) : "");
+    auto row = [&](const char* op, Recorder& rec) {
+        if (rec.size() == 0) return;
+        Result r;
+        r.workload = wl + "." + op;
+        r.ops = rec.size();
+        r.seconds = wall;                 // wall of the whole mix; per-op latencies below
+        r.p50 = rec.pct(0.50);
+        r.p99 = rec.pct(0.99);
+        r.note = base_note;
+        emit(r);
+    };
+    row("read", merged.read);
+    row("update", merged.update);
+    row("insert", merged.insert);
+    if (merged.scan.size()) {
+        Result r; r.workload = wl + ".scan"; r.ops = merged.scan.size(); r.seconds = wall;
+        r.p50 = merged.scan.pct(0.50); r.p99 = merged.scan.pct(0.99);
+        r.note = base_note + " rows/scans=" +
+                 std::to_string(merged.scan.size() ? merged.scan_rows / merged.scan.size() : 0);
+        emit(r);
+    }
+    row("rmw", merged.rmw);
+    db.close();
+}
+
 void print_methodology(const Config& c) {
     struct utsname u{};
     uname(&u);
@@ -431,7 +607,8 @@ void print_methodology(const Config& c) {
               << "# " << first_line_containing("/proc/cpuinfo", "model name") << "\n"
               << "# wal_dir=" << c.dir << " (backing fs not classified in the skeleton)\n"
               << "# durability=" << c.durability << " threads=" << c.threads
-              << " keys=" << c.keys << " valsize=" << c.valsize << " seed=" << c.seed << "\n"
+              << " keys=" << c.keys << " valsize=" << c.valsize << " seed=" << c.seed
+              << " ops=" << (c.ops ? c.ops : c.keys) << " (per YCSB mix)\n"
               << "# caveat: io_uring backend not observable from a hooks-off build"
                  " (attribution lands with M1 step 4)\n"
               << "# columns: workload\tops\tseconds\tops_per_sec\tp50_us\tp99_us\trss_mb\tnote\n";
@@ -454,6 +631,7 @@ int main(int argc, char** argv) {
         else if (a == "--dir")        c.dir = next("--dir");
         else if (a == "--durability") c.durability = next("--durability");
         else if (a == "--workloads")  c.workloads = next("--workloads");
+        else if (a == "--ops")        c.ops = (size_t)std::strtoull(next("--ops"), nullptr, 10);
         else if (a == "--keep")       c.keep = true;
         else { std::cerr << "unknown arg: " << a << "\n"; return 2; }
     }
@@ -486,6 +664,13 @@ int main(int argc, char** argv) {
         else if (w == "ckptload")     r = w_ckptload(c);
         else if (w == "coldrecovery") r = w_coldrecovery(c);
         else if (w == "memory")       r = w_memory(c);
+        else if (w.size() == 6 && w.compare(0, 5, "ycsb_") == 0) {
+            const YcsbSpec* spec = nullptr;
+            for (const auto& s : kYcsb) if (s.name == w[5]) spec = &s;
+            if (!spec) { std::cerr << "unknown ycsb mix: " << w << "\n"; rc = 2; continue; }
+            w_ycsb(c, *spec);   // emits its own per-op-type rows
+            continue;
+        }
         else { std::cerr << "unknown workload: " << w << "\n"; rc = 2; continue; }
         emit(r);
         if (r.note.find("ABORTED") != std::string::npos ||
