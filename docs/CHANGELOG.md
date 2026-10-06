@@ -84,6 +84,118 @@ version history; 0.28.0 is recorded in full.
   checkpoint stall live (writers completed 4 ops during a 91 ms
   checkpoint), the first datapoint for M6 item 6.
 
+## 0.28.1 — Audit-2 remediation (complete)
+
+The second external adversarial audit round over 0.28.0. Every fix ships
+with a fail-first regression test in the Audit-2 battery (appended to
+`CKV_ONLY_REMEDIATION=1`; each PoC was verified failing on pre-fix 0.28.0
+first — TXN-1 reproduced as a value-based write skew, TXN-2 as pool
+exhaustion at ~16.5k absent-read txns on a 1 MiB pool, EXTRA-2 as 4
+corrupted neighboring keys, API-3 as silently dropped observers).
+
+**Engine:**
+
+- **TXN-1 (SSI soundness, critical):** `PhantomTracker::record_transition`
+  records EVERY committed write, not only existence flips — an UPDATE of
+  a key inside a concurrently scanned range is a read-write
+  antidependency and now conflicts the scanner. Pre-fix, a
+  scan-then-dependent-write transaction committed across a concurrent
+  update of the scanned key (value-based write skew). Refinement in this
+  release: a no-op delete of an ABSENT key (false→false) stays
+  unrecorded — its tombstone carries a cts above every concurrent
+  snapshot, so no visible scan output can change; the v17 no-op-delete
+  contract (blind and transactional) remains conflict-free.
+- **TXN-2:** absent read-set keys become point range reads `[k,k]`
+  validated through the phantom tracker (`find_index`, non-creating)
+  instead of materializing an invisible index entry per negative lookup
+  — the unbounded pool leak on absent-read workloads is gone;
+  check-then-insert still conflicts (covered by the `[k,k]` range read +
+  TXN-1's insert recording).
+- **TXN-3:** `ReadWriteTransaction` cleanup keys on ENGINE liveness (a
+  `weak_ptr<ChronoKV>` pin from the public Transaction's keepalive), not
+  the Database open-flag — `close()` with a live transaction no longer
+  leaves its reader slot and phantom registration pinned forever. Member
+  order fixed so `txn_` is destroyed while `engine_keepalive_` still pins.
+- **WAL-1:** torn-tail-vs-interior classification never trusts the
+  damaged frame's own length field (a corrupted length could point
+  anywhere and make interior damage look like a torn tail — silent
+  truncation of everything after it). On a parse failure the recovery
+  scan looks for ANY CRC-valid frame with a continuing LSN at any later
+  offset (cheap LSN + structural prefilter keeps it linear in practice):
+  found → CORRUPT (loud, file untouched), none → TORN_TAIL.
+- **WAL-2:** creating a segment — or reopening one left EMPTY by an
+  earlier failed attempt — fsyncs the WAL DIRECTORY before any record
+  in it can be acknowledged; a failed dir fsync fails the open.
+- **WAL-3:** `fsync_dir(path)` syncs the PARENT of `path`; both
+  rotation-path call sites passed the WAL directory itself, syncing the
+  WRONG directory — the MANIFEST rename was never actually made durable
+  on those paths. They now pass `manifest_path()`.
+- **WAL-4:** recovery bounds the segment loop by what is on disk: a
+  MANIFEST `active_id` beyond max-present+1 cannot come from any
+  interrupted rotation and fails loud immediately (pre-fix: a ~2^64
+  iteration loop); the legitimately checkpoint-deleted prefix is skipped
+  in O(1).
+- **BT-1:** `BTree::put` checks conservative split headroom
+  (`5*(height+1)+1` pages) BEFORE any mutation — pool exhaustion
+  mid-split-cascade can no longer orphan acked keys (pre-fix: lower
+  levels split and relinked before upper-level allocations could fail).
+  In-place updates (new value ≤ old) are exempt on BOTH standalone
+  write entry points — `put` and `put_with_old` (the parity gap in the
+  first cut of this arc was caught by an external-review probe; the
+  extended exhaustion test was verified failing on `put_with_old`
+  before the fix landed): they allocate nothing (`put_recursive`'s
+  fits()/compact path), so an exhausted pool must not refuse them.
+- **BT-2:** the standalone `BTree` serializes structural writers
+  (`write_mu_`); under the engine the lock is uncontended (tree writes
+  already serialize under `nm_`).
+- **EXTRA-1:** the reservation-window throw latches the WAL fail-stop
+  INSIDE `group_append` while `batch_mu_` is held — a concurrent
+  committer can no longer reserve and write past the burned cts in the
+  window before `commit_txn`'s (idempotent) latch runs.
+- **EXTRA-2 (memory safety):** the leaf in-place-update path computed
+  the slab offset in `uint16_t`; a value larger than `free_hi` wrapped,
+  passed both size guards, and memcpy'd out of bounds across pages. Now
+  computed in `size_t` with an exact `fits()` predicate.
+- **API-1:** the header is a TRUE single header — `#pragma once`,
+  `static` → `inline` free functions, `static inline` members. Both
+  consumer shapes (double-include in one TU; two TUs linked together)
+  are CI-GATED (`make lint-header`), not informational.
+- **API-3:** the observer registry lives in a shared `ObserverState`
+  that MOVES with the `Database`; async workers, `Batch` and
+  `Transaction` capture it by `shared_ptr` — no raw `Database*` a move
+  can orphan (pre-fix: observers silently stopped firing after a move;
+  the unregister lambda of a surviving handle could dangle).
+
+**Tests:** 15-check Audit-2 battery (`run_audit2_regression_tests`,
+fork-isolated where the failure mode is death); v17 guard test 4 FLIPPED
+to expect Conflict (its old expectation encoded exactly the TXN-1
+anomaly — the flip is documented at the test, not silent); `main.cpp`
+double-includes the header as a live API-1 check.
+
+**CI/Make:** `lint` job (`-Werror` syntax gates over header+suite, hooks
+on/off; `-Wconversion` count ratchet vs `ci/wconversion.baseline` = 33
+via `scripts/lint_wconversion.sh` — the uint16-narrowing class behind
+CKV-001/002 and EXTRA-2; header hygiene gating); `build-shared` compiles
+the stress/release binaries ONCE per run for dst+crashfuzz (the one big
+TU is >1 GiB RSS and minutes per compile; ccache cannot help a single
+TU); experimental non-blocking sanitizer legs (io_uring-disabled asan/tsan
+— the only config where the WAL write-path fault legs execute — and
+clang asan/tsan with `-static-libsan`) until each has been green once;
+`make asan CXX=clang++-18` links (gcc/clang static-sanitizer flag spell-
+ing); per-leg artifact names via `strategy.job-index`.
+
+**Measured cost (arena geometry, 200k keys / 100 B / 4 threads, group
+durability, 2-core sandbox — floors, not ledger material):** ~10–13%
+on write-heavy mixes (fillseq 30.1k→26.1k, fillrandom 39.5k→35.1k,
+ycsb_a ~40k→~36k ops/s), reads unchanged; ycsb_a RSS +11% (the tracker
+now holds updated keys until pruned). Accepted: SSI soundness and the
+exhaustion-safety of BT-1 outrank the delta; the nightly ledger records
+it per rule 9.
+
+**Known build-memory note:** the patched TU OOMs a 1 GiB container at
+`-O1` where 0.28.0 fit (the A2 battery's lambda/std::function density);
+`-O0` builds in ~25 s. One more data point for the v30 source-split.
+
 ## 0.28.0 — v28 audit remediation (complete)
 
 The 21 findings of the `docs/request.txt` adversarial audit (CKV-001…021)

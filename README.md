@@ -10,8 +10,26 @@ transactions with phantom detection, a paged B+ tree index, and
 io_uring-accelerated WAL writes — all in one header with no external
 dependencies.
 
-Current version: **0.28.0** (`CHRONOKV_VERSION` in `chronokv.hpp`) — the
-**v28 audit-remediation arc is complete**: all 21 findings of the
+Current version: **0.28.1** (`CHRONOKV_VERSION` in `chronokv.hpp`) — the
+**Audit-2 remediation arc**: the second external adversarial round over
+0.28.0, shipped with a fail-first regression test per fix (the Audit-2
+battery in `CKV_ONLY_REMEDIATION=1 ./build/release/test`): TXN-1 (SSI
+value-antidependency — the phantom tracker now records every committed
+write, not only existence flips; no-op deletes of absent keys stay
+exempt), TXN-2 (negative lookups no longer materialize index entries),
+TXN-3 (close-with-live-txn no longer pins reader state), WAL-1…WAL-4
+(torn-tail classification that never trusts a damaged length field,
+segment-creation dir fsync, the wrong-directory rotation fsync, bounded
+recovery loops), BT-1/BT-2 (pre-mutation split headroom; standalone-tree
+writer safety), EXTRA-1/EXTRA-2 (reservation-throw latch inside
+group_append; uint16 slab-offset wrap), API-1/API-3 (a TRUE single
+header — `#pragma once` + inline, CI-gated; observers survive a Database
+move), plus the v29 CI hardening (lint gates, -Wconversion ratchet,
+shared build artifacts, experimental sanitizer legs). One deliberate
+semantic change: updating a present key inside a concurrently scanned
+range now conflicts (v17 guard test 4 flipped — its old expectation
+encoded the TXN-1 anomaly). The **v28 audit-remediation arc is
+complete**: all 21 findings of the
 `docs/request.txt` adversarial audit (CKV-001…CKV-021) plus the external
 review's two platform defects are resolved or verified-with-tests, each
 with a fail-first regression test in the remediation battery
