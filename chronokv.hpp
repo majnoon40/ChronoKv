@@ -1,4 +1,77 @@
+#pragma once
 // chronokv.hpp — ChronoKV engine and public C++ API.
+//
+// v28.1 SHIPPED (AUDIT-2 REMEDIATION — the second external adversarial
+// audit round over 0.28.0; every fix ships with a fail-first regression
+// test in the Audit-2 battery appended to CKV_ONLY_REMEDIATION):
+//   TXN-1  SSI soundness: the phantom tracker records EVERY committed
+//          write, not only existence flips — a value UPDATE inside a
+//          scanned range is a read-write antidependency (pre-audit PoC:
+//          scan-then-dependent-write committed across a concurrent
+//          update — value-based write skew). 0.28.1 refinement: a no-op
+//          delete of an ABSENT key stays unrecorded (its tombstone is
+//          above every concurrent snapshot; no visible scan output can
+//          change), keeping the v17 no-op-delete contract conflict-free.
+//   TXN-2  absent read-set keys become point range reads [k,k] validated
+//          through the phantom tracker instead of materializing an index
+//          entry per negative lookup (pre-audit PoC: 1 MiB pool exhausted
+//          at ~16.5k absent-read txns).
+//   TXN-3  ReadWriteTransaction cleanup keys on ENGINE liveness (weak_ptr
+//          pin), not the Database flag — close() with a live txn no longer
+//          pins its reader slot / phantom registration forever; member
+//          order fixed so txn_ dies while the keepalive still pins.
+//   WAL-1  torn-tail-vs-interior classification never trusts the damaged
+//          frame's own length field: scan for any CRC-valid frame with a
+//          continuing LSN after the failure point (prefiltered, linear in
+//          practice); found -> CORRUPT (loud), else -> TORN_TAIL.
+//   WAL-2  creating (or reopening still-empty) a segment fsyncs the WAL
+//          DIRECTORY before any record in it can be acked; a failed dir
+//          fsync fails the open, and the empty segment is re-synced on
+//          the next attempt.
+//   WAL-3  fsync_dir takes a FILE path and syncs its PARENT — the two
+//          rotation-path calls passed the wal dir itself, syncing the
+//          WRONG directory (the MANIFEST rename was never made durable).
+//          Now they pass manifest_path().
+//   WAL-4  recovery bounds the segment loop by what is on disk: a
+//          MANIFEST active_id beyond max-present+1 is corruption (loud,
+//          fast) instead of a ~2^64-iteration loop; the legitimately
+//          deleted prefix (ckpt_ts > 0) is skipped in O(1).
+//   BT-1   put checks conservative split headroom (5*(height+1)+1 pages)
+//          BEFORE any mutation — pool exhaustion mid-cascade can no
+//          longer orphan acked keys; in-place updates (new value <= old)
+//          are exempt on BOTH standalone write entry points (put and
+//          put_with_old — parity caught by an external-review probe of
+//          the first cut of this arc): they allocate nothing.
+//   BT-2   standalone BTree serializes structural writers (write_mu_);
+//          the engine already serializes under nm_, so it is uncontended
+//          there.
+//   EXTRA-1 the reservation-window throw latches the WAL fail-stop INSIDE
+//          group_append (under batch_mu_) — no concurrent committer can
+//          reserve and write past the burned cts before commit_txn's
+//          (idempotent) latch runs.
+//   EXTRA-2 the leaf in-place-update path computed the slab offset in
+//          uint16_t: a value larger than free_hi wrapped and passed both
+//          guards -> out-of-bounds memcpy across pages (pre-audit PoC:
+//          4 neighboring keys corrupted). Now size_t with an exact fits().
+//   API-1  the header is a TRUE single header: #pragma once, static ->
+//          inline, static-inline members — double-includable in one TU and
+//          linkable from two TUs (both now CI-gated, not informational).
+//   API-3  observer registry lives in a shared ObserverState that MOVES
+//          with the Database; async/Batch/Transaction paths capture it by
+//          shared_ptr — no raw Database* a move can orphan (pre-audit
+//          PoC: observers silently dropped after a move).
+//   CI: `lint` job (-Werror syntax gates hooks-on/off, -Wconversion count
+//   ratchet vs ci/wconversion.baseline, header hygiene gating), shared
+//   stress/release binaries for dst+crashfuzz (the one big TU compiles
+//   once per run), experimental non-blocking sanitizer legs (io_uring-
+//   disabled asan/tsan — the only config where the WAL write-path fault
+//   legs run — and clang asan/tsan) until each is green once.
+//   KNOWN SEMANTIC CHANGE: v17 guard test 4 flipped (update of a present
+//   key inside a scanned range now CONFLICTS — the old expectation encoded
+//   exactly the TXN-1 anomaly). Measured cost of TXN-1+BT-1 on the arena
+//   geometry (2-core sandbox, group durability): ~10% on write-heavy mixes
+//   (fillseq/fillrandom/ycsb_a), reads unchanged — the ledger records it.
+//   CHRONOKV_VERSION 0.28.1.
 //
 // v28.0 SHIPPED (v28 AUDIT REMEDIATION COMPLETE — the docs/request.txt
 // adversarial audit's CKV-001..021 findings plus the external review's
@@ -1707,7 +1780,7 @@ namespace dst {
     }
 }
 
-static inline void stress_point(const char* name) {
+inline void stress_point(const char* name) {
     (void)name;
     // v27 M0: while the deterministic controller is armed, every stress
     // point is a scheduling point — the seeded baton handoff REPLACES the
@@ -1729,7 +1802,7 @@ static inline void stress_point(const char* name) {
     }
 }
 #else
-static inline void stress_point(const char*) {}
+inline void stress_point(const char*) {}
 #endif
 
 // ======================== Linearizability history recorder ========================
@@ -1989,9 +2062,9 @@ namespace diag {
 
 // ======================== CRC-32 ========================
 
-static uint32_t CRCT[256];
+inline uint32_t CRCT[256];
 
-static void crc_init() {
+inline void crc_init() {
     for (uint32_t i = 0; i < 256; ++i) {
         uint32_t c = i;
         for (int k = 0; k < 8; ++k)
@@ -2000,7 +2073,7 @@ static void crc_init() {
     }
 }
 
-static 
+inline
 // ================================================================
 // [SECTION_1_CRC_IO_PRIMITIVES]
 // ================================================================
@@ -2020,7 +2093,7 @@ uint32_t crc32(const uint8_t* d, size_t n) {
 
 // ======================== Checked I/O ========================
 
-static bool write_all(int fd, const uint8_t* d, size_t n) {
+inline bool write_all(int fd, const uint8_t* d, size_t n) {
     while (n > 0) {
 #ifdef CHRONOKV_FAULT_INJECTION
         if (fault::fire(fault::Kind::WriteFail)) { errno = EIO; return false; }
@@ -2042,7 +2115,7 @@ static bool write_all(int fd, const uint8_t* d, size_t n) {
     return true;
 }
 
-static bool checked_fsync(int fd) {
+inline bool checked_fsync(int fd) {
 #ifdef CHRONOKV_FAULT_INJECTION
     if (fault::fire(fault::Kind::FsyncFail)) { errno = EIO; return false; }
 #endif
@@ -2069,9 +2142,16 @@ inline std::function<int(int)>& ckv_close_hook_for_test() {
     static std::function<int(int)> h;
     return h;
 }
+// EXTRA-1 regression test: runs in commit_txn's catch AFTER group_append has unwound
+// (batch_mu_ released) and BEFORE commit_txn's own latch call, so a test can park the
+// throwing committer exactly in the window where the old code had not latched yet.
+inline std::function<void()>& ckv_post_reservation_throw_hook_for_test() {
+    static std::function<void()> h;
+    return h;
+}
 #endif
 
-static bool checked_close(int fd) {
+inline bool checked_close(int fd) {
 #ifdef CHRONOKV_TEST_HOOKS
     auto do_close = [&](int f) -> int {
         if (auto& h = ckv_close_hook_for_test(); h) return h(f);
@@ -2093,7 +2173,7 @@ static bool checked_close(int fd) {
     return do_close(fd) == 0;
 }
 
-static bool fsync_dir(const std::string& path) {
+inline bool fsync_dir(const std::string& path) {
 #ifdef CHRONOKV_FAULT_INJECTION
     if (fault::fire(fault::Kind::DirFsyncFail)) { return false; }
 #endif
@@ -2109,7 +2189,7 @@ static bool fsync_dir(const std::string& path) {
     return ok;
 }
 
-static bool checked_rename(const std::string& from, const std::string& to) {
+inline bool checked_rename(const std::string& from, const std::string& to) {
 #ifdef CHRONOKV_FAULT_INJECTION
     if (fault::fire(fault::Kind::RenameFail)) { errno = EIO; return false; }
 #endif
@@ -2141,9 +2221,9 @@ static bool checked_rename(const std::string& from, const std::string& to) {
 // For a single entry with a 1-byte key, that's 8 + 4 + 2 + 1 + 4 + value + 1
 // = 20 + value. So value can be at most 0xFFFF8 - 20 = 1048564 bytes.
 // We use 1 MiB - 256 as a conservative cap that leaves room for the framing.
-static constexpr size_t MAX_KEY_BYTES   = 65535;        // serialized as u16
-static constexpr size_t MAX_VALUE_BYTES = (1u << 20) - 256;  // < 1 MiB - framing overhead
-static constexpr size_t WAL_MAX_RECORD  = 1u << 20;     // hard cap on a serialized record (incl. header)
+inline constexpr size_t MAX_KEY_BYTES   = 65535;        // serialized as u16
+inline constexpr size_t MAX_VALUE_BYTES = (1u << 20) - 256;  // < 1 MiB - framing overhead
+inline constexpr size_t WAL_MAX_RECORD  = 1u << 20;     // hard cap on a serialized record (incl. header)
 // v28 FIX (audit CKV-001): the B+ tree PAGE-SAFE key bound. A leaf entry
 // costs PageHeader(32) + LeafSlot(12) + key + value against the 4096-byte
 // page, and the engine's tree value is the 8-byte encoded KeyEntry pointer
@@ -2163,7 +2243,7 @@ static constexpr size_t WAL_MAX_RECORD  = 1u << 20;     // hard cap on a seriali
 // limits: the v24 Fix Group-1 rationale above is about WAL framing.
 // The static_asserts pinning this derivation live next to the page-layout
 // structs in namespace chronokv_btree.
-static constexpr size_t TREE_MAX_KEY_BYTES = 4048;
+inline constexpr size_t TREE_MAX_KEY_BYTES = 4048;
 
 // v28 (audit CKV-001): typed refusal for entries that can never fit a
 // page. Thrown BEFORE any page mutation, so a throw leaves the tree
@@ -2179,7 +2259,7 @@ struct PageCapacityError : std::runtime_error {
 
 using WriteSet = std::vector<std::tuple<std::string, std::string, bool>>;
 
-static std::vector<uint8_t> wal_ser(uint64_t ts, const WriteSet& ws) {
+inline std::vector<uint8_t> wal_ser(uint64_t ts, const WriteSet& ws) {
     std::vector<uint8_t> o;
     auto u64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) o.push_back((v >> (8*i)) & 0xFF); };
     auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) o.push_back((v >> (8*i)) & 0xFF); };
@@ -2203,7 +2283,7 @@ static std::vector<uint8_t> wal_ser(uint64_t ts, const WriteSet& ws) {
 // ================================================================
 // [SECTION_2_WAL_FRAMING]
 // ================================================================
-static std::vector<uint8_t> wal_frame(const std::vector<uint8_t>& p) {
+inline std::vector<uint8_t> wal_frame(const std::vector<uint8_t>& p) {
     std::vector<uint8_t> o;
     o.reserve(8 + p.size());  // v18 M3: pre-size
     uint32_t len = static_cast<uint32_t>(p.size());
@@ -2228,7 +2308,7 @@ static std::vector<uint8_t> wal_frame(const std::vector<uint8_t>& p) {
 // segment merging, or a non-1-base snapshot import can diverge them without
 // breaking recovery. wal_ser() still emits the MVCC part [cts][n][entries];
 // the WAL layer prepends the lsn at physical-write time.
-static std::vector<uint8_t> wal_prepend_lsn(uint64_t lsn, const std::vector<uint8_t>& mvcc_payload) {
+inline std::vector<uint8_t> wal_prepend_lsn(uint64_t lsn, const std::vector<uint8_t>& mvcc_payload) {
     std::vector<uint8_t> full;
     for (int i = 0; i < 8; ++i) full.push_back((lsn >> (8*i)) & 0xFF);
     full.insert(full.end(), mvcc_payload.begin(), mvcc_payload.end());
@@ -2242,7 +2322,7 @@ static std::vector<uint8_t> wal_prepend_lsn(uint64_t lsn, const std::vector<uint
 
 enum class WalStatus { OK, TORN_TAIL, CORRUPT };
 
-static std::pair<WalStatus, std::vector<std::pair<uint64_t, WriteSet>>>
+inline std::pair<WalStatus, std::vector<std::pair<uint64_t, WriteSet>>>
 wal_recover_buf(const std::vector<uint8_t>& buf) {
     std::vector<std::pair<uint64_t, WriteSet>> out;
     size_t pos = 0;
@@ -2340,17 +2420,33 @@ wal_recover_buf(const std::vector<uint8_t>& buf) {
             have_lsn = true;
             out.push_back({ts, ws});
         } else {
-            uint32_t len = 0;
-            if (save + 4 <= buf.size())
-                for (int i = 0; i < 4; ++i)
-                    len |= static_cast<uint32_t>(buf[save+i]) << (8*i);
-
+            // WAL-1 fix: never trust the damaged frame's own length field
+            // (a corrupted length can point anywhere, or past EOF, and make
+            // interior damage look like a torn tail). Instead scan EVERY
+            // later byte offset for a CRC-valid frame whose LSN continues
+            // the sequence; if one exists, this is interior corruption and
+            // must never be truncated. Only a tail with no valid frame after
+            // it is a torn tail. A cheap LSN prefilter keeps the scan linear
+            // in practice (CRC is only computed for plausible candidates).
             bool valid_after = false;
-            if (len >= 20 && len <= (1u << 20) && save + 8 + len <= buf.size()) {
-                size_t nxt = save + 8 + len;
+            for (size_t off = save + 1; !valid_after && off + 8 + 20 <= buf.size(); ++off) {
+                if (have_lsn) {
+                    uint64_t cl = 0;
+                    for (int i = 0; i < 8; ++i) cl |= uint64_t(buf[off+8+i]) << (8*i);
+                    if (cl < expected_lsn || cl - expected_lsn > (uint64_t(1) << 32)) continue;
+                }
+                {   // cheap structural prefilter (no allocation, no CRC): plausible length, and a
+                    // write-count that fits it (each entry costs >= 7 bytes after the 20-byte header)
+                    uint32_t c_len = 0, c_n = 0;
+                    for (int i = 0; i < 4; ++i) c_len |= uint32_t(buf[off+i]) << (8*i);
+                    if (c_len < 20 || c_len > (1u << 20) || off + 8 + c_len > buf.size()) continue;
+                    for (int i = 0; i < 4; ++i) c_n |= uint32_t(buf[off+8+16+i]) << (8*i);
+                    if (c_n > (c_len - 20) / 7) continue;
+                }
+                size_t nxt = off;
                 uint64_t l2, t2;
                 WriteSet w2;
-                if (parse(nxt, l2, t2, w2)) valid_after = true;
+                if (parse(nxt, l2, t2, w2) && (!have_lsn || l2 >= expected_lsn)) valid_after = true;
             }
 
             return {valid_after ? WalStatus::CORRUPT : WalStatus::TORN_TAIL, out};
@@ -2360,7 +2456,7 @@ wal_recover_buf(const std::vector<uint8_t>& buf) {
     return {WalStatus::OK, out};
 }
 
-static std::pair<WalStatus, std::vector<std::pair<uint64_t, WriteSet>>>
+inline std::pair<WalStatus, std::vector<std::pair<uint64_t, WriteSet>>>
 wal_recover_file(const std::string& path) {
     std::ifstream ff(path, std::ios::binary);
     if (!ff) return {WalStatus::OK, {}};
@@ -3263,7 +3359,7 @@ inline std::atomic<int64_t>& pwrite_fail_after_bytes_for_test() {
 }
 #endif
 
-static bool pwrite_all(int fd, const uint8_t* d, size_t n, off_t offset) {
+inline bool pwrite_all(int fd, const uint8_t* d, size_t n, off_t offset) {
 #ifdef CHRONOKV_TEST_HOOKS
     {
         const int64_t budget = pwrite_fail_after_bytes_for_test().exchange(-1);
@@ -3710,10 +3806,30 @@ private:
         // latches failed_; a recovery open gets recover_all's loud verdict).
         if (!truncate_torn_tail(p)) return false;
 
+        // WAL-2 fix: remember whether this open CREATES the segment, so the
+        // new directory entry can be made durable before any record in it
+        // is acknowledged.
+        std::error_code ex_ec;
+        const bool existed = std::filesystem::exists(p, ex_ec);
+
         // v25.1 M2 Phase 2: O_WRONLY (not O_APPEND) so pwrite works for the
         // fallback path. lseek(SEEK_END) before writes positions at the end.
         active_fd_ = ::open(p.c_str(), O_CREAT | O_WRONLY, 0644);
         if (active_fd_ < 0) return false;
+        // WAL-2 fix: fsync the WAL directory (fsync_dir takes a FILE path
+        // and syncs its parent) after creating a segment; fail the open,
+        // and therefore every later ack, if that fails.
+        // WAL-2 retry fix: an earlier attempt may have created the file and then
+        // failed the directory fsync, leaving an EMPTY segment whose directory
+        // entry was never made durable; a later open sees it as "existing".
+        // A still-empty segment is therefore synced exactly like a new one.
+        std::error_code sz_ec;
+        const bool fresh = !existed || std::filesystem::file_size(p, sz_ec) == 0;
+        if (fresh && !fsync_dir(p)) {
+            (void)checked_close(active_fd_);
+            active_fd_ = -1;
+            return false;
+        }
         active_id_ = id;
         // v25.1 M2: track segment size for size-based rotation.
         // The file may have existing content (reopened after restart).
@@ -3774,7 +3890,7 @@ private:
         CKV_CRASH_POINT("rot_before_manifest");
         if (!write_manifest(new_id, last_ckpt_ts_)) { failed_ = true; return; }
         CKV_CRASH_POINT("rot_after_manifest");
-        if (!fsync_dir(dir_)) { failed_ = true; return; }
+        if (!fsync_dir(manifest_path() /* WAL-3: a file IN dir_, so dir_ itself is synced */)) { failed_ = true; return; }
         CKV_CRASH_POINT("rot_after_dir_fsync");
     }
 
@@ -4084,6 +4200,12 @@ public:
         // in every catch here. Burn first — the published prefix must be
         // able to advance past this hole — then rethrow; commit_txn
         // surfaces the exception as WalFailure.
+        // EXTRA-1 fix: latch the fail-stop HERE, while batch_mu_ is still
+        // held. Latching only in commit_txn's catch (after this unwinds and
+        // releases batch_mu_) let a concurrent committer reserve ts+1 and
+        // write it past the burned hole -> "interior gap" at next open.
+        // commit_txn still calls fail_stop_for_reservation_throw() (idempotent).
+        if (ts != 0) failed_.store(true, std::memory_order_release);
         if (ts != 0 && on_abandon) on_abandon(ts);
         throw;
     }
@@ -4559,7 +4681,7 @@ bool rotate_after_checkpoint(uint64_t ckpt_ts) {
         // deduped on replay). Counted and warned so the README's "every
         // fsync on both rotation paths is checked" is literally true,
         // without fail-stopping an instance over cleanup metadata.
-        if (!fsync_dir(dir_)) {
+        if (!fsync_dir(manifest_path() /* WAL-3: a file IN dir_, so dir_ itself is synced */)) {
             diag::wal_fsync_fails.fetch_add(1, std::memory_order_relaxed);
             i_wal_fsync_fails.fetch_add(1, std::memory_order_relaxed);
             std::cerr << "WARNING: post-checkpoint rotation: final directory "
@@ -4697,9 +4819,28 @@ bool rotate_after_checkpoint(uint64_t ckpt_ts) {
             }
         }
 
+        // WAL-4 fix: bound the segment loop by what is actually on disk.
+        // A MANIFEST active_id more than one past the highest present
+        // segment cannot come from any interrupted rotation (the documented
+        // window is "MANIFEST names N, N+1 present-empty or missing"), so it
+        // is corruption; previously recovery iterated up to 2^64 ids.
+        uint64_t first_id = 1;
+        {
+            const std::vector<uint64_t> present = list_segment_ids(dir);
+            const uint64_t max_present = present.empty() ? 0 : present.back();
+            if (max_present != UINT64_MAX && active_id > max_present + 1)
+                throw std::runtime_error("Recovery failed: MANIFEST active_id=" +
+                    std::to_string(active_id) + " exceeds highest present WAL segment " +
+                    std::to_string(max_present) + " + 1");
+            // Ids below active_id-1 may be legitimately deleted only when a
+            // checkpoint exists; skip the (all-missing) prefix in O(1).
+            if (ckpt_ts > 0 && active_id >= 2 && !present.empty())
+                first_id = std::max<uint64_t>(1, std::min<uint64_t>(present.front(), active_id - 1));
+        }
+
         // 3. Read segments 1..active_id with strict validation.
         WalStatus worst = WalStatus::OK;
-        for (uint64_t id = 1; id <= active_id; ++id) {
+        for (uint64_t id = first_id; id <= active_id; ++id) {
             char seg_path[128];
             snprintf(seg_path, sizeof(seg_path), "%s/wal_%06llu.log",
                      dir.c_str(), (unsigned long long)id);
@@ -4925,9 +5066,28 @@ public:
         if (it != active_snapshots_.end()) active_snapshots_.erase(it);
     }
 
+#ifdef CHRONOKV_TEST_HOOKS
+    size_t active_reader_count_for_test() {   // TXN-3 regression test
+        std::lock_guard<std::mutex> lk(mu_);
+        return active_snapshots_.size();
+    }
+#endif
     void record_transition(uint64_t commit_ts, const std::string& key,
                            bool old_exists, bool new_exists) {
-        if (old_exists == new_exists) return;
+        // TXN-1 fix: record EVERY committed write, not only existence
+        // flips. A range reader must conflict with any write inside its
+        // scanned range after its snapshot (an UPDATE of a key it read via
+        // the scan is a read-write dependency just like an insert/delete).
+        // TXN-1 refinement (0.28.1): the ONE exception is a no-op delete
+        // of an absent key (old_exists == new_exists == false). Its
+        // tombstone carries a cts above every concurrent snapshot, so no
+        // scan's VISIBLE output can change — recording it is a false
+        // conflict, and the v17 contract (blind and transactional no-op
+        // deletes do not conflict with an older range reader) is sound and
+        // stays green. Inserts (false->true), deletes of present keys
+        // (true->false) and updates (true->true) all remain recorded;
+        // SSI compares no values, so a same-value update still conflicts.
+        if (!old_exists && !new_exists) return;
 
         std::lock_guard<std::mutex> lk(mu_);
         mods_by_ts_[commit_ts].insert(key);
@@ -5799,8 +5959,8 @@ private:
         InstanceNode* next;
     };
     InstanceNode instance_node_{this, nullptr};
-    static std::mutex instance_registry_mu_;
-    static InstanceNode* instance_registry_head_;
+    static inline std::mutex instance_registry_mu_;   // API-1: inline (header-only, multi-TU safe)
+    static inline InstanceNode* instance_registry_head_ = nullptr;
     void register_instance() {
         std::lock_guard<std::mutex> lk(instance_registry_mu_);
         instance_node_.next = instance_registry_head_;
@@ -6310,7 +6470,7 @@ public:
 
     TxnResult commit_txn(uint64_t read_ts, const WriteSet& ws,
                          const std::set<std::string>& rs,
-                         const std::vector<RangeRead>& range_reads = {},
+                         const std::vector<RangeRead>& range_reads_in = {},
                          uint64_t* out_cts = nullptr) {
         if (out_cts) *out_cts = 0;
         if (ws.empty()) return TxnResult::Committed;
@@ -6394,6 +6554,11 @@ public:
         // is atomic by itself; the latch protects every FUTURE commit and
         // the checkpoint path from trusting a possibly-diverged index.
         std::set<KeyEntry*> all_entries;
+        // TXN-2 fix: absent read keys become point range reads [k,k] (local
+        // copy of the caller's range reads + these), validated through the
+        // phantom tracker instead of materializing an index entry per
+        // negative lookup (which leaked pool pages without bound).
+        std::vector<RangeRead> range_reads(range_reads_in);
         try {
             for (auto& [k, v, d] : ws) {
                 auto [e, is_new] = ensure_index(k);
@@ -6405,8 +6570,15 @@ public:
             // KeyEntry* is stable (heap-allocated, engine-owned, deferred reclamation).
             for (auto& [e, k, v, d] : witems) all_entries.insert(e);
             for (auto& k : rs) {
-                auto [e, dummy] = ensure_index(k);
-                all_entries.insert(e);
+                // Non-creating lookup (write-set keys were ensured above).
+                if (KeyEntry* e = find_index(k)) {
+                    all_entries.insert(e);
+                } else {
+                    // Absent at commit time: any write of k committed after
+                    // read_ts is recorded by the phantom tracker (TXN-1 fix
+                    // records every write), so [k,k] catches a later insert.
+                    range_reads.push_back(RangeRead{k, k, read_ts, 0});
+                }
             }
         } catch (...) {
             index_failed_.store(true, std::memory_order_release);
@@ -6453,8 +6625,8 @@ public:
          Version* h = e->head.load(std::memory_order_acquire);
          bool old_exists = h && !h->deleted;
          bool new_exists = !d;
-         if (old_exists != new_exists)
-             transitions.emplace_back(k, old_exists, new_exists);
+         // TXN-1 fix: publish every write (see record_transition).
+         transitions.emplace_back(k, old_exists, new_exists);
      }
 
      auto on_reserve = [&](uint64_t reserved_cts) -> bool {
@@ -6510,6 +6682,9 @@ public:
              // no higher cts is ever written, the on-disk WAL stays a
              // contiguous prefix, reopen recovers every earlier acked
              // write, and the fresh instance is writable again.
+#ifdef CHRONOKV_TEST_HOOKS
+             if (auto& hk = ckv_post_reservation_throw_hook_for_test(); hk) hk();   // EXTRA-1 test window
+#endif
              wal_->fail_stop_for_reservation_throw();
              return TxnResult::WalFailure;
          }
@@ -7697,6 +7872,9 @@ public:
     void register_phantom_reader(uint64_t read_ts) {
         phantom_tracker_.register_reader(read_ts);
     }
+#ifdef CHRONOKV_TEST_HOOKS
+    size_t phantom_reader_count_for_test() { return phantom_tracker_.active_reader_count_for_test(); }
+#endif
     void deregister_phantom_reader(uint64_t read_ts) {
         phantom_tracker_.deregister_reader(read_ts);
     }
@@ -8423,8 +8601,6 @@ public:
 
 // v25.1 M0.6: static member definitions for the instance registry.
 // These live here (after the ChronoKV class definition) so the type is complete.
-std::mutex ChronoKV::instance_registry_mu_;
-ChronoKV::InstanceNode* ChronoKV::instance_registry_head_ = nullptr;
 
 // ======================== RAII SnapshotGuard (out-of-line definitions) =======
 // The class itself is declared before ChronoKV (so ChronoKV's read paths can
@@ -8474,6 +8650,11 @@ class ReadWriteTransaction {
     // tests), guarded_ is false and cleanup always runs.
     std::weak_ptr<std::atomic<bool>> db_alive_;
     bool guarded_ = false;
+    // TXN-3 fix: weak ref to the engine (from the public Transaction's
+    // keepalive). Cleanup runs whenever the ENGINE is alive, not only
+    // while the Database flag is set (close() with a live txn used to leave
+    // its reader slot / phantom registration pinned forever).
+    std::weak_ptr<ChronoKV> engine_weak_;
 
     // Returns true if the owning Database is still open and the engine
     // referenced by kv_ is still alive.  Only meaningful when guarded_
@@ -8503,6 +8684,12 @@ public:
         : kv_(kv), db_alive_(std::move(db_alive)), guarded_(true) {
         slot_ = kv_.acquire_slot_with_phantom(read_ts_);
     }
+    ReadWriteTransaction(ChronoKV& kv, std::weak_ptr<std::atomic<bool>> db_alive,
+                         std::weak_ptr<ChronoKV> engine)
+        : kv_(kv), db_alive_(std::move(db_alive)), guarded_(true),
+          engine_weak_(std::move(engine)) {
+        slot_ = kv_.acquire_slot_with_phantom(read_ts_);
+    }
 
     // Test-only / internal constructor that does NOT guard against
     // Database lifetime.  The caller must guarantee that the supplied
@@ -8516,7 +8703,8 @@ public:
 #endif
 
     ~ReadWriteTransaction() {
-        if (engine_live()) {
+        std::shared_ptr<ChronoKV> pin = engine_weak_.lock();   // TXN-3
+        if (pin || engine_live()) {
             if (!slot_released_) kv_.release_slot(slot_);
             if (phantom_registered_) kv_.deregister_phantom_reader(read_ts_);
         }
@@ -8699,7 +8887,7 @@ public:
 
 // ======================== M6 benchmark harness (CHRONOKV_BENCH) ========================
 #ifdef CHRONOKV_BENCH
-static void run_bench() {
+inline void run_bench() {
     const int NWARMUP = 5000;
     const int NWRITE = 200000;
     const int NREAD = 2000000;
@@ -8776,12 +8964,12 @@ namespace chronokv {
 // CKV_STRESS_SEED and the CKV_ONLY_CRASHFUZZ gate ship in main.cpp. No
 // engine changes; the dst runner swaps to the M0 deterministic scheduler
 // when M0 ships.
-static constexpr const char* CHRONOKV_VERSION = "0.28.0";
-static constexpr int CHRONOKV_VERSION_MAJOR = 0;
-static constexpr int CHRONOKV_VERSION_MINOR = 28;
+inline constexpr const char* CHRONOKV_VERSION = "0.28.1";
+inline constexpr int CHRONOKV_VERSION_MAJOR = 0;
+inline constexpr int CHRONOKV_VERSION_MINOR = 28;
 // v25.7: PATCH was stale (said 2 while the string said 0.25.6). Kept in
 // lockstep with CHRONOKV_VERSION from here on.
-static constexpr int CHRONOKV_VERSION_PATCH = 0;
+inline constexpr int CHRONOKV_VERSION_PATCH = 1;
 
 // ---- Error hierarchy --------------------------------------------------
 class Error : public std::runtime_error {
@@ -9044,7 +9232,8 @@ public:
     // causing null dereferences in close()/get()/etc.
     Database(Database&& src) noexcept
         : checkpoint_path_(std::move(src.checkpoint_path_)),
-          alive_(std::move(src.alive_)) {
+          alive_(std::move(src.alive_)),
+          obs_(std::move(src.obs_)) {   // API-3: observers follow the move
         // v25.8: steal the engine/closed state under src's close_mu_ so a
         // move concurrent with src-side API calls cannot observe a torn
         // handoff (moves during concurrent use remain caller-UB, but the
@@ -9059,6 +9248,7 @@ public:
             close();                           // clean up current (idempotent)
             checkpoint_path_ = std::move(src.checkpoint_path_);
             alive_ = std::move(src.alive_);
+            obs_ = std::move(src.obs_);        // API-3: observers follow the move
             {
                 std::lock_guard<std::mutex> lk(src.close_mu_);
                 engine_ = std::move(src.engine_);
@@ -9485,7 +9675,6 @@ public:
     std::future<Status> put_async(std::string key, std::string value) {
         auto eng = api_engine();   // v25.8: race-free check + keepalive copy
         std::weak_ptr<std::atomic<bool>> w = alive_;
-        Database* self = this;
 #ifdef CHRONOKV_TEST_HOOKS
         // v27 M1 (async recording): begin stamped at the API entry; the end
         // is stamped in the worker when the shared state is made ready.
@@ -9498,7 +9687,7 @@ public:
 #else
         const uint64_t rec_t0 = 0;
 #endif
-        return std::async(std::launch::async, [eng, w, self, rec_t0,
+        return std::async(std::launch::async, [eng, w, obs_cap = obs_, rec_t0,
                           key = std::move(key), value = std::move(value)]() {
             if (auto sp = w.lock(); !sp || !*sp) return Status::Failed;
             // v28 CKV-016: the public async contract is "errors via
@@ -9514,7 +9703,7 @@ public:
             auto r = eng->commit_txn(UINT64_MAX, ws, {}, {}, &cts);
             auto status = Database::map_txn_result(r);
             if (status == Status::OK) {
-                if (auto sp2 = w.lock(); sp2 && *sp2) self->notify_observers(ws);
+                if (auto sp2 = w.lock(); sp2 && *sp2) Database::notify_state(obs_cap.get(), ws);
             }
 #ifdef CHRONOKV_TEST_HOOKS
             if (rec_t0) {
@@ -9581,13 +9770,12 @@ public:
     std::future<Status> erase_async(std::string key) {
         auto eng = api_engine();   // v25.8: race-free check + keepalive copy
         std::weak_ptr<std::atomic<bool>> w = alive_;
-        Database* self = this;
 #ifdef CHRONOKV_TEST_HOOKS
         const uint64_t rec_t0 = txnrec::is_armed() ? txnrec::now_ns() : 0;  // v27 M1: see put_async
 #else
         const uint64_t rec_t0 = 0;
 #endif
-        return std::async(std::launch::async, [eng, w, self, rec_t0, key = std::move(key)]() {
+        return std::async(std::launch::async, [eng, w, obs_cap = obs_, rec_t0, key = std::move(key)]() {
             if (auto sp = w.lock(); !sp || !*sp) return Status::Failed;
             // v28 CKV-016: same containment contract as put_async — engine
             // exceptions resolve the future with Status::Failed, never as a
@@ -9598,7 +9786,7 @@ public:
             auto r = eng->commit_txn(UINT64_MAX, ws, {}, {}, &cts);
             auto status = Database::map_txn_result(r);
             if (status == Status::OK) {
-                if (auto sp2 = w.lock(); sp2 && *sp2) self->notify_observers(ws);
+                if (auto sp2 = w.lock(); sp2 && *sp2) Database::notify_state(obs_cap.get(), ws);
             }
 #ifdef CHRONOKV_TEST_HOOKS
             if (rec_t0) {
@@ -9629,9 +9817,12 @@ public:
     // All keys in the batch are committed atomically in a single
     // commit_txn call.
 
+private:
+    struct ObserverState;   // API-3 (defined below)
+public:
     class Batch {
     public:
-        Batch(Database& db) : db_(db) {}
+        Batch(Database& db) : db_(db), obs_(db.obs_) {}
 
         void put(std::string key, std::string value) {
             entries_.push_back({std::move(key), std::move(value), false});
@@ -9710,7 +9901,7 @@ public:
             // silently skipped observer notification — observers never
             // saw batch writes. This was a correctness gap caught during
             // M1.5 state verification.
-            if (status == Status::OK) db_.notify_observers(ws);
+            if (status == Status::OK) Database::notify_state(obs_.get(), ws);
             return status;
         }
 
@@ -9721,6 +9912,7 @@ public:
         struct Entry { std::string key, value; bool deleted; };
         Database& db_;
         std::vector<Entry> entries_;
+        std::shared_ptr<ObserverState> obs_;   // API-3
     };
 
     Batch create_batch() { return Batch(*this); }
@@ -9779,11 +9971,18 @@ public:
         ObserverHandle(std::function<void()> unreg) : unregister_(std::move(unreg)) {}
     };
 
+#ifdef CHRONOKV_TEST_HOOKS
+    // TXN-3 regression test: lets a test hold the engine like any other
+    // live handle (stream / txn keepalive) across close().
+    std::shared_ptr<ChronoKV> engine_for_test() const { return engine_; }
+#endif
     ObserverHandle observe(std::string prefix, ObserverCallback callback) {
         check_open();
-        std::lock_guard<std::mutex> lk(observer_mu_);
-        size_t idx = observers_.size();
-        observers_.push_back({std::move(prefix), std::move(callback)});
+        std::shared_ptr<ObserverState> st = obs_;
+        if (!st) throw LifecycleError("database was moved from");
+        std::lock_guard<std::mutex> lk(st->mu);
+        size_t idx = st->observers.size();
+        st->observers.push_back({std::move(prefix), std::move(callback)});
         // v25.7 (review M2): the unregister lambda used to capture raw
         // `this`; a handle outliving its Database ran the lambda against a
         // destroyed mutex. Same weak_ptr-liveness pattern Transaction uses:
@@ -9793,13 +9992,13 @@ public:
         // (callback = nullptr), never erased, so captured indices stay
         // valid; observers_ therefore grows with TOTAL observe() calls
         // over the Database's lifetime (~56 bytes per tombstone).
-        std::weak_ptr<std::atomic<bool>> w = alive_;
-        Database* self = this;
-        return ObserverHandle([self, idx, w]() {
-            if (auto sp = w.lock(); !sp || !*sp) return;
-            std::lock_guard<std::mutex> lk(self->observer_mu_);
-            if (idx < self->observers_.size()) {
-                self->observers_[idx].callback = nullptr;  // mark as removed
+        std::weak_ptr<ObserverState> ws = st;
+        return ObserverHandle([ws, idx]() {
+            auto s = ws.lock();
+            if (!s) return;
+            std::lock_guard<std::mutex> lk(s->mu);
+            if (idx < s->observers.size()) {
+                s->observers[idx].callback = nullptr;  // mark as removed
             }
         });
     }
@@ -9843,8 +10042,15 @@ private:
         std::string prefix;
         ObserverCallback callback;
     };
-    std::mutex observer_mu_;
-    std::vector<Observer> observers_;
+    // API-3 fix: observer registry lives in a shared state object owned
+    // by the Database and MOVED with it; handles hold a weak_ptr to it and
+    // Transaction/Batch/async paths hold a shared_ptr (never a raw
+    // Database* that a move would orphan).
+    struct ObserverState {
+        std::mutex mu;
+        std::vector<Observer> observers;
+    };
+    std::shared_ptr<ObserverState> obs_ = std::make_shared<ObserverState>();
 
     // v25.1 M1.5: called from commit path to notify observers.
     // Walks the write-set, checks prefixes, enqueues notifications.
@@ -9855,11 +10061,13 @@ private:
     // vector::empty() here and vector::push_back in observe()). The lock is
     // now taken unconditionally; relative to the WAL I/O a commit performs,
     // one uncontended mutex is noise.
-    void notify_observers(const WriteSet& ws) {
-        std::lock_guard<std::mutex> lk(observer_mu_);
-        if (observers_.empty()) return;
+    void notify_observers(const WriteSet& ws) { notify_state(obs_.get(), ws); }
+    static void notify_state(ObserverState* st, const WriteSet& ws) {
+        if (!st) return;
+        std::lock_guard<std::mutex> lk(st->mu);
+        if (st->observers.empty()) return;
         for (auto& [key, value, deleted] : ws) {
-            for (auto& obs : observers_) {
+            for (auto& obs : st->observers) {
                 if (obs.callback && key.compare(0, obs.prefix.size(), obs.prefix) == 0) {
                     std::optional<std::string> old_val;  // not available in blind-write path
                     std::optional<std::string> new_val = deleted
@@ -9905,7 +10113,6 @@ class Transaction {
     // Database friend). A pointer, not a reference, because move-assignment
     // must be able to rebind it.
     Database* db_;
-    std::unique_ptr<ReadWriteTransaction> txn_;
     // v25.8 (adversarial review rank 1): keepalive on the engine for the
     // transaction's lifetime. ReadWriteTransaction holds a raw ChronoKV&;
     // without this, close() concurrent with an active transaction destroyed
@@ -9913,12 +10120,16 @@ class Transaction {
     // simply outlives the transaction — its operations still fail cleanly
     // with LifecycleError via check_active()'s liveness flag).
     std::shared_ptr<ChronoKV> engine_keepalive_;
+    // TXN-3 fix: txn_ declared AFTER the keepalive so it is destroyed
+    // first (reverse member order) while the engine is still pinned.
+    std::unique_ptr<ReadWriteTransaction> txn_;
     bool active_ = true;
     // v24 fix: weak_ptr into the owning Database's liveness flag.
     // Locks the weak_ptr and inspects the boolean value — this catches
     // both Database destruction (weak_ptr expires) AND Database::close()
     // (boolean set to false before engine is reset).
     std::weak_ptr<std::atomic<bool>> db_alive_;
+    std::shared_ptr<Database::ObserverState> obs_state_;   // API-3
 
 #ifdef CHRONOKV_TEST_HOOKS
     // v27 M1 (txnrec): recording identity for this transaction. Stamped at
@@ -9938,9 +10149,11 @@ class Transaction {
     Transaction(Database& db, ChronoKV& engine, std::weak_ptr<std::atomic<bool>> db_alive,
                 std::shared_ptr<ChronoKV> engine_keepalive, uint64_t rec_begin_ns = 0)
         : db_(&db),
-          txn_(std::make_unique<ReadWriteTransaction>(engine, db_alive)),
           engine_keepalive_(std::move(engine_keepalive)),
-          db_alive_(std::move(db_alive)) {
+          txn_(std::make_unique<ReadWriteTransaction>(engine, db_alive,
+                   std::weak_ptr<ChronoKV>(engine_keepalive_))),
+          db_alive_(std::move(db_alive)),
+          obs_state_(db.obs_) {
 #ifdef CHRONOKV_TEST_HOOKS
         if (rec_begin_ns && txn_) {
             rec_txn_id_ = txnrec::next_txn_id();
@@ -9990,10 +10203,11 @@ public:
     // Move-only — explicit because active_ must be cleared on the source.
     Transaction(Transaction&& o) noexcept
         : db_(o.db_)
-          , txn_(std::move(o.txn_))
           , engine_keepalive_(std::move(o.engine_keepalive_))
+          , txn_(std::move(o.txn_))
           , active_(o.active_)
-          , db_alive_(std::move(o.db_alive_)) {
+          , db_alive_(std::move(o.db_alive_))
+          , obs_state_(std::move(o.obs_state_)) {
 #ifdef CHRONOKV_TEST_HOOKS
         rec_txn_id_ = o.rec_txn_id_;        // v27 M1 (txnrec): identity follows the txn
         rec_begin_ns_ = o.rec_begin_ns_;
@@ -10047,6 +10261,7 @@ public:
             active_ = o.active_;
             db_alive_ = std::move(o.db_alive_);
             db_ = o.db_;   // v25.7 (review M3): observer target follows the txn
+            obs_state_ = std::move(o.obs_state_);   // API-3
 #ifdef CHRONOKV_TEST_HOOKS
             rec_txn_id_ = o.rec_txn_id_;    // v27 M1 (txnrec)
             rec_begin_ns_ = o.rec_begin_ns_;
@@ -10160,7 +10375,7 @@ public:
         // incomplete. old_val remains nullopt (same as every other path —
         // the commit side never reads previous values).
         if (result == ::TxnResult::Committed && !obs_ws.empty())
-            db_->notify_observers(obs_ws);
+            Database::notify_state(obs_state_.get(), obs_ws);   // API-3
 #ifdef CHRONOKV_TEST_HOOKS
         // v27 M1 (txnrec): recorded AFTER the engine commit and observer
         // notify — the latest point inside the call — so end_ns
@@ -10333,6 +10548,11 @@ public:
 
     // Statistics for diagnostics.
     size_t capacity() const { return capacity_; }
+    // BT-1 fix: pages alloc() can still hand out (free list + bump room).
+    size_t pages_available() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return free_list_.size() + (capacity_ - bump_) / PAGE_SIZE;
+    }
     size_t allocated() const {
         std::lock_guard<std::mutex> lk(mu_);
         return bump_;
@@ -10453,16 +10673,16 @@ static_assert(sizeof(PageHeader) == 32, "PageHeader must be 32 bytes");
 // realistically wrap on a single leaf between a fence capture and its
 // validation. Interior pages never carry a LeafFence; their reserved halves
 // stay zero and are not bumped.
-static inline uint32_t page_mut_epoch(const PageHeader* h) {
+inline uint32_t page_mut_epoch(const PageHeader* h) {
     const uint32_t hi = static_cast<uint32_t>(h->mut_epoch_hi);
     const uint32_t lo = static_cast<uint32_t>(h->mut_epoch_lo);
     return (hi << 16) | lo;
 }
-static inline void page_set_mut_epoch(PageHeader* h, uint32_t epoch) {
+inline void page_set_mut_epoch(PageHeader* h, uint32_t epoch) {
     h->mut_epoch_lo = static_cast<uint16_t>(epoch & 0xFFFFu);
     h->mut_epoch_hi = static_cast<uint16_t>((epoch >> 16) & 0xFFFFu);
 }
-static inline void page_bump_mut_epoch(PageHeader* h) {
+inline void page_bump_mut_epoch(PageHeader* h) {
     page_set_mut_epoch(h, page_mut_epoch(h) + 1u);
 }
 
@@ -10697,7 +10917,29 @@ public:
 #endif
 
     // Insert or update a key. Returns true on insert, false on update.
+    // BT-1 fix: a put may split the leaf, cascade k-way splits up every
+    // level and finally allocate a new root; the old code allocated the
+    // root (and upper-level pages) AFTER lower levels were already split
+    // and relinked, so exhaustion mid-cascade orphaned acked keys. Check a
+    // conservative worst case BEFORE any mutation and throw bad_alloc with
+    // the tree untouched. Greedy group planning yields <= 5 pages per
+    // level (each adjacent pair of groups overflows one page budget and a
+    // split page holds <= 2 budgets), plus the root page.
+    void require_split_headroom() {
+        size_t height = 1;
+        PageId id = root_id_.load(std::memory_order_acquire);
+        while (true) {
+            const Page* p = pool_.get(id);
+            const PageHeader* h = header(p);
+            if (h->is_leaf || h->key_count == 0) break;
+            id = interior_slots(p)[0].child_page_id;
+            ++height;
+        }
+        if (pool_.pages_available() < 5 * (height + 1) + 1) throw std::bad_alloc();
+    }
+
     bool put(const std::string& key, const std::string& value) {
+        std::lock_guard<std::mutex> wlk(write_mu_);   // BT-2 fix
         // v28 (CKV-002): tree-level key bound. Any leaf key can become an
         // interior separator when its page splits, and a separator costs
         // sizeof(InteriorSlot) + key against the same page budget — a key
@@ -10710,6 +10952,12 @@ public:
         if (key.size() > MAX_STORABLE_KEY_BYTES)
             throw PageCapacityError(
                 "key too large for the B+ tree: " + std::to_string(key.size()));
+        {   // An update that fits the existing value in place (new value <= old) allocates nothing,
+            // so it must not be refused just because the pool is nearly exhausted.
+            std::string cur_val;
+            if (!(get(key, &cur_val) && value.size() <= cur_val.size()))
+                require_split_headroom();   // BT-1 fix: fail before any mutation
+        }
         generation_.fetch_add(1, std::memory_order_relaxed);  // M1.4: atomic (concurrent-safe)
         InsertResult r = put_recursive(root_id_.load(std::memory_order_acquire), key, value);
         if (r.split) {
@@ -10728,6 +10976,7 @@ public:
     // and the function returns true (existed). If the key is new, returns false.
     bool put_with_old(const std::string& key, const std::string& value,
                       std::string* old_value) {
+        std::lock_guard<std::mutex> wlk(write_mu_);   // BT-2 fix
         generation_.fetch_add(1, std::memory_order_relaxed);
         // Check if key exists first (shared crabbing).
         std::string existing;
@@ -10739,6 +10988,15 @@ public:
         if (key.size() > MAX_STORABLE_KEY_BYTES)   // v28 (CKV-002): same gate as put()
             throw PageCapacityError(
                 "key too large for the B+ tree: " + std::to_string(key.size()));
+        // 0.28.1 (BT-1 parity with put(); external-review probe): an in-place
+        // update — existing key, new value no larger than the old — allocates
+        // NOTHING (put_recursive's fits()/compact path), so an exhausted pool
+        // must not refuse it. The old value is already in hand from the
+        // existence check above, so the exemption costs nothing here.
+        // Fail-first: the extended A2 BT-1 exhaustion test threw bad_alloc on
+        // this path pre-fix (verified failing before this edit landed).
+        if (!(existed && value.size() <= existing.size()))
+            require_split_headroom();   // BT-1 fix: fail before any mutation
         InsertResult r = put_recursive(root_id_.load(std::memory_order_acquire), key, value);
         if (r.split) {
             // Root split: v28 (CKV-002) — k-way-capable install (same as
@@ -10753,6 +11011,7 @@ public:
 
     // Erase a key. Returns true if the key existed.
     bool erase(const std::string& key) {
+        std::lock_guard<std::mutex> wlk(write_mu_);   // BT-2 fix
         generation_.fetch_add(1, std::memory_order_relaxed);  // M1.4: atomic (concurrent-safe)
         return erase_recursive(root_id_.load(std::memory_order_acquire), key);
     }
@@ -11461,6 +11720,10 @@ public:
 
 private:
     PagePool& pool_;
+    // BT-2 fix: serializes structural writers (put/put_with_old/erase).
+    // The engine already serializes tree writes under nm_, so this is an
+    // uncontended lock there; it makes the standalone BTree writer-safe.
+    std::mutex write_mu_;
     // v25.1 M1.6: root_id_ is atomic because it's read by concurrent
     // get/find_leaf/cursor traversals while put may reassign it during a
     // root split. Relaxed loads on read paths (the latch on the root page
@@ -12087,23 +12350,27 @@ private:
                 // Otherwise: write the new value at the top of the slab,
                 // leaving the old value's space as a hole (compaction
                 // will reclaim it later).
-                uint16_t new_off = free_hi(p) - value.size();
-                if (new_off >= free_lo(p) + sizeof(LeafSlot) + value.size()) {
-                    // Wait — need to recheck: we need space for the new value
-                    // AND the existing slot's key. The slot is already there.
-                    // Just need space for the new value.
-                    if (new_off >= free_lo(p)) {
-                        std::memcpy(p->bytes + new_off, value.data(), value.size());
-                        slots[i].value_off = new_off;
-                        slots[i].value_len = value.size();
-                        page_bump_mut_epoch(h);   // v28 CKV-008
-                        return {false, false, "", 0};
-                    }
+                // EXTRA-2 fix: compute in size_t. The old uint16_t
+                // `free_hi - value.size()` wrapped for values larger than
+                // free_hi and passed both guards -> out-of-bounds memcpy
+                // into other pages. An update needs no new slot, only
+                // value.size() bytes between free_lo and free_hi.
+                auto fits = [&]() {
+                    const size_t fh = free_hi(p), fl = free_lo(p);
+                    return value.size() <= fh && fh - value.size() >= fl;
+                };
+                if (fits()) {
+                    const uint16_t new_off = static_cast<uint16_t>(free_hi(p) - value.size());
+                    std::memcpy(p->bytes + new_off, value.data(), value.size());
+                    slots[i].value_off = new_off;
+                    slots[i].value_len = value.size();
+                    page_bump_mut_epoch(h);   // v28 CKV-008
+                    return {false, false, "", 0};
                 }
                 // Not enough space even for just the new value — try compact then split.
                 compact_leaf(p);
-                new_off = free_hi(p) - value.size();
-                if (new_off >= free_lo(p)) {
+                if (fits()) {
+                    const uint16_t new_off = static_cast<uint16_t>(free_hi(p) - value.size());
                     std::memcpy(p->bytes + new_off, value.data(), value.size());
                     slots[i].value_off = new_off;
                     slots[i].value_len = value.size();

@@ -26,6 +26,16 @@
 # ("g++: fatal error: Killed signal terminated program cc1plus"). On small
 # containers use:  make release RELEASE_FLAGS="-O1 -g"
 CXX      ?= g++
+
+# v29: gcc spells the static sanitizer-runtime flag -static-libasan; clang
+# rejects it ("unknown argument") and spells it -static-libsan. Pick by $(CXX)
+# so `make asan CXX=clang++-18` links (CXX is set on the line above, or on the
+# command line, which overrides it).
+ifneq (,$(findstring clang,$(CXX)))
+ASAN_STATIC ?= -static-libsan
+else
+ASAN_STATIC ?= -static-libasan
+endif
 CXXSTD    = -std=c++20
 WARN      = -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
             -Wno-unused-but-set-variable -Wno-sign-compare -Wno-missing-field-initializers \
@@ -46,7 +56,7 @@ RELEASE_FLAGS = -O2 -g
 # ASan, so this is safe on all g++ versions.
 ASAN_FLAGS    = -O1 -g -fsanitize=address,undefined \
                 -fno-omit-frame-pointer -fno-sanitize-recover=undefined \
-                -DCKV_UNDER_SANITIZER=1 -static-libasan
+                -DCKV_UNDER_SANITIZER=1 $(ASAN_STATIC)
 TSAN_FLAGS    = -O1 -g -fsanitize=thread \
                 -fno-omit-frame-pointer -DCKV_UNDER_SANITIZER=1
 # v26.2: -DCKV_UNDER_SANITIZER=1 was REMOVED from STRESS_FLAGS. It had
@@ -173,6 +183,51 @@ $(BIN_DIR)/smoke_off/stress/test: main.cpp chronokv.hpp | $(BIN_DIR)/smoke_off/s
 	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) $(STRESS_FLAGS) \
 	    main.cpp -o $@ -lpthread
 
+# ---- v29 CI hardening: fast static gates (no codegen, no test run) ----
+# -fsyntax-only parses and type-checks without generating code, so these need
+# none of the >1 GiB cc1plus RSS of a real build and take seconds. They are
+# what CI's `lint` job runs, and they run locally the same way.
+#   lint-werror      the project's own WARN set promoted to -Werror, over the
+#                    header alone (hooks-off and hooks-on) and the whole test
+#                    suite (main.cpp, hooks-on and hooks-off). Zero warnings
+#                    today, so this is free; it keeps it that way. Try it with
+#                    another compiler:  make lint-werror CXX=clang++-18
+#   lint-conversion  -Wconversion ratchet over the header: the warning count may
+#                    not grow past ci/wconversion.baseline (scripts/
+#                    lint_wconversion.sh). The uint16_t narrowing class behind
+#                    audit CKV-001/002 is exactly what it flags.
+LINT_WARN = $(WARN) -Werror
+
+lint: lint-werror lint-conversion lint-header
+
+lint-werror:
+	printf '#include "chronokv.hpp"\n' | $(CXX) $(CXXSTD) $(LINT_WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) -fsyntax-only -x c++ -
+	printf '#include "chronokv.hpp"\n' | $(CXX) $(CXXSTD) $(LINT_WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) -fsyntax-only -x c++ -
+	$(CXX) $(CXXSTD) $(LINT_WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) -fsyntax-only main.cpp
+	$(CXX) $(CXXSTD) $(LINT_WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) -fsyntax-only main.cpp
+
+lint-conversion:
+	CXX='$(CXX)' bash scripts/lint_wconversion.sh
+
+# Header hygiene (audit API-1): the "single header" must be usable the way any
+# real consumer uses it (#pragma once + inline statics make both checks pass).
+#   lint-header-reinclude  the header included twice in one translation unit
+#   lint-header-2tu        the header included from two TUs that are linked
+LH = $(BIN_DIR)/lint-header
+
+lint-header: lint-header-reinclude lint-header-2tu
+
+lint-header-reinclude:
+	printf '#include "chronokv.hpp"\n#include "chronokv.hpp"\n' | $(CXX) $(CXXSTD) $(INCLUDE) -fsyntax-only -x c++ -
+
+lint-header-2tu:
+	mkdir -p $(LH)
+	printf '#include "chronokv.hpp"\nint ckv_tu1() { return 1; }\n' > $(LH)/tu1.cpp
+	printf '#include "chronokv.hpp"\nint ckv_tu2() { return 2; }\n' > $(LH)/tu2.cpp
+	printf 'int ckv_tu1(); int ckv_tu2();\nint main() { return ckv_tu1() + ckv_tu2() == 3 ? 0 : 1; }\n' > $(LH)/main.cpp
+	$(CXX) $(CXXSTD) $(INCLUDE) -O0 -pthread $(LH)/tu1.cpp $(LH)/tu2.cpp $(LH)/main.cpp -o $(LH)/a.out
+	$(LH)/a.out
+
 # ---- dirs ----
 $(BIN_DIR)/release $(BIN_DIR)/asan $(BIN_DIR)/tsan $(BIN_DIR)/stress $(BIN_DIR)/coverage \
 $(BIN_DIR)/arena \
@@ -185,4 +240,5 @@ clean:
 
 .PHONY: release asan tsan stress coverage arena arena-baselines \
 	smoke_off_release smoke_off_asan smoke_off_tsan smoke_off_stress \
+	lint lint-werror lint-conversion lint-header lint-header-reinclude lint-header-2tu \
 	all clean

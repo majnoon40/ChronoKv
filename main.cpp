@@ -25,6 +25,7 @@
 // =====================================================================
 
 #include "chronokv.hpp"
+#include "chronokv.hpp"   // API-1: header must be idempotent (#pragma once)
 #include <atomic>
 #include <barrier>   // review regression tests (C1)
 #include <cassert>
@@ -3513,9 +3514,20 @@ return 0;
                  << " expected scan=0 r=Committed)\n";
     }
 
-    // Guard test 4: updating an already-present key is not a phantom by default.
-    // This test is expected to pass under the current policy and should remain
-    // green after the redesign.
+    // A2 (TXN-1) SEMANTIC CHANGE — guard test 4 FLIPPED (0.28.1): updating
+    // a present key INSIDE a scanned range now DOES conflict. The pre-Audit-2
+    // policy tracked only existence transitions, so a value update inside
+    // the range was invisible to phantom validation — a value-based
+    // write-skew anomaly (Audit-2 TXN-1; standalone PoC on 0.28.0: T1
+    // scanned k, T2 updated k, T1's dependent write committed). SSI requires
+    // the rw-antidependency on the scanned key's VALUE, so the scanner must
+    // conflict. The old assertion here ("should remain green after the
+    // redesign") encoded exactly the unsound behavior the audit ranked
+    // critical to fix; it is flipped, not deleted, so the semantic change
+    // stays visible. No-op deletes of ABSENT keys remain non-conflicting
+    // (tests 3 and 5, engine-side exemption in record_transition): a
+    // tombstone above every concurrent snapshot cannot change any scan's
+    // visible output.
     {
         const std::string wd = "/tmp/v17_red_phantom_update_present";
         std::filesystem::remove_all(wd);
@@ -3528,19 +3540,19 @@ return 0;
         auto scan = t.range_scan("m", "n");
         bool saw_m = (scan.size() == 1 && scan[0].first == "m");
 
-        // Update an already-present key. This changes the value but not
-        // logical existence, so it should not be treated as a phantom.
+        // Update an already-present key INSIDE the scanned range: a
+        // read-write antidependency on the scanned value (A2 TXN-1).
         kv.commit("m", "2");
 
         t.write("a", "99");
         TxnResult r = t.commit();
 
-        bool ok = saw_m && (r == TxnResult::Committed);
-        report("v17 phantom: update of present key does not conflict", ok);
+        bool ok = saw_m && (r == TxnResult::Conflict);
+        report("v17 phantom (A2 TXN-1): update of present key in scanned range CONFLICTS", ok);
         if (!ok)
             std::cout << "    (scan=" << scan.size()
                  << " r=" << to_string(r)
-                 << " expected scan=1 r=Committed)\n";
+                 << " expected scan=1 r=Conflict)\n";
     }
 
     // Phantom regression test 5: a transaction that only deletes an absent key should not
@@ -11462,7 +11474,316 @@ static int run_dst_test() {
 // forked children (the crash-fuzz pattern) so a regression FAILS the check
 // instead of taking the suite down.
 // =====================================================================
+// =====================================================================
+// Audit-2 regression battery (TXN-1..BT-2 + EXTRA-2), appended to
+// CKV_ONLY_REMEDIATION. Each case is a trimmed PoC body and FAILS on
+// HEAD 8863bc8 (fail-first). API-1 is a build check (also exercised by the
+// double #include at the top of this file); CI 2-TU link check:
+//   printf '#include "chronokv.hpp"\n#include "chronokv.hpp"\nint f1(){return 1;}\n' >a.cpp
+//   printf '#include "chronokv.hpp"\nint f1();\nint main(){return f1()-1;}\n' >b.cpp
+//   g++ -std=c++20 -I. -pthread a.cpp b.cpp -o ab && ./ab
+// EXTRA-1 (latch inside group_append) is covered by pocs run_all.sh's
+// widened-window race (needs a scratch header with an injected sleep).
+// =====================================================================
+namespace a2 {
+static std::string mk(const char* tag) {
+    std::string t = std::string("/tmp/") + tag + ".XXXXXX";
+    std::vector<char> b(t.begin(), t.end()); b.push_back(0);
+    if (!mkdtemp(b.data())) throw std::runtime_error("mkdtemp");
+    return b.data();
+}
+static std::vector<uint8_t> slurp(const std::string& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+static void spew(const std::string& p, const std::vector<uint8_t>& b) {
+    std::ofstream f(p, std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(b.data()), (std::streamsize)b.size());
+}
+static uint32_t le32(const std::vector<uint8_t>& b, size_t p) {
+    return (uint32_t)b[p] | ((uint32_t)b[p+1] << 8) | ((uint32_t)b[p+2] << 16) | ((uint32_t)b[p+3] << 24);
+}
+// fork + deadline: returns child exit code, or -1 on deadline/signal.
+static int run_forked(const std::function<int()>& body, int deadline_ms) {
+    std::cout.flush();
+    pid_t pid = fork();
+    if (pid == 0) { int rc = 5; try { rc = body(); } catch (...) { rc = 3; } _exit(rc); }
+    auto t0 = std::chrono::steady_clock::now();
+    int st = 0;
+    while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(deadline_ms)) {
+        if (waitpid(pid, &st, WNOHANG) == pid) return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+        usleep(10000);
+    }
+    kill(pid, SIGKILL); waitpid(pid, &st, 0);
+    return -1;
+}
+}  // namespace a2
+
+static int run_audit2_regression_tests() {
+    using namespace chronokv;
+    namespace fs = std::filesystem;
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& d = "") {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) { ++fails; if (!d.empty()) std::cout << "      (" << d << ")\n"; }
+    };
+    auto guard = [&](const char* name, const std::function<void()>& fn) {
+        try { fn(); } catch (const std::exception& e) { check(name, false, std::string("exception: ") + e.what()); }
+    };
+    Options mem; mem.page_pool_bytes = 16u << 20;
+
+    // ---- TXN-1: a scanned key UPDATED after the snapshot must conflict.
+    guard("A2 TXN-1 scan/update conflict", [&] {
+        auto db = Database::open(mem); db.put("k", "0"); db.put("x", "0");
+        auto t1 = db.begin(); (void)t1.range_scan("k", "k");
+        auto t2 = db.begin(); (void)t2.get("x"); t2.put("k", "1"); Status s2 = t2.commit();
+        t1.put("x", "1"); Status s1 = t1.commit();
+        check("A2 TXN-1 scan/update conflict", s2 == Status::OK && s1 == Status::Conflict,
+              "T2=" + std::to_string((int)s2) + " T1=" + std::to_string((int)s1));
+    });
+    guard("A2 TXN-1 SSI write-skew still rejected", [&] {
+        auto db = Database::open(mem); db.put("a", "1"); db.put("b", "1");
+        auto t1 = db.begin(); auto t2 = db.begin();
+        (void)t1.get("a"); (void)t1.get("b"); (void)t2.get("a"); (void)t2.get("b");
+        t1.put("a", "0"); Status s1 = t1.commit();
+        t2.put("b", "0"); Status s2 = t2.commit();
+        check("A2 TXN-1 SSI write-skew still rejected", s1 == Status::OK && s2 == Status::Conflict);
+    });
+
+    // ---- WAL-1: corrupted length field of an interior frame -> CORRUPT, file untouched.
+    guard("A2 WAL-1 corrupt length is not a torn tail", [&] {
+        std::string dir = a2::mk("ckv_a2_wal1");
+        Options o; o.wal_dir = dir; o.durability = DurabilityMode::Sync; o.page_pool_bytes = 16u << 20;
+        { auto db = Database::open(o); db.put("a", "A"); db.put("b", "B"); db.put("c", "C"); db.close(); }
+        auto base = a2::slurp(dir + "/wal_000001.log");
+        std::vector<size_t> offs; size_t pos = 0;
+        while (pos + 8 <= base.size()) { offs.push_back(pos); pos += 8 + a2::le32(base, pos); }
+        bool ok = offs.size() >= 3; std::string why;
+        auto trial = [&](const char* name, const std::function<void(std::vector<uint8_t>&)>& mut, bool expect_throw) {
+            std::string d2 = dir + "_" + name; fs::copy(dir, d2, fs::copy_options::recursive);
+            std::string p = d2 + "/wal_000001.log"; auto b = a2::slurp(p); mut(b); a2::spew(p, b);
+            size_t before = b.size(); bool threw = false; bool a_ok = false;
+            Options o2 = o; o2.wal_dir = d2;
+            try { auto db = Database::open(o2); a_ok = db.get("a").has_value() && db.get("b").has_value(); db.close(); }
+            catch (const std::exception&) { threw = true; }
+            if (expect_throw && (!threw || fs::file_size(p) != before)) { ok = false; why += std::string(name) + " not rejected/file changed; "; }
+            if (!expect_throw && (threw || !a_ok)) { ok = false; why += std::string(name) + " torn tail not recovered; "; }
+            fs::remove_all(d2);
+        };
+        if (ok) {
+            trial("len_ffffffff", [&](auto& b) { for (int i = 0; i < 4; ++i) b[offs[1] + i] = 0xFF; }, true);
+            trial("len_plus1", [&](auto& b) { uint32_t l = a2::le32(b, offs[1]) + 1; for (int i = 0; i < 4; ++i) b[offs[1] + i] = (l >> (8 * i)) & 0xFF; }, true);
+            trial("torn_tail", [&](auto& b) { b.resize(offs[2] + 5); }, false);
+        }
+        fs::remove_all(dir);
+        check("A2 WAL-1 corrupt length is not a torn tail", ok, why);
+    });
+
+#ifdef CHRONOKV_FAULT_INJECTION
+    // ---- WAL-2: creating a segment must fsync the WAL directory before any ack.
+    guard("A2 WAL-2 new segment dir fsync", [&] {
+        std::string dir = a2::mk("ckv_a2_wal2");
+        Options o; o.wal_dir = dir; o.durability = DurabilityMode::Sync; o.page_pool_bytes = 16u << 20;
+        ::fault::arm(::fault::Kind::DirFsyncFail, 1);
+        Status s = Status::OK; bool threw = false;
+        try { auto db = Database::open(o); s = db.put("a", "1"); db.close(); } catch (const std::exception&) { threw = true; }
+        int rem = ::fault::remaining.load(); ::fault::disarm(); fs::remove_all(dir);
+        check("A2 WAL-2 new segment dir fsync", rem == 0 && (threw || s != Status::OK),
+              "remaining=" + std::to_string(rem) + " put=" + std::to_string((int)s));
+    });
+#endif
+
+    // ---- TXN-2: negative lookups must not consume the index/pool; check-then-insert still conflicts.
+    guard("A2 TXN-2 absent reads do not leak", [&] {
+        Options o; o.page_pool_bytes = 1u << 20; auto db = Database::open(o); db.put("w", "0");
+        int i = 0; bool ok = true;
+        for (; i < 30000; ++i) {
+            auto t = db.begin(); (void)t.get("absent_user_" + std::to_string(i)); t.put("w", std::to_string(i));
+            if (t.commit() != Status::OK) { ok = false; break; }
+        }
+        check("A2 TXN-2 absent reads do not leak", ok, "stopped at " + std::to_string(i));
+    });
+    guard("A2 TXN-2 check-then-insert conflicts", [&] {
+        auto db = Database::open(mem); db.put("w", "0");
+        auto t1 = db.begin(); bool absent = !t1.get("user_x").has_value();
+        auto t2 = db.begin(); t2.put("user_x", "bob"); Status s2 = t2.commit();
+        t1.put("w", "1"); Status s1 = t1.commit();
+        check("A2 TXN-2 check-then-insert conflicts", absent && s2 == Status::OK && s1 == Status::Conflict,
+              "T1=" + std::to_string((int)s1));
+    });
+
+    // ---- BT-1: pool exhaustion during a split must not lose acked keys.
+    guard("A2 BT-1 exhaustion keeps acked keys", [&] {
+        int bad = 0, combos = 0;
+        for (int shuffled = 0; shuffled < 2; ++shuffled)
+        for (size_t pages : {2, 3, 4, 5, 8, 12})
+        for (size_t S : {2000, 1000, 300, 100}) {
+            chronokv_page::PagePool pool(pages * 4096); chronokv_btree::BTree t(pool);
+            std::vector<std::string> keys;
+            for (int i = 0; i < 4000; ++i) { char b[16]; snprintf(b, sizeof b, "%06d", i); std::string k = b; k.resize(S, 'x'); keys.push_back(k); }
+            if (shuffled) std::shuffle(keys.begin(), keys.end(), std::mt19937(7));
+            std::vector<std::string> ok;
+            bool threw = false;
+            for (auto& k : keys) { try { t.put(k, "v"); ok.push_back(k); } catch (const std::bad_alloc&) { threw = true; break; } }
+            if (!threw) continue;
+            ++combos;
+            for (auto& k : ok) { std::string out; if (!t.get(k, &out)) { ++bad; break; } }
+        }
+        check("A2 BT-1 exhaustion keeps acked keys", combos > 0 && bad == 0,
+              std::to_string(bad) + " of " + std::to_string(combos) + " combos lost keys");
+    });
+
+    // ---- WAL-4: absurd MANIFEST active_id must fail fast (pre-fix: ~2^64 loop).
+    guard("A2 WAL-4 huge active_id fails fast", [&] {
+        std::string base = a2::mk("ckv_a2_wal4"), wal = base + "/wal", ck = base + "/ck";
+        fs::create_directories(wal); fs::create_directories(ck);
+        Options o; o.wal_dir = wal; o.checkpoint_path = ck + "/ckpt"; o.durability = DurabilityMode::Sync; o.page_pool_bytes = 16u << 20;
+        { auto db = Database::open(o); db.put("a", "1"); db.checkpoint(); db.put("b", "2"); db.close(); }
+        auto mf = a2::slurp(wal + "/MANIFEST");
+        bool ok = true; std::string why;
+        auto variant = [&](const char* name, uint64_t active, int want) {
+            std::string d2 = base + "_" + name; fs::copy(base, d2, fs::copy_options::recursive);
+            auto b = mf; for (int i = 0; i < 8; ++i) b[8 + i] = (active >> (8 * i)) & 0xFF;
+            uint32_t c = ::crc32(b.data() + 8, b.size() - 8); for (int i = 0; i < 4; ++i) b[4 + i] = (c >> (8 * i)) & 0xFF;
+            a2::spew(d2 + "/wal/MANIFEST", b);
+            Options o2 = o; o2.wal_dir = d2 + "/wal"; o2.checkpoint_path = d2 + "/ck/ckpt";
+            int rc = a2::run_forked([&] { auto db = Database::open(o2); return 0; }, 5000);
+            if (rc != want) { ok = false; why += std::string(name) + " rc=" + std::to_string(rc) + "; "; }
+            fs::remove_all(d2);
+        };
+        uint64_t cur = 0; for (int i = 0; i < 8; ++i) cur |= (uint64_t)mf[8 + i] << (8 * i);
+        variant("control", cur, 0);
+        variant("huge", 100000000ULL, 3);
+        variant("u64max", UINT64_MAX, 3);
+        fs::remove_all(base);
+        check("A2 WAL-4 huge active_id fails fast", ok, why);
+    });
+
+    // ---- API-3: observers follow a moved Database.
+    guard("A2 API-3 observers survive move", [&] {
+        int cb1 = 0, cb2 = 0;
+        { auto a = Database::open(mem); auto h = a.observe("k", [&](auto&&...) { cb1++; });
+          Database b = std::move(a); b.put("k", "v"); }
+        { auto a = Database::open(mem); auto h = a.observe("k", [&](auto&&...) { cb2++; });
+          Database b = Database::open(mem); b = std::move(a); b.put("k", "v"); }
+        check("A2 API-3 observers survive move", cb1 == 1 && cb2 == 1,
+              "construct=" + std::to_string(cb1) + " assign=" + std::to_string(cb2));
+    });
+
+    // ---- TXN-3: close() with a live txn must not pin its reader registration.
+    guard("A2 TXN-3 close with live txn unpins", [&] {
+        auto db = Database::open(mem); db.put("a", "1");
+        std::shared_ptr<ChronoKV> eng = db.engine_for_test();
+        { auto txn = db.begin(); (void)txn.get("a"); (void)txn.range_scan("a", "z");
+          db.close(); try { txn.abort(); } catch (const std::exception&) {} }
+        size_t pinned = eng->phantom_reader_count_for_test();
+        check("A2 TXN-3 close with live txn unpins", pinned == 0, "pinned=" + std::to_string(pinned));
+    });
+
+    // ---- BT-2: standalone BTree concurrent writers lose nothing.
+    guard("A2 BT-2 concurrent writers", [&] {
+        chronokv_page::PagePool pool(128ull << 20); chronokv_btree::BTree t(pool);
+        auto key = [](int th, int n) { char b[40]; snprintf(b, sizeof b, "t%02d_%08d", th, n); return std::string(b); };
+        std::vector<std::thread> w;
+        for (int th = 0; th < 4; ++th) w.emplace_back([&, th] { for (int n = 0; n < 20000; ++n) t.put(key(th, n), "v"); });
+        for (auto& x : w) x.join();
+        size_t miss = 0;
+        for (int th = 0; th < 4; ++th) for (int n = 0; n < 20000; ++n) { std::string o; if (!t.get(key(th, n), &o)) ++miss; }
+        check("A2 BT-2 concurrent writers", miss == 0, "missing=" + std::to_string(miss));
+    });
+
+    // ---- EXTRA-2: growing a value past free_hi must not corrupt other pages.
+    guard("A2 EXTRA-2 update-path wrap", [&] {
+        chronokv_page::PagePool pool(64ull << 20); chronokv_btree::BTree t(pool);
+        auto val = [](int i) { std::string v(100, (char)('a' + (i % 26))); v += std::to_string(i); return v; };
+        char kb[16];
+        for (int i = 0; i < 3000; ++i) { snprintf(kb, sizeof kb, "k%06d", i); t.put(kb, val(i)); }
+        t.put("k000000", std::string(2500, 'Z'));
+        size_t bad = 0;
+        for (int i = 1; i < 3000; ++i) { snprintf(kb, sizeof kb, "k%06d", i); std::string o; if (!t.get(kb, &o) || o != val(i)) ++bad; }
+        std::string o; bool f = t.get("k000000", &o) && o.size() == 2500;
+        check("A2 EXTRA-2 update-path wrap", bad == 0 && f, std::to_string(bad) + " other keys corrupt");
+    });
+
+#ifdef CHRONOKV_FAULT_INJECTION
+    // ---- WAL-2 retry: a segment left EMPTY by a failed dir fsync must be synced again on the next open.
+    guard("A2 WAL-2 retry after failed dir fsync", [&] {
+        std::string dir = a2::mk("ckv_a2_wal2r");
+        Options o; o.wal_dir = dir; o.durability = DurabilityMode::Sync; o.page_pool_bytes = 16u << 20; o.auto_start_gc = false;
+        ::fault::arm(::fault::Kind::DirFsyncFail, 1);
+        { try { auto db = Database::open(o); (void)db.put("a", "1"); db.close(); } catch (const std::exception&) {} }
+        int r1 = ::fault::remaining.load();
+        ::fault::arm(::fault::Kind::DirFsyncFail, 1);
+        { try { auto db = Database::open(o); (void)db.put("a", "1"); db.close(); } catch (const std::exception&) {} }
+        int r2 = ::fault::remaining.load(); ::fault::disarm(); fs::remove_all(dir);
+        check("A2 WAL-2 retry after failed dir fsync", r1 == 0 && r2 == 0,
+              "first remaining=" + std::to_string(r1) + " second remaining=" + std::to_string(r2));
+    });
+#ifdef CHRONOKV_TEST_HOOKS
+    // ---- EXTRA-1: the fail-stop latch must already be set when group_append releases batch_mu_.
+    guard("A2 EXTRA-1 latch set before unlock", [&] {
+        std::string dir = a2::mk("ckv_a2_x1");
+        Options o; o.wal_dir = dir; o.durability = DurabilityMode::Sync; o.page_pool_bytes = 16u << 20; o.auto_start_gc = false;
+        bool ok = true, b_acked = false; std::string why;
+        {
+            auto db = Database::open(o);
+            (void)db.put("pre", "1");
+            std::atomic<bool> in_hook{false}, release{false};
+            ckv_post_reservation_throw_hook_for_test() = [&] { in_hook = true; while (!release) std::this_thread::sleep_for(std::chrono::milliseconds(1)); };
+            ::fault::arm(::fault::Kind::AllocFail, 1);
+            std::thread ta([&] { try { (void)db.put("A", "1"); } catch (...) {} });
+            auto t0 = std::chrono::steady_clock::now();
+            while (!in_hook && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (!in_hook) { ok = false; why = "hook never reached (AllocFail not consumed in the reservation window)"; }
+            else {
+                // A has thrown and unwound out of group_append (batch_mu_ free) but has NOT run commit_txn's latch yet.
+                Status sb = db.put("B", "1");
+                b_acked = (sb == Status::OK);
+                if (b_acked) { ok = false; why = "B was acknowledged past the burned timestamp"; }
+            }
+            release = true; ta.join(); ckv_post_reservation_throw_hook_for_test() = nullptr; ::fault::disarm();
+            db.close();
+        }
+        bool reopened = false;
+        try { auto db = Database::open(o); reopened = db.get("pre").has_value() && (!b_acked || db.get("B").has_value()); db.close(); }
+        catch (const std::exception& e) { why += std::string(" reopen threw: ") + e.what(); }
+        fs::remove_all(dir);
+        check("A2 EXTRA-1 latch set before unlock", ok && reopened, why);
+    });
+#endif
+#endif
+
+    guard("A2 BT-1 in-place update after exhaustion", [&] {
+        chronokv_page::PagePool pool(16 * 4096); chronokv_btree::BTree t(pool);
+        std::string first; size_t n = 0;
+        for (; n < 100000; ++n) { char b[24]; snprintf(b, sizeof b, "%08zu", n); std::string k = b; k.resize(100, 'x'); try { t.put(k, "v"); if (n == 0) first = k; } catch (const std::bad_alloc&) { break; } }
+        bool upd_ok = true; try { t.put(first, "w"); } catch (const std::bad_alloc&) { upd_ok = false; }
+        // 0.28.1 (external-review probe): put_with_old PARITY — the in-place
+        // exemption must hold on BOTH standalone tree write entry points;
+        // put_with_old already holds the old value, so its check is free.
+        // Fail-first: pre-fix this threw bad_alloc on the exhausted pool
+        // despite the update needing ZERO allocation.
+        bool upd_old_ok = true; std::string oldv;
+        try { t.put_with_old(first, "z", &oldv); } catch (const std::bad_alloc&) { upd_old_ok = false; }
+        std::string out; bool readable = t.get(first, &out) && out == "z";
+        check("A2 BT-1 in-place update after exhaustion",
+              n > 0 && upd_ok && upd_old_ok && readable && oldv == "w",
+              "n=" + std::to_string(n) + " put_ok=" + std::to_string(upd_ok) +
+              " put_with_old_ok=" + std::to_string(upd_old_ok) + " oldv=" + oldv);
+    });
+
+    std::cout << (fails == 0 ? "   AUDIT-2 REGRESSION TESTS PASSED\n"
+                             : "   AUDIT-2 REGRESSION FAILURES: " + std::to_string(fails) + "\n");
+    return fails;
+}
+
+static int run_remediation_tests_v28();
 static int run_remediation_tests() {
+    int f = run_remediation_tests_v28();
+    f += run_audit2_regression_tests();
+    return f;
+}
+static int run_remediation_tests_v28() {
     using namespace chronokv;
     int fails = 0;
     auto check = [&](const char* name, bool ok, const std::string& detail = "") {

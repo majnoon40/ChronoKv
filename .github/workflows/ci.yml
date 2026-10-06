@@ -38,6 +38,20 @@
 #              suite per kind + unforced headline run).
 #   gate:      ci-passed aggregates every job — a single required check
 #              for branch protection.
+#   v29 CI:    - `lint`: seconds-long -fsyntax-only gates (the project's WARN
+#                set as -Werror on g++, header + test suite, hooks on/off; a
+#                -Wconversion count ratchet, scripts/lint_wconversion.sh;
+#                clang++-18 -Werror as an informational step; header hygiene:
+#                re-include in one TU + a 2-TU link).
+#              - `build-shared`: the stress and release binaries are compiled
+#                ONCE per run and handed to `dst` (8 nightly shards) and
+#                `crashfuzz` as artifacts instead of each re-compiling the one
+#                large translation unit.
+#              - experimental sanitizer legs (`experimental: true`): the
+#                io_uring-disabled asan/tsan builds (the only config where the
+#                WAL write-path fault legs run) and clang asan/tsan. They do
+#                not block `ci-passed` until each has been green once —
+#                then delete the flag and it gates.
 #
 # io_uring: every default build attempts real io_uring. The test binary
 # probes the ring at runtime, prints the feature summary
@@ -71,11 +85,46 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 jobs:
+  # ---- v29: fast static gates -----------------------------------------------
+  lint:
+    name: lint (-Werror, -Wconversion ratchet, header hygiene)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Warnings as errors (g++; header + test suite; hooks on/off)
+        run: make lint-werror
+
+      - name: -Wconversion ratchet (warning count may not grow)
+        run: make lint-conversion
+
+      # clang's -Wall -Wextra set differs from g++'s and has never been
+      # enforced here. Checked locally with clang++-18 18.1.3: 4 errors today
+      # (3x -Wunused-lambda-capture, 1x -Wunused-private-field), so this stays
+      # informational until those are fixed; then delete continue-on-error.
+      - name: Warnings as errors (clang++-18), informational
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18
+          make lint-werror CXX=clang++-18
+
+      # Header hygiene (audit API-1): the "single header" must be includable
+      # twice in one TU and from two TUs linked together (#pragma once + inline
+      # statics). Gating since the audit-2 fixes.
+      - name: Header hygiene, re-include in one TU
+        run: make lint-header-reinclude
+
+      - name: Header hygiene, two TUs link
+        run: make lint-header-2tu
+
   # ---- hooks-on: full internal test suite --------------------------------
   engine-tests:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -130,6 +179,29 @@ jobs:
             bin: build/release/test
             cxx: g++
             extra_defs: -DCKV_IOURING_DISABLED
+          # ---- v29 experimental sanitizer legs (non-blocking until green once) ----
+          # The io_uring-disabled build is the ONLY configuration where the WAL
+          # write-path fault legs (pwrite_all WriteShort/WriteFail, D2
+          # async-write-stage) run — they SKIP on native io_uring builds — and
+          # until now it ran in release only. Under ASan+UBSan those error
+          # paths also get leak/UB checking. (crash-injection stays skipped
+          # under every sanitizer: fork is unreliable there, a property of
+          # the build, not of CI config.)
+          - name: asan+ubsan (io_uring disabled)
+            os: ubuntu-24.04
+            target: asan
+            bin: build/asan/test
+            cxx: g++
+            extra_defs: -DCKV_IOURING_DISABLED
+            experimental: true
+          # clang's sanitizer runtime and codegen differ from gcc's.
+          - name: asan+ubsan (clang++-18)
+            os: ubuntu-24.04
+            target: asan
+            bin: build/asan/test
+            cxx: clang++-18
+            install: clang-18
+            experimental: true
     steps:
       - uses: actions/checkout@v4
 
@@ -158,7 +230,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-log-engine-${{ matrix.target }}-${{ matrix.cxx }}-${{ matrix.os }}
+          name: test-log-engine-${{ strategy.job-index }}-${{ matrix.target }}
           path: test.log
           if-no-files-found: ignore
 
@@ -166,14 +238,38 @@ jobs:
   # The former 3-batch split (CHRONOKV_TSAN_BATCH 1/2/3) was removed from
   # main.cpp and the Makefile; one job now covers everything.
   tsan:
-    name: tsan (full suite)
+    name: tsan (${{ matrix.name }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: full suite
+            cxx: g++
+          # v29 experimental legs (non-blocking until green once): the
+          # io_uring-disabled build (WAL write-path fault legs under TSan) and
+          # clang's TSan runtime (different instrumentation than gcc's).
+          - name: full suite, io_uring disabled
+            cxx: g++
+            extra_defs: -DCKV_IOURING_DISABLED
+            experimental: true
+          - name: full suite, clang++-18
+            cxx: clang++-18
+            install: clang-18
+            experimental: true
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install compiler
+        if: ${{ matrix.install }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.install }}
+
       - name: Build
-        run: make tsan
+        run: make tsan CXX=${{ matrix.cxx }} CKV_EXTRA_DEFS='${{ matrix.extra_defs }}'
 
       - name: Run tests
         run: |
@@ -184,7 +280,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-log-tsan-full
+          name: test-log-tsan-${{ strategy.job-index }}
           path: test.log
           if-no-files-found: ignore
 
@@ -228,6 +324,38 @@ jobs:
           path: test.log
           if-no-files-found: ignore
 
+  # ---- v29: shared binaries ---------------------------------------------------
+  # The project is ONE large translation unit (>1 GiB cc1plus RSS, minutes per
+  # compile). Before this job every consumer compiled its own copy: each of the
+  # 8 nightly DST shards rebuilt `stress`, and `release` was rebuilt again for
+  # crashfuzz and the lincheck leg. Now each is built once per run and handed
+  # on as an artifact. (ccache would not help: any header change invalidates
+  # the one translation unit.) The binaries bake in the checkout path via
+  # CHRONOKV_SOURCE_DIR, identical on every runner of this repo, and consumers
+  # still run actions/checkout so the sources exist at that path.
+  build-shared:
+    name: build (${{ matrix.target }}, shared)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [stress, release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make ${{ matrix.target }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: build/${{ matrix.target }}/test
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: error
+
   # ---- v27 M2: dedicated crash-fuzz job (N seeds) --------------------------
   # Scales the v26 M2 crash-fuzz regime by SEEDS, independently of the
   # full-suite jobs: push/PR run a bounded config (2 bases x 24 rounds x 26
@@ -241,13 +369,20 @@ jobs:
   # uploaded with the log.
   crashfuzz:
     name: crashfuzz (N seeds)
+    needs: build-shared
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'pull_request') && '30' || '150') }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build
-        run: make release
+      - name: Download shared release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: bin-release
+          path: build/release
+
+      - name: Make binary executable
+        run: chmod +x build/release/test
 
       - name: Run crash-fuzz (bounded PR / long nightly)
         env:
@@ -299,6 +434,7 @@ jobs:
   #      checker and be non-vacuous.
   dst:
     name: dst (N seeds, shard ${{ matrix.shard }})
+    needs: build-shared
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'pull_request') && '60' || '240') }}
     # v26.3-review-era fix: the nightly 100k-seed DST sweep measured
@@ -315,10 +451,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build (stress${{ matrix.shard == 0 && ' + release' || '' }})
-        run: |
-          make stress
-          if [ "${{ matrix.shard }}" = "0" ]; then make release; fi
+      - name: Download shared stress binary
+        uses: actions/download-artifact@v4
+        with:
+          name: bin-stress
+          path: build/stress
+
+      # shard 0 also runs the lincheck leg, which uses the release binary.
+      - name: Download shared release binary (shard 0)
+        if: matrix.shard == 0
+        uses: actions/download-artifact@v4
+        with:
+          name: bin-release
+          path: build/release
+
+      - name: Make binaries executable
+        run: chmod +x build/*/test
 
       - name: DST harness, N seeds per scenario (bounded PR / sharded nightly)
         env:
@@ -573,7 +721,7 @@ jobs:
   # ---- gate: single aggregate check for branch protection ----------------
   ci-passed:
     name: ci-passed
-    needs: [engine-tests, tsan, public-api-smoke, dst, crashfuzz, coverage]
+    needs: [lint, build-shared, engine-tests, tsan, public-api-smoke, dst, crashfuzz, coverage]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     if: always()
