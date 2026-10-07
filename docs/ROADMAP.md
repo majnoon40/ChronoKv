@@ -1,5 +1,732 @@
 # ChronoKV roadmap — v29 → v30: challenge the real databases
 
+Written 2026-10-07 against `main @ e9eb787` (**0.28.1** — the Audit-2
+remediation arc, shipped as PR #2, plus the arena-ledger vehicle split).
+This document **rebaselines and supersedes** the 2026-09-27 plan (v29 → v30,
+revision 3, written against `3161c77` / 0.28.0), which is preserved in full
+as the appendix — including its own appendix (the superseded 2026-09-17
+plan), per the disposition rule. Every item of the 2026-09-27 plan is
+accounted for in the disposition table below; nothing was silently dropped.
+
+**Why a rebase, not a revision 4.** The delta since revision 3 is not
+citation polish — an entire independent audit round ran, found thirteen
+defects including a genuine SSI soundness hole the first round had graded
+"verified sound", and all of it shipped as 0.28.1 with fail-first tests.
+That changes this plan's own gate status (M0 executed, closure pending),
+its evidence base (two rounds, 34 findings, both remediated), and its
+process rules (three new ones, each earned the hard way). By this
+document's own adoption mechanics, that is a new plan with a disposition
+table, not a revision block.
+
+---
+
+## What changed since the last plan was written
+
+Nine days between plans (2026-09-27 → 2026-10-06). In order, with the
+evidence in-tree or in the CI ledger:
+
+1. **v29 M0 executed — the independent re-audit ran** (the "Audit-2" round,
+   commissioned per M0's work statement: the 0.28.0 tag, the original audit
+   and the remediation specification's status table handed over as the map).
+   It found **13 defects**: TXN-1/2/3 (transaction & SSI), WAL-1/2/3/4
+   (recovery & durability), BT-1/2 (tree exhaustion & standalone writer
+   safety), EXTRA-1/2 (latch window, uint16 slab-offset wrap), API-1/3
+   (single-header ODR, observer-move lifetime). The most consequential:
+   **TXN-1 — the phantom tracker recorded only existence transitions, so a
+   value UPDATE inside a concurrently scanned range did not conflict the
+   scanner.** A standalone PoC on 0.28.0 committed the resulting
+   value-based write skew. The first audit's §7 had graded phantom
+   detection "(verified sound)". Both statements were true — of their
+   round. Process rule 11 exists because of this sentence.
+2. **0.28.1 shipped the full remediation** (PR #2, `5cd74b5`, merged
+   `b6fb181`): every finding fixed fail-first — each PoC was reproduced
+   against pre-fix 0.28.0 first (TXN-2: a 1 MiB pool exhausted at absent-
+   read txn 16,554; EXTRA-2: a 2,500-byte update corrupted 4 neighboring
+   keys; API-3: observers fired 0 times after a Database move) — with a
+   15-check Audit-2 battery appended to `CKV_ONLY_REMEDIATION`, one
+   deliberate semantic change shipped as a *flipped, renamed, cited* test
+   (v17 guard test 4: update-in-scanned-range now CONFLICTS), and one
+   soundness refinement over the audit's own fix (no-op deletes of absent
+   keys stay unrecorded — a tombstone above every concurrent snapshot
+   cannot change any visible scan output, so recording it is pure false
+   conflict; the v17 no-op-delete contract stays green by soundness, not
+   by accommodation).
+3. **Cross-verification caught the fixer's gap** (process rule 12): the
+   reviewing harness probed BT-1's in-place-update exemption and found it
+   missing from `put_with_old` while the changelog claimed it generally.
+   Fixed fail-first (extended exhaustion test verified throwing bad_alloc
+   on `put_with_old` pre-fix, green post-fix). The fixer did not have the
+   last word on the fixer's patch — and that is the only reason the claim
+   and the code agree today.
+4. **v29 CI hardening landed in the same arc**: the `lint` job (-Werror
+   syntax gates over header+suite hooks-on/off in 40 s; a **-Wconversion
+   count ratchet** — baseline 33 — making the uint16-narrowing class behind
+   CKV-001/002 *and* EXTRA-2 a permanently gated property; header hygiene
+   now GATING: double-include + two-TU link, both green since API-1);
+   `build-shared` (the one big TU compiles once per run and rides to
+   dst/crashfuzz as artifacts — crashfuzz 4m42s → 3m13s); four
+   **experimental sanitizer legs** (asan/tsan × io_uring-disabled — the
+   only config where the WAL write-path fault legs execute — and clang).
+   All four experimental legs green three runs straight (#64, #65, #66):
+   the promotion condition ("green once → delete the flag and it gates")
+   is met; flag removal is the next CI commit.
+5. **The arena ledger vehicle was repaired** (`e9eb787`): two consecutive
+   nightlies (#62 on `8863bc8`, #65 on `b6fb181` — identical deaths on both
+   sides of the merge, so it was the vehicle's budget, not 0.28.1's delta)
+   proved the single 60-minute job never fit: the ChronoKV group+async legs
+   measured **44m01s**, leaving the five baselines a ≥15m31s lower bound
+   before the cap killed them mid-leg, every night. The ledger never
+   completed a pass, so M1's "one green week" acceptance clock could not
+   start. Now two parallel jobs (`arena-chronokv` 90 min from measurement;
+   `arena-baselines` 180 min generous-on-purpose with the rule-13 tighten-
+   after-measuring follow-up written into the job comment). Geometry
+   untouched — geometry changes are ledger-format changes (rule 9).
+6. **The cost of correctness, measured** (rule 9; sandbox floors — 2-core
+   Xeon 2.5 GHz, 1 GiB, 4.19 kernel io_uring-blocked, overlayfs, -O1,
+   group durability, 200k keys / 100 B / 4 threads / seed 42): 0.28.1 costs
+   **~10–13% on write-heavy mixes** (fillseq 30,077→26,056; fillrandom
+   39,530→35,067; ycsb_a ~40k→~36k ops/s both directions), reads unchanged
+   (130,129→131,353), ycsb_a RSS +10.7% (210.9→233.5 MiB — the tracker now
+   holds every written key until pruned). Accepted: SSI soundness and
+   exhaustion-safety outrank the delta; the ledger records it, and M5's
+   writer-thread rewrite is where the throughput gets bought back.
+7. **The build-memory wall rose again**: the post-Audit-2 TU (28,016 lines:
+   `chronokv.hpp` 13,445 + `main.cpp` 14,571) OOMs a 1 GiB container at
+   `-O1`, where 0.28.0 fit; ASan does not build there at any -O level.
+   `-O0` builds in ~25 s and the full suite (495 checks) passes. This is
+   the third arc in a row that raised the wall — v29 M2 gains a
+   pressure-relief item (5), unlocked by API-1: the header is now ODR-safe,
+   so the *test suite* can split into linked TUs without touching the
+   engine.
+
+---
+
+## The challenge, stated honestly
+
+ChronoKV is a zero-dependency, single-header, single-process embedded
+key-value store. That niche has incumbents, and they are not soft targets:
+
+| | SQLite | LMDB | RocksDB | ChronoKV today (0.28.1) |
+| --- | --- | --- | --- | --- |
+| Deployment scale | billions | hundreds of millions | industry standard server-side | hobby/evaluation |
+| Correctness proof | TH3 + OSS-Fuzz + astronomical field exposure | long field history, simple core | huge field history, battle-tested | **two independent adversarial rounds (21 + 13 findings), every fix fail-first; machine-checked gates (4-config sanitizer matrix, DST, lincheck, crash-fuzz, lint ratchets)** — deep, young, and now *iterated* |
+| Transactions | WAL mode: snapshot isolation; writers serialized | MVCC, single writer at a time | write-batch atomicity; SI via pessimistic/optimistic `TransactionDB` — not serializable | **SSI — serializable, multi-writer; value-antidependencies inside scanned ranges tracked since 0.28.1 (TXN-1)** |
+| Durability I/O | pwrite + fsync (portable) | mmap + msync | pwrite + fsync (pluggable env; io_uring on read paths) | **default-path io_uring write→fdatasync chains** — kernel deadline (`LINK_TIMEOUT`), registered-buffer/file ladder, 3-strike pwrite fallback; segment-creation dir-fsync and rotation-path dir-fsync correctness since 0.28.1 (WAL-2/WAL-3) |
+| Recoverable to a point in time | no (backup only) | no | yes (WAL + backups) | **yes — PITR is a first-class API**; recovery loops bounded and interior corruption loud (WAL-1/WAL-4) |
+| Memory at scale | page cache, transparent | virtual, sparse | block cache + memtables, tuned | **256 MiB monotonic pool — still the credibility gap**; exhaustion is now pre-mutation and loud (BT-1) but nothing is reclaimed yet |
+| Form factor | amalgamation, ubiquitous | small C lib | large library suite | **one header, zero dependencies — double-include and two-TU-link CI-gated (API-1)** |
+
+Read that table twice and the strategy writes itself. ChronoKV will not
+out-test SQLite's field exposure in a decade, will not out-feature RocksDB's
+tuning surface in two, and should not try. What it can do — what this arc
+does — is close the one front where today it is not credible (memory and
+steady-state behavior at real scale), press the two fronts where it is
+already ahead of every incumbent in its class (transactional semantics and
+durability I/O), and convert the front nobody else publishes on (adversarial
+verification) from an event into a permanent, machine-checked property.
+
+Four fronts, four claims — carried from the 2026-09-27 plan, claims 1 and 2
+strengthened by what Audit-2 proved:
+
+1. **Trust, by construction — and by iteration.** SQLite proves correctness
+   by volume of testing and exposure. ChronoKV proves it by *construction*:
+   every canonical invariant machine-checked in CI, every audit published
+   in-tree, every fix born fail-first, power-loss semantics tested against
+   a block layer that actually lies. Audit-2 added the second half of the
+   claim: a construction can pass one independent round and still hide a
+   soundness hole (TXN-1 under a "verified sound" grade), so trust here
+   means *surviving repeated rounds* — the 1.0.0 gate is a round, not a
+   ceremony, and it now has a precedent with teeth.
+2. **Serializable by default.** Every incumbent in the class stops short of
+   serializable: SQLite's WAL mode and LMDB serialize their writers, and
+   RocksDB's `TransactionDB` (pessimistic or optimistic) tops out at
+   snapshot isolation — SI, not SSI; write skew is not prevented. ChronoKV
+   runs concurrent serializable (SSI) transactions — since 0.28.1 including
+   the value-antidependency half (an update inside a scanned range
+   conflicts the scanner) — and by v29 M2 proves them with a write-skew
+   checker in CI. That checker is no longer optional polish: TXN-1 was
+   found by an audit, not by lincheck, which is the remediation spec's
+   predicted SSI-blindness demonstrated in production.
+3. **fsync-per-commit at group-commit prices.** io_uring is not unique in
+   the class — RocksDB's POSIX env uses it on read paths — but no embedded
+   KV makes it the **default** WAL durability path. ChronoKV's is a
+   hard-linked write→fdatasync chain with a kernel-enforced deadline
+   (`LINK_TIMEOUT`), a registered-buffer/file ladder, and a
+   runtime-degrading offset-pinned pwrite fallback (0.28.0: deep
+   availability probe + 3-strike CQE degradation). With the v29
+   writer-thread rewrite, chained write+fsync plus adaptive group commit is
+   the throughput story: durable writes that don't serialize the
+   committers — and reclaim the ~10% the soundness fixes cost.
+4. **Real scale, bounded memory.** 100 million keys in bounded *memory* at
+   steady state — tree pool, version heap and reader slack, all three
+   budgeted: `page_pool_bytes` alone bounds only the B+ tree, while values
+   live in `Version` chains on the regular heap — with recovery in tens of
+   seconds and numbers published — or the other three claims don't matter,
+   because nobody who needs a *database* can deploy a monotonic memory
+   ceiling.
+
+What this roadmap does **not** claim, equally on purpose: no SQL, no
+multi-process, no replication, no cross-platform, no third-party
+compression, no bindings. The deferral table survives this rebase verbatim;
+"single header, zero dependencies, verifiably correct" is the product. The
+challenge is to make that product *competitive*, not to make it *bigger*.
+
+---
+
+## Where the project actually stands (0.28.1)
+
+Two adversarial rounds are closed and remediated: the 2026-09-23 audit's
+21 findings (CKV-001…021) plus platform defects F1/F2, shipped as 0.28.0;
+and Audit-2's 13 findings over the 0.28.0 tag, shipped as 0.28.1 with the
+15-check battery, the flipped v17 guard test, and the CI hardening. The
+full suite stands at 495 checks green (sandbox, -O0), including crash-fuzz
+(624 iterations, 316 armed crash points reached, 0 violations, every point
+reachable), DST (fork-isolated, seeded), and lincheck with all 8 mutation
+detectors proving the checker non-vacuous.
+
+Worth recording because it shapes the next arc — the Audit-2 implementer,
+like the v28 one, did not blindly transcribe the specification:
+
+- TXN-1's fix as specified would have made **no-op deletes of absent keys**
+  conflict with every overlapping scanner. The shipped version records
+  every write *except* the provably-unobservable one (`!old_exists &&
+  !new_exists` — the tombstone's cts is above every concurrent snapshot),
+  keeping the v17 contract green by soundness instead of flipping two more
+  tests to accept false conflicts.
+- TXN-2 replaced the audit's "materialize less" with "materialize
+  nothing": absent read-set keys become `[k,k]` point range reads through
+  the phantom tracker, which TXN-1's completeness is exactly what makes
+  sufficient — the two fixes are load-bearing for each other, and the
+  battery tests the composition (check-then-insert still conflicts).
+- WAL-3 was found by reading `fsync_dir`'s actual semantics against its
+  call sites (it syncs the *parent* of the path it is given): both
+  rotation-path calls passed the WAL directory itself and had therefore
+  been syncing the wrong directory — the MANIFEST rename was never made
+  durable on those paths. The audit-1 round walked past this; the v25.7
+  manifest-brick history made the second round look.
+
+What 0.28.1 did *not* do, and v29 inherits:
+
+- **M0's closure is pending.** The Audit-2 *report itself is not in-tree*
+  (rule 8 violation-in-waiting: the finding IDs TXN-1…API-3 are cited by
+  the battery's comments but the report they came from lives outside the
+  repository), the **delta confirmation round** over 0.28.1 has not run,
+  and **tag `v0.28.1` does not exist** (rule 2: only `v0.28.0` is tagged).
+  The rewrite milestones (M3+) stay gated until M0 closes — the gate did
+  its job once already this arc; it does not get waved through now.
+- **The suite still carries the vacuous tests** the first audit enumerated
+  beyond the arc's scope (v17 GC-boundedness, v18 LSN-contiguity,
+  `m2_phase1` size-rotation admission, the 30 s soak's missing oracle).
+  v29 M2.
+- **The structural debt is untouched except where Audit-2 hardened its
+  edges**: the monotonic page pool remains (exhaustion is pre-mutation and
+  loud via BT-1's headroom check, feeding the same D4 latch — one health
+  model, reinforced — but `PagePool::free()` still has no *engine* callers
+  and `is_hazardous()` still has none at all); no merge/rebalance; GC
+  sweeps at O(N²/256); the leader-election handshake in the WAL committer
+  (M5 deletes it); `nm_` still serializes every new-key insert. The TU
+  grew to 28,016 lines and now OOMs 1 GiB at `-O1` where 0.28.0 fit; the
+  README's and Makefile's "~17k" counts remain stale (v30 M2 fixes all
+  three). API-1 is the one structural item that *closed*: the header is
+  genuinely multi-TU-safe and CI-gated — which is also what makes the
+  test-suite split in M2 item 5 mechanical rather than brave.
+- **The README still publishes exactly one performance number** (async at
+  0.256× sync — the indictment stands). The arena now exists with rule-9
+  methodology headers and repaired nightly vehicle; the first *completed*
+  ledger night starts the green-week clock, and the README performance
+  section lands with M1's acceptance, not before.
+
+### Progress
+
+| Milestone | Status | Shipped as |
+| --- | --- | --- |
+| Adversarial audit round 1 (21 findings, verdict D) | **DONE** | 2026-09-23 report, in-tree |
+| Remediation specification + waves 1–5 | **DONE** | 0.28.0, tag `v0.28.0` |
+| v29 M0 deliverable zero (audit docs in-tree) | **DONE** | `docs/audits/` (2026-09-23, 2026-09-24) |
+| v29 M0 re-audit commission (Audit-2 over 0.28.0) | **EXECUTED** — 13 findings, all remediated fail-first | PR #2 (`5cd74b5`, merged `b6fb181`) = 0.28.1 |
+| v29 M0 closure | **PENDING** — report publication under `docs/audits/`, delta confirmation round over 0.28.1, tag `v0.28.1` | — |
+| v29 M1 — benchmark arena | **STARTED** — steps 1–3 shipped; step 4 vehicle repaired (split into parallel `arena-chronokv`/`arena-baselines` jobs after #62/#65 proved the 60-min budget). Remaining: first completed nightly (starts the green-week clock), baselines-timeout tightening from measurement, D/E/F adapters, pinning/vendoring, noise-band calibration + gate enablement, ledger-promotion decision | `bench/`, ci.yml `arena-*` (`e9eb787`) |
+| v29 CI hardening (adjacent, unplanned-in-9/27) | **SHIPPED** — lint/ratchet/hygiene gates, build-shared, 4 experimental sanitizer legs green ×3 (#64/#65/#66) → promotion condition met | `5cd74b5` |
+| v29 M2 — catcher hardening | not started (gains item 5: TU pressure relief) | — |
+| v29 M3–M7 — the overhaul | not started; **gated on M0 closure** | — |
+| v30 M0–M5 — the challenge, 1.0.0 | not started | — |
+
+---
+
+## Reading rules (kept verbatim, one addition)
+
+The 2026-09-27 plan's reading rules survive unchanged — no speculative
+work; fail-first precision (defect-asserting checks verified failing,
+controls and contract tests passing by design); canonical IDs for new
+invariants (R/I/D/E/P/B/T, P1 pending with M4); documented migration rule
+before any on-disk format change (M6 carries the arc's first); measured
+claims only — numbers are budgets, not trophies. Sizes remain T-shirt
+guesses (**S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ a
+quarter). The pace assumption survives contact with reality: a full
+audit → remediate → cross-verify → merge round took **nine days**
+(2026-09-27 → 2026-10-06), faster than the five-week arc it was planned
+against; if the pace halves, the plan re-sequences milestones, it does not
+renegotiate gates. Citations prefer function-scope anchors and carry
+"as of" tags, because this repo keeps proving line numbers rot.
+
+**NEW — verdicts are round-scoped.** A "verified sound" grade from any
+audit round means *no defect found by that round's reading*. TXN-1 lived
+for at least one full round under exactly that phrase. No section of any
+document in this repo may cite a soundness verdict without its round.
+
+### Load-bearing constraints (carried, with status)
+
+1. **The re-audit (v29 M0) lands before any rewrite.** STATUS: executed —
+   Audit-2 ran, found Critical/High-class defects, and the loop-back
+   ("Critical or High loops back to remediation before any rewrite
+   milestone begins") ran exactly as designed: 0.28.1 shipped before any
+   M3+ line was written. The constraint keeps holding until M0 *closes*
+   (report in-tree, delta confirmation round, tag); M1/M2 are not
+   rewrites and proceed.
+2. **The arena (v29 M1) lands before the rewrites it measures.** STATUS:
+   in progress — vehicle repaired, first completed nightly pending.
+   *Measure before predict* has now also been applied to the vehicle
+   itself (rule 13 was earned by two dead nightlies).
+3. **Catcher hardening (v29 M2) lands before the rewrites it guards.**
+   Unchanged — and Audit-2 upgraded item 1 from "spec says the checker is
+   blind" to "the blindness shipped a real anomaly past round one".
+4. **The 1.0.0 gate is not negotiable.** Unchanged, with a track record:
+   the second independent round found a soundness hole in a
+   "remediation-complete" engine nine days after the first declared
+   closure. The gate is the reason, not the obstacle.
+5. **Composition over duration.** Unchanged — the Audit-2 battery composed
+   into the existing remediation gate; the arena split reused the existing
+   ledger format; the lint ratchet reused the existing WARN set.
+
+---
+
+# v29 — The overhaul (0.29.0)
+
+Theme unchanged: close the credibility gap. Every structural weakness a
+real database would laugh at — the monotonic pool, the missing merge, the
+leader handshake, the O(N²) GC, the invisible benchmarks — gets closed or
+measured, in an order where each rewrite is guarded by catchers written
+before it and measured by an arena built before it. Three of the four
+subsystems are touched (page lifecycle, delete path, WAL committer). The
+2026-09-27 plan's "verified-sound list" is preserved but read under the
+new rule: those grades are round-1-scoped; TXN-1 revised one of them
+(phantom detection) in round 2, and the delta confirmation round is what
+re-grades the rest.
+
+## M0 — Independent re-audit  **[S] [GATE] — EXECUTED, CLOSURE PENDING**
+
+**What happened.** Deliverable zero shipped (both round-1 documents are
+in-tree under `docs/audits/`). The re-audit was commissioned per this
+milestone's own work statement and ran over the 0.28.0 tag: 13 findings
+(TXN-1/2/3, WAL-1/2/3/4, BT-1/2, EXTRA-1/2, API-1/3), each reproduced
+fail-first, each remediated with a battery test, shipped as 0.28.1 in
+nine days including cross-verification of the fixes by a second
+independent harness (which caught the `put_with_old` parity gap — rule 12
+earned).
+
+**Acceptance, honestly stated.** The original bar — "zero Critical/High
+findings, verdict B or better" — was **not met at audit time**: TXN-1
+(SSI soundness), EXTRA-2 (memory corruption) and WAL-3 (durability) are
+Critical/High class. The gate's loop-back arm executed instead, which is
+also what the milestone text prescribes. M0 therefore closes only when:
+
+1. **The Audit-2 report is committed under `docs/audits/`** (rule 8: the
+   finding IDs are cited from the battery's comments; the report they came
+   from must be checkable from the tree — the round-1 lesson, not
+   repeated).
+2. **A delta confirmation round runs over 0.28.1** — verify all 13
+   closures at depth (not checklist), and hunt specifically in the classes
+   the *fixes* could have introduced: the phantom tracker's new
+   completeness (memory growth, pruning liveness under long readers), the
+   `[k,k]` point-range path (TXN-2) against the range-read machinery,
+   WAL-1's offset-scan classifier against adversarial corruption, BT-1's
+   headroom arithmetic against the split planner's real worst case.
+   Verdict B or better, zero new Critical/High.
+3. **Tag `v0.28.1`** exists (rule 2 — the version, the changelog and the
+   tag ship together or the release identity is prose).
+
+Until then, M3+ stays gated. M1/M2 proceed.
+
+## M1 — The benchmark arena  **[M] [MEASURE FIRST] — STARTED**
+
+**Status.** Steps 1–3 shipped (engine-side workloads incl. the `nm_`
+isolation fills; YCSB A–F over zipfian(0.99)-CDF with documented
+deviations; SQLite/LMDB/RocksDB adapters under identical methodology with
+the three fairness fixes — LMDB dbi priming, RocksDB parent-dir creation,
+the SQLite WAL read-snapshot trap). Step 4's vehicle shipped, died twice
+on its own budget (#62, #65 — identically, across the merge), and was
+split into parallel jobs (`e9eb787`): `arena-chronokv` (90 min cap from a
+measured 44m01s) and `arena-baselines` (180 min cap, generous-on-purpose,
+with the tighten-after-measuring follow-up in the job comment).
+
+**Remaining, in order.**
+1. **First completed nightly** — the green-week clock starts the night
+   both arena jobs finish and upload (`arena-ledger-chronokv-<run_id>`,
+   `arena-ledger-baselines-<run_id>`). Then tighten the baselines cap to
+   the measured budget (rule 13's follow-through).
+2. D/E/F baseline adapters (step 3 completion).
+3. Version pinning + vendoring/fetch recipes under `bench/third_party/`
+   (policy README already shipped) — the ledger's comparisons must be
+   reproducible across runner images.
+4. Noise-band calibration from the green week: per-metric bands,
+   N-iteration medians, explicit re-run policy — then **gate enablement**
+   (add both arena jobs to `ci-passed` needs + commit the bands). The
+   first recorded regression-vs-baseline event is already known: 0.28.1's
+   ~10–13% write-mix delta (sandbox floors; the ledger re-measures it on
+   fixed-spec runners).
+5. The ledger-promotion decision (committed `bench/results/` needs
+   contents:write or a bot commit) and the **soak vehicle naming** that
+   M4 and v30 M1 depend on (hosted jobs die at 6 h: self-hosted runner,
+   rolling nightly chain with persisted state, or offline rig with
+   committed logs).
+
+**Acceptance** (unchanged): `make arena` produces the six-table
+comparison; the README performance section exists and links the
+methodology; the nightly ledger shows one full green week. No engine
+changes in this milestone.
+
+## M2 — Catcher hardening  **[M]**
+
+**Anchor** (upgraded by Audit-2): remediation spec §11 predicted lincheck's
+SSI blindness; TXN-1 *demonstrated* it — a real write-skew-class anomaly
+found by an audit round because no machine checker covered the class. Plus
+the remaining audit-enumerated vacuous tests, plus the build-memory wall.
+
+**Work.**
+1. lincheck gains the SSI anti-dependency (write-skew) checker and a
+   synthetic write-skew anomaly battery — the checker that proves claim 2,
+   now with a production miss to validate against: the TXN-1 PoC history,
+   replayed through the checker, must flag the pre-fix engine and pass the
+   post-fix one.
+2. The DST plan grammar grows merge/rebalance/cascade and
+   reclamation-retirement scenarios *before that code exists* — scenarios
+   written against the design; the implementation must survive them.
+3. De-vacuate the remainder: v17 GC-boundedness, v18 LSN-contiguity,
+   `m2_phase1` size-rotation, the 30 s soak's oracle. Each upgraded test
+   proven once by temporary reversion in a scratch build.
+4. The crash-fuzz plan grammar composes GC sweeps, checkpoint, rotation
+   and merge windows — and now also the Audit-2 surfaces: segment-creation
+   dir-fsync windows (WAL-2), the recovery offset-scan classifier
+   (WAL-1), reservation-window throws under batch pressure (EXTRA-1).
+5. **NEW — TU pressure relief (test-side split).** Anchor: the 28,016-line
+   TU OOMs 1 GiB at `-O1` where 0.28.0 fit, and ASan doesn't build there
+   at all; every arc raises the wall; the experimental-leg policy (sanitizer
+   coverage for the write-path fault legs) depends on builds small machines
+   can make. API-1 (0.28.1) removed the blocker: the header is ODR-safe,
+   so `main.cpp`'s batteries split into linked TUs each including the
+   header — no engine change, mechanical by construction, `make -j`
+   parallel. The engine-side split + amalgamated release artifact stays
+   v30 M2; this item is the pressure relief until then. Acceptance: a
+   1 GiB container builds the full suite (release) at `-O1` and the
+   sanitizer matrix at `-O0`, all 495 checks green, CI wall-time not
+   worse.
+
+**Acceptance** (carried): a synthetic write-skew history fails the new
+checker; every de-vacuated test fails against a reintroduction of its
+defect class; the merge/reclaim DST scenarios run green against the
+current (merge-free) tree; plus item 5's build acceptance.
+
+## M3 — Page reclamation  **[L]**  *(gated on M0 closure)*
+
+Carried unchanged from the 2026-09-27 plan (appendix §M3): wire
+`PagePool::free()`, give the hazard-pointer machinery its consumers,
+retire pages through the epoch reclaimer or generation-tagged ids with the
+ABA (HP4) decision made **before** implementation; CKV-008's mutation epoch
+is the stale-descent net for live pages, not a reuse-safety mechanism.
+Two updates from 0.28.1: pool exhaustion now surfaces *pre-mutation*
+(BT-1's headroom check throws before any page is touched, and the engine's
+catch latches D4) — the "one health model, not two" requirement is
+already half-built; and TXN-2 removed the negative-lookup leak that would
+otherwise have polluted the reclamation numbers (absent reads no longer
+materialize index entries at all). `stats()` gains pool utilization and
+high-water mark; `health()` degrades at 80%, fails at 95%.
+
+**Acceptance** (unchanged): delete-then-reinsert workload's high-water mark
+stabilizes instead of ratcheting; TSan-clean; no use-after-free under ASan
+with reuse enabled; arena delete-churn table shows bounded memory.
+
+## M4 — Leaf merge and rebalance  **[XL]**  *(gated on M0 closure)*
+
+Carried unchanged (appendix §M4): feasible on 0.28.0's plan-before-mutate
+byte-aware split planner — merges are its mirror image, sharing the
+capacity model (a model BT-1's headroom arithmetic now also leans on; M3's
+reuse work and BT-1's `5*(height+1)+1` bound get re-derived together, with
+the split planner as the single source of capacity truth). Crabbing with
+exclusive latches on the delete path; sibling borrow vs. merge; interior
+key deletion; root collapse; the fence-recheck machinery exists.
+
+**New invariant (unchanged).**
+> **P1** — under a sustained delete-heavy workload the page pool reaches
+> steady state with bounded utilization, with no use-after-free and no ABA.
+
+**Acceptance** (unchanged): P1 under a 7-day soak (ASan/TSan interleaved)
+on the soak vehicle named in M1; concurrent cursor + concurrent merge
+clean under TSan *and* M2's DST scenarios; differential-vs-`std::map`
+passes with merges active; the arena's delete-churn and space-amplification
+tables move.
+
+## M5 — WAL writer thread  **[L]**  *(gated on M0 closure)*
+
+Carried unchanged (appendix §M5): the arena baseline is the "before"
+column — which now includes 0.28.1's ~10% write-path delta as part of the
+honest starting point, not a regression to hide. Dedicated writer thread +
+bounded MPSC queue; **deletes** `leader_active_`, the shared `cur_batch_`
+mutation, the leader/follower handshake and the `pending_` FIFO — the code
+stops existing; it does not get rewritten more carefully. Unlocks
+`SINGLE_ISSUER`, `DEFER_TASKRUN`, `SQPOLL` worth its kernel thread, queue
+depth > 1. Adaptive group-commit linger. Old path one release behind a
+compile flag, then deleted, with the full DST + crash-fuzz + fault matrix
+re-run first. One 0.28.1 interaction to respect: EXTRA-1's fail-stop latch
+now fires *inside* `group_append` under `batch_mu_` — the writer-thread
+design inherits that latch point (the reservation window moves into the
+queue producer; the latch semantics — no committer past a burned cts —
+must survive the move verbatim).
+
+**Acceptance** (unchanged, plus one): arena "after" tables show no
+regression at any concurrency and a measurable win at 8+ committers;
+C1/H3-class reversion probes fail loudly; crash-fuzz green; dead code
+gone; the triple identity **cts-order == WAL-order == phantom-order**
+re-proven by the full matrix — and since TXN-1, phantom-order carries
+*every* write, so the identity has strictly more content to preserve.
+
+## M6 — Space and steady state  **[M]**
+
+Carried unchanged (appendix §M6): persistent incremental GC cursor
+(O(N/256) sweeps); slab-compaction reuse against a published
+space-amplification budget; WAL delta-encoding only if it pays;
+**multi-version PITR deltas** — the arc's first deliberate on-disk format
+change, migration rule before implementation, GC-watermark coupling in
+scope from day one; streaming recovery parse (recover_all's 64 MiB slurp);
+checkpoint-stall measure-then-decide; observer notification thread; async
+API worker-pool-or-removal decided by an arena table. Two 0.28.1
+interactions: the observer thread builds on API-3's `ObserverState`
+shared_ptr (its lifetime semantics are already move-safe and
+raw-pointer-free — the notification thread becomes the state's only
+locker); and TXN-1's tracker growth (every written key, until pruned —
+ycsb_a RSS +10.7% at sandbox scale) belongs to the same memory accounting
+as the version heap: the GC watermark and the phantom-tracker prune share
+a "oldest live reader" notion, and M6 makes that sharing explicit and
+budgeted rather than two independent prunes racing.
+
+**Acceptance** (unchanged): sweep cost linear at 10M keys; space-amp
+published and within budget; the PITR format change carries its migration
+test; the async decision is an executed commit, not a discussion.
+
+## M7 — Release 0.29.0  **[S]**
+
+**Gate** (carried, extended): delta re-audit (reclamation, merge, writer
+thread, format change) clean; P1 proven; arena tables re-run with no
+unexplained regressions; changelog complete; CHANGELOG/README/version in
+the same commits they describe — **and the tag with them** (0.28.1's
+pending tag is the incident this extension encodes, per rule 2's own
+precedent of owning its violations).
+
+---
+
+# v30 — The challenge (1.0.0)
+
+Theme unchanged: convert the overhauled engine into a *defensible* product —
+every property the audits verified by hand becomes machine-checked; every
+performance claim becomes a published, regression-gated table; the scale
+story gets a number a database person respects; the version number means
+what it says.
+
+## M0 — Invariant machine-checking  **[M]**
+
+Carried unchanged (appendix, v30 §M0): every canonical invariant ID gets a
+runtime checker, a CI job, or a reviewed checked-by-construction argument;
+the 14-row matrix becomes a living test-plan document; the untested-error-
+lines ledger driven to zero for the durability path; docs gain the
+invariant→checker→job mapping. One addition from this arc: the matrix gains
+Audit-2's rows (the TXN-1 recording-completeness property, the `[k,k]`
+point-range equivalence, WAL-1's classification contract, BT-1's headroom
+bound) — the canonical ID set extends, per the reading rules, when new
+invariants land. The lint ratchet (0.28.1) is the first invariant of this
+kind already machine-checked in CI; v30 M0 generalizes the pattern.
+
+**Acceptance** (unchanged): intentionally breaking any invariant in a
+scratch build fails at least one CI gate — proven once per invariant,
+recorded in the audit trail.
+
+## M1 — The scale soak  **[L]**
+
+Carried unchanged (appendix, v30 §M1): 100M keys, RSS-level memory budgets
+(tree pool + version heap + reader slack), pool-high-water curve, cold
+recovery ≤ 30 s at 100M keys **with the bulk-load/sorted-build path as a
+named prerequisite** (the `nm_` per-key mutex makes it unreachable
+otherwise; the `nm_` sharding decision is measured by v29 M1's fills and
+taken before this milestone ends); 24-hour arena soak + 7-day steady-state
+variant on the soak vehicle; read-side budgets against LMDB/SQLite with
+"published, regressing loudly when touched" as the gate. One 0.28.1
+interaction: TXN-2 closed the negative-lookup materialization leak that
+would otherwise have made a read-heavy soak's memory curve lie — the soak
+measures a pool whose growth is real workload growth, not phantom index
+entries.
+
+## M2 — Build and release engineering  **[M]**
+
+Carried (appendix, v30 §M2) with two updates. The anchor grew: 28,016 lines
+in one TU (13,445 + 14,571 as of 0.28.1), `-O1` OOMs 1 GiB, ASan doesn't
+build there at all; the stale "~17k" README/Makefile counts are now stale
+by ~11k, and this milestone still corrects all three. The prerequisite
+shipped early: **API-1 (0.28.1) made the header ODR-safe** — double-include
+and two-TU link are CI-gated — so the amalgamated single header becomes a
+*generated release artifact* assembled from sources that are already
+multi-TU-correct, and the test-side split (v29 M2 item 5) will have proven
+the build system half. Reproducible builds (`sha256`-stable per commit),
+signed tags, release tarballs, vendored baselines stay out of the artifact.
+
+**Acceptance** (unchanged): a 1 GiB container builds the split repo at
+`-O2`; the amalgamated artifact passes the full suite including the arena
+smoke leg.
+
+## M3 — Power-loss truth  **[L]**
+
+Carried unchanged (appendix, v30 §M3): `dm-flakey` fault-injecting block
+layer; crash-fuzz grammar extended with fsync-lies and device-lose-flush;
+plan B named in the milestone (`scsi-debug`, or documented local VM rig +
+reduced CI leg); fail-first-at-the-block-layer acceptance. Audit-2 raised
+the stakes with evidence: **WAL-2 and WAL-3 are exactly this bug class** —
+directory-entry durability and a wrong-directory fsync are invisible to
+`_exit()`-based crash fuzzing (the page cache survives; the directory
+metadata was never tested against a lying device) and were found by
+*reading*, not by running. A block layer that lies is the only harness
+that could have caught them mechanically. The D-invariant set finally gets
+tested against a layer that can violate it.
+
+## M4 — Documentation overhaul  **[M]**
+
+Carried unchanged (appendix, v30 §M4): user guide beyond the README;
+failure-mode catalog (every `Status` and `health()` level with operator
+action); safety-properties page updated to post-v29 truth; the honest
+head-to-head page generated from the arena ledger. Addition: the
+safety-properties page must document the TXN-1 semantic change (scanned-
+range updates conflict; no-op deletes of absent keys don't, and why that
+is sound) — a contract change shipped as a flipped test deserves a
+prose contract too.
+
+## M5 — The 1.0.0 gate  **[S]**
+
+Carried unchanged (appendix, v30 §M5): final independent adversarial audit,
+full depth, published in-tree; API/ABI freeze + LTS policy; semantic
+versioning from here forward. Acceptance: verdict **A or B+**; benchmark
+tables published and regression-gated; every invariant machine-checked;
+failure-mode catalog complete; sign-off in the changelog. Audit-2 is the
+precedent that gives this gate meaning: the last "final" audit of a
+remediation-complete engine found thirteen more defects, one of them a
+soundness hole in the flagship claim. The 1.0.0 round assumes nothing.
+
+---
+
+# Disposition of the 2026-09-27 plan
+
+Every item of the superseded plan, accounted for (its own old-arc
+disposition table travels with it in the appendix and still governs those
+older items):
+
+| 2026-09-27 item | Disposition here | Note |
+| --- | --- | --- |
+| Header + revisions 1–3 | **SUPERSEDED** by this document's writing line | The plan is preserved verbatim in the appendix |
+| The challenge table | **UPDATED** to the 0.28.1 column | Same four fronts; claims 1–2 strengthened by Audit-2's evidence |
+| Where the project stands (0.28.0) | **REWRITTEN** for 0.28.1 | Same honest-debt structure; API-1 closed, wall rose |
+| Progress rows | **CARRIED + EXTENDED** | Audit rows, 0.28.1, CI hardening, M0 closure pending |
+| Reading rules | **CARRIED VERBATIM** + one new | "Verdicts are round-scoped" |
+| Load-bearing constraints 1–5 | **CARRIED** with status annotations | Constraint 1: executed, closure pending |
+| v29 M0 | **STATUS CHANGE** | Executed → closure gate (report in-tree, delta confirmation, tag) |
+| v29 M1 | **STATUS CHANGE** | Steps 1–3 done; step-4 vehicle split; remaining list reordered around the first completed nightly |
+| v29 M2 | **EXTENDED** | Items 1–4 carried; item 5 added (TU pressure relief, API-1-unlocked) |
+| v29 M3–M7 | **CARRIED** | With 0.28.1 interaction notes (D4/BT-1, EXTRA-1 latch point, ObserverState, tracker growth) |
+| v30 M0–M5 | **CARRIED** | M2 gains the API-1-shipped note; M3 gains the WAL-2/3 evidence; M4 gains the TXN-1 contract-doc note |
+| Old-arc disposition table (v28/v29-old/v30-old) | **CARRIED IN APPENDIX** | Still governs; PARKED items remain PARKED |
+| Explicitly out of scope | **CARRIED VERBATIM** | Including the cts-monotonicity protection |
+| Process rules 1–10 | **CARRIED VERBATIM** | Rules 11–14 added below |
+| Suggested first commit | **SUPERSEDED** | By "The next five commits" below |
+| External review disposition (rev 2) | **HISTORICAL** | Travels with the appendix |
+
+# Explicitly out of scope (kept)
+
+The deferrals survive this rebase because they were correct:
+**Raft/replication** (a multi-version project of its own), **language
+bindings** (conflicts with single-header purity), **encryption at rest**
+(the embedder's filesystem layer), **multi-process / non-Linux**
+(documented limitations with real architectural cost), **third-party
+compression** (breaks the zero-dependency differentiator; delta-encoding
+gets most of the win), **SQL** (a different product; the comparison page
+says so plainly).
+
+One genuine strength to keep protecting: `cts` is a monotonic counter, not
+wall-clock — the entire clock-skew bug class does not apply. Do not
+introduce a wall-clock dependency anywhere in the durability path; it would
+open a bug class the project currently does not have. (Audit-2 agrees by
+silence: thirteen findings, none clock-related.)
+
+# Process overhaul (permanent rules)
+
+Rules 1–10 carried verbatim from the 2026-09-27 plan (appendix): fail-first
+or it didn't happen; version identity in the same commit; changelog at merge
+time; every accepted external finding gets an ID; the reviewer checklist;
+composition over duration; known-limitation entries before the fix exists;
+refuted probes stay in the suite; measured claims only; baselines are
+benchmarks, not dependencies. Four new rules, each paid for:
+
+11. **Audit rounds repeat; verdicts are round-scoped.** "Verified sound"
+    means *that round found nothing*. Every arc ends with an independent
+    round over the shipped state, and Critical/High findings loop back to
+    remediation before rewrites proceed. Earned by: TXN-1, a soundness hole
+    in the flagship claim, shipped under round 1's "phantom detection
+    (verified sound)" grade.
+12. **Fixes are cross-verified independently of the fixer.** The harness
+    that reviews a fix is not the harness that wrote it; differential PoCs
+    run against pre-fix code for every claimed defect. Earned by: the
+    `put_with_old` parity gap — a changelog claim contradicted by the
+    shipped code, caught only because a second harness probed the claim
+    instead of trusting it.
+13. **CI vehicles must fit their own budgets — measured, then sized.** A
+    new CI job ships with a budget derived from a measured run, or with an
+    explicitly-generous cap and a written tighten-after-measuring follow-up
+    in the job itself. Earned by: two consecutive nightlies (#62, #65)
+    killed mid-baselines by a 60-minute cap set before anyone had ever
+    measured the vehicle — the ledger's green-week clock lost nine nights
+    to a number nobody checked.
+14. **Contract changes flip tests; they never delete them.** When a fix
+    deliberately changes observable semantics, the contradicting test is
+    renamed, flipped, and commented with the finding ID at the test site —
+    the change stays visible in the suite forever. Earned by: v17 guard
+    test 4, whose old expectation ("should remain green after the
+    redesign") encoded exactly the TXN-1 anomaly; it now reads "update of
+    present key in scanned range CONFLICTS" with the citation inline.
+
+# The next five commits
+
+1. **This document's adoption** (rule 3 mechanics): replace the plan,
+   CHANGELOG entry, README Roadmap paragraph updated — one commit.
+2. **Promote the experimental legs**: delete the four `experimental: true`
+   flags (condition met: green ×3 in #64/#65/#66) and fix the four clang
+   warnings (3× `-Wunused-lambda-capture`, 1× `-Wunused-private-field`) so
+   the clang lint leg loses its `continue-on-error` too.
+3. **M0 closure, part 1**: publish the Audit-2 report under `docs/audits/`
+   (rule 8) and tag `v0.28.1` (rule 2).
+4. **First completed nightly** (vehicle already shipped): confirm both
+   arena jobs finish, then tighten the baselines timeout from the measured
+   duration — rule 13's follow-through, written into the job comment at
+   `e9eb787`. The green-week clock starts here.
+5. **M0 closure, part 2**: commission the delta confirmation round over
+   0.28.1 (the four hunt-classes are named in M0's acceptance). Verdict B+
+   unlocks M3 — and M2 item 1 (the write-skew checker) should be written
+   while the round runs, so the confirmation audit has the new catcher to
+   lean on.
+
+---
+
+# Appendix — the superseded 2026-09-27 plan (v29 → v30, revision 3), kept in full per the disposition rule
+
+Written against `main @ 3161c77` (0.28.0). Superseded 2026-10-07 by the
+rebaselined plan above; preserved verbatim below — including its own
+appendix (the 2026-09-17 plan). Statuses inside are as of 0.28.0; the
+disposition table above maps every item to its current home.
+
+# ChronoKV roadmap — v29 → v30: challenge the real databases
+
 Written 2026-09-27 against `main @ 3161c77` (**0.28.0**, the complete audit
 remediation arc, tagged). This document **supersedes** the previous v28/v29/v30
 sections of `docs/ROADMAP.md` (written 2026-09-17 against v25.3, *before* the

@@ -7,6 +7,25 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **docs (roadmap rebase):** `docs/ROADMAP.md` is rebaselined against
+  `main @ e9eb787` (**0.28.1**) as a new plan — not a revision block: the
+  Audit-2 round changed the plan's own gate status (v29 M0 executed,
+  closure pending: report in-tree, delta confirmation round, tag
+  `v0.28.1`), its evidence base (two independent rounds, 21 + 13 findings,
+  both remediated fail-first), and its process rules (11: verdicts are
+  round-scoped — TXN-1 shipped under round 1's "verified sound"; 12:
+  fixes are cross-verified independently of the fixer — the
+  `put_with_old` parity gap; 13: CI vehicles fit their own measured
+  budgets — the two dead nightlies; 14: contract changes flip tests,
+  never delete them — v17 guard test 4). v29 M1's remaining list is
+  reordered around the first completed nightly; M2 gains item 5 (the
+  test-suite TU split API-1 unlocked — the 28,016-line TU OOMs 1 GiB at
+  `-O1` where 0.28.0 fit); v30 M2/M3 gain the API-1-shipped and
+  WAL-2/3-evidence notes. The 2026-09-27 plan is preserved verbatim as
+  the appendix with a full disposition table in the new body — nothing
+  silently dropped. README Roadmap paragraph updated in the same commit
+  (rule 3).
+
 - **ci (v29 M1 step 4, arena split):** the nightly ledger vehicle is now
   TWO parallel jobs — `arena-chronokv` (group + async legs; 90-min timeout
   sized from run #65's measured 44m01s, ~2x headroom) and `arena-baselines`
