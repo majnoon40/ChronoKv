@@ -7,6 +7,24 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **ci (v29 M1 step 4, arena split):** the nightly ledger vehicle is now
+  TWO parallel jobs — `arena-chronokv` (group + async legs; 90-min timeout
+  sized from run #65's measured 44m01s, ~2x headroom) and `arena-baselines`
+  (five configs; 180-min timeout deliberately generous — the pre-split
+  cancellation gives only a lower bound, "tighten after the first
+  completed night publishes real per-config durations" is written into the
+  job comment). Two consecutive nightlies died identically (#62 on
+  `8863bc8`, #65 on `b6fb181`): the ChronoKV legs consumed ~44 of the
+  60-minute budget and the baselines were cancelled ~15.5 min in, every
+  night — the ledger never completed, so M1's "one green ledger week"
+  acceptance could never start. Parallelization fixes the budget without
+  touching the geometry (geometry changes are ledger-format changes, rule
+  9); artifact names follow the split (`arena-ledger-chronokv-<run_id>` /
+  `arena-ledger-baselines-<run_id>` — nothing consumed the old single
+  name; no committed ledger exists yet). Both jobs remain informational
+  (NOT in `ci-passed` needs): gate enablement still needs one green week
+  plus the calibrated noise bands.
+
 - **docs (v29 M0, deliverable zero):** the two companion documents the
   roadmap leaned on but that never existed in-tree are committed under
   `docs/audits/`: the Full Adversarial Audit (2026-09-23 — 21 findings,
