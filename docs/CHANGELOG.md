@@ -7,6 +7,38 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **test (v29 M2 item 1): `lincheck::check_write_skew` — the SSI
+  anti-dependency checker, closing the blindness Audit-2's TXN-1
+  demonstrated.** lincheck validated view consistency (reads match their
+  snapshot) and real-time order; the TXN-1 history satisfies BOTH and is
+  still not serializable — the missing layer was the multiversion
+  dependency graph. The checker builds it (ww version chains; wr
+  observed-version edges; rw anti-dependency edges from point reads AND
+  scans: any committed write to a read key / in-range scan key above the
+  reader's snapshot forces reader-before-writer) and flags cycles as
+  `anti-dependency-cycle`. Scope discipline: writes inside
+  (observed_version, snapshot] stay check_cts_order's snapshot-soundness
+  class — one violation class per checker. Aborted txns contribute
+  nothing; write-only txns cannot close cycles alone (mirroring the
+  engine's entry-lock FUW + phantom-validation split). Ships with: the
+  Section 1d synthetic battery — classic x/y write-skew, the TXN-1 PoC
+  shape pinned VERBATIM (W2), lost update, phantom crossed-scan-inserts,
+  plus serial/disjoint/post-fix-abort controls; wiring into both engine
+  workload aggregates (every seed's committed history must be acyclic);
+  and an engine-shaped Section 3b mutation (fabricated missed-
+  anti-dependency pair on real recorded txns — in a clean SSI history
+  every committed read sits at-or-below its snapshot, so a genuine cycle
+  takes BOTH missed halves, reconstructed). **Live roadmap acceptance**
+  (same driver, extracted checker, both engines): against tag `v0.28.0`
+  the anomaly commits and the checker flags the exact cycle
+  (`T2 -[rw 'x': read@2 missed write@4]-> T1 -[rw scan[k,k]@snap 2
+  missed 'k'@3]-> T2`); against the post-fix engine T1 is refused
+  (Conflict) and the committed history is CLEAN. Suite grows 495 → 503
+  checks; verified green (full suite completes at 503 PASS + the known
+  ptrace-only async-p50 artifact under gdb; the bare-run environment
+  abort is unchanged and already classified in the delta-confirmation
+  report).
+
 - **docs (v29 M0 CLOSED): the delta confirmation round over 0.28.1 —
   verdict B+ (clean).** `docs/audits/2026-10-delta-confirmation-0.28.1.md`
   records the round the roadmap's M0 gate required: all four hunt-classes

@@ -10383,7 +10383,10 @@ static int run_pitr_test() {
 // txn id; synchronous, full interval soundness) are all recorded and
 // checked: check_scans (phantom/missing/stale vs cts replay) and
 // check_set_adds (order-insensitive set algebra) join check_cts_order and
-// check_list_append. RangeScanStream remains unrecorded (lazy multi-call
+// check_list_append. v29 M2 item 1 adds check_write_skew — the multiversion
+// dependency-graph (ww/wr/rw) cycle detector that closes the SSI blind spot
+// Audit-2's TXN-1 demonstrated (battery: Section 1d; engine wiring:
+// Sections 2/2b; mutation: Section 3b). RangeScanStream remains unrecorded (lazy multi-call
 // iteration has no single sound interval; documented). Arm on an EMPTY (or
 // quiesced-and-unread) database, else pre-arm state reads as fabricated.
 namespace lincheck {
@@ -11030,6 +11033,136 @@ inline std::vector<Violation> check_set_adds(const std::vector<Txn>& txns,
             }
         }
     }
+    return v;
+}
+
+
+// v29 M2 item 1 (roadmap): the SSI anti-dependency ("write-skew") checker
+// — lincheck's DEMONSTRATED blind spot. Audit-2's TXN-1 was found by an
+// audit round, not by this suite: every pre-existing checker validates
+// view consistency (reads match their snapshot) and real-time order, and
+// the TXN-1 history satisfies both — it is snapshot-consistent and still
+// not serializable. What was missing is the multiversion dependency graph:
+//
+//   ww  earlier writer of a key -> later writer (version-chain order)
+//   wr  writer of an observed version -> the reader that observed it
+//   rw  reader/scaner -> every committed writer whose key is the read's key
+//       (or falls inside the scan's range) at a cts ABOVE the reader's
+//       snapshot: the read missed that write, so the reader must serialize
+//       BEFORE the writer (anti-dependency — the edge class SI checkers
+//       do not see)
+//
+// A committed history is serializable only if this graph is acyclic; a
+// cycle IS the anomaly (write-skew, lost update, phantom-skew). Scope
+// discipline: writes with cts inside (observed_version, snapshot] are
+// check_cts_order's snapshot-soundness class and are deliberately NOT
+// edges here — each checker owns exactly one violation class. Aborted
+// txns contribute nothing (their writes never exist). Write-only (blind)
+// txns have no reads: they receive rw edges and chain via ww but cannot
+// close a cycle by themselves — mirroring why the engine's entry-lock FUW
+// plus phantom-tracker range validation jointly suffice. Reads/scans with
+// no recorded snapshot (UINT64_MAX) are skipped: sound under-detection,
+// documented. Acceptance per roadmap M2 item 1: the TXN-1 PoC shape
+// (battery W2 below) and every synthetic anomaly are flagged; the serial
+// and disjoint controls and every clean engine history pass; the pre-fix
+// engine's LIVE recorded PoC history is flagged and the post-fix engine's
+// is clean (demonstrated in the 0.28.1 confirmation record).
+inline std::vector<Violation> check_write_skew(const std::vector<Txn>& txns) {
+    std::vector<Violation> v;
+    auto viol = [&](std::string d) { v.push_back(Violation{"anti-dependency-cycle", std::move(d)}); };
+
+    std::vector<const Txn*> ct;
+    for (const auto& t : txns) if (t.committed) ct.push_back(&t);
+    const size_t n = ct.size();
+    if (n < 2) return v;
+
+    std::map<std::string, std::vector<std::pair<uint64_t, size_t>>> wbyk;  // key -> (cts, idx), sorted
+    for (size_t i = 0; i < n; ++i) {
+        if (!ct[i]->commit_cts) continue;
+        for (const auto& w : ct[i]->writes)
+            wbyk[w.key].emplace_back(ct[i]->commit_cts, i);
+    }
+    for (auto& kv : wbyk) std::sort(kv.second.begin(), kv.second.end());
+
+    std::vector<std::vector<std::pair<size_t, std::string>>> adj(n);
+    std::set<std::pair<size_t, size_t>> seen;
+    auto edge = [&](size_t a, size_t b, std::string why) {
+        if (a == b || !seen.emplace(a, b).second) return;
+        adj[a].push_back({b, std::move(why)});
+    };
+    auto tid = [&](size_t i) { return "T" + std::to_string(ct[i]->id); };
+
+    // ww: version-chain order per key.
+    for (const auto& kv : wbyk) {
+        const auto& vec = kv.second;
+        for (size_t j = 1; j < vec.size(); ++j)
+            edge(vec[j - 1].second, vec[j].second, "ww '" + kv.first + "'");
+    }
+
+    // wr + rw (point reads and scans).
+    for (size_t i = 0; i < n; ++i) {
+        const Txn& t = *ct[i];
+        if (!t.has_snapshot || t.snapshot == UINT64_MAX) continue;
+        for (const auto& r : t.reads) {
+            if (r.version_cts == UINT64_MAX) continue;   // read-your-writes overlay: tautological
+            auto wit = wbyk.find(r.key);
+            if (wit == wbyk.end()) continue;
+            for (const auto& w : wit->second) {
+                if (w.first == r.version_cts)
+                    edge(w.second, i, "wr '" + r.key + "'@" + std::to_string(w.first));
+                else if (w.first > t.snapshot)
+                    edge(i, w.second, "rw '" + r.key + "': read@" + std::to_string(r.version_cts) +
+                                      " (snap " + std::to_string(t.snapshot) + ") missed write@" +
+                                      std::to_string(w.first));
+            }
+        }
+        for (const auto& sc : t.scans) {
+            if (sc.snap == UINT64_MAX) continue;
+            for (const auto& kv : wbyk) {
+                if (kv.first < sc.lo || kv.first > sc.hi) continue;
+                for (const auto& w : kv.second)
+                    if (w.first > sc.snap)
+                        edge(i, w.second, "rw scan[" + sc.lo + "," + sc.hi + "]@snap " +
+                                          std::to_string(sc.snap) + " missed '" + kv.first + "'@" +
+                                          std::to_string(w.first));
+            }
+        }
+    }
+
+    // Cycle detection: colored DFS, first 5 distinct cycles reported.
+    std::vector<int> color(n, 0);
+    std::vector<size_t> path;
+    int reported = 0;
+    auto report_cycle = [&](const std::vector<size_t>& cyc) {
+        std::string d = "committed history is not serializable: ";
+        for (size_t q = 0; q < cyc.size(); ++q) {
+            size_t a = cyc[q], b = cyc[(q + 1) % cyc.size()];
+            std::string why;
+            for (const auto& e : adj[a]) if (e.first == b) { why = e.second; break; }
+            d += tid(a) + " -[" + why + "]-> ";
+        }
+        d += tid(cyc.front());
+        viol(std::move(d));
+    };
+    std::function<void(size_t)> dfs = [&](size_t u) {
+        if (reported >= 5) return;
+        color[u] = 1;
+        path.push_back(u);
+        for (const auto& e : adj[u]) {
+            if (reported >= 5) break;
+            if (color[e.first] == 1) {
+                auto it = std::find(path.begin(), path.end(), e.first);
+                report_cycle(std::vector<size_t>(it, path.end()));
+                ++reported;
+            } else if (color[e.first] == 0) {
+                dfs(e.first);
+            }
+        }
+        path.pop_back();
+        color[u] = 2;
+    };
+    for (size_t s = 0; s < n && reported < 5; ++s)
+        if (color[s] == 0) dfs(s);
     return v;
 }
 
@@ -13842,6 +13975,129 @@ static int run_lincheck_test() {
         }
     }
 
+    // ---- Section 1d: synthetic WRITE-SKEW battery (v29 M2 item 1 — the
+    // SSI anti-dependency checker) ----
+    // Each anomaly below is a history a CORRECT SSI engine can never
+    // commit; check_write_skew must flag each. W2 is shape-verbatim the
+    // Audit-2 TXN-1 PoC the PRE-0.28.1 engine actually committed
+    // (cross-verification log: T2=Committed updating the scanned key,
+    // T1=Committed on its dependent write — value-based write skew),
+    // which is the roadmap's acceptance: the checker must flag the
+    // pre-fix engine's history and pass the post-fix engine's (C3 below
+    // pins the post-fix shape: T1 aborted, committed history acyclic;
+    // the live old-engine demonstration rides the confirmation record).
+    auto mkx = [](uint64_t id, uint64_t snap, uint64_t cts,
+                  std::vector<std::tuple<std::string, bool, std::string, uint64_t>> rs,
+                  std::vector<std::tuple<std::string, std::string, uint64_t,
+                      std::vector<std::pair<std::string, std::string>>>> scans,
+                  std::vector<std::pair<std::string, std::string>> ws) {
+        lincheck::Txn t;
+        t.id = id; t.is_write = !ws.empty(); t.committed = true;
+        t.has_snapshot = true; t.snapshot = snap; t.commit_cts = cts;
+        for (auto& [k, found, val, vcts] : rs) {
+            t.order.push_back({true, t.reads.size()});
+            t.reads.push_back(lincheck::ReadEv{k, found, val, vcts});
+        }
+        for (auto& [lo, hi, ssnap, entries] : scans) {
+            lincheck::ScanEv sc; sc.lo = lo; sc.hi = hi; sc.snap = ssnap; sc.entries = entries;
+            t.scans.push_back(std::move(sc));
+        }
+        for (auto& [k, val] : ws) {
+            t.order.push_back({false, t.writes.size()});
+            t.writes.push_back(lincheck::WriteEv{k, val, false});
+        }
+        return t;
+    };
+    {
+        // W1 — classic write-skew (constraint x+y >= 1): both read both
+        // keys at snapshot 1, each writes one. Edges: T2's y-read missed
+        // T3's y-write (T2->T3); T3's x-read missed T2's x-write (T3->T2).
+        std::vector<lincheck::Txn> h;
+        h.push_back(mkw(1, 0, 1, 0, 0, {{"x", "1"}, {"y", "1"}}));
+        h.push_back(mkx(2, 1, 2, {{"x", true, "1", 1}, {"y", true, "1", 1}}, {}, {{"x", "0"}}));
+        h.push_back(mkx(3, 1, 3, {{"x", true, "1", 1}, {"y", true, "1", 1}}, {}, {{"y", "0"}}));
+        auto v = lincheck::check_write_skew(h);
+        check("lincheck: synthetic write-skew (x/y constraint) flagged",
+              lincheck::has_kind(v, "anti-dependency-cycle"), lincheck::describe(v));
+    }
+    {
+        // W2 — the TXN-1 PoC shape: T2 (id 2) read x, then UPDATED the
+        // scanned key k and committed FIRST (cts 2); T1 (id 3) scanned
+        // [k,k] at snapshot 1 — missing k's new version — then wrote its
+        // dependent x and committed (cts 3). Pre-fix engine: both
+        // committed (existence-only tracking saw no phantom). Edges:
+        // T1's scan missed k@2 (T1->T2); T2's x-read missed T1's x-write
+        // @3 > snap 1 (T2->T1) — cycle.
+        std::vector<lincheck::Txn> h;
+        h.push_back(mkw(1, 0, 1, 0, 0, {{"k", "0"}, {"x", "0"}}));
+        h.push_back(mkx(2, 1, 2, {{"x", true, "0", 1}}, {}, {{"k", "1"}}));
+        h.push_back(mkx(3, 1, 3, {}, {{"k", "k", 1, {{"k", "0"}}}}, {{"x", "1"}}));
+        auto v = lincheck::check_write_skew(h);
+        check("lincheck: TXN-1 PoC history (scan missed a concurrent UPDATE) flagged",
+              lincheck::has_kind(v, "anti-dependency-cycle"), lincheck::describe(v));
+    }
+    {
+        // W3 — lost update: both read x@1, both write x. ww chains T2->T3;
+        // T3's stale x-read missed T2's write (T3->T2) — cycle.
+        std::vector<lincheck::Txn> h;
+        h.push_back(mkw(1, 0, 1, 0, 0, {{"x", "0"}}));
+        h.push_back(mkx(2, 1, 2, {{"x", true, "0", 1}}, {}, {{"x", "1"}}));
+        h.push_back(mkx(3, 1, 3, {{"x", true, "0", 1}}, {}, {{"x", "2"}}));
+        auto v = lincheck::check_write_skew(h);
+        check("lincheck: synthetic lost update flagged",
+              lincheck::has_kind(v, "anti-dependency-cycle"), lincheck::describe(v));
+    }
+    {
+        // W4 — phantom write-skew: two empty scans of [k0,k9], each
+        // inserting a key invisible to the other (false->true transitions
+        // were recorded even pre-TXN-1 — the scan rw edges must catch it).
+        std::vector<lincheck::Txn> h;
+        h.push_back(mkx(2, 1, 2, {}, {{"k0", "k9", 1, {}}}, {{"k1", "a"}}));
+        h.push_back(mkx(3, 1, 3, {}, {{"k0", "k9", 1, {}}}, {{"k5", "b"}}));
+        auto v = lincheck::check_write_skew(h);
+        check("lincheck: synthetic phantom write-skew (crossed scan inserts) flagged",
+              lincheck::has_kind(v, "anti-dependency-cycle"), lincheck::describe(v));
+    }
+    {
+        // C1 — serial control: the same ops, but T3 snapshots AFTER T2's
+        // commit and reads T2's x-write: acyclic (this is the serialization
+        // the SSI engine forces by aborting one side).
+        std::vector<lincheck::Txn> h;
+        h.push_back(mkw(1, 0, 1, 0, 0, {{"x", "1"}, {"y", "1"}}));
+        h.push_back(mkx(2, 1, 2, {{"x", true, "1", 1}, {"y", true, "1", 1}}, {}, {{"x", "0"}}));
+        h.push_back(mkx(3, 2, 3, {{"x", true, "0", 2}, {"y", true, "1", 1}}, {}, {{"y", "0"}}));
+        auto v = lincheck::check_write_skew(h);
+        check("lincheck: serial reordering of the write-skew passes (control)",
+              v.empty(), lincheck::describe(v));
+    }
+    {
+        // C2 — disjoint-key control: concurrent readers/writers on
+        // separate keys have no shared dependency surface.
+        std::vector<lincheck::Txn> h;
+        h.push_back(mkw(1, 0, 1, 0, 0, {{"x", "0"}, {"y", "0"}}));
+        h.push_back(mkx(2, 1, 2, {{"x", true, "0", 1}}, {}, {{"x", "9"}}));
+        h.push_back(mkx(3, 1, 3, {{"y", true, "0", 1}}, {}, {{"y", "9"}}));
+        auto v = lincheck::check_write_skew(h);
+        check("lincheck: disjoint-key concurrent writers pass (control)",
+              v.empty(), lincheck::describe(v));
+    }
+    {
+        // C3 — the post-fix TXN-1 shape: the engine refuses T1 (Conflict),
+        // so the committed history holds only the setup writer and T2;
+        // T1 rides along as an ABORTED txn (with its scan) and must be
+        // ignored by the checker — exactly what the post-fix engine
+        // records for the PoC workload.
+        std::vector<lincheck::Txn> h;
+        h.push_back(mkw(1, 0, 1, 0, 0, {{"k", "0"}, {"x", "0"}}));
+        h.push_back(mkx(2, 1, 2, {{"x", true, "0", 1}}, {}, {{"k", "1"}}));
+        lincheck::Txn ab = mkx(3, 1, 0, {}, {{"k", "k", 1, {{"k", "0"}}}}, {{"x", "1"}});
+        ab.committed = false; ab.is_write = false;
+        h.push_back(ab);
+        auto v = lincheck::check_write_skew(h);
+        check("lincheck: post-fix TXN-1 history (T1 aborted) passes",
+              v.empty(), lincheck::describe(v));
+    }
+
     // ---- Section 2: real engine workload (v27 M2: N-seed scaling) ----
     // CKV_LINCHECK_SEEDS=N sweeps the workload's PRNG base (default: ONE
     // run at the historical 0xC0FFEE11 base, so the always-run suite is
@@ -13932,6 +14188,10 @@ static int run_lincheck_test() {
             if (!t.reads.empty()) n_readers++;
         }
         auto v = both(hist);
+        {   // v29 M2 item 1: the anti-dependency checker joins the engine verdict.
+            auto ws = lincheck::check_write_skew(hist);
+            v.insert(v.end(), ws.begin(), ws.end());
+        }
         bool nonvacuous = hist.size() >= 100 && n_writers >= 5 && n_readers >= 10 &&
                           committed_appends.load() >= 5;
         check((std::string("lincheck: engine list-append workload is strictly serializable") +
@@ -14069,6 +14329,8 @@ static int run_lincheck_test() {
             v.insert(v.end(), w.begin(), w.end());
             auto x = lincheck::check_set_adds(hist2, "S");
             v.insert(v.end(), x.begin(), x.end());
+            auto y = lincheck::check_write_skew(hist2);   // v29 M2 item 1
+            v.insert(v.end(), y.begin(), y.end());
         }
         // CKV_LINCHECK_DUMP=1: full recorded-history dump to stderr on
         // violation — the triage handle for mixed-workload failures (the
@@ -14212,6 +14474,53 @@ static int run_lincheck_test() {
 
     // ---- Section 3b: mutations of the RECORDED mixed-API history ----
     // The new checkers must bite engine-shaped data too, not just synthetics.
+    {
+        // (v) v29 M2 item 1: fabricate the TXN-1 dependency pair on
+        // ENGINE-SHAPED txns. In a clean SSI history every committed read
+        // sits at-or-below its snapshot (anything above was refused), so a
+        // genuine anti-dependency cycle cannot be conjured from one field —
+        // it takes the two missed dependencies the engine refuses to let
+        // co-commit, reconstructed on real recorded txns: a scanning writer
+        // A and a standalone (write-only, no-snapshot) put B whose key lies
+        // inside A's scan range. Drop A's scan snapshot below B's write (A's
+        // scan now "missed" B -> rw edge A->B), and give B a fabricated
+        // pre-A read of a key A wrote (B "missed" A -> rw edge B->A). Either
+        // half alone is what the engine rejects at commit; together they
+        // close A->B->A. Proves the checker bites engine-shaped data with
+        // the exact anomaly shape Audit-2's TXN-1 shipped as.
+        bool done = false, ok = false;
+        auto h = hist2;
+        lincheck::Txn* A = nullptr;
+        lincheck::Txn* B = nullptr;
+        for (auto& t : h)
+            if (!A && t.committed && t.is_write && !t.scans.empty() && t.commit_cts && !t.writes.empty())
+                A = &t;
+        if (A) {
+            const auto& sc = A->scans[0];
+            for (auto& t : h) {
+                if (&t == A || !t.committed || !t.is_write || !t.reads.empty()) continue;
+                if (t.snapshot != UINT64_MAX || !t.commit_cts || t.writes.empty()) continue;
+                bool in_range = false;
+                for (const auto& w : t.writes)
+                    if (sc.lo <= w.key && w.key <= sc.hi) { in_range = true; break; }
+                if (in_range) { B = &t; break; }
+            }
+        }
+        if (A && B && B->commit_cts > 0 && A->commit_cts > 0) {
+            A->scans[0].snap = B->commit_cts - 1;              // A's scan misses B's write
+            B->has_snapshot = true;
+            B->snapshot = A->commit_cts - 1;                   // B "started" before A's write
+            B->order.push_back({true, B->reads.size()});
+            B->reads.push_back(lincheck::ReadEv{A->writes.front().key, false, "", 0});
+            done = true;
+        }
+        if (done) {
+            auto v = lincheck::check_write_skew(h);
+            ok = lincheck::has_kind(v, "anti-dependency-cycle");
+        }
+        check("lincheck: mixed-history mutation flagged — fabricated missed anti-dependency pair",
+              ok, done ? "anti-dependency-cycle not flagged" : "no suitable A/B pair recorded");
+    }
     {
         // (i) drop a scan entry -> scan-missing-key (every recorded entry was
         // live at the scan's snapshot, so any deletion is a true omission).

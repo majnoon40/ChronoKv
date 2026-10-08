@@ -248,7 +248,7 @@ What 0.28.1 did *not* do, and v29 inherits:
 | v29 M0 closure | **DONE 2026-10-08** — reconstructed report + tag `v0.28.1` + delta confirmation round, verdict **B+ (clean)**: 20/20 probes, one Low doc-truth finding fixed in the closure commit; **M3+ gate lifted** | `docs/audits/2026-10-delta-confirmation-0.28.1.md` (+ probes) |
 | v29 M1 — benchmark arena | **STARTED** — steps 1–3 shipped; step 4 vehicle repaired (split into parallel `arena-chronokv`/`arena-baselines` jobs after #62/#65 proved the 60-min budget). Remaining: first completed nightly (starts the green-week clock), baselines-timeout tightening from measurement, D/E/F adapters, pinning/vendoring, noise-band calibration + gate enablement, ledger-promotion decision | `bench/`, ci.yml `arena-*` (`e9eb787`) |
 | v29 CI hardening (adjacent, unplanned-in-9/27) | **SHIPPED + PROMOTED** — lint/ratchet/hygiene gates, build-shared; the 4 experimental sanitizer legs went green ×3 (#64/#65/#66) → flags deleted, all 12 legs gating | `5cd74b5`; promotion `0027fe0` |
-| v29 M2 — catcher hardening | not started (gains item 5: TU pressure relief) | — |
+| v29 M2 — catcher hardening | **STARTED** — item 1 (write-skew checker) shipped 2026-10-08 with live pre-fix-flag/post-fix-pass proof; items 2–5 pending | `check_write_skew` + Section 1d battery |
 | v29 M3–M7 — the overhaul | not started — M0 CLOSED 2026-10-08; order still governed by constraints 2–3 (arena green week, catchers first) | — |
 | v30 M0–M5 — the challenge, 1.0.0 | not started | — |
 
@@ -418,7 +418,7 @@ comparison; the README performance section exists and links the
 methodology; the nightly ledger shows one full green week. No engine
 changes in this milestone.
 
-## M2 — Catcher hardening  **[M]**
+## M2 — Catcher hardening  **[M] — STARTED (item 1 shipped 2026-10-08)**
 
 **Anchor** (upgraded by Audit-2): remediation spec §11 predicted lincheck's
 SSI blindness; TXN-1 *demonstrated* it — a real write-skew-class anomaly
@@ -430,7 +430,20 @@ the remaining audit-enumerated vacuous tests, plus the build-memory wall.
    synthetic write-skew anomaly battery — the checker that proves claim 2,
    now with a production miss to validate against: the TXN-1 PoC history,
    replayed through the checker, must flag the pre-fix engine and pass the
-   post-fix one.
+   post-fix one. **DONE 2026-10-08**: `lincheck::check_write_skew` — the
+   multiversion dependency graph (ww version chains, wr observed-version
+   edges, and the rw ANTI-dependency edges from point reads AND scans that
+   SI-level checking cannot see) with cycle = anomaly; scope-disciplined
+   against check_cts_order (snapshot-soundness stays there). Ships with a
+   4-anomaly + 3-control synthetic battery (W2 pins the TXN-1 PoC shape
+   verbatim; C3 pins the post-fix aborted shape), wiring into BOTH engine
+   workload aggregates (list-append + mixed-API, every seed), and an
+   engine-shaped mutation (a fabricated missed-anti-dependency pair on
+   real recorded txns). Live acceptance demonstrated: the same driver run
+   against tag `v0.28.0` records the anomaly committing and the checker
+   flags the exact cycle (T2 -[rw 'x' missed write@4]-> T1 -[rw scan[k,k]
+   missed 'k'@3]-> T2); post-fix the engine refuses T1 and the committed
+   history is CLEAN. Suite grows 495 → 503 checks.
 2. The DST plan grammar grows merge/rebalance/cascade and
    reclamation-retirement scenarios *before that code exists* — scenarios
    written against the design; the implementation must survive them.
@@ -753,9 +766,11 @@ benchmarks, not dependencies. Four new rules, each paid for:
    remaining item 4).
 5. **M0 closure, part 2** — **DONE 2026-10-08**: delta confirmation
    round executed (20 probes, verdict B+, one Low doc-truth finding fixed
-   in the closure commit); M3 unlocked. Next up per the plan: M2 item 1,
-   the lincheck write-skew checker, validated against the TXN-1 PoC
-   history — written before any M3+ rewrite starts (constraint 3).
+   in the closure commit); M3 unlocked. **M2 item 1 (the write-skew
+   checker) landed the same day** — validated live against the TXN-1 PoC
+   history on both engines, before any M3+ rewrite starts (constraint 3
+   honored). Remaining catcher work: M2 items 2–5 (DST grammar growth,
+   de-vacuation, crash-fuzz composition, TU pressure relief).
 
 ---
 
