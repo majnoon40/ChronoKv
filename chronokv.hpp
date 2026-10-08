@@ -4133,11 +4133,12 @@ public:
 
     // v17 race closure:
     //
-    // The caller validates range reads and publishes existence transitions
-    // inside this timestamp-reservation critical section. Therefore, if a
-    // writer receives commit timestamp N and a reader later receives commit
+    // The caller validates range reads and publishes write transitions
+    // (TXN-1: every write, not only existence flips) inside this
+    // timestamp-reservation critical section. Therefore, if a writer
+    // receives commit timestamp N and a reader later receives commit
     // timestamp N+1, the reader is guaranteed to observe the writer's
-    // existence transition before it validates.
+    // recorded write before it validates.
     //
     // If validation fails, we still reserve the timestamp and write an empty
     // no-op record. This preserves WAL timestamp contiguity. The caller burns
@@ -5033,8 +5034,12 @@ public:
 class PhantomTracker {
     mutable std::mutex mu_;
 
-    // commit_ts -> keys whose logical existence changed at that commit.
-    // Only absent->present and present->absent transitions are stored.
+    // commit_ts -> keys WRITTEN at that commit. Since 0.28.1 (TXN-1) this
+    // records EVERY committed write with one sound exemption — a no-op
+    // delete of an absent key (!old_exists && !new_exists) is never stored
+    // (see record_transition): value updates inside a scanned range are
+    // rw-antidependencies and MUST be here; the pre-0.28.1 "existence
+    // transitions only" contract was the TXN-1 soundness hole.
     std::map<uint64_t, std::set<std::string>> mods_by_ts_;
 
     // Active ReadWriteTransaction snapshot timestamps. A modification with
@@ -5108,9 +5113,14 @@ public:
                               uint64_t read_ts) const {
         std::lock_guard<std::mutex> lk(mu_);
 
-        // A phantom exists if any existence transition committed after the
-        // reader's snapshot timestamp falls inside [lo, hi] (INCLUSIVE, matching
-        // range_scan's inclusive upper bound — v20.1 blocker #3).
+        // A conflict exists if ANY recorded write (TXN-1: every write, not
+        // only existence flips) committed after the reader's snapshot
+        // timestamp falls inside [lo, hi] (INCLUSIVE, matching range_scan's
+        // inclusive upper bound — v20.1 blocker #3). Cost is O(ts-entries
+        // above read_ts × log keys-per-entry): a fresh transaction pays for
+        // writes since its own snapshot, not for what older pinned readers
+        // hold (delta-confirmation probe 1d measured 56 ms for a 200k-mod
+        // commit by the pinning reader itself).
         auto it = mods_by_ts_.upper_bound(read_ts);
         while (it != mods_by_ts_.end()) {
             auto kit = it->second.lower_bound(lo);
@@ -6616,7 +6626,7 @@ public:
             }
         }
 
-        // v17 race closure: compute logical existence transitions while holding
+        // v17 race closure: compute logical write transitions while holding
      // the relevant commit_mu locks. Phantom validation and transition
      // publication occur inside WAL timestamp reservation so commit-timestamp
      // order and phantom order are identical.

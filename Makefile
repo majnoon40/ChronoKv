@@ -21,10 +21,15 @@
 # removed — `make tsan` runs the FULL suite as one step. CI runners
 # complete it comfortably inside one job.
 
-# NOTE: the whole project is ONE translation unit (~17k lines). Building it
-# at -O2 needs well over 1 GiB of RSS -- below that, cc1plus is OOM-killed
-# ("g++: fatal error: Killed signal terminated program cc1plus"). On small
-# containers use:  make release RELEASE_FLAGS="-O1 -g"
+# NOTE: the whole project is ONE translation unit (28,016 lines as of
+# 0.28.1 -- this note is one of the stale-count sites the v29 M2 item-5 /
+# v30 M2 split corrects when it lands). Building it at -O2 needs well over
+# 1 GiB of RSS -- below that, cc1plus is OOM-killed ("g++: fatal error:
+# Killed signal terminated program cc1plus"). On small containers use:
+#   make release RELEASE_FLAGS="-O1 -g"
+# Since the Audit-2 battery landed, a 1 GiB container can be killed even at
+# bare -O0; the VERIFIED workaround (delta-confirmation round, 2026-10-08):
+#   make release RELEASE_FLAGS="-O0 --param ggc-min-expand=5"
 CXX      ?= g++
 
 # v29: gcc spells the static sanitizer-runtime flag -static-libasan; clang

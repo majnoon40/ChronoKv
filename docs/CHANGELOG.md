@@ -7,6 +7,38 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **docs (v29 M0 CLOSED): the delta confirmation round over 0.28.1 —
+  verdict B+ (clean).** `docs/audits/2026-10-delta-confirmation-0.28.1.md`
+  records the round the roadmap's M0 gate required: all four hunt-classes
+  probed mechanically (20/20 PASS; the probe program is committed beside
+  the report and re-runnable — rule 8's spirit applied to audits
+  themselves). Class 1 (TXN-1 tracker): bounded under default GC
+  (write-only holds entries at 0), long readers correctly pin their
+  conflict set and GC prunes to 0 on release, 56 ms commit-validation at
+  200k pinned mods (long-reader-borne, inherent to first-updater-wins
+  range validation). Class 2 (TXN-2 point ranges): sound across prune
+  pressure, net-absent churn, self-insert, empty key, 4048-byte key,
+  oversized read-set key. Class 3 (WAL-1): every adversarial construct
+  classifies on the loud side — double-damaged interiors CORRUPT, stale
+  rollback debris TORN_TAIL (D2 preserved), unreachable-LSN jumps
+  TORN_TAIL, 8 MiB worst-case scan 0 ms. Class 4 (BT-1): the
+  `5*(height+1)+1` bound re-derived against the real planner and
+  stress-probed in three packing regimes the battery did not cover
+  (entry-cost just over budget/2, near-maximum, thirds — 84 exhaustion
+  combos, zero lost acked keys, observed max 6 pages/put). **One Low
+  finding, fixed in this commit:** four comments still described the
+  pre-TXN-1 "existence transitions only" contract (`mods_by_ts_`,
+  `has_phantom_in_range`, group_append's race-closure note, commit_txn's
+  transitions note) — the CKV-017/021 doc-truth class, corrected; lint +
+  ratchet + both batteries re-run green after the comment-only edit. The
+  report also records the sandbox's environmental full-suite anomaly
+  (thread-creation EAGAIN under anomalous kernel limits; three
+  independent non-reproductions; CI authoritative) and the build-wall
+  datum (bare `-O0` now needs `--param ggc-min-expand=5` on a 1 GiB
+  container — verified workaround added to the Makefile note). **M0 is
+  CLOSED; the M3+ gate is lifted** (order still governed by the arena
+  green week and the catcher-first constraints).
+
 - **ci (v29 M1, rule-13 follow-through): arena caps right-sized from the
   first completed ledger night.** Run #68 (2026-10-08) was the split
   vehicle's first full pass — and the ledger's first complete night:

@@ -245,11 +245,11 @@ What 0.28.1 did *not* do, and v29 inherits:
 | Remediation specification + waves 1–5 | **DONE** | 0.28.0, tag `v0.28.0` |
 | v29 M0 deliverable zero (audit docs in-tree) | **DONE** | `docs/audits/` (2026-09-23, 2026-09-24) |
 | v29 M0 re-audit commission (Audit-2 over 0.28.0) | **EXECUTED** — 13 findings, all remediated fail-first | PR #2 (`5cd74b5`, merged `b6fb181`) = 0.28.1 |
-| v29 M0 closure | **IN PROGRESS** — reconstructed report committed (original session lost; provenance documented inside), tag `v0.28.1` placed; remaining: the delta confirmation round over 0.28.1 | `docs/audits/2026-10-audit-2-reconstructed.md` |
+| v29 M0 closure | **DONE 2026-10-08** — reconstructed report + tag `v0.28.1` + delta confirmation round, verdict **B+ (clean)**: 20/20 probes, one Low doc-truth finding fixed in the closure commit; **M3+ gate lifted** | `docs/audits/2026-10-delta-confirmation-0.28.1.md` (+ probes) |
 | v29 M1 — benchmark arena | **STARTED** — steps 1–3 shipped; step 4 vehicle repaired (split into parallel `arena-chronokv`/`arena-baselines` jobs after #62/#65 proved the 60-min budget). Remaining: first completed nightly (starts the green-week clock), baselines-timeout tightening from measurement, D/E/F adapters, pinning/vendoring, noise-band calibration + gate enablement, ledger-promotion decision | `bench/`, ci.yml `arena-*` (`e9eb787`) |
 | v29 CI hardening (adjacent, unplanned-in-9/27) | **SHIPPED + PROMOTED** — lint/ratchet/hygiene gates, build-shared; the 4 experimental sanitizer legs went green ×3 (#64/#65/#66) → flags deleted, all 12 legs gating | `5cd74b5`; promotion `0027fe0` |
 | v29 M2 — catcher hardening | not started (gains item 5: TU pressure relief) | — |
-| v29 M3–M7 — the overhaul | not started; **gated on M0 closure** | — |
+| v29 M3–M7 — the overhaul | not started — M0 CLOSED 2026-10-08; order still governed by constraints 2–3 (arena green week, catchers first) | — |
 | v30 M0–M5 — the challenge, 1.0.0 | not started | — |
 
 ---
@@ -277,13 +277,13 @@ document in this repo may cite a soundness verdict without its round.
 
 ### Load-bearing constraints (carried, with status)
 
-1. **The re-audit (v29 M0) lands before any rewrite.** STATUS: executed —
-   Audit-2 ran, found Critical/High-class defects, and the loop-back
-   ("Critical or High loops back to remediation before any rewrite
-   milestone begins") ran exactly as designed: 0.28.1 shipped before any
-   M3+ line was written. The constraint keeps holding until M0 *closes*
-   (report in-tree, delta confirmation round, tag); M1/M2 are not
-   rewrites and proceed.
+1. **The re-audit (v29 M0) lands before any rewrite.** STATUS:
+   **SATISFIED — M0 closed 2026-10-08.** Audit-2 ran, found
+   Critical/High-class defects, the loop-back ran exactly as designed
+   (0.28.1 shipped before any M3+ line was written), and the delta
+   confirmation round verified the closures at depth (verdict B+, probes
+   committed). The foundation under the rewrite milestones is now
+   independently verified, not self-verified.
 2. **The arena (v29 M1) lands before the rewrites it measures.** STATUS:
    in progress — vehicle repaired, first completed nightly pending.
    *Measure before predict* has now also been applied to the vehicle
@@ -314,7 +314,7 @@ new rule: those grades are round-1-scoped; TXN-1 revised one of them
 (phantom detection) in round 2, and the delta confirmation round is what
 re-grades the rest.
 
-## M0 — Independent re-audit  **[S] [GATE] — EXECUTED, CLOSURE PENDING**
+## M0 — Independent re-audit  **[S] [GATE] — CLOSED 2026-10-08**
 
 **What happened.** Deliverable zero shipped (both round-1 documents are
 in-tree under `docs/audits/`). The re-audit was commissioned per this
@@ -348,15 +348,29 @@ also what the milestone text prescribes. M0 therefore closes only when:
    `[k,k]` point-range path (TXN-2) against the range-read machinery,
    WAL-1's offset-scan classifier against adversarial corruption, BT-1's
    headroom arithmetic against the split planner's real worst case.
-   Verdict B or better, zero new Critical/High.
+   Verdict B or better, zero new Critical/High. **DONE 2026-10-08 —
+   verdict B+ (clean)**: 20 mechanical probes across the four hunt
+   classes all pass (committed, re-runnable:
+   `docs/audits/2026-10-delta-confirmation-probes.cpp`), zero new
+   Critical/High/Medium, one Low doc-truth finding (four comments still
+   describing the pre-TXN-1 "existence transitions only" contract) fixed
+   in the closure commit. Report:
+   `docs/audits/2026-10-delta-confirmation-0.28.1.md` — it also records
+   the BT-1 bound re-derivation against the real planner, two behavioral
+   notes for M6/v30-M4 (GC-off tracker scale; long-reader validation
+   cost), and the environmental classification of this sandbox's
+   full-suite thread-EAGAIN anomaly (three independent
+   non-reproductions; CI is the authoritative vehicle).
 3. **Tag `v0.28.1`** exists (rule 2 — the version, the changelog and the
    tag ship together or the release identity is prose). **DONE** — the tag
    rides the reconstruction commit, completing the arc's in-tree record
    (the same convention as `v0.28.0` tagging the arc-completion commit
    `3161c77` rather than the release commit).
 
-**Status:** items 1 and 3 closed 2026-10-08; **item 2 — the delta
-confirmation round — is the sole remaining M0 gate on M3+.**
+**Status: CLOSED 2026-10-08** — all three items done (reconstructed
+report, confirmation round at verdict B+, tag `v0.28.1`). **The M3+
+rewrite gate is lifted**; sequencing behind M1's green week and M2's
+catchers (constraints 2–3) still governs the order of work.
 
 Until then, M3+ stays gated. M1/M2 proceed.
 
@@ -445,7 +459,7 @@ checker; every de-vacuated test fails against a reintroduction of its
 defect class; the merge/reclaim DST scenarios run green against the
 current (merge-free) tree; plus item 5's build acceptance.
 
-## M3 — Page reclamation  **[L]**  *(gated on M0 closure)*
+## M3 — Page reclamation  **[L]**  *(M0 gate lifted 2026-10-08)*
 
 Carried unchanged from the 2026-09-27 plan (appendix §M3): wire
 `PagePool::free()`, give the hazard-pointer machinery its consumers,
@@ -464,7 +478,7 @@ high-water mark; `health()` degrades at 80%, fails at 95%.
 stabilizes instead of ratcheting; TSan-clean; no use-after-free under ASan
 with reuse enabled; arena delete-churn table shows bounded memory.
 
-## M4 — Leaf merge and rebalance  **[XL]**  *(gated on M0 closure)*
+## M4 — Leaf merge and rebalance  **[XL]**  *(M0 gate lifted 2026-10-08)*
 
 Carried unchanged (appendix §M4): feasible on 0.28.0's plan-before-mutate
 byte-aware split planner — merges are its mirror image, sharing the
@@ -484,7 +498,7 @@ clean under TSan *and* M2's DST scenarios; differential-vs-`std::map`
 passes with merges active; the arena's delete-churn and space-amplification
 tables move.
 
-## M5 — WAL writer thread  **[L]**  *(gated on M0 closure)*
+## M5 — WAL writer thread  **[L]**  *(M0 gate lifted 2026-10-08)*
 
 Carried unchanged (appendix §M5): the arena baseline is the "before"
 column — which now includes 0.28.1's ~10% write-path delta as part of the
@@ -737,11 +751,11 @@ benchmarks, not dependencies. Four new rules, each paid for:
    (baselines 180→60). The green-week clock is running — six more
    nights, then noise-band calibration and gate enablement (M1
    remaining item 4).
-5. **M0 closure, part 2**: commission the delta confirmation round over
-   0.28.1 (the four hunt-classes are named in M0's acceptance). Verdict B+
-   unlocks M3 — and M2 item 1 (the write-skew checker) should be written
-   while the round runs, so the confirmation audit has the new catcher to
-   lean on.
+5. **M0 closure, part 2** — **DONE 2026-10-08**: delta confirmation
+   round executed (20 probes, verdict B+, one Low doc-truth finding fixed
+   in the closure commit); M3 unlocked. Next up per the plan: M2 item 1,
+   the lincheck write-skew checker, validated against the TXN-1 PoC
+   history — written before any M3+ rewrite starts (constraint 3).
 
 ---
 
