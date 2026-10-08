@@ -7,6 +7,28 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **test (v29 M2 item 1, CI-hardening follow-up): the write-skew
+  mutation cannot starve.** Run #72 (all legs) failed exactly one check —
+  the Section 3b fabricated-anti-dependency-pair mutation reported "no
+  suitable A/B pair": its first predicate required a COMMITTED
+  scanning-writer plus a write-only UINT64_MAX-snapshot writer inside
+  the scan range, and on CI's faster runners (real io_uring, -O2, 4
+  cores) SSI refused every scanning writer on the recorded seed — the
+  engine working correctly starved the detector (the checker itself was
+  clean: every engine-workload aggregate passed on every leg, zero
+  false positives across runners). Fixed per the anti-vacuity culture:
+  (1) exhaustive pair search — any committed writer B whose key falls in
+  ANY scan of ANY committed scanning-writer A, B's read/snapshot shape
+  unrestricted; (2) a fallback that cannot starve while the workload's
+  nonvacuity gate holds — two REAL committed write txns, A gaining a
+  fabricated point scan over B's key at snap cts_B−1 (synthetic scan,
+  engine-real txns/keys/cts, identical cycle algebra) — with the
+  fallback use printed so it can never pass silently unused-shaped.
+  The starvation detail line now names the real invariant (fewer than
+  two committed writers ⇒ the nonvacuity gate should have failed
+  first). Verified: 5 seeds green locally (primary path), lint +
+  ratchet clean.
+
 - **test (v29 M2 item 1): `lincheck::check_write_skew` — the SSI
   anti-dependency checker, closing the blindness Audit-2's TXN-1
   demonstrated.** lincheck validated view consistency (reads match their

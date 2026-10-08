@@ -443,7 +443,13 @@ the remaining audit-enumerated vacuous tests, plus the build-memory wall.
    against tag `v0.28.0` records the anomaly committing and the checker
    flags the exact cycle (T2 -[rw 'x' missed write@4]-> T1 -[rw scan[k,k]
    missed 'k'@3]-> T2); post-fix the engine refuses T1 and the committed
-   history is CLEAN. Suite grows 495 → 503 checks.
+   history is CLEAN. Suite grows 495 → 503 checks. CI-hardened in
+   follow-up (run #72 taught it): the engine-shaped mutation's first
+   pair predicate starved on faster runners where SSI refused every
+   committed scanning writer — it now searches pairs exhaustively and
+   carries a non-vacuous fabricated-scan fallback over two REAL
+   committed writers, so the mutation cannot silently skip while the
+   workload's nonvacuity gate holds.
 2. The DST plan grammar grows merge/rebalance/cascade and
    reclamation-retirement scenarios *before that code exists* — scenarios
    written against the design; the implementation must survive them.

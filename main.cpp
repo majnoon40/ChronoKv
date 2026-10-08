@@ -14481,35 +14481,72 @@ static int run_lincheck_test() {
         // genuine anti-dependency cycle cannot be conjured from one field —
         // it takes the two missed dependencies the engine refuses to let
         // co-commit, reconstructed on real recorded txns: a scanning writer
-        // A and a standalone (write-only, no-snapshot) put B whose key lies
-        // inside A's scan range. Drop A's scan snapshot below B's write (A's
-        // scan now "missed" B -> rw edge A->B), and give B a fabricated
-        // pre-A read of a key A wrote (B "missed" A -> rw edge B->A). Either
+        // A and another committed writer B with a key inside A's scan
+        // range. Drop A's covering scan snapshot below B's write (A's scan
+        // now "missed" B -> rw edge A->B), and give B a fabricated pre-A
+        // read of a key A wrote (B "missed" A -> rw edge B->A). Either
         // half alone is what the engine rejects at commit; together they
-        // close A->B->A. Proves the checker bites engine-shaped data with
-        // the exact anomaly shape Audit-2's TXN-1 shipped as.
-        bool done = false, ok = false;
+        // close A->B->A.
+        //
+        // CI HARDENING (run #72, every leg): the first version of this
+        // mutation required B to be write-only with a UINT64_MAX snapshot
+        // and took the FIRST committed scanning writer as A — on CI's
+        // faster runners (real io_uring, -O2, 4 cores) SSI refused every
+        // scanning writer on some seeds and the check starved ("no
+        // suitable A/B pair"). Two changes, keeping it non-vacuous:
+        //   1. exhaustive pair search — ANY committed writer B whose key
+        //      falls in ANY of A's scans (reads/snapshot shape of B
+        //      unrestricted), over ALL scanning-writer candidates A;
+        //   2. a fallback that cannot starve while the workload's
+        //      nonvacuity gate holds: two REAL committed write txns; A
+        //      gains a fabricated point scan over B's key at snap
+        //      cts_B - 1. The scan is synthetic, the txns/keys/cts are
+        //      engine data, and the cycle algebra is identical.
+        bool done = false, ok = false, via_fallback = false;
         auto h = hist2;
         lincheck::Txn* A = nullptr;
         lincheck::Txn* B = nullptr;
+        size_t a_scan_idx = 0;
+        std::vector<lincheck::Txn*> cwriters;
         for (auto& t : h)
-            if (!A && t.committed && t.is_write && !t.scans.empty() && t.commit_cts && !t.writes.empty())
-                A = &t;
-        if (A) {
-            const auto& sc = A->scans[0];
-            for (auto& t : h) {
-                if (&t == A || !t.committed || !t.is_write || !t.reads.empty()) continue;
-                if (t.snapshot != UINT64_MAX || !t.commit_cts || t.writes.empty()) continue;
-                bool in_range = false;
-                for (const auto& w : t.writes)
-                    if (sc.lo <= w.key && w.key <= sc.hi) { in_range = true; break; }
-                if (in_range) { B = &t; break; }
+            if (t.committed && t.is_write && t.commit_cts && !t.writes.empty())
+                cwriters.push_back(&t);
+        // Primary: a real scanning writer A + any other committed writer B
+        // with a key inside one of A's scan ranges.
+        for (auto& t : h) {
+            if (A) break;
+            if (!t.committed || !t.is_write || !t.commit_cts || t.scans.empty() || t.writes.empty())
+                continue;
+            for (auto& u : h) {
+                if (&u == &t || !u.committed || !u.is_write || !u.commit_cts) continue;
+                bool pair_found = false;
+                for (size_t si = 0; si < t.scans.size() && !pair_found; ++si) {
+                    const auto& sc = t.scans[si];
+                    for (const auto& w : u.writes)
+                        if (sc.lo <= w.key && w.key <= sc.hi) {
+                            A = &t; B = &u; a_scan_idx = si; pair_found = true; break;
+                        }
+                }
+                if (pair_found) break;
             }
         }
-        if (A && B && B->commit_cts > 0 && A->commit_cts > 0) {
-            A->scans[0].snap = B->commit_cts - 1;              // A's scan misses B's write
+        // Fallback: two real committed writers; A gains the fabricated scan.
+        if (!A && cwriters.size() >= 2) {
+            A = cwriters[0]; B = cwriters[1];
+            if (A == B) B = cwriters.size() > 2 ? cwriters[2] : nullptr;
+            if (A && B && A != B) {
+                lincheck::ScanEv sc;
+                sc.lo = sc.hi = B->writes.front().key;
+                sc.snap = B->commit_cts - 1;
+                A->scans.push_back(std::move(sc));
+                a_scan_idx = A->scans.size() - 1;
+                via_fallback = true;
+            } else { A = B = nullptr; }
+        }
+        if (A && B) {
+            A->scans[a_scan_idx].snap = B->commit_cts - 1;      // A's scan misses B's write
             B->has_snapshot = true;
-            B->snapshot = A->commit_cts - 1;                   // B "started" before A's write
+            B->snapshot = A->commit_cts - 1;                    // B "started" before A's write
             B->order.push_back({true, B->reads.size()});
             B->reads.push_back(lincheck::ReadEv{A->writes.front().key, false, "", 0});
             done = true;
@@ -14519,7 +14556,10 @@ static int run_lincheck_test() {
             ok = lincheck::has_kind(v, "anti-dependency-cycle");
         }
         check("lincheck: mixed-history mutation flagged — fabricated missed anti-dependency pair",
-              ok, done ? "anti-dependency-cycle not flagged" : "no suitable A/B pair recorded");
+              ok, done ? (ok ? "" : "anti-dependency-cycle not flagged")
+                       : "history has fewer than two committed writers (nonvacuity gate should have failed first)");
+        if (done && via_fallback)
+            std::cout << "      (mutation used the fabricated-scan fallback: no committed scanning writer in this history)\n";
     }
     {
         // (i) drop a scan entry -> scan-missing-key (every recorded entry was
