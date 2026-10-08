@@ -69,7 +69,8 @@ evidence in-tree or in the CI ledger:
    only config where the WAL write-path fault legs execute — and clang).
    All four experimental legs green three runs straight (#64, #65, #66):
    the promotion condition ("green once → delete the flag and it gates")
-   is met; flag removal is the next CI commit.
+   is met; flags deleted in `0027fe0` (2026-10-08) — all 12 legs now
+   gate `ci-passed`.
 5. **The arena ledger vehicle was repaired** (`e9eb787`): two consecutive
    nightlies (#62 on `8863bc8`, #65 on `b6fb181` — identical deaths on both
    sides of the merge, so it was the vehicle's budget, not 0.28.1's delta)
@@ -244,9 +245,9 @@ What 0.28.1 did *not* do, and v29 inherits:
 | Remediation specification + waves 1–5 | **DONE** | 0.28.0, tag `v0.28.0` |
 | v29 M0 deliverable zero (audit docs in-tree) | **DONE** | `docs/audits/` (2026-09-23, 2026-09-24) |
 | v29 M0 re-audit commission (Audit-2 over 0.28.0) | **EXECUTED** — 13 findings, all remediated fail-first | PR #2 (`5cd74b5`, merged `b6fb181`) = 0.28.1 |
-| v29 M0 closure | **PENDING** — report publication under `docs/audits/`, delta confirmation round over 0.28.1, tag `v0.28.1` | — |
+| v29 M0 closure | **IN PROGRESS** — reconstructed report committed (original session lost; provenance documented inside), tag `v0.28.1` placed; remaining: the delta confirmation round over 0.28.1 | `docs/audits/2026-10-audit-2-reconstructed.md` |
 | v29 M1 — benchmark arena | **STARTED** — steps 1–3 shipped; step 4 vehicle repaired (split into parallel `arena-chronokv`/`arena-baselines` jobs after #62/#65 proved the 60-min budget). Remaining: first completed nightly (starts the green-week clock), baselines-timeout tightening from measurement, D/E/F adapters, pinning/vendoring, noise-band calibration + gate enablement, ledger-promotion decision | `bench/`, ci.yml `arena-*` (`e9eb787`) |
-| v29 CI hardening (adjacent, unplanned-in-9/27) | **SHIPPED** — lint/ratchet/hygiene gates, build-shared, 4 experimental sanitizer legs green ×3 (#64/#65/#66) → promotion condition met | `5cd74b5` |
+| v29 CI hardening (adjacent, unplanned-in-9/27) | **SHIPPED + PROMOTED** — lint/ratchet/hygiene gates, build-shared; the 4 experimental sanitizer legs went green ×3 (#64/#65/#66) → flags deleted, all 12 legs gating | `5cd74b5`; promotion `0027fe0` |
 | v29 M2 — catcher hardening | not started (gains item 5: TU pressure relief) | — |
 | v29 M3–M7 — the overhaul | not started; **gated on M0 closure** | — |
 | v30 M0–M5 — the challenge, 1.0.0 | not started | — |
@@ -333,7 +334,13 @@ also what the milestone text prescribes. M0 therefore closes only when:
 1. **The Audit-2 report is committed under `docs/audits/`** (rule 8: the
    finding IDs are cited from the battery's comments; the report they came
    from must be checkable from the tree — the round-1 lesson, not
-   repeated).
+   repeated). **DONE 2026-10-08 — as a labeled reconstruction**
+   (`docs/audits/2026-10-audit-2-reconstructed.md`): the original audit
+   session was not preserved, so the committed record consolidates the
+   in-tree remediation artifacts (fix rationale comments, the battery, the
+   0.28.1 changelog) and the independent cross-verification log, with
+   severities assigned-in-reconstruction and an explicit statement of what
+   is unrecoverable. Nothing is invented to fill the gap.
 2. **A delta confirmation round runs over 0.28.1** — verify all 13
    closures at depth (not checklist), and hunt specifically in the classes
    the *fixes* could have introduced: the phantom tracker's new
@@ -343,7 +350,13 @@ also what the milestone text prescribes. M0 therefore closes only when:
    headroom arithmetic against the split planner's real worst case.
    Verdict B or better, zero new Critical/High.
 3. **Tag `v0.28.1`** exists (rule 2 — the version, the changelog and the
-   tag ship together or the release identity is prose).
+   tag ship together or the release identity is prose). **DONE** — the tag
+   rides the reconstruction commit, completing the arc's in-tree record
+   (the same convention as `v0.28.0` tagging the arc-completion commit
+   `3161c77` rather than the release commit).
+
+**Status:** items 1 and 3 closed 2026-10-08; **item 2 — the delta
+confirmation round — is the sole remaining M0 gate on M3+.**
 
 Until then, M3+ stays gated. M1/M2 proceed.
 
@@ -700,12 +713,18 @@ benchmarks, not dependencies. Four new rules, each paid for:
 
 1. **This document's adoption** (rule 3 mechanics): replace the plan,
    CHANGELOG entry, README Roadmap paragraph updated — one commit.
+   **DONE** (`b5a7eee`).
 2. **Promote the experimental legs**: delete the four `experimental: true`
-   flags (condition met: green ×3 in #64/#65/#66) and fix the four clang
-   warnings (3× `-Wunused-lambda-capture`, 1× `-Wunused-private-field`) so
-   the clang lint leg loses its `continue-on-error` too.
+   flags (condition met: green ×3 in #64/#65/#66) — **DONE** (`0027fe0`).
+   Still open: fix the four clang warnings (3× `-Wunused-lambda-capture`,
+   1× `-Wunused-private-field`) so the clang *lint* leg loses its
+   `continue-on-error` too — needs a clang-18 environment to fix verified
+   (no unverified warning fixes); tracked here until landed.
 3. **M0 closure, part 1**: publish the Audit-2 report under `docs/audits/`
-   (rule 8) and tag `v0.28.1` (rule 2).
+   (rule 8) and tag `v0.28.1` (rule 2) — **DONE 2026-10-08**, with the
+   report committed as a labeled reconstruction (the original session was
+   not preserved; the document states exactly what is consolidated from
+   where, and what is unrecoverable).
 4. **First completed nightly** (vehicle already shipped): confirm both
    arena jobs finish, then tighten the baselines timeout from the measured
    duration — rule 13's follow-through, written into the job comment at

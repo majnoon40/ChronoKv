@@ -7,6 +7,27 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **docs (audit record — v29 M0 closure items 1 + 3):**
+  `docs/audits/2026-10-audit-2-reconstructed.md` commits the Audit-2
+  record per rule 8. The original audit session was **not preserved** —
+  discovered at M0-closure time; which reviewer ran it, with what prompt
+  and what verdict letter, is unrecoverable. Rather than leave the
+  battery's finding IDs citing a document that exists nowhere (the exact
+  rule-8 failure the round-1 lesson warns about), the record is
+  **reconstructed and labeled as such**: findings, mechanisms, PoC results
+  and detectors consolidated from the in-tree remediation artifacts (fix
+  rationale comments, the 15-check battery, the 0.28.1 changelog entry,
+  the header's v28.1 preamble) plus the independent cross-verification log
+  (differential PoCs re-run against tag `v0.28.0`: TXN-1 anomalous commit,
+  TXN-2 exhaustion at txn 16,554, EXTRA-2 four corrupted keys, API-3 zero
+  observer fires — each reproduced pre-fix, closed post-fix). Severity
+  classes are assigned-in-reconstruction from impact, not transcribed; the
+  document states plainly what it cannot know. All 13 findings carry a
+  rule-8 mapping row (finding → detector → commit). **Tag `v0.28.1`**
+  rides this commit (rule 2; convention matches `v0.28.0` tagging the
+  arc-completion commit). M0 stays open on its remaining item: the delta
+  confirmation round over 0.28.1 — the gate on M3+.
+
 - **ci (v29): the four experimental sanitizer legs are PROMOTED to
   gating.** The io_uring-disabled asan/tsan legs — the only config where
   the WAL write-path fault legs execute (`pwrite_all` WriteShort/WriteFail,
