@@ -47,11 +47,13 @@
 #                ONCE per run and handed to `dst` (8 nightly shards) and
 #                `crashfuzz` as artifacts instead of each re-compiling the one
 #                large translation unit.
-#              - experimental sanitizer legs (`experimental: true`): the
-#                io_uring-disabled asan/tsan builds (the only config where the
-#                WAL write-path fault legs run) and clang asan/tsan. They do
-#                not block `ci-passed` until each has been green once —
-#                then delete the flag and it gates.
+#              - promoted sanitizer legs (2026-10-07): the io_uring-disabled
+#                asan/tsan builds (the only config where the WAL write-path
+#                fault legs run) and clang asan/tsan shipped as
+#                `experimental: true` (non-blocking until green once); runs
+#                #64/#65/#66 made each green three times — the promotion
+#                condition in the original comment — so the flags were
+#                deleted and all four legs now GATE via ci-passed.
 #
 # io_uring: every default build attempts real io_uring. The test binary
 # probes the ring at runtime, prints the feature summary
@@ -124,7 +126,6 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
-    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -179,21 +180,23 @@ jobs:
             bin: build/release/test
             cxx: g++
             extra_defs: -DCKV_IOURING_DISABLED
-          # ---- v29 experimental sanitizer legs (non-blocking until green once) ----
-          # The io_uring-disabled build is the ONLY configuration where the WAL
-          # write-path fault legs (pwrite_all WriteShort/WriteFail, D2
-          # async-write-stage) run — they SKIP on native io_uring builds — and
-          # until now it ran in release only. Under ASan+UBSan those error
-          # paths also get leak/UB checking. (crash-injection stays skipped
-          # under every sanitizer: fork is unreliable there, a property of
-          # the build, not of CI config.)
+          # ---- v29 sanitizer legs (PROMOTED to gating 2026-10-07) ----
+          # Shipped as experimental (non-blocking until green once); green
+          # three runs straight (#64/#65/#66) — the promotion condition —
+          # so the flags were deleted. The io_uring-disabled build is the
+          # ONLY configuration where the WAL write-path fault legs
+          # (pwrite_all WriteShort/WriteFail, D2 async-write-stage) run —
+          # they SKIP on native io_uring builds — and until 0.28.1 it ran
+          # in release only. Under ASan+UBSan those error paths also get
+          # leak/UB checking. (crash-injection stays skipped under every
+          # sanitizer: fork is unreliable there, a property of the build,
+          # not of CI config.)
           - name: asan+ubsan (io_uring disabled)
             os: ubuntu-24.04
             target: asan
             bin: build/asan/test
             cxx: g++
             extra_defs: -DCKV_IOURING_DISABLED
-            experimental: true
           # clang's sanitizer runtime and codegen differ from gcc's.
           - name: asan+ubsan (clang++-18)
             os: ubuntu-24.04
@@ -201,7 +204,6 @@ jobs:
             bin: build/asan/test
             cxx: clang++-18
             install: clang-18
-            experimental: true
     steps:
       - uses: actions/checkout@v4
 
@@ -241,24 +243,22 @@ jobs:
     name: tsan (${{ matrix.name }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: full suite
             cxx: g++
-          # v29 experimental legs (non-blocking until green once): the
-          # io_uring-disabled build (WAL write-path fault legs under TSan) and
-          # clang's TSan runtime (different instrumentation than gcc's).
+          # v29 legs (PROMOTED to gating 2026-10-07 after #64/#65/#66 —
+          # green three runs straight): the io_uring-disabled build (WAL
+          # write-path fault legs under TSan) and clang's TSan runtime
+          # (different instrumentation than gcc's).
           - name: full suite, io_uring disabled
             cxx: g++
             extra_defs: -DCKV_IOURING_DISABLED
-            experimental: true
           - name: full suite, clang++-18
             cxx: clang++-18
             install: clang-18
-            experimental: true
     steps:
       - uses: actions/checkout@v4
 

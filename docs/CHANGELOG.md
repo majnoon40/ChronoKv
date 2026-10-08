@@ -7,6 +7,20 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **ci (v29): the four experimental sanitizer legs are PROMOTED to
+  gating.** The io_uring-disabled asan/tsan legs — the only config where
+  the WAL write-path fault legs execute (`pwrite_all` WriteShort/WriteFail,
+  the D2 async-write-stage) — and the clang asan/tsan legs shipped in
+  0.28.1 under `experimental: true` with an explicit promotion policy
+  ("green once → delete the flag and it gates"). Runs #64, #65 and #66
+  made each green three times straight; the flags and both matrices'
+  `continue-on-error` are deleted, and all 12 legs (9 engine-tests + 3
+  tsan) now gate `ci-passed`. The clang *lint* informational step keeps
+  its `continue-on-error` until the four catalogued clang warnings
+  (3× `-Wunused-lambda-capture`, 1× `-Wunused-private-field`) are fixed —
+  this promotion covers the sanitizer legs only, per the policy's own
+  one-green-one-flag mechanics.
+
 - **docs (roadmap rebase):** `docs/ROADMAP.md` is rebaselined against
   `main @ e9eb787` (**0.28.1**) as a new plan — not a revision block: the
   Audit-2 round changed the plan's own gate status (v29 M0 executed,
