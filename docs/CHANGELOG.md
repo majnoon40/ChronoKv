@@ -7,6 +7,20 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **ci (v29 M1, rule-13 follow-through): arena caps right-sized from the
+  first completed ledger night.** Run #68 (2026-10-08) was the split
+  vehicle's first full pass — and the ledger's first complete night:
+  `arena-chronokv` **31m55s**, `arena-baselines` **15m33s**, both
+  artifacts uploaded, nightly green end-to-end. The baselines' measured
+  15m33s shows the pre-split cancellations were budget *allocation* (the
+  ChronoKV legs eating 44 of 60 shared minutes), not baseline slowness —
+  the killed lower bound was nearly the whole real cost. Per the
+  tighten-after-measuring follow-up written into the job comment at
+  `e9eb787`: baselines cap 180→60 (~4x headroom, sized to also absorb
+  the coming D/E/F adapters); chronokv stays 90 (~2.8x over the faster
+  measurement — shared-runner variance is the budget's job). The
+  green-week clock (M1 acceptance) is running: night 1/7 banked.
+
 - **docs (audit record — v29 M0 closure items 1 + 3):**
   `docs/audits/2026-10-audit-2-reconstructed.md` commits the Audit-2
   record per rule 8. The original audit session was **not preserved** —

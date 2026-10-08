@@ -669,7 +669,10 @@ jobs:
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
     # Sized from measurement, not hope: run #65 spent 44m01s in the
-    # group+async legs on the fixed geometry. 90 = ~2x headroom.
+    # group+async legs on the fixed geometry; the first completed split
+    # night (#68, 2026-10-08) measured 31m55s. 90 keeps ~2.8x headroom
+    # over the faster observation — variance on shared runners is the
+    # budget's job, not the ledger's.
     timeout-minutes: 90
     env:
       # Fixed ledger geometry (calibration stage): 200k keys, 100 B values,
@@ -719,13 +722,14 @@ jobs:
     name: arena — baselines (nightly ledger, informational)
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
-    # Generous on purpose: the pre-split cancellation gives only a LOWER
-    # bound (>= 15.5 min, killed mid-leg with completion count unknown;
-    # sqlite-full's fsync-per-write tail is the expected dominator).
-    # Nightly-only vehicle on a public repo — the cap costs nothing until
-    # consumed. TIGHTEN THIS after the first completed night publishes the
-    # real per-config durations (rule 9: measure, then budget).
-    timeout-minutes: 180
+    # TIGHTENED per its own written follow-up (rule 13: measure, then
+    # budget): the first completed night (#68, 2026-10-08) measured
+    # 15m33s for all five configs — the pre-split lower bound (>= 15.5
+    # min, killed mid-leg) turns out to have been nearly the whole cost;
+    # the old deaths were budget allocation, not baseline slowness. 60
+    # keeps ~4x headroom for runner variance AND the coming D/E/F
+    # adapters (which grow this leg); re-tighten only on measurement.
+    timeout-minutes: 60
     env:
       # IDENTICAL to arena-chronokv — see the geometry note there.
       ARENA_KEYS: "200000"

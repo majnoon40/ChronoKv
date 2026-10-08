@@ -373,10 +373,16 @@ measured 44m01s) and `arena-baselines` (180 min cap, generous-on-purpose,
 with the tighten-after-measuring follow-up in the job comment).
 
 **Remaining, in order.**
-1. **First completed nightly** — the green-week clock starts the night
-   both arena jobs finish and upload (`arena-ledger-chronokv-<run_id>`,
-   `arena-ledger-baselines-<run_id>`). Then tighten the baselines cap to
-   the measured budget (rule 13's follow-through).
+1. **First completed nightly — DONE, night 1/7 banked** (run #68,
+   2026-10-08, on `b5a7eee`): `arena-chronokv` 31m55s and
+   `arena-baselines` 15m33s, both artifacts uploaded
+   (`arena-ledger-{chronokv,baselines}-37764953712`), whole nightly
+   green. The measured 15m33s proves the pre-split deaths were budget
+   allocation, not baseline slowness (the killed lower bound was
+   ≥15.5 min — nearly the entire real cost). Caps right-sized in the
+   same breath per rule 13: baselines 180→60 (~4x headroom, room for
+   the D/E/F adapters), chronokv stays 90 (~2.8x over 31m55s). The
+   green-week clock is running: six more nights.
 2. D/E/F baseline adapters (step 3 completion).
 3. Version pinning + vendoring/fetch recipes under `bench/third_party/`
    (policy README already shipped) — the ledger's comparisons must be
@@ -725,10 +731,12 @@ benchmarks, not dependencies. Four new rules, each paid for:
    report committed as a labeled reconstruction (the original session was
    not preserved; the document states exactly what is consolidated from
    where, and what is unrecoverable).
-4. **First completed nightly** (vehicle already shipped): confirm both
-   arena jobs finish, then tighten the baselines timeout from the measured
-   duration — rule 13's follow-through, written into the job comment at
-   `e9eb787`. The green-week clock starts here.
+4. **First completed nightly** — **DONE** (#68, 2026-10-08: chronokv
+   31m55s, baselines 15m33s, both artifacts up, nightly green); caps
+   tightened from the measurement in the same commit as this status
+   (baselines 180→60). The green-week clock is running — six more
+   nights, then noise-band calibration and gate enablement (M1
+   remaining item 4).
 5. **M0 closure, part 2**: commission the delta confirmation round over
    0.28.1 (the four hunt-classes are named in M0's acceptance). Verdict B+
    unlocks M3 — and M2 item 1 (the write-skew checker) should be written
