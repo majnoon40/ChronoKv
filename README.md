@@ -301,11 +301,15 @@ inactive transaction), `Error` (engine failures), `NotYetImplementedError`.
   **replayed on the next open — on a clean restart, no power loss
   involved**; if the rollback's *fsync* fails, the guarantee degrades to
   clean-restart durability (only a power loss can undo the truncation).
-  Both sub-cases fail-stop the instance (D3), log `WARNING`/`FATAL`, and
-  count in `wal_stats().truncate_fails`; recovery cannot distinguish the
-  poisoned tail from legitimate data, so the window survives the reopen.
-  See `docs/audits/2026-10-src-audit-findings.md` for the reproduction
-  and the options under maintainer decision.
+  Both sub-cases fail-stop the instance (D3), log `WARNING`/`FATAL`,
+  count in `wal_stats().truncate_fails`, and — since the 2026-10 option-4
+  fix — add a distinct `rollback-indeterminate` reason to `health()`
+  (in-memory only; it does not survive the reopen). Recovery cannot
+  distinguish the poisoned tail from legitimate data, so the window
+  survives the reopen; zero-fill neutralization (probe: converts the tail
+  into the ordinary torn-tail shape) and a persisted marker remain under
+  maintainer decision. See `docs/audits/2026-10-src-audit-findings.md`
+  (addendum) for the reproduction, probe outputs and options.
 - Invariant **D3**: once any fsync on the WAL path returns an error the
   instance fail-stops — `failed_` latches permanently, writes return
   `Status::Failed` (`TxnResult::DatabaseFailed`), reads of already-durable

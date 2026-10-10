@@ -3499,6 +3499,14 @@ class WalSegments {
     std::mutex batch_mu_;
     std::condition_variable batch_cv_;
     std::atomic<bool> failed_{false};
+    // SRC-B option 4 (maintainer decision 2026-10): a rollback of a
+    // rejected batch could not be COMPLETED — its ftruncate failed, or the
+    // post-truncate fsync failed — so the batch's CRC-valid frames may
+    // persist in this WAL and replay on a future open (the D2
+    // indeterminate window; the instance is fail-stopped either way).
+    // In-memory only: no on-disk marker, no new public Status. Surfaced
+    // through health() beside the fail-stop reason.
+    std::atomic<bool> rollback_indeterminate_{false};
     std::shared_ptr<Batch> cur_batch_;
     // H3 fix: FIFO of batches that have records but no leader yet.
     // cur_batch_ (when non-null) is always pending_.back() -- the batch
@@ -3667,6 +3675,7 @@ public:
         }
 #endif
         if (!f) {
+            const int open_errno = errno;   // SRC-A nit: capture BEFORE exists().
             // SRC-A fix: same contract as the instance read_manifest — only
             // a confirmed-absent path means "no manifest"; an existing path
             // that fails to open is an error (D1), not an absence.
@@ -3674,7 +3683,7 @@ public:
             if (!std::filesystem::exists(mp, ec) && !ec)
                 return {0, 0};  // no manifest
             throw std::runtime_error(
-                "MANIFEST exists but could not be opened (errno=" + std::to_string(errno) + "): " + mp);
+                "MANIFEST exists but could not be opened (errno=" + std::to_string(open_errno) + "): " + mp);
         }
         std::vector<uint8_t> buf(
             (std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -3778,6 +3787,9 @@ private:
         }
 #endif
         if (!f) {
+            const int open_errno = errno;   // SRC-A nit: capture BEFORE exists() —
+                                            // the failed open's errno is the diagnostic,
+                                            // and later calls may clobber it.
             // SRC-A fix (2026-10 source audit): ONLY a confirmed-ABSENT path
             // may mean "no manifest". Pre-fix, EVERY open failure (EACCES,
             // EMFILE, EIO — anything that sets failbit) returned the {1,0}
@@ -3793,7 +3805,7 @@ private:
             if (!std::filesystem::exists(manifest_path(), ec) && !ec)
                 return {1, 0};  // no manifest: genuinely new database
             throw std::runtime_error(
-                "MANIFEST exists but could not be opened (errno=" + std::to_string(errno) +
+                "MANIFEST exists but could not be opened (errno=" + std::to_string(open_errno) +
                 "): " + manifest_path());
         }
         std::vector<uint8_t> buf(
@@ -4153,6 +4165,9 @@ public:
     WalSegments& operator=(const WalSegments&) = delete;
 
     bool is_failed() const { return failed_; }
+    bool rollback_indeterminate() const {
+        return rollback_indeterminate_.load(std::memory_order_acquire);
+    }
 
     // v28 CKV-012R (Phase 2): latch the D3 fail-stop after a reservation-
     // window throw. The burn advanced the in-memory published prefix, but
@@ -4596,6 +4611,7 @@ public:
                         if (trc != 0) {
                             diag::wal_truncate_fails.fetch_add(1, std::memory_order_relaxed);
                             i_wal_truncate_fails.fetch_add(1, std::memory_order_relaxed);
+                            rollback_indeterminate_.store(true, std::memory_order_release);   // SRC-B opt.4
                             std::cerr << "WARNING: ftruncate failed after WAL durability "
                                          "failure (errno=" << errno << ") — non-durable "
                                          "record may persist in the WAL file\n";
@@ -4626,6 +4642,7 @@ public:
                             if (!checked_fsync(active_fd_)) {
                                 diag::wal_truncate_fails.fetch_add(1, std::memory_order_relaxed);
                                 i_wal_truncate_fails.fetch_add(1, std::memory_order_relaxed);
+                                rollback_indeterminate_.store(true, std::memory_order_release);   // SRC-B opt.4
                                 std::cerr << "FATAL: could not make the WAL rollback "
                                              "truncation durable (errno=" << errno
                                           << ") — the failed batch may resurrect "
@@ -4809,6 +4826,7 @@ bool rotate_after_checkpoint(uint64_t ckpt_ts) {
             }
 #endif
             if (!mf) {
+                const int open_errno = errno;   // SRC-A nit: capture BEFORE exists().
                 // SRC-A fix: an existing-but-unopenable MANIFEST is an error,
                 // not an absent one — falling into the filename-inference
                 // branch here would silently discard the rotation state
@@ -4817,7 +4835,7 @@ bool rotate_after_checkpoint(uint64_t ckpt_ts) {
                 const bool absent = !std::filesystem::exists(mp, ec) && !ec;
                 if (!absent)
                     throw std::runtime_error("Recovery failed: MANIFEST exists but could not be opened (errno=" +
-                                             std::to_string(errno) + "): " + mp);
+                                             std::to_string(open_errno) + "): " + mp);
             }
             if (mf) {
                 std::vector<uint8_t> buf(
@@ -6110,6 +6128,11 @@ public:
         if (wal_ && wal_->is_failed()) {
             h.level = 2;
             h.reasons.push_back("wal fail-stop mode active");
+            if (wal_->rollback_indeterminate())
+                h.reasons.push_back(
+                    "rollback-indeterminate: a rejected batch's rollback (ftruncate or "
+                    "its fsync) failed — its CRC-valid frames may persist in this WAL and "
+                    "replay on a future open (SRC-B window; in-memory signal, not on disk)");
             return h;
         }
         if (index_failed_.load(std::memory_order_acquire)) {

@@ -7,6 +7,31 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **fix (SRC-B option 4, maintainer decision): `rollback-indeterminate`
+  health reason.** Both rollback-failure branches (the ftruncate failure
+  and the post-truncate fsync failure) set an in-memory latch on
+  WalSegments, surfaced through `health()` beside the D3 fail-stop
+  reason: the WAL tail may hold a rejected batch whose frames recovery
+  cannot distinguish from legitimate data. No on-disk change, no new
+  public Status (per the decision). Fail-first: SRC-D (both branches,
+  exact `Status::WalFailure` + level 2 + reason presence + fault-charge
+  accounting) FAILED pre-fix (`reason_present=0`), PASSES post. SRC-A
+  follow-ups from the review: errno captured into a local BEFORE
+  `filesystem::exists()` at all three throw sites (exists() could
+  clobber the diagnostic), and new SRC-A2 control check pins the
+  genuinely-absent-MANIFEST fresh-database path (static `{0,0}`,
+  instance `{1,0}` + segment creation, recover_all filename inference)
+  against regression by the new throw. Option 3 (bounded retry) SKIPPED
+  per the decision's safety condition — analysis in the audit addendum.
+  Zero-fill neutralization candidate PROBED (not implemented, decision
+  pending): zero tail at EOF classifies TORN_TAIL and the existing
+  repair truncates it (interior zeros stay CORRUPT/loud); with
+  TruncateFail injected, an external zero-fill + fdatasync keeps the
+  rejected key ABSENT across a clean reopen (poison tail → ordinary
+  torn-tail shape); errno-realism table in the addendum (helps: EINTR +
+  setattr-broken-data-alive class; does not help: device EIO, EBADF,
+  EROFS — fails harmlessly there, flag stays set).
+
 - **fix (SRC audit round, 2026-10): MANIFEST open-failure conflation
   (finding A, Medium) — all three readers now fail loud.** `read_manifest`,
   `read_manifest_dir` and `recover_all`'s read-only open treated EVERY

@@ -445,6 +445,105 @@ static int run_src_audit_regression_tests() {
               " post_put=" + std::to_string((int)ps) + " reopen_keys=" + std::to_string(keys_ok));
     });
 
+    // ---- SRC-A2 (control): a genuinely ABSENT MANIFEST must keep its
+    // fresh-database semantics — the SRC-A throw must not regress the
+    // sentinel path. Covers the static reader contract ({0,0}), the
+    // instance fresh open ({1,0} + segment creation), and recover_all's
+    // filename inference on reopen (no rotation ran, so no MANIFEST
+    // exists yet — the normal non-checkpointed shape).
+    guard("SRC-A2 absent-manifest fresh path", [&] {
+        std::string base = a2::mk("ckv_src_a2"), wal = base + "/wal", ck = base + "/ck";
+        fs::create_directories(wal); fs::create_directories(ck);
+        auto mf = WalSegments::read_manifest_for_test(wal);   // static reader: {0,0}
+        bool static_ok = (mf.first == 0 && mf.second == 0);
+        Options o; o.wal_dir = wal; o.checkpoint_path = ck + "/ckpt";
+        o.durability = DurabilityMode::Sync; o.page_pool_bytes = 16u << 20;
+        { auto db = Database::open(o); db.put("x", "1"); db.close(); }   // fresh open ({1,0})
+        bool no_manifest = !fs::exists(wal + "/MANIFEST");
+        bool reopened = false;
+        { auto db = Database::open(o); reopened = db.get("x").has_value(); db.close(); }  // inference
+        fs::remove_all(base); fs::remove_all(ck);
+        check("SRC-A2 absent MANIFEST: sentinel + filename inference still fresh-DB semantics",
+              static_ok && no_manifest && reopened,
+              "static={" + std::to_string(mf.first) + "," + std::to_string(mf.second) +
+              "} no_manifest=" + std::to_string(no_manifest) +
+              " reopened_with_x=" + std::to_string(reopened));
+    });
+
+    // ---- SRC-D (SRC-B option 4, maintainer decision 2026-10): BOTH
+    // rollback-failure branches must leave a distinct in-memory signal on
+    // the failed instance — a "rollback-indeterminate" health reason
+    // beside the D3 fail-stop — so an operator looking at the sick
+    // instance knows the WAL tail may hold a rejected batch. No on-disk
+    // change and no new public Status (by decision); the zero-fill and
+    // poison-marker candidates remain under probe (audit-doc addendum).
+    guard("SRC-D rollback-indeterminate health reason", [&] {
+        auto has_reason = [](const Health& h) {
+            for (const auto& r : h.reasons)
+                if (r.find("rollback-indeterminate") != std::string::npos) return true;
+            return false;
+        };
+        // B2 shape — the ftruncate ITSELF fails. Sync durability + a
+        // write-stage batch failure routes into the truncate branch
+        // (`written` never published — the CKV-004 gate), with the
+        // CKV-004R injector producing one COMPLETE CRC-valid frame on
+        // disk before the failure.
+        bool b2_ok = false; std::string b2_why;
+        {
+            std::string base = a2::mk("ckv_src_d2"), wal = base + "/wal";
+            fs::create_directories(wal);
+            Options o; o.wal_dir = wal; o.durability = DurabilityMode::Sync;
+            o.page_pool_bytes = 16u << 20; o.auto_start_gc = false;
+            o.recover_on_open = false;
+            auto db = Database::open(o);
+            (void)db.put("acked", "1");
+            WriteSet probe_ws = {{"rejected", "2", false}};
+            const size_t frame_sz = wal_make_record(1, 1, probe_ws).size();
+            db.inject_iouring_for_test(
+                std::make_unique<chronokv_iouring::MockIoUring>(
+                    chronokv_iouring::MockIoUring::MOCK_FAILURE));
+            chronokv_iouring::pwrite_fail_after_bytes_for_test().store((int64_t)frame_sz);
+            ::fault::arm(::fault::Kind::TruncateFail, 1);
+            Status s = db.put("rejected", "2");
+            chronokv_iouring::pwrite_fail_after_bytes_for_test().store(-1);
+            int rem = ::fault::remaining.load();
+            ::fault::disarm();
+            Health h = db.health();
+            b2_ok = (s == Status::WalFailure) && h.level == 2 && has_reason(h) && rem == 0;
+            b2_why = "status=" + std::to_string((int)s) + " level=" + std::to_string(h.level) +
+                     " reason_present=" + std::to_string((int)has_reason(h)) +
+                     " charge_remaining=" + std::to_string(rem);
+            db.close();
+            fs::remove_all(base);
+        }
+        // B1 shape — truncate SUCCEEDS, its fsync fails (FsyncFail charge 2:
+        // the batch durability fsync, then the rollback fsync — the D2a
+        // arming pattern).
+        bool b1_ok = false; std::string b1_why;
+        {
+            std::string base = a2::mk("ckv_src_d1"), wal = base + "/wal";
+            fs::create_directories(wal);
+            Options o; o.wal_dir = wal; o.durability = DurabilityMode::Sync;
+            o.page_pool_bytes = 16u << 20; o.auto_start_gc = false;
+            o.recover_on_open = false;
+            auto db = Database::open(o);
+            (void)db.put("acked", "1");
+            ::fault::arm(::fault::Kind::FsyncFail, 2);
+            Status s = db.put("rejected", "2");
+            int rem = ::fault::remaining.load();
+            ::fault::disarm();
+            Health h = db.health();
+            b1_ok = (s == Status::WalFailure) && h.level == 2 && has_reason(h) && rem == 0;
+            b1_why = "status=" + std::to_string((int)s) + " level=" + std::to_string(h.level) +
+                     " reason_present=" + std::to_string((int)has_reason(h)) +
+                     " charge_remaining=" + std::to_string(rem);
+            db.close();
+            fs::remove_all(base);
+        }
+        check("SRC-D rollback-indeterminate reason set (truncate-fail AND rollback-fsync-fail branches)",
+              b2_ok && b1_ok, "B2[" + b2_why + "]  B1[" + b1_why + "]");
+    });
+
     std::cout << (fails == 0 ? "   SRC-AUDIT REGRESSION TESTS PASSED\n"
                              : "   SRC-AUDIT REGRESSION FAILURES: " + std::to_string(fails) + "\n");
     return fails;
