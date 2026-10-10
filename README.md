@@ -295,21 +295,34 @@ inactive transaction), `Error` (engine failures), `NotYetImplementedError`.
 - Invariant **D2**: a batch for which any caller observed `WalFailure` is
   absent from the WAL after *any* crash, not merely after a clean restart —
   the rollback truncation is itself fsynced, so it cannot be undone by a
-  power loss. **Known indeterminate window (SRC-B, reproduced 2026-10-10,
-  contract decision pending):** if the rollback `ftruncate` *itself* fails,
-  the rejected batch's CRC-valid frame may remain in the WAL and be
-  **replayed on the next open — on a clean restart, no power loss
-  involved**; if the rollback's *fsync* fails, the guarantee degrades to
-  clean-restart durability (only a power loss can undo the truncation).
-  Both sub-cases fail-stop the instance (D3), log `WARNING`/`FATAL`,
-  count in `wal_stats().truncate_fails`, and — since the 2026-10 option-4
-  fix — add a distinct `rollback-indeterminate` reason to `health()`
-  (in-memory only; it does not survive the reopen). Recovery cannot
-  distinguish the poisoned tail from legitimate data, so the window
-  survives the reopen; zero-fill neutralization (probe: converts the tail
-  into the ordinary torn-tail shape) and a persisted marker remain under
-  maintainer decision. See `docs/audits/2026-10-src-audit-findings.md`
-  (addendum) for the reproduction, probe outputs and options.
+  power loss. **Known indeterminate window — NARROWED, not closed (SRC-B
+  decision 2026-10-10):** if the rollback `ftruncate` *itself* fails, the
+  leader now zero-fills the FULL attempted batch extent (every record of a
+  multi-record group-commit batch) via a chunked `pwrite` loop (short
+  writes and `EINTR` retried) and `fdatasync`s it: recovery classifies
+  zeros-at-EOF as the ordinary `TORN_TAIL` — never interior-CORRUPT, and
+  nothing can append after the extent (`failed_` latches in the same
+  leader pass; every writer path checks it) — so the existing tested
+  repair truncates it and the rejected frames cannot replay on the next
+  open. The `rollback-indeterminate` health reason (option 4) clears ONLY
+  if the fill AND its `fdatasync` both succeed; the instance fail-stops
+  (D3) regardless. If either fails, the fill fails harmlessly (no throw,
+  no new Status) and the flag stays. **Residual exposure:** (i) the fill's
+  own `fdatasync` failing, (ii) process death before the fill completes,
+  (iii) errno classes where the data-write path is also broken (device
+  EIO, EROFS, EBADF), and (iv) the separate rollback-*fsync*-failure
+  branch, deliberately untouched — its truncated-but-unsynced state is a
+  power-loss-only exposure (no resurrection on clean restarts; SRC-D B1).
+  In every residual case `health()` reports level 2 with the
+  `rollback-indeterminate` reason (in-memory only) — an operator-visible
+  signal to restore from backup rather than trust the segment tail. A
+  persisted poison marker — the only mechanism that survives reopen — is
+  DEFERRED to the v30 M3 power-loss infrastructure (maintainer decision).
+  Pinned by SRC-D (branch classification) and SRC-E1/E2/E3 (multi-record
+  fill incl. a page-spanning record; fill-write failure; fill-sync
+  failure), each mutation-verified. See
+  `docs/audits/2026-10-src-audit-findings.md` (addendum) for the probe
+  outputs, the decision record and the errno-realism table.
 - Invariant **D3**: once any fsync on the WAL path returns an error the
   instance fail-stops — `failed_` latches permanently, writes return
   `Status::Failed` (`TxnResult::DatabaseFailed`), reads of already-durable

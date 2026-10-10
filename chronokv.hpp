@@ -3389,6 +3389,21 @@ inline std::atomic<int64_t>& pwrite_fail_after_bytes_for_test() {
     static std::atomic<int64_t> v{-1};
     return v;
 }
+// SRC-B zero-fill neutralization hooks (maintainer decision 2026-10-10):
+// one-shot failure injection into the rollback zero-fill's OWN pwrite and
+// fdatasync legs. Deliberately test hooks, not fault kinds: the fault core
+// is single-slot (the scenario already arms TruncateFail), and the batch-
+// write pwrite hook above is consumed before the fill runs. exchange()
+// makes each a one-shot and gives the tests a consumption witness (anti-
+// vacuity: a test whose hook was never consumed proves the fill never ran).
+inline std::atomic<bool>& wal_zerofill_fail_write_for_test() {
+    static std::atomic<bool> v{false};
+    return v;
+}
+inline std::atomic<bool>& wal_zerofill_fail_sync_for_test() {
+    static std::atomic<bool> v{false};
+    return v;
+}
 #endif
 
 inline bool pwrite_all(int fd, const uint8_t* d, size_t n, off_t offset) {
@@ -3577,6 +3592,15 @@ class WalSegments {
     // batch_mu_, which is the path where the old bare `throw;` (outside the
     // handler) called std::terminate. Set to a lambda that throws.
     std::function<void()> leader_post_unlock_hook_;
+    // SRC-E1 (zero-fill multi-record test): pause the elected leader BEFORE
+    // it drains pending_ — the collection window in which followers enqueue
+    // onto the batch it is about to drain. Makes multi-record group-commit
+    // batches DETERMINISTIC in release TEST builds: the bare yield() is
+    // scheduler-dependent, and on small machines the leader typically
+    // re-locks before any follower has enqueued (every batch single-record).
+    // Test-gated exactly like leader_post_unlock_hook_ above: zero
+    // production cost (the call site is CHRONOKV_TEST_HOOKS-gated too).
+    std::function<void()> leader_pre_drain_hook_;
 #endif
     // v25.1 M2: stress_point hook for the CQE-wait gap test.
     // When set, the leader calls this BEFORE waiting for the CQE, allowing
@@ -4318,6 +4342,9 @@ public:
             // bare yield() below widens it nondeterministically; the dst
             // point makes the window schedulable from the seed.
             stress_point("wal_leader_elected");
+#ifdef CHRONOKV_TEST_HOOKS
+            if (leader_pre_drain_hook_) leader_pre_drain_hook_();   // SRC-E1
+#endif
             std::this_thread::yield();
             lk.lock();
 
@@ -4615,6 +4642,89 @@ public:
                             std::cerr << "WARNING: ftruncate failed after WAL durability "
                                          "failure (errno=" << errno << ") — non-durable "
                                          "record may persist in the WAL file\n";
+                            // SRC-B ZERO-FILL NEUTRALIZATION (maintainer decision
+                            // 2026-10-10; probe evidence: SRC audit addendum —
+                            // zeros at EOF classify TORN_TAIL and the existing
+                            // tested repair truncates them; interior zeros with a
+                            // surviving CRC-valid frame classify CORRUPT).
+                            // ftruncate failed, but the DATA write path may still
+                            // work (EINTR; setattr-broken-but-data-alive errno
+                            // classes), so zero the FULL attempted batch extent —
+                            // every record of a multi-record group-commit batch,
+                            // [batch_start, batch_start + batch_bytes) — leaving
+                            // no CRC-valid rejected frame for a future open to
+                            // replay. Nothing can append after this extent: the
+                            // fail-stop is latched below in this same leader pass
+                            // (failed_ = true), and every writer path checks it —
+                            // group_append's entry `if (failed_) return {1, 0};`,
+                            // the leader drain's `if (failed_) { leader_threw =
+                            // true; throw ... }` BEFORE any batch I/O (an
+                            // already-queued batch is failed, never written), and
+                            // commit_txn's `wal_->is_failed()` gate. Best-effort,
+                            // fail harmless: no throw out of this path, no new
+                            // Status; the flag is cleared ONLY if the fill AND
+                            // its fdatasync both succeed; failed_ stays latched
+                            // either way (D3 and the fail-stop are untouched).
+                            // Residual exposure (README D2): this fdatasync
+                            // failing, process death before the fill completes,
+                            // and errno classes where pwrite fails too (device
+                            // EIO, EROFS, EBADF). The rollback-FSYNC-failure
+                            // branch is deliberately NOT touched (decision).
+                            bool fill_ok = true;
+                            try {
+                                static constexpr size_t kZeroChunk = 64u * 1024u;
+                                const size_t zlen = batch_bytes < kZeroChunk ? batch_bytes : kZeroChunk;
+                                const std::string zeros(zlen, '\0');
+                                const size_t fill_extent = batch_bytes;   // FULL attempted extent
+                                size_t done = 0;
+                                while (done < fill_extent) {
+                                    const size_t n = (fill_extent - done) < kZeroChunk
+                                                         ? (fill_extent - done) : kZeroChunk;
+                                    size_t w = 0;
+                                    while (w < n) {
+#ifdef CHRONOKV_TEST_HOOKS
+                                        if (chronokv_iouring::wal_zerofill_fail_write_for_test().exchange(false)) {
+                                            errno = EIO; fill_ok = false; break;
+                                        }
+#endif
+                                        const ssize_t k = ::pwrite(active_fd_, zeros.data() + w, n - w,
+                                                                   static_cast<off_t>(batch_start + done + w));
+                                        if (k < 0) {
+                                            if (errno == EINTR) continue;    // interrupted: retry
+                                            fill_ok = false; break;          // device/fs refused
+                                        }
+                                        if (k == 0) { errno = EIO; fill_ok = false; break; }
+                                        w += static_cast<size_t>(k);         // short write: continue
+                                    }
+                                    if (!fill_ok) break;
+                                    done += n;
+                                }
+                            } catch (...) { fill_ok = false; }   // allocation failure: harmless, flag stays
+                            bool sync_ok = false;
+                            if (fill_ok) {
+#ifdef CHRONOKV_TEST_HOOKS
+                                if (chronokv_iouring::wal_zerofill_fail_sync_for_test().exchange(false)) {
+                                    errno = EIO;
+                                } else
+#endif
+                                sync_ok = (::fdatasync(active_fd_) == 0);
+                            }
+                            if (fill_ok && sync_ok) {
+                                // Durable zeros: a future open classifies the
+                                // extent TORN_TAIL and truncates it — the
+                                // window is neutralized for this event, so the
+                                // indeterminate flag comes back down. The
+                                // instance stays fail-stopped regardless.
+                                rollback_indeterminate_.store(false, std::memory_order_release);
+                                std::cerr << "NOTE: rollback zero-fill neutralized the rejected batch ("
+                                          << batch_bytes << " bytes at offset " << batch_start
+                                          << "); recovery will repair it as a torn tail\n";
+                            } else {
+                                std::cerr << "WARNING: rollback zero-fill INCOMPLETE (fill=" << fill_ok
+                                          << " fdatasync=" << sync_ok << " errno=" << errno
+                                          << ") — rollback-indeterminate stays set; the rejected "
+                                             "batch's frames may persist and replay on a future open\n";
+                            }
                         } else {
                             // v26 M0, invariant D2: ftruncate only updates the
                             // page cache and the in-core inode. WITHOUT an
@@ -9777,6 +9887,13 @@ public:
     void set_leader_post_unlock_hook_for_test(std::function<void()> fn) {
         auto eng = api_engine();
         if (eng->wal_) eng->wal_->leader_post_unlock_hook_ = std::move(fn);
+    }
+    // SRC-E1: pause the elected leader before it drains pending_, so N
+    // concurrent committers deterministically collect into ONE batch
+    // (mirrors leader_post_unlock_hook_; see WalSegments::leader_pre_drain_hook_).
+    void set_leader_pre_drain_hook_for_test(std::function<void()> fn) {
+        auto eng = api_engine();
+        if (eng->wal_) eng->wal_->leader_pre_drain_hook_ = std::move(fn);
     }
 #ifdef CHRONOKV_TEST_HOOKS
     // v28 (CKV-003c): see ChronoKV::ckpt_dirty_capture_hook_.

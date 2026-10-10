@@ -236,3 +236,53 @@ the ONLY mechanism that survives the reopen itself — if the zero-fill's
 fdatasync also fails, or the process dies before the fill, the next
 instance still cannot tell. Decision deferred to the maintainer as
 instructed; nothing beyond option 4 was implemented.
+
+
+---
+
+## SRC-B DECISION (maintainer, 2026-10-10): zero-fill IMPLEMENTED; persisted marker DEFERRED
+
+Decision: implement best-effort zero-fill neutralization in the rollback-ftruncate-FAILURE
+branch only; DEFER the persisted poison marker (revisit after v30 M3 power-loss infra). The
+rollback-fsync-failure branch is untouched. The window is documented as NARROWED, not closed.
+
+What shipped (engine, ~60 lines in the `trc != 0` branch):
+
+1. Extent: the FULL attempted batch extent `[batch_start, batch_start + batch_bytes)` — every
+   record of a multi-record group-commit batch — zeroed via a chunked `pwrite` loop that
+   retries short writes and `EINTR` (k<0 && EINTR → retry; k==0 → EIO fail).
+2. Then `fdatasync`. `rollback_indeterminate_` is cleared ONLY if fill AND fdatasync both
+   succeed. `failed_` stays latched regardless (D3/fail-stop untouched).
+3. Fill or fdatasync failure: flag stays, WARNING logged, no throw out of the failure path, no
+   new Status. Allocation failure inside the fill is caught (`fill_ok = false`).
+4. Append-prevention after the zero region (code citations): `group_append` entry
+   `if (failed_) return {1, 0};` (no new batch enqueues); leader drain
+   `if (failed_) { leader_threw = true; throw ...; }` BEFORE any batch I/O (an already-queued
+   batch fails, never writes); `commit_txn` gate `if (wal_ && wal_->is_failed()) return
+   TxnResult::DatabaseFailed;`. SRC-E1 asserts this empirically (post-failure put → Failed,
+   file size frozen).
+
+Test seams added (no production behavior): `wal_zerofill_fail_write_for_test()` /
+`wal_zerofill_fail_sync_for_test()` one-shot hooks with consumption witnesses (anti-vacuity),
+and `leader_pre_drain_hook_` (pauses the elected leader in the election→drain window — makes
+multi-record batches DETERMINISTIC in release builds; without it every batch on the 2-core box
+was single-record: 16/16 attempts split, `batch_bytes=8230 expected=8350`).
+
+Tests: SRC-D B2 flipped to the neutralization contract (reason CLEARED + rejected ABSENT after
+clean reopen); SRC-E1 (4-record batch — 3 small + 1 spanning >1 page (8 KiB) — byte-exact
+extent assertion, all rejected absent, acked prefix intact, reopen size == batch_start, open
+does NOT throw (no interior-CORRUPT), no append after); SRC-E2 (fill-write fails → flag stays,
+reason present, hook consumed); SRC-E3 (fill-sync fails → flag stays, reason present, hook
+consumed). Fail-first: all four FAIL without the fill block (E1 detail: `batch_bytes=8350
+expected=8350 ... reason_gone=0` + resurrection on reopen), PASS with it. Mutations: M4
+(extent shortened by one record) → SRC-E1 FAILS with `reopen threw: recovery failed: WAL
+corruption in segment 1` (the surviving CRC-valid frame after zeros classifies interior CORRUPT
+— loud, exactly as the probe predicted); M5 (flag cleared unconditionally) → SRC-E2+E3 FAIL,
+nothing else. Header restored byte-identical after each.
+
+Residual window (documented in README D2): (i) the fill's fdatasync failing; (ii) process death
+before the fill completes; (iii) errno classes where pwrite fails too (device EIO, EROFS,
+EBADF); (iv) the untouched rollback-fsync-failure branch (power-loss-only; SRC-D B1 pins the
+clean-restart behavior). The persisted poison marker remains the only mechanism covering
+reopen-crossing cases — deferred to v30 M3 as decided. Modeling limit unchanged: crash/model-
+level only, no power-loss claim.

@@ -483,11 +483,11 @@ static int run_src_audit_regression_tests() {
                 if (r.find("rollback-indeterminate") != std::string::npos) return true;
             return false;
         };
-        // B2 shape — the ftruncate ITSELF fails. Sync durability + a
-        // write-stage batch failure routes into the truncate branch
-        // (`written` never published — the CKV-004 gate), with the
-        // CKV-004R injector producing one COMPLETE CRC-valid frame on
-        // disk before the failure.
+        // B2 shape — the ftruncate ITSELF fails, and the zero-fill
+        // neutralization (maintainer decision 2026-10-10) SUCCEEDS: the
+        // flag must be CLEARED, the reason absent, and the rejected key
+        // ABSENT after a clean reopen (pre-zero-fill this leg reproduced
+        // the resurrection; SRC-E2/E3 own the fill-failure legs).
         bool b2_ok = false; std::string b2_why;
         {
             std::string base = a2::mk("ckv_src_d2"), wal = base + "/wal";
@@ -509,11 +509,22 @@ static int run_src_audit_regression_tests() {
             int rem = ::fault::remaining.load();
             ::fault::disarm();
             Health h = db.health();
-            b2_ok = (s == Status::WalFailure) && h.level == 2 && has_reason(h) && rem == 0;
-            b2_why = "status=" + std::to_string((int)s) + " level=" + std::to_string(h.level) +
-                     " reason_present=" + std::to_string((int)has_reason(h)) +
-                     " charge_remaining=" + std::to_string(rem);
             db.close();
+            bool absent = false, acked = false, open_ok = true;
+            Options o2 = o; o2.recover_on_open = true;
+            try {
+                auto db2 = Database::open(o2);
+                absent = !db2.get("rejected").has_value();
+                acked = db2.get("acked").has_value();
+                db2.close();
+            } catch (const std::exception& e) { open_ok = false; b2_why = e.what(); }
+            b2_ok = (s == Status::WalFailure) && h.level == 2 && !has_reason(h) && rem == 0 &&
+                    open_ok && absent && acked;
+            b2_why += " status=" + std::to_string((int)s) + " level=" + std::to_string(h.level) +
+                     " reason_present=" + std::to_string((int)has_reason(h)) +
+                     " charge_remaining=" + std::to_string(rem) +
+                     " reopen_ok=" + std::to_string(open_ok) +
+                     " rejected_absent=" + std::to_string(absent) + " acked=" + std::to_string(acked);
             fs::remove_all(base);
         }
         // B1 shape — truncate SUCCEEDS, its fsync fails (FsyncFail charge 2:
@@ -540,8 +551,191 @@ static int run_src_audit_regression_tests() {
             db.close();
             fs::remove_all(base);
         }
-        check("SRC-D rollback-indeterminate reason set (truncate-fail AND rollback-fsync-fail branches)",
+        check("SRC-D rollback-indeterminate: fsync-branch SETS it; truncate-branch zero-fill CLEARS it",
               b2_ok && b1_ok, "B2[" + b2_why + "]  B1[" + b1_why + "]");
+    });
+
+    // ---- SRC-E1 (zero-fill, multi-record): a group-commit batch of FOUR
+    // records (three small + one spanning more than one 4 KiB page: 8 KiB
+    // value) fails at the WRITE stage AFTER every frame has landed on disk
+    // (pwrite-budget hook, budget >= batch => complete frames + failed
+    // call), the rollback ftruncate fails (TruncateFail), and the zero-fill
+    // must neutralize the FULL attempted extent — not just the first frame.
+    // Determinism: frame sizes are exact (wal_make_record over the real
+    // framing), so each attempt asserts the byte-exact extent; an attempt
+    // whose batch did not collect all four records (group-commit timing)
+    // retries on a fresh instance (fail-stop is per-instance). Carries the
+    // decision's T4 assertions: reopen size == batch_start (torn-tail
+    // repair), open does NOT throw (zeros at EOF classify TORN_TAIL, never
+    // interior-CORRUPT), and the fail-stop prevents ANY append after the
+    // zero region (post-failure put -> Failed, file size frozen).
+    guard("SRC-E1 multi-record batch zero-fill", [&] {
+        auto frame_of = [](const std::string& k, const std::string& v) {
+            WriteSet ws{{k, v, false}};
+            return (uint64_t)wal_make_record(1, 1, ws).size();   // lsn/cts fixed-width: size is exact
+        };
+        const std::string big(8192, 'Z');                        // spans > 1 page
+        const uint64_t expect_batch = frame_of("rk0", "v0") + frame_of("rk1", "v1") +
+                                      frame_of("rk2", "v2") + frame_of("rk3", big);
+        bool ok = false; std::string why; int attempt = 0;
+        for (; attempt < 16 && !ok; ++attempt) {
+            std::string base = a2::mk("ckv_src_e1"), wal = base + "/wal";
+            fs::create_directories(wal);
+            Options o; o.wal_dir = wal; o.durability = DurabilityMode::Sync;
+            o.page_pool_bytes = 32u << 20; o.auto_start_gc = false;
+            o.recover_on_open = false;
+            const std::string seg = wal + "/wal_000001.log";
+            auto db = Database::open(o);
+            db.inject_iouring_for_test(
+                std::make_unique<chronokv_iouring::MockIoUring>(
+                    chronokv_iouring::MockIoUring::MOCK_FAILURE));
+            (void)db.put("acked0", "a0");
+            (void)db.put("acked1", "a1");
+            const uint64_t S0 = (uint64_t)fs::file_size(seg);
+            chronokv_iouring::pwrite_fail_after_bytes_for_test().store(16 * 1024 * 1024);
+            ::fault::arm(::fault::Kind::TruncateFail, 1);
+            // Deterministic collection: hold the elected leader in the
+            // election->drain window long enough for all followers to
+            // enqueue onto its batch (release builds have no other seam
+            // here; see WalSegments::leader_pre_drain_hook_).
+            db.set_leader_pre_drain_hook_for_test([] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            });
+            std::vector<Status> st(4, Status::OK);
+            std::barrier sync_point(4);
+            std::vector<std::thread> th;
+            for (int t = 0; t < 4; ++t) th.emplace_back([&, t] {
+                sync_point.arrive_and_wait();
+                st[t] = db.put("rk" + std::to_string(t), t == 3 ? big : "v" + std::to_string(t));
+            });
+            for (auto& x : th) x.join();
+            db.set_leader_pre_drain_hook_for_test(nullptr);
+            chronokv_iouring::pwrite_fail_after_bytes_for_test().store(-1);
+            int rem = ::fault::remaining.load();
+            ::fault::disarm();
+            const uint64_t S1 = (uint64_t)fs::file_size(seg);
+            // Fail-stop + append-prevention (decision item 4): the next put is
+            // refused and the file does not grow past the zeroed extent.
+            Status post = db.put("never", "written");
+            const uint64_t S2 = (uint64_t)fs::file_size(seg);
+            Health h = db.health();
+            bool reason_gone = true;
+            for (const auto& r : h.reasons)
+                if (r.find("rollback-indeterminate") != std::string::npos) reason_gone = false;
+            bool all_rejected = true;
+            for (int t = 0; t < 4; ++t) if (st[t] != Status::WalFailure) all_rejected = false;
+            const bool batch_shape = (S1 - S0 == expect_batch) && rem == 0;
+            if (!batch_shape || !all_rejected || post != Status::Failed ||
+                S2 != S1 || h.level != 2 || !reason_gone) {
+                why = "attempt " + std::to_string(attempt) +
+                      ": batch_bytes=" + std::to_string(S1 - S0) +
+                      " expected=" + std::to_string(expect_batch) +
+                      " allWalFailure=" + std::to_string((int)all_rejected) +
+                      " post=" + std::to_string((int)post) +
+                      " size_frozen=" + std::to_string((int)(S2 == S1)) +
+                      " level=" + std::to_string(h.level) +
+                      " reason_gone=" + std::to_string((int)reason_gone);
+                db.close(); fs::remove_all(base);
+                continue;   // group-commit timing split the batch — fresh instance
+            }
+            db.close();
+            // Clean reopen: zeros-at-EOF must classify TORN_TAIL and the repair
+            // must truncate to batch_start; interior-CORRUPT would THROW here.
+            bool open_ok = true, keys_ok = false; uint64_t size_after = 0;
+            Options o2 = o; o2.recover_on_open = true;
+            try {
+                auto db2 = Database::open(o2);
+                size_after = (uint64_t)fs::file_size(seg);
+                keys_ok = db2.get("acked0").has_value() && db2.get("acked1").has_value() &&
+                          !db2.get("rk0").has_value() && !db2.get("rk1").has_value() &&
+                          !db2.get("rk2").has_value() && !db2.get("rk3").has_value() &&
+                          !db2.get("never").has_value();
+                db2.close();
+            } catch (const std::exception& e) { open_ok = false; why = std::string("reopen threw: ") + e.what(); }
+            fs::remove_all(base);
+            ok = open_ok && keys_ok && size_after == S0;
+            if (!ok && (why.empty() || why.find("reopen") != 0))
+                why = "open_ok=" + std::to_string((int)open_ok) +
+                      " keys_ok=" + std::to_string((int)keys_ok) +
+                      " size_after=" + std::to_string(size_after) + " S0=" + std::to_string(S0);
+        }
+        check("SRC-E1 multi-record zero-fill: rejected absent, acked intact, size==batch_start, no append after",
+              ok, ok ? ("converged at attempt " + std::to_string(attempt)) : why);
+    });
+
+    // ---- SRC-E2: the zero-fill's OWN pwrite fails (one-shot hook) ->
+    // neutralization incomplete: flag STAYS set, health reason PRESENT,
+    // WalFailure unchanged, no crash. hook_consumed is the anti-vacuity
+    // witness (CKV-018 lesson): an unconsumed hook proves the fill never ran.
+    guard("SRC-E2 fill-write failure keeps the flag", [&] {
+        std::string base = a2::mk("ckv_src_e2"), wal = base + "/wal";
+        fs::create_directories(wal);
+        Options o; o.wal_dir = wal; o.durability = DurabilityMode::Sync;
+        o.page_pool_bytes = 16u << 20; o.auto_start_gc = false; o.recover_on_open = false;
+        auto db = Database::open(o);
+        (void)db.put("acked", "1");
+        WriteSet probe_ws = {{"rejected", "2", false}};
+        const size_t frame_sz = wal_make_record(1, 1, probe_ws).size();
+        db.inject_iouring_for_test(
+            std::make_unique<chronokv_iouring::MockIoUring>(
+                chronokv_iouring::MockIoUring::MOCK_FAILURE));
+        chronokv_iouring::pwrite_fail_after_bytes_for_test().store((int64_t)frame_sz);
+        ::fault::arm(::fault::Kind::TruncateFail, 1);
+        chronokv_iouring::wal_zerofill_fail_write_for_test().store(true);
+        Status s = db.put("rejected", "2");
+        chronokv_iouring::pwrite_fail_after_bytes_for_test().store(-1);
+        bool hook_consumed = !chronokv_iouring::wal_zerofill_fail_write_for_test().load();
+        int rem = ::fault::remaining.load();
+        ::fault::disarm();
+        Health h = db.health();
+        bool reason = false;
+        for (const auto& r : h.reasons)
+            if (r.find("rollback-indeterminate") != std::string::npos) reason = true;
+        db.close();
+        fs::remove_all(base);
+        check("SRC-E2 fill-write failure: flag stays, reason present, no crash",
+              s == Status::WalFailure && h.level == 2 && reason && hook_consumed && rem == 0,
+              "status=" + std::to_string((int)s) + " level=" + std::to_string(h.level) +
+              " reason=" + std::to_string((int)reason) +
+              " hook_consumed=" + std::to_string((int)hook_consumed) +
+              " charge_remaining=" + std::to_string(rem));
+    });
+
+    // ---- SRC-E3: the fill's writes SUCCEED but its fdatasync fails
+    // (one-shot hook) -> the neutralization is page-cache-only and must NOT
+    // clear the flag. Sync-hook consumption is the anti-vacuity witness.
+    guard("SRC-E3 fill-sync failure keeps the flag", [&] {
+        std::string base = a2::mk("ckv_src_e3"), wal = base + "/wal";
+        fs::create_directories(wal);
+        Options o; o.wal_dir = wal; o.durability = DurabilityMode::Sync;
+        o.page_pool_bytes = 16u << 20; o.auto_start_gc = false; o.recover_on_open = false;
+        auto db = Database::open(o);
+        (void)db.put("acked", "1");
+        WriteSet probe_ws = {{"rejected", "2", false}};
+        const size_t frame_sz = wal_make_record(1, 1, probe_ws).size();
+        db.inject_iouring_for_test(
+            std::make_unique<chronokv_iouring::MockIoUring>(
+                chronokv_iouring::MockIoUring::MOCK_FAILURE));
+        chronokv_iouring::pwrite_fail_after_bytes_for_test().store((int64_t)frame_sz);
+        ::fault::arm(::fault::Kind::TruncateFail, 1);
+        chronokv_iouring::wal_zerofill_fail_sync_for_test().store(true);
+        Status s = db.put("rejected", "2");
+        chronokv_iouring::pwrite_fail_after_bytes_for_test().store(-1);
+        bool hook_consumed = !chronokv_iouring::wal_zerofill_fail_sync_for_test().load();
+        int rem = ::fault::remaining.load();
+        ::fault::disarm();
+        Health h = db.health();
+        bool reason = false;
+        for (const auto& r : h.reasons)
+            if (r.find("rollback-indeterminate") != std::string::npos) reason = true;
+        db.close();
+        fs::remove_all(base);
+        check("SRC-E3 fill-sync failure: flag stays, reason present",
+              s == Status::WalFailure && h.level == 2 && reason && hook_consumed && rem == 0,
+              "status=" + std::to_string((int)s) + " level=" + std::to_string(h.level) +
+              " reason=" + std::to_string((int)reason) +
+              " hook_consumed=" + std::to_string((int)hook_consumed) +
+              " charge_remaining=" + std::to_string(rem));
     });
 
     std::cout << (fails == 0 ? "   SRC-AUDIT REGRESSION TESTS PASSED\n"

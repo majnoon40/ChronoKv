@@ -7,6 +7,42 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **feat (SRC-B DECISION IMPLEMENTED 2026-10-10): zero-fill
+  neutralization of the rollback-ftruncate-failure window; persisted
+  marker DEFERRED to v30 M3.** The ftruncate-failure branch now zeroes
+  the FULL attempted batch extent — every record of a multi-record
+  group-commit batch, `[batch_start, batch_start + batch_bytes)` — via a
+  chunked `pwrite` loop (short writes and `EINTR` retried; `k==0` treated
+  as EIO) followed by `fdatasync`. Recovery sees zeros-at-EOF =
+  `TORN_TAIL` (never interior-CORRUPT: no CRC-valid frame survives the
+  extent) and the existing tested repair truncates it — rejected frames
+  cannot replay on a future open. `rollback_indeterminate_` clears ONLY
+  on fill+fdatasync success; `failed_` stays latched regardless (D3 and
+  the fail-stop untouched; append-prevention after the extent cited in
+  the code comment and asserted in SRC-E1). Fill or sync failure is
+  harmless: WARNING logged, flag stays, no throw out of the failure path,
+  no new Status. The rollback-FSYNC-failure branch is deliberately
+  untouched (power-loss-only window). Window NARROWED, not closed —
+  residual exposure (README D2): the fill's fdatasync failing, death
+  before the fill completes, and pwrite-broken errno classes (device EIO,
+  EROFS, EBADF). Test seams (no production behavior):
+  `wal_zerofill_fail_{write,sync}_for_test` one-shot hooks with
+  consumption witnesses (anti-vacuity), and `leader_pre_drain_hook_`
+  pausing the elected leader in the election→drain window — without it,
+  multi-record batches are scheduler-dependent (16/16 attempts split on
+  the 2-core box). Tests: SRC-D B2 flipped to the neutralization contract
+  (reason CLEARED + rejected ABSENT after clean reopen); SRC-E1
+  (4-record batch — 3 small + one 8 KiB page-spanning — byte-exact extent
+  assertion, rejected absent / acked intact / reopen size ==
+  batch_start / open does not throw / post-failure put refused and file
+  size frozen), SRC-E2 (fill-write failure keeps flag+reason, hook
+  consumed), SRC-E3 (fill-sync failure keeps flag+reason, hook consumed).
+  Fail-first: all four FAIL without the fill block, PASS with it.
+  Mutations: M4 (extent shortened by one record) → SRC-E1 FAILS with
+  `reopen threw: WAL corruption in segment 1` (a surviving frame after
+  zeros classifies interior CORRUPT — loud, as the probe predicted); M5
+  (flag cleared unconditionally) → SRC-E2+E3 FAIL, nothing else; header
+  restored byte-identical after each.
 - **fix (SRC-B option 4, maintainer decision): `rollback-indeterminate`
   health reason.** Both rollback-failure branches (the ftruncate failure
   and the post-truncate fsync failure) set an in-memory latch on
@@ -23,8 +59,8 @@ version history; 0.28.0 is recorded in full.
   instance `{1,0}` + segment creation, recover_all filename inference)
   against regression by the new throw. Option 3 (bounded retry) SKIPPED
   per the decision's safety condition — analysis in the audit addendum.
-  Zero-fill neutralization candidate PROBED (not implemented, decision
-  pending): zero tail at EOF classifies TORN_TAIL and the existing
+  Zero-fill neutralization candidate PROBED (since IMPLEMENTED per the
+  2026-10-10 decision — see the top bullet): zero tail at EOF classifies TORN_TAIL and the existing
   repair truncates it (interior zeros stay CORRUPT/loud); with
   TruncateFail injected, an external zero-fill + fdatasync keeps the
   rejected key ABSENT across a clean reopen (poison tail → ordinary
