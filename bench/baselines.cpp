@@ -27,8 +27,13 @@
 //       rocksdb-tuned sync=false + WAL, 128 MB memtable, no compression,
 //                     4 bg jobs                process-crash   (documented tune)
 //
-// Workloads (the comparable core; D/E/F adapters are the step-3 follow-up):
-//   fillseq, fillrandom, readrandom (uniform), overwrite, ycsb_a/b/c.
+// Workloads (the comparable core — the full arena set, step 3 COMPLETE):
+//   fillseq, fillrandom, readrandom (uniform), overwrite, ycsb_a..ycsb_f.
+//   D/E/F mirror bench/arena.cpp's w_ycsb semantics exactly: D's
+//   read-latest is the geometric(0.001) tail over the inserted prefix
+//   (documented deviation from YCSB's exact latest generator, same shape,
+//   identical in both harnesses); E scans zipfian starts with len 1..100
+//   and materializes rows; F records the combined read+write latency.
 //
 // Build:  make arena-baselines        (auto-detects sqlite3/lmdb/rocksdb headers)
 //         small boxes: make arena-baselines ARENA_FLAGS="-O1"
@@ -179,6 +184,14 @@ struct Engine {
                      std::string* err) = 0;
     virtual bool get(unsigned tid, const std::string& k, std::string* out,
                      std::string* err) = 0;
+    // Range scan [lo, hi] INCLUSIVE over the key16 space, materializing
+    // every row (key AND value bytes touched — the arena's range_scan
+    // returns vector<pair<string,string>>, so a count-only baseline scan
+    // would do strictly less work: a fairness requirement, not a detail).
+    // Appends to *rows; returns false on engine error (*err set).
+    virtual bool scan(unsigned tid, const std::string& lo, const std::string& hi,
+                      std::vector<std::pair<std::string, std::string>>* rows,
+                      std::string* err) = 0;
     virtual void close() = 0;
 };
 
@@ -186,7 +199,7 @@ struct Engine {
 #ifdef CKV_BASE_SQLITE
 class SqliteEngine : public Engine {
     std::vector<sqlite3*> conns_;
-    std::vector<sqlite3_stmt*> puts_, gets_;
+    std::vector<sqlite3_stmt*> puts_, gets_, scans_;
     bool full_;
     std::string path_;
     static int exec_(sqlite3* db, const char* sql) {
@@ -204,6 +217,7 @@ public:
         conns_.resize(threads, nullptr);
         puts_.resize(threads, nullptr);
         gets_.resize(threads, nullptr);
+        scans_.resize(threads, nullptr);
         for (unsigned t = 0; t < threads; ++t) {
             if (sqlite3_open(path_.c_str(), &conns_[t]) != SQLITE_OK) {
                 *err = "sqlite3_open failed"; return;
@@ -216,6 +230,7 @@ public:
                 != SQLITE_OK) { *err = "create table failed"; return; }
             sqlite3_prepare_v2(conns_[t], "INSERT OR REPLACE INTO kv VALUES(?,?)", -1, &puts_[t], nullptr);
             sqlite3_prepare_v2(conns_[t], "SELECT v FROM kv WHERE k=?", -1, &gets_[t], nullptr);
+            sqlite3_prepare_v2(conns_[t], "SELECT k,v FROM kv WHERE k>=? AND k<=?", -1, &scans_[t], nullptr);
         }
     }
     std::string describe() const override {
@@ -257,7 +272,8 @@ public:
         } else if (rc != SQLITE_DONE) {
             *err = sqlite3_errmsg(conns_[tid]);
         }
-        // RESET IMMEDIATELY after extracting the row. A SELECT left sitting
+        // RESET IMMEDIATELY after extracting the row (scan() below obeys
+        // the same rule for the same reason). A SELECT left sitting
         // on its result row keeps this connection's WAL read snapshot OPEN;
         // the next BEGIN IMMEDIATE on the SAME connection then conflicts
         // with its own read txn and — per SQLite's deadlock-avoidance rule
@@ -268,10 +284,33 @@ public:
         sqlite3_reset(gets_[tid]);
         return found || rc == SQLITE_DONE;
     }
+    bool scan(unsigned tid, const std::string& lo, const std::string& hi,
+              std::vector<std::pair<std::string, std::string>>* rows,
+              std::string* err) override {
+        sqlite3_stmt* st = scans_[tid];
+        sqlite3_reset(st);
+        sqlite3_bind_blob(st, 1, lo.data(), (int)lo.size(), SQLITE_STATIC);
+        sqlite3_bind_blob(st, 2, hi.data(), (int)hi.size(), SQLITE_STATIC);
+        int rc;
+        while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+            const unsigned char* kb = (const unsigned char*)sqlite3_column_blob(st, 0);
+            const unsigned char* vb = (const unsigned char*)sqlite3_column_blob(st, 1);
+            rows->emplace_back(std::string((const char*)kb, (size_t)sqlite3_column_bytes(st, 0)),
+                               std::string((const char*)vb, (size_t)sqlite3_column_bytes(st, 1)));
+        }
+        // RESET BEFORE RETURNING — the WAL read-snapshot trap documented at
+        // get() is LIVE for ycsb_e: the same connection alternates scans and
+        // insert txns, and an unreset scan statement makes the next BEGIN
+        // IMMEDIATE fail SQLITE_BUSY without consulting the busy handler.
+        sqlite3_reset(st);
+        if (rc != SQLITE_DONE) { *err = sqlite3_errmsg(conns_[tid]); return false; }
+        return true;
+    }
     void close() override {
         for (size_t t = 0; t < conns_.size(); ++t) {
             if (puts_[t]) sqlite3_finalize(puts_[t]);
             if (gets_[t]) sqlite3_finalize(gets_[t]);
+            if (scans_[t]) sqlite3_finalize(scans_[t]);
             if (conns_[t]) sqlite3_close(conns_[t]);
         }
         conns_.clear();
@@ -342,6 +381,29 @@ public:
         mdb_txn_abort(txn);
         return true;
     }
+    bool scan(unsigned, const std::string& lo, const std::string& hi,
+              std::vector<std::pair<std::string, std::string>>* rows,
+              std::string* err) override {
+        MDB_txn* txn = nullptr;
+        int rc = mdb_txn_begin(env_, nullptr, MDB_RDONLY, &txn);
+        if (rc) { *err = mdb_strerror(rc); return false; }
+        MDB_cursor* cur = nullptr;
+        if ((rc = mdb_cursor_open(txn, dbi_, &cur))) {
+            *err = mdb_strerror(rc); mdb_txn_abort(txn); return false;
+        }
+        MDB_val mk{(size_t)lo.size(), (void*)lo.data()}, mv{};
+        rc = mdb_cursor_get(cur, &mk, &mv, MDB_SET_RANGE);
+        while (rc == 0) {
+            std::string k((const char*)mk.mv_data, mk.mv_size);
+            if (k > hi) break;
+            rows->emplace_back(std::move(k), std::string((const char*)mv.mv_data, mv.mv_size));
+            rc = mdb_cursor_get(cur, &mk, &mv, MDB_NEXT);
+        }
+        if (rc != MDB_NOTFOUND) { if (rc) *err = mdb_strerror(rc); }
+        mdb_cursor_close(cur);
+        mdb_txn_abort(txn);
+        return rc == MDB_NOTFOUND || rc == 0;
+    }
     void close() override { if (env_) { mdb_env_close(env_); env_ = nullptr; } }
 };
 #endif
@@ -394,6 +456,16 @@ public:
         *err = s.ToString();
         return false;
     }
+    bool scan(unsigned, const std::string& lo, const std::string& hi,
+              std::vector<std::pair<std::string, std::string>>* rows,
+              std::string* err) override {
+        const rocksdb::Slice hi_s(hi);
+        std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(rocksdb::ReadOptions()));
+        for (it->Seek(lo); it->Valid() && it->key().compare(hi_s) <= 0; it->Next())
+            rows->emplace_back(it->key().ToString(), it->value().ToString());
+        if (!it->status().ok()) { *err = it->status().ToString(); return false; }
+        return true;
+    }
     void close() override { db_.reset(); }
 };
 #endif
@@ -408,7 +480,7 @@ struct Config {
     size_t ops = 0;
     std::string dir = "/tmp/ckv_baselines";
     std::string engine = "sqlite-full";
-    std::string workloads = "fillseq,fillrandom,readrandom,overwrite,ycsb_a,ycsb_b,ycsb_c";
+    std::string workloads = "fillseq,fillrandom,readrandom,overwrite,ycsb_a,ycsb_b,ycsb_c,ycsb_d,ycsb_e,ycsb_f";
     bool keep = false;
 };
 
@@ -607,6 +679,137 @@ void w_ycsb(Engine& e, const Config& c, char mix, unsigned read_pct, unsigned up
     }
 }
 
+// ---- YCSB D/E/F (v29 M1 step-3 completion) ----
+// Mirrors bench/arena.cpp's w_ycsb operation-for-operation so the ledger's
+// D/E/F rows are same-methodology comparisons: per-thread rng seeded
+// seed*7919+t; one roll per op with the arena's pick() ORDER (read ->
+// update -> rmw -> scan -> insert-fallback); D's read-latest samples the
+// geometric(0.001) tail over keys+inserted (the arena's documented
+// deviation from YCSB's exact latest generator — IDENTICAL shape in both
+// harnesses is what makes the row comparable); inserts extend the keyspace
+// past the prep range via one shared counter; E scans zipfian starts with
+// len = 1 + rng()%100 (YCSB maxscanlength) and MATERIALIZES rows (the
+// arena's range_scan returns pairs; a count-only scan would do less work);
+// F's rmw records the combined read+write latency and rewrites the value
+// it read (fresh value on a miss), exactly as the arena does.
+void w_ycsb_def(Engine& e, const Config& c, char mix) {
+    const std::string wl = std::string("ycsb_") + mix;
+    // (insert needs no percentage: it is the pick() fallback, exactly as
+    // in the arena's w_ycsb — D and E both fall through to it at 5%.)
+    unsigned read_pct = 0, scan_pct = 0, rmw_pct = 0;
+    if (mix == 'd')      { read_pct = 95; }
+    else if (mix == 'e') { scan_pct = 95; }
+    else if (mix == 'f') { read_pct = 50; rmw_pct = 50; }
+    std::mt19937_64 rng(c.seed);
+    std::string err;
+    if (!prep_fill(e, c, rng, false, &err)) {
+        Result r; r.workload = wl; r.note = "ABORTED prep: " + err; emit(r); return;
+    }
+    const size_t ops = c.ops ? c.ops : c.keys;
+    const size_t per = std::max<size_t>(100, ops / c.threads);
+    const Zipfian zipf(c.keys);
+
+    struct St {
+        Recorder read, insert, scan, rmw;
+        size_t scan_rows = 0;
+    };
+    std::vector<St> st(c.threads);
+    std::atomic<size_t> next_insert{0};
+    std::atomic<uint64_t> misses{0};
+    std::atomic<bool> failed{false};
+    std::mutex err_mu; std::string first_err;
+    auto capture = [&](const std::string& e2) {
+        if (!e2.empty()) { std::lock_guard<std::mutex> g(err_mu); if (first_err.empty()) first_err = e2; }
+    };
+
+    const auto t0 = Clock::now();
+    std::vector<std::thread> ts;
+    for (unsigned t = 0; t < c.threads; ++t) ts.emplace_back([&, t] {
+        std::mt19937_64 lrng(c.seed * 7919 + t);
+        St& s = st[t];
+        s.read.reserve(per); s.insert.reserve(per / 10);
+        std::string out, e2;
+        std::vector<std::pair<std::string, std::string>> rows;
+        for (size_t i = 0; i < per; ++i) {
+            const unsigned roll = (unsigned)(lrng() % 100);
+            unsigned acc = 0;
+            const auto pick = [&](unsigned pct) { acc += pct; return roll < acc; };
+            const auto s0 = Clock::now();
+            const auto us = [&] {
+                return std::chrono::duration<double, std::micro>(Clock::now() - s0).count();
+            };
+            if (read_pct && pick(read_pct)) {
+                size_t k;
+                if (mix == 'd') {   // read-latest: geometric tail over inserted prefix
+                    const size_t total = c.keys + next_insert.load(std::memory_order_relaxed);
+                    std::geometric_distribution<size_t> geo(0.001);
+                    size_t back = std::min(geo(lrng), total - 1);
+                    k = total - 1 - back;
+                } else {
+                    k = zipf.next(lrng);
+                }
+                out.clear();
+                if (!e.get(t, key16(k), &out, &e2)) { failed.store(true); capture(e2); }
+                else if (out.empty()) misses.fetch_add(1, std::memory_order_relaxed);
+                s.read.record(us());
+            } else if (rmw_pct && pick(rmw_pct)) {
+                const size_t k = zipf.next(lrng);
+                out.clear();
+                if (!e.get(t, key16(k), &out, &e2)) { failed.store(true); capture(e2); }
+                const std::string nv = out.empty() ? make_value(lrng, c.valsize) : out;
+                if (!e.put(t, key16(k), nv, &e2)) { failed.store(true); capture(e2); }
+                s.rmw.record(us());                       // combined R+W latency (YCSB F)
+            } else if (scan_pct && pick(scan_pct)) {
+                const size_t start = zipf.next(lrng);
+                const size_t len = 1 + (size_t)(lrng() % 100);   // YCSB maxscanlength=100
+                rows.clear();
+                if (!e.scan(t, key16(start), key16(start + len), &rows, &e2)) {
+                    failed.store(true); capture(e2);
+                }
+                s.scan_rows += rows.size();
+                s.scan.record(us());
+            } else {                                        // insert (D and E)
+                const size_t k = c.keys + next_insert.fetch_add(1, std::memory_order_relaxed);
+                if (!e.put(t, key16(k), make_value(lrng, c.valsize), &e2)) {
+                    failed.store(true); capture(e2);
+                }
+                s.insert.record(us());
+            }
+        }
+    });
+    for (auto& th : ts) th.join();
+    const double wall = elapsed_s(t0);
+
+    St m;
+    for (auto& s : st) {
+        m.read.merge(std::move(s.read));
+        m.insert.merge(std::move(s.insert));
+        m.scan.merge(std::move(s.scan));
+        m.rmw.merge(std::move(s.rmw));
+        m.scan_rows += s.scan_rows;
+    }
+    std::string note = "zipfian(0.99)-cdf threads=" + std::to_string(c.threads) +
+        (failed.load() ? " FAILED-OPS" : "") +
+        (misses.load() ? " misses=" + std::to_string(misses.load()) : "");
+    { std::lock_guard<std::mutex> g(err_mu); if (!first_err.empty()) note += " first_err=" + first_err; }
+    auto row = [&](const char* op, Recorder& rec) {
+        if (rec.size() == 0) return;
+        Result r; r.workload = wl + std::string(".") + op;
+        r.ops = rec.size(); r.seconds = wall;
+        r.p50 = rec.pct(0.50); r.p99 = rec.pct(0.99);
+        r.note = note; emit(r);
+    };
+    row("read", m.read);
+    row("insert", m.insert);
+    if (m.scan.size()) {
+        Result r; r.workload = wl + ".scan"; r.ops = m.scan.size(); r.seconds = wall;
+        r.p50 = m.scan.pct(0.50); r.p99 = m.scan.pct(0.99);
+        r.note = note + " rows/scans=" + std::to_string(m.scan_rows / m.scan.size());
+        emit(r);
+    }
+    row("rmw", m.rmw);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -654,7 +857,10 @@ int main(int argc, char** argv) {
         else if (w == "ycsb_a")      w_ycsb(*e, c, 'a', 50, 50);
         else if (w == "ycsb_b")      w_ycsb(*e, c, 'b', 95, 5);
         else if (w == "ycsb_c")      w_ycsb(*e, c, 'c', 100, 0);
-        else { std::cerr << "unknown workload: " << w << " (baseline subset: fillseq,fillrandom,readrandom,overwrite,ycsb_a,ycsb_b,ycsb_c; D/E/F adapters are the step-3 follow-up)\n"; rc = 2; }
+        else if (w == "ycsb_d")      w_ycsb_def(*e, c, 'd');
+        else if (w == "ycsb_e")      w_ycsb_def(*e, c, 'e');
+        else if (w == "ycsb_f")      w_ycsb_def(*e, c, 'f');
+        else { std::cerr << "unknown workload: " << w << " (set: fillseq,fillrandom,readrandom,overwrite,ycsb_a..ycsb_f)\n"; rc = 2; }
     }
     e->close();
     if (!c.keep) { std::error_code ec; std::filesystem::remove_all(c.dir, ec); }

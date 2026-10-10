@@ -638,47 +638,54 @@ jobs:
   # Runs the arena (ChronoKV, both durability classes) and the five baseline
   # configs over a FIXED geometry on a fixed-spec runner, and uploads the
   # TSVs (each carries its rule-9 methodology header: hardware, engine
-  # versions, geometry, seed, durability class) as artifacts.
+  # versions, geometry, seed, durability class) as an artifact.
   #
-  # SPLIT INTO TWO PARALLEL JOBS (2026-10-07, after runs #62 and #65): the
-  # single 60-minute job never fit its own workload — TWO CONSECUTIVE
-  # nightlies died identically (#62 on 8863bc8 pre-0.28.1, #65 on b6fb181
-  # post-merge): the ChronoKV group+async legs (full workload set) consumed
-  # ~44 of the 60 minutes and the five baselines were cancelled ~15.5 min
-  # in, EVERY night. The ledger never completed, so M1's acceptance ("one
-  # green ledger week") could never start. The fix parallelizes the vehicle
-  # instead of touching the geometry — geometry changes are ledger-format
-  # changes (rule 9), and the budget was simply mis-sized from the start.
-  # Artifact naming follows the split: one run now produces TWO ledger parts,
-  # arena-ledger-chronokv-<run_id> and arena-ledger-baselines-<run_id>
-  # (superseding arena-ledger-<run_id>; no committed ledger exists yet, so
-  # nothing consumes the old name).
+  # VEHICLE HISTORY (each step measured, per rule 13):
+  #   cbfa94b  one job, 60-min cap.
+  #   #62/#65  died identically: ChronoKV legs 44m01s + baselines killed
+  #            at >=15m31s — the budget never fit the sequential workload.
+  #   e9eb787  split into two PARALLEL jobs (90/180-min caps). Green from
+  #            #68 on (31m55s + 15m33s) — but the split put the two legs on
+  #            DIFFERENT MACHINES: #75's headers record baselines on
+  #            "AMD EPYC 7763" and ChronoKV on "Intel Xeon 6973P-C". The
+  #            fairness protocol this ledger exists for says "same harness,
+  #            same HARDWARE, methodology written down once and applied
+  #            identically" — a cross-engine comparison across two CPUs is
+  #            not the product. The split optimized wall-clock and silently
+  #            broke comparability; the methodology headers caught it
+  #            (which is exactly what rule 9 headers are for).
+  #   NOW      re-merged to ONE job (same machine by construction), cap
+  #            120 min from the measured sequential need (#65: ~60 min
+  #            killed-at-budget; #68 split legs sum ~48 min cross-machine;
+  #            120 = >=2x headroom). Artifact name reverts to the original
+  #            arena-ledger-<run_id> (the split-era part names never gained
+  #            a consumer). GREEN-WEEK CLOCK RESTARTS at the first
+  #            completed night on THIS vehicle: nights 1-3 (#68/#74/#75)
+  #            ran cross-machine — their per-engine rows stay valid for
+  #            same-engine trend (each row carries its own hardware
+  #            header), but their cross-engine comparisons are not
+  #            same-hardware ledger material, so they do not count toward
+  #            the "one green week" acceptance. Rule 9 over sunk nights.
   #
   # INFORMATIONAL BY DESIGN until the noise protocol is calibrated: the M1
   # acceptance is "the nightly ledger shows one full green week" BEFORE
-  # deltas-beyond-noise start failing the job, so NEITHER job is in
+  # deltas-beyond-noise start failing the job, so this job is NOT in
   # ci-passed's needs — a flaky shared runner must never block a PR, and
   # the gate must never learn to be ignored (the lesson the DST resharding
-  # history already paid for). Enabling the regression gate = adding both
-  # arena jobs to ci-passed needs + committing the calibrated noise bands,
+  # history already paid for). Enabling the regression gate = adding
+  # `arena` to ci-passed needs + committing the calibrated noise bands,
   # after the green week. Gate enablement and ledger promotion (committed
   # bench/results/ needs contents:write or a bot commit) remain deferred
-  # with calibration, unchanged by the split.
-  arena-chronokv:
-    name: arena — chronokv (nightly ledger, informational)
+  # with calibration.
+  arena:
+    name: arena (nightly ledger, informational)
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
-    # Sized from measurement, not hope: run #65 spent 44m01s in the
-    # group+async legs on the fixed geometry; the first completed split
-    # night (#68, 2026-10-08) measured 31m55s. 90 keeps ~2.8x headroom
-    # over the faster observation — variance on shared runners is the
-    # budget's job, not the ledger's.
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       # Fixed ledger geometry (calibration stage): 200k keys, 100 B values,
       # 4 threads, seed 42. Geometry changes are ledger-format changes —
-      # bump the ledger spec, never silently mix geometries. IDENTICAL in
-      # both arena jobs; that identity is what makes the ledger comparable.
+      # bump the ledger spec, never silently mix geometries.
       ARENA_KEYS: "200000"
       ARENA_OPS: "200000"
       ARENA_THREADS: "4"
@@ -687,8 +694,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build arena
-        run: make arena
+      - name: Install baseline libraries (pinned per bench/third_party/versions.txt; distro installs during calibration, recipes recorded for vendoring)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev liblmdb-dev librocksdb-dev
+
+      - name: Build arena + baselines
+        run: make arena arena-baselines
 
       - name: Run arena — ChronoKV (group + async)
         run: |
@@ -702,55 +714,8 @@ jobs:
               echo "::warning::arena run chronokv-$dur exited nonzero (informational job)"
           done
 
-      - name: Ledger digest (throughput-only summary in the job log)
-        if: always()
+      - name: Run baselines (five configs, identical geometry, SAME machine)
         run: |
-          for f in bench/results/*.tsv; do
-            echo "== $f"
-            grep -vE '^#' "$f" | awk -F'\t' '{printf "  %-22s %12s ops/s  p50=%-6s p99=%s\n", $1, $4, $5, $6}'
-          done
-
-      - name: Upload ledger artifact (chronokv part)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: arena-ledger-chronokv-${{ github.run_id }}
-          path: bench/results/
-          if-no-files-found: warn
-
-  arena-baselines:
-    name: arena — baselines (nightly ledger, informational)
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-24.04
-    # TIGHTENED per its own written follow-up (rule 13: measure, then
-    # budget): the first completed night (#68, 2026-10-08) measured
-    # 15m33s for all five configs — the pre-split lower bound (>= 15.5
-    # min, killed mid-leg) turns out to have been nearly the whole cost;
-    # the old deaths were budget allocation, not baseline slowness. 60
-    # keeps ~4x headroom for runner variance AND the coming D/E/F
-    # adapters (which grow this leg); re-tighten only on measurement.
-    timeout-minutes: 60
-    env:
-      # IDENTICAL to arena-chronokv — see the geometry note there.
-      ARENA_KEYS: "200000"
-      ARENA_OPS: "200000"
-      ARENA_THREADS: "4"
-      ARENA_SEED: "42"
-      ARENA_VALSIZE: "100"
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install baseline libraries (distro versions; the methodology header records them per run)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev liblmdb-dev librocksdb-dev
-
-      - name: Build baselines
-        run: make arena-baselines
-
-      - name: Run baselines (five configs, identical geometry)
-        run: |
-          mkdir -p bench/results
           for eng in sqlite-full sqlite-normal lmdb rocksdb-sync rocksdb-tuned; do
             ./build/arena/baselines \
               --engine "$eng" \
@@ -769,11 +734,11 @@ jobs:
             grep -vE '^#' "$f" | awk -F'\t' '{printf "  %-22s %12s ops/s  p50=%-6s p99=%s\n", $1, $4, $5, $6}'
           done
 
-      - name: Upload ledger artifact (baselines part)
+      - name: Upload ledger artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: arena-ledger-baselines-${{ github.run_id }}
+          name: arena-ledger-${{ github.run_id }}
           path: bench/results/
           if-no-files-found: warn
 

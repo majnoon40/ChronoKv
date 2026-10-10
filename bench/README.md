@@ -5,7 +5,7 @@ measures (load-bearing constraint 2 — *measure before predict*). Everything
 here is a hooks-OFF consumer build: the public API only, exactly what an
 embedder compiles.
 
-## Status: M1 steps 1–3(start) — engine-side + YCSB mixes + baseline adapters
+## Status: M1 steps 1–3 COMPLETE — engine-side + YCSB A–F + baseline adapters (all six mixes) + version pins
 
 `arena.cpp` ships the engine-side micro suite: `fillseq` / `fillrandom`
 (the new-key `nm_`-path isolation workloads), `readrandom`, `overwrite`,
@@ -40,12 +40,23 @@ third-party storage header; nothing here is reachable from the engine):
 | `rocksdb-sync` | defaults + `WriteOptions.sync=true` | power-loss | Sync / Group |
 | `rocksdb-tuned` | `sync=false` + WAL, 128 MiB memtable, no compression, 4 bg jobs | process-crash | Async |
 
-Workloads: `fillseq`, `fillrandom`, `readrandom`, `overwrite`, `ycsb_a/b/c`
-(D/E/F baseline adapters are the step-3 follow-up). Adapters currently build
-against **distro packages** (header-presence detection in the Makefile);
-version pinning + vendoring/fetch recipes under `bench/third_party/`
-(see its README) and the CI nightly ledger with the calibrated noise
-protocol are step 3-completion / step 4.
+Workloads: `fillseq`, `fillrandom`, `readrandom`, `overwrite`,
+`ycsb_a/b/c/d/e/f` — the full arena set. **Step 3 is COMPLETE (D/E/F
+shipped 2026-10-10)**: an `Engine::scan` primitive that MATERIALIZES
+rows (the arena's range_scan returns pairs; a count-only scan would do
+strictly less work — fairness), D's geometric(0.001) read-latest tail
+over the shared insert counter, E's zipfian-start / len-1..100 scans
+(the SQLite adapter resets its scan statement before returning — the
+WAL read-snapshot trap, now live in E's scan+insert alternation on one
+connection), and F's combined read+write rmw latency. Version pins live
+in `bench/third_party/versions.txt` (sqlite 3.45.1, lmdb 0.9.31,
+rocksdb 8.9.1 — cross-checked against the ledger's methodology headers,
+sha256-verified by `bench/third_party/fetch.sh`); CI keeps installing
+distro packages during calibration (per-run versions ride the headers).
+The nightly ledger vehicle is ONE job again — same-hardware fairness:
+the parallel split ran the two legs on different CPUs (#75's headers
+caught it), so the green-week clock restarts on the merged vehicle.
+Remaining step-4 work: the green week, noise bands, gate enablement.
 
 Validation quirks the adapters hit and fixed (each a fairness issue, not a
 flake): LMDB requires `mdb_dbi_open` priming or every dbi-0 op fails EINVAL;

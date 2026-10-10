@@ -7,6 +7,66 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **bench (v29 M1 step 3, COMPLETE): YCSB D/E/F baseline adapters +
+  version pins.** `Engine::scan` joins the adapter interface — and it
+  MATERIALIZES rows (key+value bytes touched), because the arena's
+  `range_scan` returns `vector<pair<string,string>>` and a count-only
+  baseline scan would do strictly less work: a fairness requirement, not
+  a detail. Per-engine scans: SQLite prepared `k>=? AND k<=?` with
+  reset-before-return (the WAL read-snapshot trap the step-3 validation
+  paid for once is now LIVE in ycsb_e's scan+insert alternation on the
+  same connection); LMDB `MDB_SET_RANGE`+`MDB_NEXT` cursor walk in a
+  read txn; RocksDB iterator `Seek`+`Slice::compare` bound.
+  `w_ycsb_def` mirrors `bench/arena.cpp`'s w_ycsb operation-for-
+  operation (same per-thread seeding, same pick() order, D's
+  geometric(0.001) read-latest over the shared insert counter, E's
+  zipfian-start/len-1..100, F's combined R+W rmw rewriting the value it
+  read). Validated on sqlite-full/sqlite-normal/lmdb: zero FAILED-OPS,
+  op-mix counts IDENTICAL across engines at equal seeds (the fairness
+  property), `rows/scans=51` matching the arena's #75 E rows exactly;
+  the rocksdb leg is stub-syntax-checked locally (no bookworm package)
+  and gets its first full compile in CI. Default workload set is now the
+  full ten. **Pins:** `bench/third_party/versions.txt` — sqlite 3.45.1,
+  lmdb 0.9.31, rocksdb 8.9.1 (the versions the CI ledger builds
+  against, cross-checked against run #75's methodology headers) with
+  each release artifact's sha256 (fetched over TLS from canonical
+  origins) and the GitHub-archive re-record rule; `fetch.sh` verifies
+  every pin (mismatch fatal, never blind-accepted; curl/wget/python3
+  fallbacks); `src/` gitignored. CI keeps installing distro packages
+  during calibration — headers record per-run versions; build caching
+  lands with gate enablement.
+- **ci (v29 M1 step 4, FAIRNESS REVERT): the arena ledger vehicle is
+  ONE job again.** The e9eb787 split fixed the budget and ran green
+  (#68/#74/#75) — but parallel jobs mean parallel RUNNERS, and #75's
+  methodology headers caught the cost: baselines on "AMD EPYC 7763",
+  ChronoKV on "Intel Xeon 6973P-C". The fairness protocol this ledger
+  exists for says "same harness, same hardware"; a cross-engine
+  comparison across two CPUs is not the product. Re-merged to a single
+  job (same machine by construction) with a MEASURED 120-minute cap
+  (#65's sequential need ~60 min killed-at-budget; split legs summed
+  ~48 min; >=2x headroom — rule 13), artifact name reverted to
+  `arena-ledger-<run_id>` (the split-era part names never gained a
+  consumer). **The green-week clock RESTARTS at the first completed
+  night on the merged vehicle**: nights 1–3 ran cross-machine — their
+  per-engine rows stay valid for same-engine trend (each row carries
+  its own hardware header), their cross-engine comparisons are not
+  ledger material. Rule 9 over sunk nights; the headers catching this
+  is rule 9 working exactly as designed.
+- **docs (roadmap): the soak vehicle is NAMED** (M1 spec item 4): the
+  rolling nightly chain with persisted state + aggregate verdict —
+  hosted 6-h caps rule out literal 24-h/7-day jobs, no self-hosted
+  machine exists or is depended on, and the ledger artifact machinery
+  plus the coming noise bands ARE the state + verdict mechanisms.
+  24-h soak = chained nightly segments; P1's 7-day soak = a 7-night
+  chain; segments rebuild from pinned geometry so runner variance lands
+  in the bands. Self-hosted remains an upgrade path before v30 M1;
+  acceptances are vehicle-independent. M1's remaining list also records
+  the ledger's first honest comparison rows (#75): ChronoKV
+  group-durability fills/updates at 2.3k–5.4k ops/s vs power-loss-class
+  baselines at 3.9k–9.9k, reads competitive (ycsb_c 943k vs rocksdb
+  915k; lmdb's mmap owns readrandom at 4.0M) — the writer-thread
+  rewrite's before-column, exactly as claim 3 predicted.
+
 - **test (v29 M2 item 1, CI-hardening follow-up): the write-skew
   mutation cannot starve.** Run #72 (all legs) failed exactly one check —
   the Section 3b fabricated-anti-dependency-pair mutation reported "no

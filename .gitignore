@@ -22,3 +22,6 @@ chronokv_iouring_test.tmp
 *.swp
 *~
 .DS_Store
+
+# pinned baseline fetches (bench/third_party/fetch.sh)
+bench/third_party/src/

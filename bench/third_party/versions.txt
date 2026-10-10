@@ -1,0 +1,43 @@
+# bench/third_party/versions.txt — baseline version pins (rule 10, M1 step 3 completion).
+#
+# These are the EXACT versions the CI ledger builds against, recorded from
+# the ubuntu-24.04 distro packages and cross-checked against the rule-9
+# methodology headers the nightly ledger prints per run (run #75,
+# 2026-10-10: sqlite "3.45.1", lmdb "LMDB 0.9.31: (July 10, 2023)",
+# rocksdb "8.9.1"). Changing a pin is a LEDGER-FORMAT change (like a
+# geometry change): bump this file, note it in the changelog, and expect
+# the noise-band calibration to restart for that engine — cross-version
+# rows are not comparable.
+#
+# sha256 values below are of the release artifacts fetched over TLS from
+# the canonical origins on 2026-10-10; fetch.sh re-verifies them on every
+# fetch. GitHub tag archives are generated, not published release assets:
+# byte-stable in practice, but if a hash ever mismatches on a GitHub
+# archive, re-record from a fresh fetch ONLY after diffing the extracted
+# tree against the upstream tag (never blind-accept a changed hash).
+#
+# name      version   artifact-sha256 (see per-engine blocks below)
+
+sqlite    3.45.1
+  url     https://www.sqlite.org/2024/sqlite-amalgamation-3450100.zip
+  sha256  5592243caf28b2cdef41e6ab58d25d653dfc53deded8450eb66072c929f030c4
+  size    2730697
+  build   unzip; cc -O2 -c sqlite3.c; ar rcs libsqlite3.a sqlite3.o
+          (or link the amalgamation .c directly into the bench binary)
+
+lmdb      0.9.31
+  url     https://github.com/LMDB/lmdb/archive/refs/tags/LMDB_0.9.31.tar.gz
+  sha256  dd70a8c67807b3b8532b3e987b0a4e998962ecc28643e1af5ec77696b081c9b0
+  size    145208
+  alt     https://git.openldap.org/openldap/openldap/-/archive/LMDB_0.9.31/openldap-LMDB_0.9.31.tar.gz
+          (full OpenLDAP tree; libraries/liblmdb is the same code)
+  build   cd libraries/liblmdb && make liblmdb.a
+
+rocksdb   8.9.1
+  url     https://github.com/facebook/rocksdb/archive/refs/tags/v8.9.1.tar.gz
+  sha256  c22d2097e7aa75629612fd020499bdae0d3e321c7bc4361960c42aaf9cbd6dc1
+  size    13293245
+  build   cmake -DCMAKE_BUILD_TYPE=Release -DWITH_TESTS=OFF -DPORTABLE=1 .
+          && make rocksdb -j"$(nproc)"   (10-20 min cold — CI must cache
+          the built library keyed on this file's rocksdb sha256; caching
+          lands with gate enablement per third_party/README.md item 3)

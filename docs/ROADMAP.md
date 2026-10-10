@@ -246,7 +246,7 @@ What 0.28.1 did *not* do, and v29 inherits:
 | v29 M0 deliverable zero (audit docs in-tree) | **DONE** | `docs/audits/` (2026-09-23, 2026-09-24) |
 | v29 M0 re-audit commission (Audit-2 over 0.28.0) | **EXECUTED** — 13 findings, all remediated fail-first | PR #2 (`5cd74b5`, merged `b6fb181`) = 0.28.1 |
 | v29 M0 closure | **DONE 2026-10-08** — reconstructed report + tag `v0.28.1` + delta confirmation round, verdict **B+ (clean)**: 20/20 probes, one Low doc-truth finding fixed in the closure commit; **M3+ gate lifted** | `docs/audits/2026-10-delta-confirmation-0.28.1.md` (+ probes) |
-| v29 M1 — benchmark arena | **STARTED** — steps 1–3 shipped; step 4 vehicle repaired (split into parallel `arena-chronokv`/`arena-baselines` jobs after #62/#65 proved the 60-min budget). Remaining: first completed nightly (starts the green-week clock), baselines-timeout tightening from measurement, D/E/F adapters, pinning/vendoring, noise-band calibration + gate enablement, ledger-promotion decision | `bench/`, ci.yml `arena-*` (`e9eb787`) |
+| v29 M1 — benchmark arena | **STARTED** — steps 1–3 COMPLETE (D/E/F adapters + version pins with sha256/fetch recipe); step-4 vehicle: split (#68–#75 green) then RE-MERGED to one same-hardware job after #75's headers caught the two-runner CPU split — green-week clock restarts on the merged vehicle (rule 9 over sunk nights); soak vehicle NAMED (rolling nightly chain). Remaining: green week (7 nights), noise bands + gate enablement, ledger-promotion decision, CI build cache | `bench/`, `bench/third_party/versions.txt`, ci.yml `arena` |
 | v29 CI hardening (adjacent, unplanned-in-9/27) | **SHIPPED + PROMOTED** — lint/ratchet/hygiene gates, build-shared; the 4 experimental sanitizer legs went green ×3 (#64/#65/#66) → flags deleted, all 12 legs gating | `5cd74b5`; promotion `0027fe0` |
 | v29 M2 — catcher hardening | **STARTED** — item 1 (write-skew checker) shipped 2026-10-08 with live pre-fix-flag/post-fix-pass proof; items 2–5 pending | `check_write_skew` + Section 1d battery |
 | v29 M3–M7 — the overhaul | not started — M0 CLOSED 2026-10-08; order still governed by constraints 2–3 (arena green week, catchers first) | — |
@@ -394,24 +394,76 @@ with the tighten-after-measuring follow-up in the job comment).
    green. The measured 15m33s proves the pre-split deaths were budget
    allocation, not baseline slowness (the killed lower bound was
    ≥15.5 min — nearly the entire real cost). Caps right-sized in the
-   same breath per rule 13: baselines 180→60 (~4x headroom, room for
-   the D/E/F adapters), chronokv stays 90 (~2.8x over 31m55s). The
-   green-week clock is running: six more nights.
-2. D/E/F baseline adapters (step 3 completion).
-3. Version pinning + vendoring/fetch recipes under `bench/third_party/`
-   (policy README already shipped) — the ledger's comparisons must be
-   reproducible across runner images.
+   same breath per rule 13. Nights 2–3 (#74, #75) also completed green.
+   **THEN the split's own fairness defect surfaced (2026-10-10):** #75's
+   methodology headers record the two jobs on DIFFERENT CPUs (baselines
+   AMD EPYC 7763, ChronoKV Intel Xeon 6973P-C) — parallel jobs mean
+   parallel runners, and the fairness protocol's "same harness, same
+   HARDWARE" is the ledger's entire product. Vehicle re-merged to ONE
+   job (same machine by construction), timeout 120 min from the measured
+   sequential need (#65: ~60 min killed-at-budget; split legs sum ~48
+   min; ≥2x headroom), artifact name reverted to `arena-ledger-<run_id>`.
+   **The green-week clock RESTARTS at the first completed night on the
+   re-merged vehicle**: nights 1–3 ran cross-machine — their per-engine
+   rows remain valid for same-engine trend (every row carries its own
+   hardware header) but their cross-engine comparisons are not
+   same-hardware ledger material. Rule 9 over sunk nights; the headers
+   catching this is rule 9 working as designed.
+2. **D/E/F baseline adapters — DONE (2026-10-10, step 3 complete).**
+   `Engine::scan` primitive added (materializes rows — the arena's
+   `range_scan` returns pairs, so a count-only baseline scan would do
+   strictly less work; the SQLite adapter resets the scan statement
+   before returning, the WAL read-snapshot trap the step-3 validation
+   already paid for once, now live in E's scan+insert alternation on the
+   same connection). `w_ycsb_def` mirrors the arena's semantics
+   operation-for-operation: D's read-latest is the geometric(0.001) tail
+   over the shared insert counter, E scans zipfian starts with len
+   1+rng()%100, F records combined read+write latency and rewrites the
+   value it read. Validated on sqlite-full/sqlite-normal/lmdb (identical
+   op-mix counts across engines at equal seeds — the fairness property;
+   `rows/scans=51` matches the arena's #75 E rows exactly; zero
+   FAILED-OPS); the rocksdb leg is stub-syntax-checked locally and gets
+   its first full compile in CI (distro 8.9.1).
+3. **Version pinning — DONE (recipe shape, 2026-10-10).**
+   `bench/third_party/versions.txt`: sqlite 3.45.1, lmdb 0.9.31,
+   rocksdb 8.9.1 — the exact versions the CI ledger builds against,
+   cross-checked against run #75's methodology headers, with sha256 of
+   each release artifact (fetched over TLS from canonical origins) and
+   the GitHub-archive re-record rule; `bench/third_party/fetch.sh`
+   downloads + verifies every pin (mismatch is fatal, never
+   blind-accepted). Distro packages remain the calibration-stage CI
+   install path (per-run versions are recorded in the headers and
+   cross-checkable against the pins); in-tree vendoring stays deferred
+   per the policy README — recipes are its sanctioned alternative; CI
+   build caching (policy item 3) lands with gate enablement.
 4. Noise-band calibration from the green week: per-metric bands,
    N-iteration medians, explicit re-run policy — then **gate enablement**
-   (add both arena jobs to `ci-passed` needs + commit the bands). The
-   first recorded regression-vs-baseline event is already known: 0.28.1's
+   (add `arena` to `ci-passed` needs + commit the bands). The first
+   recorded regression-vs-baseline event is already known: 0.28.1's
    ~10–13% write-mix delta (sandbox floors; the ledger re-measures it on
-   fixed-spec runners).
+   fixed-spec runners). The ledger's first real comparison rows (#75)
+   also give M5 its honest starting picture: ChronoKV group-durability
+   fills/updates sit at 2.3k–5.4k ops/s against power-loss-class
+   baselines at 3.9k–9.9k (sqlite-full fillseq 8.3k, rocksdb-sync
+   ycsb_a.update 9.9k) with reads competitive (ycsb_c 943k vs rocksdb
+   915k, sqlite 436k; lmdb's mmap owns readrandom at 4.0M) — the
+   writer-thread rewrite's before-column, exactly as claim 3 predicted.
 5. The ledger-promotion decision (committed `bench/results/` needs
-   contents:write or a bot commit) and the **soak vehicle naming** that
-   M4 and v30 M1 depend on (hosted jobs die at 6 h: self-hosted runner,
-   rolling nightly chain with persisted state, or offline rig with
-   committed logs).
+   contents:write or a bot commit) — and the **soak vehicle is NAMED
+   (2026-10-10): the rolling nightly chain with persisted state +
+   aggregate verdict.** Rationale: hosted jobs die at 6 h, so a literal
+   24 h/7-day single job cannot exist; the project has no self-hosted
+   machine and a milestone must not depend on acquiring one; the ledger
+   artifact machinery already ships (TSV + methodology headers ARE the
+   persisted state) and the noise-band calibration of item 4 IS the
+   aggregate-verdict mechanism. Shape: each nightly runs a deterministic
+   seeded segment; the 24 h soak = chained segments, the 7-day
+   steady-state variant (P1's acceptance) = a 7-night chain; segments
+   rebuild from pinned geometry, so runner variance lands in the bands,
+   not in the state. If a self-hosted runner is ever acquired, the
+   vehicle upgrades to a true continuous-db soak before v30 M1 — the
+   acceptances (P1 under the 7-day soak, p99 drift beyond noise fails)
+   are vehicle-independent.
 
 **Acceptance** (unchanged): `make arena` produces the six-table
 comparison; the README performance section exists and links the
