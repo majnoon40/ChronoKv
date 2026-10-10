@@ -295,7 +295,17 @@ inactive transaction), `Error` (engine failures), `NotYetImplementedError`.
 - Invariant **D2**: a batch for which any caller observed `WalFailure` is
   absent from the WAL after *any* crash, not merely after a clean restart —
   the rollback truncation is itself fsynced, so it cannot be undone by a
-  power loss.
+  power loss. **Known indeterminate window (SRC-B, reproduced 2026-10-10,
+  contract decision pending):** if the rollback `ftruncate` *itself* fails,
+  the rejected batch's CRC-valid frame may remain in the WAL and be
+  **replayed on the next open — on a clean restart, no power loss
+  involved**; if the rollback's *fsync* fails, the guarantee degrades to
+  clean-restart durability (only a power loss can undo the truncation).
+  Both sub-cases fail-stop the instance (D3), log `WARNING`/`FATAL`, and
+  count in `wal_stats().truncate_fails`; recovery cannot distinguish the
+  poisoned tail from legitimate data, so the window survives the reopen.
+  See `docs/audits/2026-10-src-audit-findings.md` for the reproduction
+  and the options under maintainer decision.
 - Invariant **D3**: once any fsync on the WAL path returns an error the
   instance fail-stops — `failed_` latches permanently, writes return
   `Status::Failed` (`TxnResult::DatabaseFailed`), reads of already-durable
@@ -303,7 +313,13 @@ inactive transaction), `Error` (engine failures), `NotYetImplementedError`.
   `"wal fail-stop mode active"`. A later *successful* fsync can therefore
   never be mistaken for evidence that earlier data survived; this is the
   property that makes the Linux fsync-error semantics (the "fsyncgate"
-  family) safe here. Every fsync on both rotation paths is checked.
+  family) safe here. Every fsync on both rotation paths is checked, with
+  exactly ONE deliberate exception (SRC-C, pinned by test): the post-unlink
+  directory fsync that finishes a checkpoint rotation is counted
+  (`wal_stats().fsync_fails`) and warned but does *not* fail-stop — the
+  MANIFEST rename is already durable at that point, the call only persists
+  the unlink of checkpoint-covered segments, and recovery tolerates their
+  resurrection (records ≤ `ckpt_ts` are deduped on replay).
 - A `Transaction` destroyed while still active calls `std::abort()` —
   commit or abort explicitly. Concurrent `Database::close()` with live
   transactions requires external synchronization.

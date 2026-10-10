@@ -1427,7 +1427,30 @@ namespace fault {
                             // (publication-prefix progress). §12 chose the
                             // fault kind over a mirror test hook: one
                             // mechanism, not both.
-                            AllocFail };
+                            AllocFail,
+                            // SRC-A (2026-10 source-only audit): simulate a
+                            // MANIFEST open failure on an EXISTING path
+                            // (EIO/EMFILE/EACCES class). Dedicated kind per
+                            // the SegOpenFail precedent: OpenFail is owned
+                            // by the checkpoint-open tests, and the
+                            // manifest opens are plain ifstream sites this
+                            // kind wraps (all three readers: the instance
+                            // read_manifest, static read_manifest_dir, and
+                            // recover_all's read-only open).
+                            ManifestOpenFail,
+                            // SRC-B (2026-10 source-only audit): fail the
+                            // rollback ftruncate after a failed batch — the
+                            // "rejected batch stays behind as CRC-valid
+                            // frames" window (a D2 contract question; probe-
+                            // only until the contract is decided).
+                            TruncateFail,
+                            // SRC-C (2026-10 source-only audit): fail ONLY
+                            // rotate_after_checkpoint's post-unlink final
+                            // directory fsync — the deliberate counted-and-
+                            // warned D3 exception. DirFsyncFail cannot
+                            // target it: the checkpoint's own dir fsync and
+                            // write_manifest's consume earlier charges.
+                            RotFinalDirFsyncFail };
     inline std::atomic<int> armed{0};
     inline std::atomic<int> remaining{0};
 
@@ -1491,6 +1514,9 @@ namespace fault {
             {"SegOpenFail", Kind::SegOpenFail},
             {"AllocFail", Kind::AllocFail},
             {"FsyncFailAfterPersist", Kind::FsyncFailAfterPersist},
+            {"ManifestOpenFail", Kind::ManifestOpenFail},
+            {"TruncateFail", Kind::TruncateFail},
+            {"RotFinalDirFsyncFail", Kind::RotFinalDirFsyncFail},
         };
         for (const auto& [name, k] : tbl)
             if (n == name) return k;
@@ -3629,7 +3655,27 @@ public:
     static std::pair<uint64_t, uint64_t> read_manifest_dir(const std::string& dir) {
         std::string mp = dir + "/MANIFEST";
         std::ifstream f(mp, std::ios::binary);
-        if (!f) return {0, 0};  // no manifest
+#ifdef CHRONOKV_FAULT_INJECTION
+        if (f.is_open() && fault::fire(fault::Kind::ManifestOpenFail)) {
+            // SRC-A: simulate the open failure FAITHFULLY — a real failed
+            // open (EMFILE/EIO/EACCES) leaves failbit set and is_open()
+            // false; close() alone leaves the stream GOOD-but-closed, which
+            // slips past `if (!f)` into the truncation throw (a misdiagnosed
+            // loud failure instead of the silent sentinel the finding is
+            // about — caught by the fail-first run of the SRC-A test).
+            f.close(); f.clear(); f.setstate(std::ios::failbit); errno = EIO;
+        }
+#endif
+        if (!f) {
+            // SRC-A fix: same contract as the instance read_manifest — only
+            // a confirmed-absent path means "no manifest"; an existing path
+            // that fails to open is an error (D1), not an absence.
+            std::error_code ec;
+            if (!std::filesystem::exists(mp, ec) && !ec)
+                return {0, 0};  // no manifest
+            throw std::runtime_error(
+                "MANIFEST exists but could not be opened (errno=" + std::to_string(errno) + "): " + mp);
+        }
         std::vector<uint8_t> buf(
             (std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         f.close();
@@ -3720,7 +3766,36 @@ private:
         // "file does not exist" is legitimately {1,0}; any other failure
         // is corruption and must fail loud (D1), same as checkpoint files.
         std::ifstream f(manifest_path(), std::ios::binary);
-        if (!f) return {1, 0};  // no manifest: genuinely new database
+#ifdef CHRONOKV_FAULT_INJECTION
+        if (f.is_open() && fault::fire(fault::Kind::ManifestOpenFail)) {
+            // SRC-A: simulate the open failure FAITHFULLY — a real failed
+            // open (EMFILE/EIO/EACCES) leaves failbit set and is_open()
+            // false; close() alone leaves the stream GOOD-but-closed, which
+            // slips past `if (!f)` into the truncation throw (a misdiagnosed
+            // loud failure instead of the silent sentinel the finding is
+            // about — caught by the fail-first run of the SRC-A test).
+            f.close(); f.clear(); f.setstate(std::ios::failbit); errno = EIO;
+        }
+#endif
+        if (!f) {
+            // SRC-A fix (2026-10 source audit): ONLY a confirmed-ABSENT path
+            // may mean "no manifest". Pre-fix, EVERY open failure (EACCES,
+            // EMFILE, EIO — anything that sets failbit) returned the {1,0}
+            // new-database sentinel, contradicting the comment above this
+            // block: the constructor then reseeded active_id to 1 and — with
+            // a size-rotated two-segment tree — appended later commits to the
+            // STALE segment while the MANIFEST named the newer one (probe:
+            // open "succeeded", health reported 0, the write landed in the
+            // wrong file). exists() stats and needs no fd, so it answers
+            // even under EMFILE. A genuinely absent MANIFEST is unchanged:
+            // {1, 0}, brand-new database.
+            std::error_code ec;
+            if (!std::filesystem::exists(manifest_path(), ec) && !ec)
+                return {1, 0};  // no manifest: genuinely new database
+            throw std::runtime_error(
+                "MANIFEST exists but could not be opened (errno=" + std::to_string(errno) +
+                "): " + manifest_path());
+        }
         std::vector<uint8_t> buf(
             (std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         f.close();
@@ -4512,7 +4587,13 @@ public:
                         // recovery.
                         diag::wal_truncations.fetch_add(1, std::memory_order_relaxed);
                         i_wal_truncations.fetch_add(1, std::memory_order_relaxed);
-                        if (ftruncate(active_fd_, batch_start) != 0) {
+                        int trc;
+#ifdef CHRONOKV_FAULT_INJECTION
+                        if (fault::fire(fault::Kind::TruncateFail)) { trc = -1; errno = EIO; }
+                        else
+#endif
+                        trc = ftruncate(active_fd_, batch_start);
+                        if (trc != 0) {
                             diag::wal_truncate_fails.fetch_add(1, std::memory_order_relaxed);
                             i_wal_truncate_fails.fetch_add(1, std::memory_order_relaxed);
                             std::cerr << "WARNING: ftruncate failed after WAL durability "
@@ -4688,7 +4769,11 @@ bool rotate_after_checkpoint(uint64_t ckpt_ts) {
         // deduped on replay). Counted and warned so the README's "every
         // fsync on both rotation paths is checked" is literally true,
         // without fail-stopping an instance over cleanup metadata.
-        if (!fsync_dir(manifest_path() /* WAL-3: a file IN dir_, so dir_ itself is synced */)) {
+        bool rot_final_fs_ok = fsync_dir(manifest_path() /* WAL-3: a file IN dir_, so dir_ itself is synced */);
+#ifdef CHRONOKV_FAULT_INJECTION
+        if (fault::fire(fault::Kind::RotFinalDirFsyncFail)) { rot_final_fs_ok = false; errno = EIO; }
+#endif
+        if (!rot_final_fs_ok) {
             diag::wal_fsync_fails.fetch_add(1, std::memory_order_relaxed);
             i_wal_fsync_fails.fetch_add(1, std::memory_order_relaxed);
             std::cerr << "WARNING: post-checkpoint rotation: final directory "
@@ -4718,6 +4803,22 @@ bool rotate_after_checkpoint(uint64_t ckpt_ts) {
 
         {
             std::ifstream mf(mp, std::ios::binary);
+#ifdef CHRONOKV_FAULT_INJECTION
+            if (mf.is_open() && fault::fire(fault::Kind::ManifestOpenFail)) {
+                mf.close(); mf.clear(); mf.setstate(std::ios::failbit); errno = EIO;   // SRC-A: faithful open-failure state
+            }
+#endif
+            if (!mf) {
+                // SRC-A fix: an existing-but-unopenable MANIFEST is an error,
+                // not an absent one — falling into the filename-inference
+                // branch here would silently discard the rotation state
+                // (active_id, ckpt_ts) that only the MANIFEST carries.
+                std::error_code ec;
+                const bool absent = !std::filesystem::exists(mp, ec) && !ec;
+                if (!absent)
+                    throw std::runtime_error("Recovery failed: MANIFEST exists but could not be opened (errno=" +
+                                             std::to_string(errno) + "): " + mp);
+            }
             if (mf) {
                 std::vector<uint8_t> buf(
                     (std::istreambuf_iterator<char>(mf)), std::istreambuf_iterator<char>());

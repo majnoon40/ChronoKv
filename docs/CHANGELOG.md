@@ -7,6 +7,57 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **fix (SRC audit round, 2026-10): MANIFEST open-failure conflation
+  (finding A, Medium) — all three readers now fail loud.** `read_manifest`,
+  `read_manifest_dir` and `recover_all`'s read-only open treated EVERY
+  ifstream failure (EACCES/EMFILE/EIO — anything setting failbit) as
+  "no manifest → new database", contradicting read_manifest's own
+  Kimi-review-1.3 comment. Executed repro on the audit's prescribed shape
+  (two non-empty size-rotated segments, MANIFEST naming segment 2,
+  faithful failbit injection): open SUCCEEDED silently, `active_id`
+  reseeded to 1, a write was ACCEPTED into the stale segment behind
+  `health level=0` (probe + battery outputs in
+  `docs/audits/2026-10-src-audit-findings.md`). Fix: only a
+  confirmed-ABSENT path (`std::filesystem::exists` — stats, needs no fd,
+  answers under EMFILE) returns the sentinel; an existing-but-unopenable
+  MANIFEST throws with errno (D1); genuinely-absent behavior unchanged.
+  Fail-first: SRC-A checks FAILED pre-fix, PASS post-fix; post-fault
+  reopen asserts the exact pre-test key set. Injection-fidelity note: the
+  first-cut injector (bare `close()`) produced a misdiagnosed truncation
+  throw instead of the silent path — the fail-first run caught the
+  unfaithful injector itself.
+- **test (SRC round): three dedicated fault kinds + the SRC battery.**
+  `ManifestOpenFail` (all three MANIFEST readers), `TruncateFail` (the
+  rollback ftruncate), `RotFinalDirFsyncFail` (the post-unlink dir fsync
+  ONLY — DirFsyncFail cannot target it; checkpoint/manifest charges
+  consume earlier sites). All CHRONOKV_FAULT_INJECTION-gated; names added
+  to `kind_from_name` and the CKV_COVERAGE_FAULT help list. SRC-C pins
+  the rotation-final fsync's intended contract end-to-end (checkpoint
+  succeeds, health < 2, counter moves, writes keep working, reopen clean)
+  — mutation-verified (making the site fail-stop flips the check).
+  CKV-004R's first check TIGHTENED from `st != Status::OK` to
+  `!rethrew && st == Status::WalFailure` (the catch branch's
+  `Status::Failed` is a distinct CKV-016-violating outcome the loose form
+  accepted) — mutation-verified (WalFailure→Failed mapping flip fails
+  the tightened check; the CKV-004 stage→class gate flip fails the
+  sibling resurrection check; tree restored byte-identical after).
+- **docs (SRC finding B — D2 contract gap): README narrowed, engine
+  UNCHANGED, decision pending.** Executed repro
+  (`docs/audits/2026-10-src-b-probe.cpp`): rollback-fsync-failure (B1)
+  keeps D2 at clean-restart strength (rejected key absent after clean
+  restart; power-loss window as documented); rollback-FTRUNCATE-failure
+  (B2) leaves the rejected batch's CRC-valid frame in the WAL and it
+  RESURRECTS on a plain clean restart — no power loss involved. Both
+  sub-cases fail-stop the instance and count in `truncate_fails`, and
+  recovery cannot distinguish the poisoned tail from legitimate data.
+  README D2 now states the window; D3 names its single deliberate
+  exception (SRC-C's site). Four options with tradeoffs are recorded in
+  the audit doc (wording-only [landed] / persisted poison marker /
+  bounded truncate retry / distinct health signal) — NO public Status or
+  on-disk behavior changed pending the maintainer decision. Modeling
+  limit stated: injected faults + clean restarts only; no power-loss
+  claim (dm-flakey remains v30 M3).
+
 - **build (v29 M2 item 5): the test-suite TU split — four translation
   units, and the wall comes down.** `main.cpp` (14,921 → 10,587 lines)
   keeps main(), the smoke section, the inline engine batteries and the

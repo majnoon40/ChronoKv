@@ -2081,7 +2081,8 @@ return 0;
             std::cerr << "CKV_COVERAGE_FAULT: unknown kind or bad budget: '"
                       << kf << "' (kinds: FsyncFail WriteFail WriteShort "
                          "RenameFail OpenFail DirFsyncFail SegOpenFail "
-                         "FsyncFailAfterPersist)" << std::endl;
+                         "FsyncFailAfterPersist AllocFail ManifestOpenFail "
+                         "TruncateFail RotFinalDirFsyncFail)" << std::endl;
             return 2;
         }
         fault::force_for_coverage(fk, budget);

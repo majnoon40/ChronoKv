@@ -344,10 +344,116 @@ static int run_audit2_regression_tests() {
     return fails;
 }
 
+
+// =====================================================================
+// SRC-audit regression battery (2026-10 source-only audit round: findings
+// A/B/C — the round that read the post-0.28.1 tree without executing it;
+// every finding re-verified by execution before any fix landed). Appended
+// to CKV_ONLY_REMEDIATION like the Audit-2 battery. Fail-first discipline:
+// SRC-A was verified FAILING on the unfixed read_manifest (open failure
+// conflated with absence); SRC-C pins an EXISTING intended contract (the
+// counted-and-warned D3 exception) and its fail-first evidence is a
+// mutation run (make the site fail-stop -> this test must flip).
+// SRC-B (D2 vs rollback-failure contract) is deliberately NOT asserted
+// here: it is a contract question under maintainer decision, reproduced by
+// a standalone probe whose output rides the audit report, not a battery
+// check enshrining either behavior.
+// =====================================================================
+static int run_src_audit_regression_tests() {
+    using namespace chronokv;
+    namespace fs = std::filesystem;
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& d = "") {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) { ++fails; if (!d.empty()) std::cout << "      (" << d << ")\n"; }
+    };
+    auto guard = [&](const char* name, const std::function<void()>& fn) {
+        try { fn(); } catch (const std::exception& e) { check(name, false, std::string("exception: ") + e.what()); }
+    };
+
+    // ---- SRC-A: an existing MANIFEST whose open FAILS (EIO/EMFILE class)
+    // must throw loudly (D1), never be conflated with "no manifest -> new
+    // database" (pre-fix: read_manifest's own comment said only absence may
+    // return the sentinel while the code returned it for EVERY open
+    // failure — silent reseed of active_id against a two-segment tree).
+    guard("SRC-A manifest-open-fail is loud", [&] {
+        std::string base = a2::mk("ckv_src_a"), wal = base + "/wal", ck = base + "/ck";
+        fs::create_directories(wal); fs::create_directories(ck);
+        Options o; o.wal_dir = wal; o.checkpoint_path = ck + "/ckpt";
+        o.durability = DurabilityMode::Sync; o.page_pool_bytes = 16u << 20;
+        { auto db = Database::open(o); db.put("a", "1"); db.put("b", "2"); db.close(); }
+        // Force a SIZE rotation so the MANIFEST names segment 2 while
+        // segment 1 still exists (size rotations never delete; only
+        // checkpoint rotations do) — the audit's prescribed shape: a
+        // silent {1,0} fallback now points recovery at the STALE segment.
+        { auto db = Database::open(o); db.force_wal_rotation_for_test(); db.put("c", "3"); db.close(); }
+        ::fault::arm(::fault::Kind::ManifestOpenFail, 1);
+        bool threw = false; std::string what;
+        try { auto db = Database::open(o); (void)db.put("d", "4"); db.close(); }
+        catch (const std::exception& e) { threw = true; what = e.what(); }
+        int rem = ::fault::remaining.load();
+        ::fault::disarm();
+        check("SRC-A manifest-open-fail is loud", threw && rem == 0,
+              "threw=" + std::to_string(threw) + " charge_remaining=" + std::to_string(rem) +
+              (threw ? " what=" + what : " (open SUCCEEDED despite failed manifest open)"));
+        // Fault cleared: reopen must see the EXACT pre-test key set.
+        bool exact = false;
+        try {
+            auto db = Database::open(o);
+            exact = db.get("a").has_value() && db.get("b").has_value() &&
+                    db.get("c").has_value() && !db.get("d").has_value();
+            db.close();
+        } catch (const std::exception& e) { what = e.what(); }
+        fs::remove_all(base); fs::remove_all(ck);
+        check("SRC-A post-fault reopen is exact (a,b,c present; d absent)", exact, what);
+    });
+
+    // ---- SRC-C: rotate_after_checkpoint's post-unlink final directory
+    // fsync is the ONE deliberate counted-and-warned D3 exception: the
+    // MANIFEST rename is already durable, recovery tolerates resurrected
+    // covered segments (records <= ckpt_ts dedupe on replay). Contract:
+    // checkpoint succeeds, NO fail-stop, counter moves, writes keep
+    // working, reopen is clean with the full key set.
+    guard("SRC-C rotation-final dir-fsync exception", [&] {
+        std::string base = a2::mk("ckv_src_c"), wal = base + "/wal", ck = base + "/ck";
+        fs::create_directories(wal); fs::create_directories(ck);
+        Options o; o.wal_dir = wal; o.checkpoint_path = ck + "/ckpt";
+        o.durability = DurabilityMode::Sync; o.page_pool_bytes = 16u << 20;
+        o.auto_start_gc = false;
+        auto db = Database::open(o);
+        db.put("k1", "v1"); db.put("k2", "v2");
+        ::fault::arm(::fault::Kind::RotFinalDirFsyncFail, 1);
+        bool ckpt_threw = false;
+        try { db.checkpoint(); } catch (const std::exception&) { ckpt_threw = true; }
+        int rem = ::fault::remaining.load();
+        ::fault::disarm();
+        Health h = db.health();
+        uint64_t fsf = db.wal_stats().fsync_fails;
+        Status ps = db.put("k3", "v3");   // must NOT be fail-stopped
+        db.close();
+        bool keys_ok = false;
+        { auto db2 = Database::open(o);
+          keys_ok = db2.get("k1").has_value() && db2.get("k2").has_value() &&
+                    db2.get("k3").has_value();
+          db2.close(); }
+        fs::remove_all(base); fs::remove_all(ck);
+        check("SRC-C rotation-final dir-fsync: counted+warned, NOT fail-stop",
+              !ckpt_threw && rem == 0 && h.level < 2 && fsf >= 1 &&
+              ps == Status::OK && keys_ok,
+              "ckpt_threw=" + std::to_string(ckpt_threw) + " charge_remaining=" + std::to_string(rem) +
+              " health=" + std::to_string(h.level) + " fsync_fails=" + std::to_string(fsf) +
+              " post_put=" + std::to_string((int)ps) + " reopen_keys=" + std::to_string(keys_ok));
+    });
+
+    std::cout << (fails == 0 ? "   SRC-AUDIT REGRESSION TESTS PASSED\n"
+                             : "   SRC-AUDIT REGRESSION FAILURES: " + std::to_string(fails) + "\n");
+    return fails;
+}
 static int run_remediation_tests_v28();
 int run_remediation_tests() {
     int f = run_remediation_tests_v28();
     f += run_audit2_regression_tests();
+    f += run_src_audit_regression_tests();   // SRC round (2026-10): findings A/C
     return f;
 }
 static int run_remediation_tests_v28() {
@@ -2020,13 +2126,23 @@ static int run_remediation_tests_v28() {
                 chronokv_iouring::MockIoUring::MOCK_FAILURE));
         chronokv_iouring::pwrite_fail_after_bytes_for_test().store((int64_t)frame_sz);
         Status st = Status::OK;
+        bool rethrew = false;
         try {
             auto f = db.put_async("rr", "vv");
             st = f.get();     // WRITE-stage failure: `written` never published -> WalFailure
-        } catch (const std::exception&) { st = Status::Failed; }
+        } catch (const std::exception&) { rethrew = true; st = Status::Failed; }
         chronokv_iouring::pwrite_fail_after_bytes_for_test().store(-1);  // one-shot; belt
+        // SRC-C1 tightening (2026-10 source audit): assert the EXACT
+        // contract, not merely "not OK". Two shipped invariants meet here:
+        // CKV-016 says the async future RESOLVES (never rethrows), and
+        // CKV-004's stage gate says a write-stage failure resolves to
+        // WalFailure. The catch branch's Status::Failed is a DIFFERENT
+        // outcome (a contract violation of CKV-016) and must stay
+        // distinguishable — `st != Status::OK` accepted both.
         check("remediation CKV-004R: the async committer observes the write failure (never acked)",
-              st != Status::OK, "status=" + std::to_string((int)st));
+              !rethrew && st == Status::WalFailure,
+              "status=" + std::to_string((int)st) + " rethrew=" + std::to_string((int)rethrew) +
+              " expected WalFailure=" + std::to_string((int)Status::WalFailure));
         db.close();
         {   // Reopen: the failed frame must NOT resurrect; the earlier acked
             // write must survive; the database must be writable again.
