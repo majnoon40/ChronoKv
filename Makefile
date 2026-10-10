@@ -21,15 +21,16 @@
 # removed — `make tsan` runs the FULL suite as one step. CI runners
 # complete it comfortably inside one job.
 
-# NOTE: the whole project is ONE translation unit (28,016 lines as of
-# 0.28.1 -- this note is one of the stale-count sites the v29 M2 item-5 /
-# v30 M2 split corrects when it lands). Building it at -O2 needs well over
-# 1 GiB of RSS -- below that, cc1plus is OOM-killed ("g++: fatal error:
-# Killed signal terminated program cc1plus"). On small containers use:
-#   make release RELEASE_FLAGS="-O1 -g"
-# Since the Audit-2 battery landed, a 1 GiB container can be killed even at
-# bare -O0; the VERIFIED workaround (delta-confirmation round, 2026-10-08):
-#   make release RELEASE_FLAGS="-O0 --param ggc-min-expand=5"
+# NOTE (v29 M2 item 5, 2026-10-10): the test suite is now FOUR translation
+# units - main.cpp (~10.6k lines) plus tests/tests_{dst,remediation,lincheck}
+# - each including the ~13.5k-line header; the largest cc1plus unit is
+# main.cpp at ~24k lines, down from the 28k monolith that a 1 GiB container
+# could not build even at bare -O0. Verified on the 1 GiB confirmation
+# sandbox after the split: release -O1 with NO ggc workaround (the old
+# monolith was OOM-killed there). -O2 on small containers can still be
+# tight; fallbacks in order: RELEASE_FLAGS="-O1 -g", then
+# RELEASE_FLAGS="-O0 --param ggc-min-expand=5". The engine-side split with
+# the amalgamated release artifact remains v30 M2.
 CXX      ?= g++
 
 # v29: gcc spells the static sanitizer-runtime flag -static-libasan; clang
@@ -154,39 +155,39 @@ all: release asan tsan stress smoke_off_release smoke_off_asan smoke_off_tsan sm
 # CKV_EXTRA_DEFS (default empty on native hardware).
 CKV_EXTRA_DEFS ?=
 
-# ---- hooks-on build rules ----
-$(BIN_DIR)/release/test: main.cpp chronokv.hpp | $(BIN_DIR)/release
-	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(RELEASE_FLAGS) \
-	    main.cpp -o $@ -lpthread
-$(BIN_DIR)/asan/test: main.cpp chronokv.hpp | $(BIN_DIR)/asan
-	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(ASAN_FLAGS) \
-	    main.cpp -o $@ -lpthread
-$(BIN_DIR)/tsan/test: main.cpp chronokv.hpp | $(BIN_DIR)/tsan
-	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(TSAN_FLAGS) \
-	    main.cpp -o $@ -lpthread
-$(BIN_DIR)/stress/test: main.cpp chronokv.hpp | $(BIN_DIR)/stress
-	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(STRESS_FLAGS) \
-	    main.cpp -o $@ -lpthread
-# v27 M3: gcov build. --coverage at BOTH compile and link; .gcno lands next
-# to the binary, .gcda is written there on clean exit (the coverage CI job
-# zeroes .gcda between per-fault-kind runs and collects via `gcov -o`).
-$(BIN_DIR)/coverage/test: main.cpp chronokv.hpp | $(BIN_DIR)/coverage
-	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) $(COVERAGE_FLAGS) \
-	    main.cpp -o $@ -lpthread --coverage
+# ---- test-suite build rules (v29 M2 item 5: FOUR translation units) ----
+# main.cpp is no longer the whole suite: the lincheck, DST and remediation
+# batteries live in tests/tests_*.cpp, cross-TU entry points declared in
+# tests/test_decls.hpp (API-1's ODR-safe header is what made this split
+# mechanical - every TU includes chronokv.hpp and links once). Objects sit
+# FLAT in each mode dir so the coverage job's `gcov build/coverage/*.gcda`
+# keeps working untouched. Per-mode flags are unchanged; the largest cc1plus
+# unit is now main.cpp (~24k lines with the header), down from the 28k
+# monolith. v27 M3 gcov note stands: --coverage at BOTH compile and link;
+# .gcno/.gcda land next to the objects, flat in the mode dir.
+TEST_SRCS = main.cpp tests/tests_dst.cpp tests/tests_remediation.cpp tests/tests_lincheck.cpp
+CKV_HDRS  = chronokv.hpp tests/test_decls.hpp
+TEST_OBJS_FOR = main.o tests_dst.o tests_remediation.o tests_lincheck.o
 
-# ---- hooks-off build rules ----
-$(BIN_DIR)/smoke_off/release/test: main.cpp chronokv.hpp | $(BIN_DIR)/smoke_off/release
-	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) $(RELEASE_FLAGS) \
-	    main.cpp -o $@ -lpthread
-$(BIN_DIR)/smoke_off/asan/test: main.cpp chronokv.hpp | $(BIN_DIR)/smoke_off/asan
-	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) $(ASAN_FLAGS) \
-	    main.cpp -o $@ -lpthread
-$(BIN_DIR)/smoke_off/tsan/test: main.cpp chronokv.hpp | $(BIN_DIR)/smoke_off/tsan
-	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) $(TSAN_FLAGS) \
-	    main.cpp -o $@ -lpthread
-$(BIN_DIR)/smoke_off/stress/test: main.cpp chronokv.hpp | $(BIN_DIR)/smoke_off/stress
-	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) $(STRESS_FLAGS) \
-	    main.cpp -o $@ -lpthread
+# $(call mk_test_bin,MODE_DIR,DEFS,FLAGS,LDEXTRA)
+define mk_test_bin
+$(BIN_DIR)/$(1)/main.o: main.cpp $(CKV_HDRS) | $(BIN_DIR)/$(1)
+	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(2) $(CKV_EXTRA_DEFS) $(3) -c main.cpp -o $$@
+$(BIN_DIR)/$(1)/tests_%.o: tests/tests_%.cpp $(CKV_HDRS) | $(BIN_DIR)/$(1)
+	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(2) $(CKV_EXTRA_DEFS) $(3) -c $$< -o $$@
+$(BIN_DIR)/$(1)/test: $(addprefix $(BIN_DIR)/$(1)/,$(TEST_OBJS_FOR)) | $(BIN_DIR)/$(1)
+	$(CXX) $(CXXSTD) $(WARN) $(3) $$^ -o $$@ -lpthread $(4)
+endef
+
+$(eval $(call mk_test_bin,release,$(HOOKS_ON_DEFS),$(RELEASE_FLAGS),))
+$(eval $(call mk_test_bin,asan,$(HOOKS_ON_DEFS),$(ASAN_FLAGS),))
+$(eval $(call mk_test_bin,tsan,$(HOOKS_ON_DEFS),$(TSAN_FLAGS),))
+$(eval $(call mk_test_bin,stress,$(HOOKS_ON_DEFS),$(STRESS_FLAGS),))
+$(eval $(call mk_test_bin,coverage,$(HOOKS_ON_DEFS),$(COVERAGE_FLAGS),--coverage))
+$(eval $(call mk_test_bin,smoke_off/release,$(HOOKS_OFF_DEFS),$(RELEASE_FLAGS),))
+$(eval $(call mk_test_bin,smoke_off/asan,$(HOOKS_OFF_DEFS),$(ASAN_FLAGS),))
+$(eval $(call mk_test_bin,smoke_off/tsan,$(HOOKS_OFF_DEFS),$(TSAN_FLAGS),))
+$(eval $(call mk_test_bin,smoke_off/stress,$(HOOKS_OFF_DEFS),$(STRESS_FLAGS),))
 
 # ---- v29 CI hardening: fast static gates (no codegen, no test run) ----
 # -fsyntax-only parses and type-checks without generating code, so these need
@@ -208,8 +209,8 @@ lint: lint-werror lint-conversion lint-header
 lint-werror:
 	printf '#include "chronokv.hpp"\n' | $(CXX) $(CXXSTD) $(LINT_WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) -fsyntax-only -x c++ -
 	printf '#include "chronokv.hpp"\n' | $(CXX) $(CXXSTD) $(LINT_WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) -fsyntax-only -x c++ -
-	$(CXX) $(CXXSTD) $(LINT_WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) -fsyntax-only main.cpp
-	$(CXX) $(CXXSTD) $(LINT_WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) -fsyntax-only main.cpp
+	$(CXX) $(CXXSTD) $(LINT_WARN) $(INCLUDE) $(HOOKS_ON_DEFS) $(CKV_EXTRA_DEFS) -fsyntax-only main.cpp tests/tests_dst.cpp tests/tests_remediation.cpp tests/tests_lincheck.cpp
+	$(CXX) $(CXXSTD) $(LINT_WARN) $(INCLUDE) $(HOOKS_OFF_DEFS) $(CKV_EXTRA_DEFS) -fsyntax-only main.cpp tests/tests_dst.cpp tests/tests_remediation.cpp tests/tests_lincheck.cpp
 
 lint-conversion:
 	CXX='$(CXX)' bash scripts/lint_wconversion.sh
@@ -232,6 +233,11 @@ lint-header-2tu:
 	printf 'int ckv_tu1(); int ckv_tu2();\nint main() { return ckv_tu1() + ckv_tu2() == 3 ? 0 : 1; }\n' > $(LH)/main.cpp
 	$(CXX) $(CXXSTD) $(INCLUDE) -O0 -pthread $(LH)/tu1.cpp $(LH)/tu2.cpp $(LH)/main.cpp -o $(LH)/a.out
 	$(LH)/a.out
+	@# v29 M2 item 5: the STRESS-defs 2-TU link — the shape the plain leg missed
+	@# (dst::my_tid was a non-inline namespace-scope thread_local; only STRESS
+	@# builds define it, and only a multi-TU link rejects the duplicates).
+	$(CXX) $(CXXSTD) $(INCLUDE) -O0 -pthread -DCHRONOKV_STRESS $(LH)/tu1.cpp $(LH)/tu2.cpp $(LH)/main.cpp -o $(LH)/a.out.stress
+	$(LH)/a.out.stress
 
 # ---- dirs ----
 $(BIN_DIR)/release $(BIN_DIR)/asan $(BIN_DIR)/tsan $(BIN_DIR)/stress $(BIN_DIR)/coverage \

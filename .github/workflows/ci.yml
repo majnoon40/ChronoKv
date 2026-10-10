@@ -217,7 +217,7 @@ jobs:
           sudo apt-get install -y ${{ matrix.install }}
 
       - name: Build
-        run: make ${{ matrix.target }} CXX=${{ matrix.cxx }} CKV_EXTRA_DEFS='${{ matrix.extra_defs }}'
+        run: make -j4 ${{ matrix.target }} CXX=${{ matrix.cxx }} CKV_EXTRA_DEFS='${{ matrix.extra_defs }}'
 
       - name: Run tests
         env:
@@ -269,7 +269,7 @@ jobs:
           sudo apt-get install -y ${{ matrix.install }}
 
       - name: Build
-        run: make tsan CXX=${{ matrix.cxx }} CKV_EXTRA_DEFS='${{ matrix.extra_defs }}'
+        run: make -j4 tsan CXX=${{ matrix.cxx }} CKV_EXTRA_DEFS='${{ matrix.extra_defs }}'
 
       - name: Run tests
         run: |
@@ -309,7 +309,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build
-        run: make ${{ matrix.target }}
+        run: make -j4 ${{ matrix.target }}
 
       - name: Run tests
         run: |
@@ -325,12 +325,14 @@ jobs:
           if-no-files-found: ignore
 
   # ---- v29: shared binaries ---------------------------------------------------
-  # The project is ONE large translation unit (>1 GiB cc1plus RSS, minutes per
-  # compile). Before this job every consumer compiled its own copy: each of the
-  # 8 nightly DST shards rebuilt `stress`, and `release` was rebuilt again for
-  # crashfuzz and the lincheck leg. Now each is built once per run and handed
-  # on as an artifact. (ccache would not help: any header change invalidates
-  # the one translation unit.) The binaries bake in the checkout path via
+  # The test suite is four translation units (v29 M2 item 5), but every one
+  # of them recompiles the ~13.5k-line engine header, so a full build is
+  # still minutes of CPU — and before this job every consumer compiled its
+  # own copy: each of the 8 nightly DST shards rebuilt `stress`, and
+  # `release` was rebuilt again for crashfuzz and the lincheck leg. Now each
+  # is built once per run (make -j4 over the four TUs) and handed on as an
+  # artifact. (ccache would not help: any header change invalidates every
+  # TU.) The binaries bake in the checkout path via
   # CHRONOKV_SOURCE_DIR, identical on every runner of this repo, and consumers
   # still run actions/checkout so the sources exist at that path.
   build-shared:
@@ -345,7 +347,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build
-        run: make ${{ matrix.target }}
+        run: make -j4 ${{ matrix.target }}
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -557,7 +559,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build (gcov-instrumented)
-        run: make coverage
+        run: make -j4 coverage
 
       - name: Per-fault-kind forced runs (bounded PR vehicle / nightly full suite)
         run: |

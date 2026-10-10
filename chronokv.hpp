@@ -1682,7 +1682,13 @@ namespace dst {
     struct Waiter { uint64_t tid; bool granted; };
     inline std::vector<Waiter> waiting;      // parked at a point, want the baton
 
-    thread_local uint64_t my_tid = UINT64_MAX;
+    // v29 M2 item 5 (TU split): inline — a namespace-scope thread_local in a
+    // header gives EVERY TU its own definition without it (the stress-mode
+    // 4-TU link failed with multiple-definition; the monolith hid this, and
+    // the header-hygiene gate missed it because it never compiled STRESS —
+    // the gate gains a stress-defs leg with this fix). Single identity also
+    // fixes the semantics: baton identity must be per-THREAD, not per-TU.
+    inline thread_local uint64_t my_tid = UINT64_MAX;
 
     inline uint64_t prng() {
         rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;

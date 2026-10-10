@@ -7,6 +7,44 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **build (v29 M2 item 5): the test-suite TU split — four translation
+  units, and the wall comes down.** `main.cpp` (14,921 → 10,587 lines)
+  keeps main(), the smoke section, the inline engine batteries and the
+  crash-fuzz/review/durability runners; `tests/tests_lincheck.cpp`
+  (lincheck namespace + run_lincheck_test, 1,919 lines),
+  `tests/tests_remediation.cpp` (a2 namespace + Audit-2 + v28 batteries,
+  2,053 lines) and `tests/tests_dst.cpp` (dstscn + run_dst_test, 462
+  lines) carry the extracted batteries; `tests/test_decls.hpp` declares
+  the three cross-TU entry points. Content is byte-identical in the move
+  except the entry points lose `static`; every TU rides the same
+  `CHRONOKV_TEST_HOOKS` gate as before, so the hooks-off smoke build
+  compiles the batteries to nothing and links clean. Makefile: one
+  `mk_test_bin` eval template replaces the nine hand-written rules;
+  objects stay FLAT per mode dir so the coverage job's
+  `gcov build/coverage/*.gcda` glob keeps working untouched; CI build
+  steps gain `-j4` (four TUs, four cores). **Measured acceptance on the
+  1 GiB confirmation sandbox** (the box where the monolith died): bare
+  `make release RELEASE_FLAGS="-O1"` builds in 68 s (monolith:
+  OOM-killed, needed `-O0 --param ggc-min-expand=5`); `make stress` at
+  `-O1` builds; ASan+UBSan builds at `-O0` with the ggc param and the
+  full remediation battery passes under it — the first sanitizer run
+  that box ever had; full suite **503 PASS / 0 FAIL bare at `-O1`**
+  (the environmental `-O0` thread-EAGAIN abort did not reproduce at
+  `-O1`); lint green incl. the ratchet at 33=33; DST 3×10 green on the
+  `-O1` stress build; hooks-off smoke green. **The split found a real
+  bug on its first link**: `dst::my_tid` was a namespace-scope
+  `thread_local` WITHOUT `inline` — every TU got its own definition, so
+  the STRESS-mode 4-TU link failed with multiple-definition (the
+  monolith hid it; the API-1 hygiene gate missed it because it never
+  compiled `-DCHRONOKV_STRESS`). Fixed to `inline thread_local` (single
+  identity is also the semantically correct baton state — per-thread,
+  not per-TU) and the class is now permanently gated: `make
+  lint-header-2tu` gained a STRESS-defs 2-TU link leg. Engine-side split
+  + amalgamated release artifact remain v30 M2; the embed story is
+  unchanged (consumers still compile exactly one header). README
+  compile-memory limitation and main.cpp's "only this file is compiled"
+  header updated in the same commit (rules 2/3/7).
+
 - **bench (v29 M1 step 3, COMPLETE): YCSB D/E/F baseline adapters +
   version pins.** `Engine::scan` joins the adapter interface — and it
   MATERIALIZES rows (key+value bytes touched), because the arena's

@@ -525,14 +525,18 @@ E1–E16 safety argument and the v24 fix log at the top of the file).
   cannot distinguish "fsynced" from "still dirty". True power-loss validation
   needs a fault-injecting block layer (`dm-flakey`) or real hardware, and is an
   open coverage gap.
-- **Compile memory**: the engine plus test suite is one ~17k-line translation
-  unit; building it at `-O2` needs well over 1 GiB of RAM (it is OOM-killed
-  below that). CI runners are fine; on small containers even
-  `make release RELEASE_FLAGS="-O1 -g"` can be OOM-killed around ~1 GiB —
-  use `RELEASE_FLAGS="-O0"` there (verified on a 1 GiB container: `-O2` and
-  `-O1 -g` killed, `-O0` builds in seconds). Sanitizer builds need
-  proportionally more; this is the strongest argument for the v30 M5
-  source-split/amalgamation plan.
+- **Compile memory**: the test suite was split into four translation units
+  (v29 M2 item 5, 2026-10-10 — `main.cpp` plus
+  `tests/tests_{lincheck,remediation,dst}.cpp`, all including the single
+  header), lowering the largest cc1plus unit from the 28k-line monolith to
+  ~24k lines. Verified on a 1 GiB container after the split:
+  `make release RELEASE_FLAGS="-O1"` builds bare (the monolith was
+  OOM-killed there), `make stress` at `-O1` builds, and ASan+UBSan builds
+  at `-O0` with `--param ggc-min-expand=5` (the full battery suite passes
+  under it). `-O2` on ~1 GiB remains untested/tight; CI runners are fine.
+  The engine-side split with the amalgamated single-header release
+  artifact remains v30 M2 — the zero-dependency embed story is unchanged:
+  consumers still compile exactly one header.
 - **GC sweep cost**: each GC pass re-scans the whole key tree to collect
   entries before processing its 256-key budget, so a full sweep is
   O(N²/256) scan work at large N (the v25.7 idle-spin fix stopped the

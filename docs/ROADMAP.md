@@ -248,7 +248,7 @@ What 0.28.1 did *not* do, and v29 inherits:
 | v29 M0 closure | **DONE 2026-10-08** — reconstructed report + tag `v0.28.1` + delta confirmation round, verdict **B+ (clean)**: 20/20 probes, one Low doc-truth finding fixed in the closure commit; **M3+ gate lifted** | `docs/audits/2026-10-delta-confirmation-0.28.1.md` (+ probes) |
 | v29 M1 — benchmark arena | **STARTED** — steps 1–3 COMPLETE (D/E/F adapters + version pins with sha256/fetch recipe); step-4 vehicle: split (#68–#75 green) then RE-MERGED to one same-hardware job after #75's headers caught the two-runner CPU split — green-week clock restarts on the merged vehicle (rule 9 over sunk nights); soak vehicle NAMED (rolling nightly chain). Remaining: green week (7 nights), noise bands + gate enablement, ledger-promotion decision, CI build cache | `bench/`, `bench/third_party/versions.txt`, ci.yml `arena` |
 | v29 CI hardening (adjacent, unplanned-in-9/27) | **SHIPPED + PROMOTED** — lint/ratchet/hygiene gates, build-shared; the 4 experimental sanitizer legs went green ×3 (#64/#65/#66) → flags deleted, all 12 legs gating | `5cd74b5`; promotion `0027fe0` |
-| v29 M2 — catcher hardening | **STARTED** — item 1 (write-skew checker) shipped 2026-10-08 with live pre-fix-flag/post-fix-pass proof; items 2–5 pending | `check_write_skew` + Section 1d battery |
+| v29 M2 — catcher hardening | **STARTED** — item 1 (write-skew checker, 2026-10-08, live pre-fix-flag/post-fix-pass proof) + item 5 (test-suite TU split, 2026-10-10: 1 GiB release/stress `-O1` bare, ASan `-O0` possible, 503/0 full suite; found+fixed the `dst::my_tid` non-inline thread_local, now stress-gated) shipped; items 2–4 pending | `check_write_skew`; `tests/`, Makefile template |
 | v29 M3–M7 — the overhaul | not started — M0 CLOSED 2026-10-08; order still governed by constraints 2–3 (arena green week, catchers first) | — |
 | v30 M0–M5 — the challenge, 1.0.0 | not started | — |
 
@@ -470,7 +470,7 @@ comparison; the README performance section exists and links the
 methodology; the nightly ledger shows one full green week. No engine
 changes in this milestone.
 
-## M2 — Catcher hardening  **[M] — STARTED (item 1 shipped 2026-10-08)**
+## M2 — Catcher hardening  **[M] — STARTED (items 1 + 5 shipped 2026-10-08/10)**
 
 **Anchor** (upgraded by Audit-2): remediation spec §11 predicted lincheck's
 SSI blindness; TXN-1 *demonstrated* it — a real write-skew-class anomaly
@@ -523,7 +523,23 @@ the remaining audit-enumerated vacuous tests, plus the build-memory wall.
    v30 M2; this item is the pressure relief until then. Acceptance: a
    1 GiB container builds the full suite (release) at `-O1` and the
    sanitizer matrix at `-O0`, all 495 checks green, CI wall-time not
-   worse.
+   worse. **DONE 2026-10-10** — `main.cpp` (14,921 → 10,587 lines) plus
+   `tests/tests_{lincheck,remediation,dst}.cpp` + `tests/test_decls.hpp`;
+   content byte-identical in the move except the three entry points lose
+   `static`. Measured on the 1 GiB confirmation sandbox: release `-O1`
+   bare (68 s — the monolith was OOM-killed here), stress `-O1` bare,
+   ASan+UBSan `-O0` with `--param ggc-min-expand=5` (battery suite green
+   under it — first sanitizer run this box ever had; TSan/UBSan matrix
+   legs ride CI), full suite **503/0 bare at `-O1`** (and the
+   environmental `-O0` abort did not reproduce at `-O1`), CI builds gain
+   `-j4`. **The split immediately paid for itself**: the 4-TU stress
+   link failed on `dst::my_tid` — a namespace-scope `thread_local` in the
+   header WITHOUT `inline` (per-TU definitions; the monolith hid it, and
+   the hygiene gate missed it because it never compiled STRESS). Fixed
+   (`inline thread_local` — single identity is also the semantically
+   correct baton state) and the class is now gated: `lint-header-2tu`
+   gained a `-DCHRONOKV_STRESS` 2-TU link leg. API-1's "true single
+   header" claim is now true under STRESS too.
 
 **Acceptance** (carried): a synthetic write-skew history fails the new
 checker; every de-vacuated test fails against a reintroduction of its
@@ -827,8 +843,10 @@ benchmarks, not dependencies. Four new rules, each paid for:
    in the closure commit); M3 unlocked. **M2 item 1 (the write-skew
    checker) landed the same day** — validated live against the TXN-1 PoC
    history on both engines, before any M3+ rewrite starts (constraint 3
-   honored). Remaining catcher work: M2 items 2–5 (DST grammar growth,
-   de-vacuation, crash-fuzz composition, TU pressure relief).
+   honored). Remaining catcher work: M2 items 2–4 (DST grammar growth,
+   de-vacuation, crash-fuzz composition) — item 5 (TU pressure relief)
+   shipped early on 2026-10-10 because the wall kept biting (bare `-O0`
+   monolith builds were already dying on the confirmation sandbox).
 
 ---
 
