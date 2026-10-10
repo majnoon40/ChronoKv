@@ -3404,6 +3404,56 @@ inline std::atomic<bool>& wal_zerofill_fail_sync_for_test() {
     static std::atomic<bool> v{false};
     return v;
 }
+// SRC-E4 (partial-fill gap, maintainer review 2026-10-11): the two hooks
+// above fail the fill's FIRST pwrite, so on a small single-record batch the
+// failed fill lands ZERO bytes — the shape where SOME zeros land and THEN
+// the fill dies was untested. Additions (one-shot, with consumption
+// witnesses; test-gated like the rest, zero production cost):
+//   fail_pwrite_nth: N>0 arms "fail the N-th fill pwrite ATTEMPT" — the
+//     slot decrements per attempt and fires at zero (errno=EIO).
+//   short_write: the next fill pwrite performs a GENUINE short write (half
+//     the remaining chunk, min 1 byte — real bytes on disk) instead of the
+//     full one, exercising the fill loop's short-write continuation (the
+//     CKV-018 WriteShort pattern, aimed at the fill).
+//   pwrite_attempts: per-fill-run attempt counter (reset at fill start).
+//   nth_fired / short_fired: consumption witnesses (anti-vacuity, the
+//     CKV-018 lesson: an unconsumed hook proves the leg never ran).
+//   last_run: WHERE the fill ran and what it achieved — segment path, batch
+//     offset, attempted extent, bytes actually zeroed, fill/sync outcome —
+//     the same facts the operator-facing WARNING prints, so the repair
+//     procedure (truncate the segment at the offset) is testable.
+inline std::atomic<int64_t>& wal_zerofill_fail_pwrite_nth_for_test() {
+    static std::atomic<int64_t> v{0};   // 0 = disabled; N>0 = fail the N-th attempt
+    return v;
+}
+inline std::atomic<bool>& wal_zerofill_short_write_for_test() {
+    static std::atomic<bool> v{false};
+    return v;
+}
+inline std::atomic<int64_t>& wal_zerofill_pwrite_attempts_for_test() {
+    static std::atomic<int64_t> v{0};
+    return v;
+}
+inline std::atomic<bool>& wal_zerofill_nth_fired_for_test() {
+    static std::atomic<bool> v{false};
+    return v;
+}
+inline std::atomic<bool>& wal_zerofill_short_fired_for_test() {
+    static std::atomic<bool> v{false};
+    return v;
+}
+struct WalZeroFillRun {
+    std::string segment_path;
+    int64_t batch_start = -1;
+    int64_t extent = 0;
+    int64_t zeroed = 0;
+    bool fill_ok = false;
+    bool sync_ok = false;
+};
+inline WalZeroFillRun& wal_zerofill_last_run_for_test() {
+    static WalZeroFillRun v;
+    return v;
+}
 #endif
 
 inline bool pwrite_all(int fd, const uint8_t* d, size_t n, off_t offset) {
@@ -4671,8 +4721,22 @@ public:
                             // EIO, EROFS, EBADF). The rollback-FSYNC-failure
                             // branch is deliberately NOT touched (decision).
                             bool fill_ok = true;
+                            size_t zeroed_bytes = 0;   // SRC-E4: actually-landed count
                             try {
                                 static constexpr size_t kZeroChunk = 64u * 1024u;
+#ifdef CHRONOKV_TEST_HOOKS
+                                // SRC-E4: reset the per-run witnesses and record WHERE the
+                                // fill is running — the operator-repair facts (segment,
+                                // offset, extent); outcome fields are finalized below, and
+                                // the WARNING prints the same numbers.
+                                chronokv_iouring::wal_zerofill_pwrite_attempts_for_test().store(0);
+                                chronokv_iouring::wal_zerofill_nth_fired_for_test().store(false);
+                                chronokv_iouring::wal_zerofill_short_fired_for_test().store(false);
+                                chronokv_iouring::wal_zerofill_last_run_for_test() =
+                                    chronokv_iouring::WalZeroFillRun{
+                                        seg_path(active_id_), static_cast<int64_t>(batch_start),
+                                        static_cast<int64_t>(batch_bytes), 0, false, false};
+#endif
                                 const size_t zlen = batch_bytes < kZeroChunk ? batch_bytes : kZeroChunk;
                                 const std::string zeros(zlen, '\0');
                                 const size_t fill_extent = batch_bytes;   // FULL attempted extent
@@ -4683,8 +4747,40 @@ public:
                                     size_t w = 0;
                                     while (w < n) {
 #ifdef CHRONOKV_TEST_HOOKS
+                                        chronokv_iouring::wal_zerofill_pwrite_attempts_for_test()
+                                            .fetch_add(1, std::memory_order_relaxed);
                                         if (chronokv_iouring::wal_zerofill_fail_write_for_test().exchange(false)) {
                                             errno = EIO; fill_ok = false; break;
+                                        }
+                                        {   // SRC-E4: fail the N-th fill pwrite ATTEMPT
+                                            // (one-shot slot; decrements per attempt, fires
+                                            // when the decrement returns 1 -> errno=EIO).
+                                            auto& nth = chronokv_iouring::wal_zerofill_fail_pwrite_nth_for_test();
+                                            if (nth.load(std::memory_order_relaxed) > 0 &&
+                                                nth.fetch_sub(1) == 1) {
+                                                chronokv_iouring::wal_zerofill_nth_fired_for_test()
+                                                    .store(true, std::memory_order_relaxed);
+                                                errno = EIO; fill_ok = false; break;
+                                            }
+                                        }
+                                        if (chronokv_iouring::wal_zerofill_short_write_for_test().exchange(false)) {
+                                            // SRC-E4: GENUINE short write — half the remaining
+                                            // chunk bytes (min 1) actually land on disk; the
+                                            // loop must CONTINUE, not fail (the fill loop's
+                                            // short-write leg, exercised with real bytes).
+                                            chronokv_iouring::wal_zerofill_short_fired_for_test()
+                                                .store(true, std::memory_order_relaxed);
+                                            const size_t half = (n - w) / 2 > 0 ? (n - w) / 2 : 1u;
+                                            const ssize_t ks = ::pwrite(active_fd_, zeros.data() + w, half,
+                                                                      static_cast<off_t>(batch_start + done + w));
+                                            if (ks < 0) {
+                                                if (errno == EINTR) continue;
+                                                fill_ok = false; break;
+                                            }
+                                            if (ks == 0) { errno = EIO; fill_ok = false; break; }
+                                            w += static_cast<size_t>(ks);
+                                            zeroed_bytes += static_cast<size_t>(ks);
+                                            continue;
                                         }
 #endif
                                         const ssize_t k = ::pwrite(active_fd_, zeros.data() + w, n - w,
@@ -4695,6 +4791,7 @@ public:
                                         }
                                         if (k == 0) { errno = EIO; fill_ok = false; break; }
                                         w += static_cast<size_t>(k);         // short write: continue
+                                        zeroed_bytes += static_cast<size_t>(k);
                                     }
                                     if (!fill_ok) break;
                                     done += n;
@@ -4709,6 +4806,16 @@ public:
 #endif
                                 sync_ok = (::fdatasync(active_fd_) == 0);
                             }
+#ifdef CHRONOKV_TEST_HOOKS
+                            {   // SRC-E4: finalize the run record — how many bytes
+                                // actually landed and which leg failed (the partial-fill
+                                // shape the repair test and the WARNING describe).
+                                auto& zf = chronokv_iouring::wal_zerofill_last_run_for_test();
+                                zf.zeroed = static_cast<int64_t>(zeroed_bytes);
+                                zf.fill_ok = fill_ok;
+                                zf.sync_ok = sync_ok;
+                            }
+#endif
                             if (fill_ok && sync_ok) {
                                 // Durable zeros: a future open classifies the
                                 // extent TORN_TAIL and truncates it — the
@@ -4720,10 +4827,25 @@ public:
                                           << batch_bytes << " bytes at offset " << batch_start
                                           << "); recovery will repair it as a torn tail\n";
                             } else {
+                                // SRC-E4: operator-actionable content — WHICH segment, WHERE
+                                // the rejected batch starts, HOW MUCH of it was zeroed, and
+                                // the consequence: a PARTIAL fill leaves interior zeros
+                                // BEFORE surviving CRC-valid frames of the same batch, which
+                                // recovery's WAL-1 interior scan classifies CORRUPT — the next
+                                // open then REFUSES until the segment is manually truncated to
+                                // the printed offset (README D2 repair procedure: everything
+                                // at/after it belongs to the rejected batch — the fail-stop
+                                // guarantees nothing appended after it, and every acked
+                                // record precedes it).
                                 std::cerr << "WARNING: rollback zero-fill INCOMPLETE (fill=" << fill_ok
-                                          << " fdatasync=" << sync_ok << " errno=" << errno
+                                          << " fdatasync=" << sync_ok << " errno=" << errno << "; "
+                                          << zeroed_bytes << " of " << batch_bytes << " bytes zeroed"
+                                          << " at offset " << batch_start << " of " << seg_path(active_id_)
                                           << ") — rollback-indeterminate stays set; the rejected "
-                                             "batch's frames may persist and replay on a future open\n";
+                                             "batch's surviving frames may persist, and the WAL may "
+                                             "refuse to open (interior-CORRUPT) until the segment is "
+                                             "manually truncated to offset "
+                                          << batch_start << " (README D2 repair procedure)\n";
                             }
                         } else {
                             // v26 M0, invariant D2: ftruncate only updates the
@@ -9879,6 +10001,13 @@ public:
     bool wal_failed_for_test() const {
         auto eng = api_engine();
         return eng->wal_ ? eng->wal_->is_failed() : false;
+    }
+    // SRC-E4: direct read of the rollback-indeterminate latch. health()
+    // surfaces it as a reason string; this pins the raw flag itself for the
+    // partial-fill battery (the string could drift, the latch must not).
+    bool rollback_indeterminate_for_test() const {
+        auto eng = api_engine();
+        return eng->wal_ && eng->wal_->rollback_indeterminate();
     }
     bool wal_leader_active_for_test() {
         auto eng = api_engine();

@@ -315,12 +315,29 @@ inactive transaction), `Error` (engine failures), `NotYetImplementedError`.
   power-loss-only exposure (no resurrection on clean restarts; SRC-D B1).
   In every residual case `health()` reports level 2 with the
   `rollback-indeterminate` reason (in-memory only) — an operator-visible
-  signal to restore from backup rather than trust the segment tail. A
+  signal to restore from backup rather than trust the segment tail.
+  **Partial-fill shape (SRC-E4):** if the fill's own `pwrite` dies AFTER
+  some zeros landed (a multi-chunk extent), the zero region is followed
+  by surviving CRC-valid frames of the same rejected batch — recovery's
+  interior-damage scan (WAL-1) classifies that CORRUPT and the open
+  REFUSES loudly (`Recovery failed: WAL corruption in segment N`): a
+  partial fill converts silent resurrection into a loud open failure
+  that needs manual repair. The incomplete-fill WARNING carries the
+  repair facts — segment path, batch offset, zeroed-of-attempted byte
+  counts — and says the WAL may refuse to open. Repair procedure: stop
+  the process, copy the segment aside, `truncate -s <offset> <segment>`
+  (everything at or after the offset belongs to the rejected batch: the
+  fail-stop guarantees nothing appended after it, and every acked record
+  precedes it), then restart. SRC-E4 executes this end to end: the
+  refusal message is asserted, and the repaired instance opens clean
+  with acked keys intact, all rejected keys absent, and writes working
+  again. A
   persisted poison marker — the only mechanism that survives reopen — is
   DEFERRED to the v30 M3 power-loss infrastructure (maintainer decision).
-  Pinned by SRC-D (branch classification) and SRC-E1/E2/E3 (multi-record
-  fill incl. a page-spanning record; fill-write failure; fill-sync
-  failure), each mutation-verified. See
+  Pinned by SRC-D (branch classification) and SRC-E1/E2/E3/E4
+  (multi-record fill incl. a page-spanning record; fill-write failure;
+  fill-sync failure; partial fill — loud refusal + operator repair), each
+  mutation-verified. See
   `docs/audits/2026-10-src-audit-findings.md` (addendum) for the probe
   outputs, the decision record and the errno-realism table.
 - Invariant **D3**: once any fsync on the WAL path returns an error the

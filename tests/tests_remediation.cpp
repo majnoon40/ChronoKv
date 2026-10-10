@@ -18,6 +18,7 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -736,6 +737,213 @@ static int run_src_audit_regression_tests() {
               " reason=" + std::to_string((int)reason) +
               " hook_consumed=" + std::to_string((int)hook_consumed) +
               " charge_remaining=" + std::to_string(rem));
+    });
+
+    // ---- SRC-E4 (partial-fill gap, maintainer review 2026-10-11): E2/E3
+    // fail the fill's FIRST pwrite on a single-record 44-byte batch, so the
+    // failed fill lands ZERO bytes — the shape where SOME zeros land and
+    // THEN the fill dies was untested. Drive it: a 4-record group-commit
+    // batch of 40 KiB values (163,992 B = three 64 KiB fill chunks);
+    // attempt 1 takes a GENUINE short write (half of chunk 1 lands; the
+    // loop must continue, not fail), attempt 2 completes chunk 1, attempt 3
+    // (chunk 2's first pwrite) dies with EIO via the N-th-pwrite hook.
+    // Consequences pinned, with consumption witnesses (attempts==3, short
+    // fired, nth fired, slot drained):
+    //   E4a — [batch_start, +64K) reads back ALL ZERO and the byte at +64K
+    //         is surviving frame data; rollback_indeterminate_ STAYS set
+    //         (raw latch + health reason); instance fail-stopped (level 2,
+    //         next put Failed, size frozen); reopen is a LOUD refusal
+    //         ("WAL corruption in segment": interior zeros followed by a
+    //         surviving CRC-valid frame — the WAL-1 valid_after scan), so
+    //         NO silent replay is possible (the database does not open);
+    //         and the documented operator repair — copy aside, truncate the
+    //         segment at the offset, restart — recovers: clean open, acked
+    //         keys intact, ALL rejected keys absent, writes work again.
+    //   E4b — the incomplete-fill WARNING carries the repair facts: the
+    //         segment name, the batch offset, the zeroed-of-attempted byte
+    //         counts, and says the WAL MAY REFUSE TO OPEN.
+    guard("SRC-E4 partial fill: loud refusal + operator repair", [&] {
+        auto frame_of = [](const std::string& k, const std::string& v) {
+            WriteSet ws{{k, v, false}};
+            return (uint64_t)wal_make_record(1, 1, ws).size();   // lsn/cts fixed-width: size is exact
+        };
+        const std::string bigv(40 * 1024, 'P');                  // nonzero fill: survivors are visible
+        const uint64_t expect_batch = frame_of("rk0", bigv) + frame_of("rk1", bigv) +
+                                      frame_of("rk2", bigv) + frame_of("rk3", bigv);
+        const int64_t kChunk = 64 * 1024;                        // the fill loop's kZeroChunk
+        bool ok_a = false, ok_b = false;
+        std::string why_a, why_b;
+        int attempt = 0;
+        for (; attempt < 16; ++attempt) {
+            std::string base = a2::mk("ckv_src_e4"), wal = base + "/wal";
+            fs::create_directories(wal);
+            Options o; o.wal_dir = wal; o.durability = DurabilityMode::Sync;
+            o.page_pool_bytes = 32u << 20; o.auto_start_gc = false;
+            o.recover_on_open = false;
+            const std::string seg = wal + "/wal_000001.log";
+            auto db = Database::open(o);
+            db.inject_iouring_for_test(
+                std::make_unique<chronokv_iouring::MockIoUring>(
+                    chronokv_iouring::MockIoUring::MOCK_FAILURE));
+            (void)db.put("acked0", "a0");
+            (void)db.put("acked1", "a1");
+            const uint64_t S0 = (uint64_t)fs::file_size(seg);
+            // Arm: the full batch lands then EIO (budget >= batch); the
+            // rollback ftruncate fails; fill attempt 1 short-writes and
+            // attempt 3 dies. pre-drain hook collects all four records into
+            // ONE batch deterministically (SRC-E1 seam).
+            chronokv_iouring::pwrite_fail_after_bytes_for_test().store(16 * 1024 * 1024);
+            ::fault::arm(::fault::Kind::TruncateFail, 1);
+            chronokv_iouring::wal_zerofill_short_write_for_test().store(true);
+            chronokv_iouring::wal_zerofill_fail_pwrite_nth_for_test().store(3);
+            db.set_leader_pre_drain_hook_for_test([] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            });
+            std::ostringstream cerr_cap;
+            auto* cerr_old = std::cerr.rdbuf(cerr_cap.rdbuf());
+            std::vector<Status> st(4, Status::OK);
+            std::barrier sync_point(4);
+            std::vector<std::thread> th;
+            for (int t = 0; t < 4; ++t) th.emplace_back([&, t] {
+                sync_point.arrive_and_wait();
+                st[t] = db.put("rk" + std::to_string(t), bigv);
+            });
+            for (auto& x : th) x.join();
+            std::cerr.rdbuf(cerr_old);
+            const std::string warned = cerr_cap.str();
+            db.set_leader_pre_drain_hook_for_test(nullptr);
+            chronokv_iouring::pwrite_fail_after_bytes_for_test().store(-1);
+            chronokv_iouring::wal_zerofill_short_write_for_test().store(false);
+            chronokv_iouring::wal_zerofill_fail_pwrite_nth_for_test().store(0);
+            int rem = ::fault::remaining.load();
+            ::fault::disarm();
+            // Consumption witnesses (anti-vacuity) + the fill run record.
+            const int64_t attempts = chronokv_iouring::wal_zerofill_pwrite_attempts_for_test().load();
+            const bool nth_fired = chronokv_iouring::wal_zerofill_nth_fired_for_test().load();
+            const bool short_fired = chronokv_iouring::wal_zerofill_short_fired_for_test().load();
+            const int64_t nth_slot = chronokv_iouring::wal_zerofill_fail_pwrite_nth_for_test().load();
+            const chronokv_iouring::WalZeroFillRun zrun = chronokv_iouring::wal_zerofill_last_run_for_test();
+            const uint64_t S1 = (uint64_t)fs::file_size(seg);
+            bool all_rejected = true;
+            for (int t = 0; t < 4; ++t) if (st[t] != Status::WalFailure) all_rejected = false;
+            if (S1 - S0 != expect_batch || rem != 0 || !all_rejected || !nth_fired || !short_fired) {
+                why_a = "attempt " + std::to_string(attempt) +
+                        ": batch_bytes=" + std::to_string(S1 - S0) +
+                        " expected=" + std::to_string(expect_batch) +
+                        " allWalFailure=" + std::to_string((int)all_rejected) +
+                        " nth_fired=" + std::to_string((int)nth_fired) +
+                        " short_fired=" + std::to_string((int)short_fired) +
+                        " charge_remaining=" + std::to_string(rem);
+                db.close(); fs::remove_all(base);
+                continue;   // group-commit timing split the batch — fresh instance
+            }
+            // Raw evidence for the report: the leader's stderr during the
+            // failed rollback (both WARNINGs), then every assertion input.
+            std::cout << "      [SRC-E4 attempt " << attempt << " — captured leader stderr]\n";
+            std::cout << "      | " << warned << "\n";
+            std::cout << "      [witnesses] attempts=" << attempts << " nth_slot=" << nth_slot
+                      << " short_fired=" << (int)short_fired << " nth_fired=" << (int)nth_fired
+                      << " zeroed=" << zrun.zeroed << "/" << zrun.extent
+                      << " fill_ok=" << (int)zrun.fill_ok << " sync_ok=" << (int)zrun.sync_ok
+                      << " batch_start=" << zrun.batch_start << " segment=" << zrun.segment_path << "\n";
+            // (2) flag STAYS set (raw latch + health reason) and the
+            // instance is fail-stopped: next put refused, size frozen.
+            const bool flag_set = db.rollback_indeterminate_for_test();
+            const Status post = db.put("never", "written");
+            const uint64_t S2 = (uint64_t)fs::file_size(seg);
+            const Health h = db.health();
+            bool reason = false;
+            for (const auto& r : h.reasons)
+                if (r.find("rollback-indeterminate") != std::string::npos) reason = true;
+            const bool stopped = flag_set && reason && h.level == 2 &&
+                                 post == Status::Failed && S2 == S1;
+            db.close();
+            // (1) the partial shape, read back from the file itself: the
+            // first chunk is ALL ZERO; the byte after it is surviving frame
+            // data (record 2's 'P' value bytes) — some zeros landed, the
+            // rest of the rejected batch did NOT.
+            const int64_t bstart = zrun.batch_start;
+            const std::vector<uint8_t> fbytes = a2::slurp(seg);
+            bool zero_prefix = bstart == (int64_t)S0 &&
+                               bstart + kChunk <= (int64_t)fbytes.size();
+            for (int64_t i = bstart; zero_prefix && i < bstart + kChunk; ++i)
+                if (fbytes[(size_t)i] != 0) zero_prefix = false;
+            const bool survivor_nonzero = zero_prefix && fbytes[(size_t)(bstart + kChunk)] != 0;
+            // (4) reopen: LOUD interior-CORRUPT refusal — the database does
+            // NOT open, so nothing (acked or rejected) can silently replay.
+            bool threw = false; std::string what;
+            Options o2 = o; o2.recover_on_open = true;
+            try { auto db2 = Database::open(o2); db2.close(); }
+            catch (const std::exception& e) { threw = true; what = e.what(); }
+            const bool refused = threw && what.find("WAL corruption in segment") != std::string::npos;
+            std::cout << "      [reopen] threw=" << (int)threw << " refused=" << (int)refused
+                      << " what=\"" << what << "\"\n";
+            // (5) the documented operator repair, executed: copy aside,
+            // truncate the segment at the WARNING's offset, restart.
+            fs::copy_file(seg, seg + ".bak", fs::copy_options::overwrite_existing);
+            fs::resize_file(seg, static_cast<uintmax_t>(bstart));
+            bool repair_ok = false, keys_ok = false, write_ok = false;
+            try {
+                auto db3 = Database::open(o2);
+                repair_ok = true;
+                auto v0 = db3.get("acked0"); auto v1 = db3.get("acked1");
+                keys_ok = v0.has_value() && *v0 == "a0" && v1.has_value() && *v1 == "a1" &&
+                          !db3.get("rk0").has_value() && !db3.get("rk1").has_value() &&
+                          !db3.get("rk2").has_value() && !db3.get("rk3").has_value() &&
+                          !db3.get("never").has_value();
+                write_ok = db3.put("after_repair", "yes") == Status::OK &&
+                           db3.get("after_repair").value_or(std::string("?")) == "yes";
+                db3.close();
+            } catch (const std::exception& e) {
+                what += std::string(" | repair reopen threw: ") + e.what();
+            }
+            std::cout << "      [repair] copy aside + truncate -s " << bstart << " " << seg
+                      << " + restart -> reopen_ok=" << (int)repair_ok
+                      << " acked_intact_rejected_absent=" << (int)keys_ok
+                      << " writes_work=" << (int)write_ok << "\n";
+            fs::remove_all(base);
+            ok_a = zero_prefix && survivor_nonzero && stopped && refused &&
+                   repair_ok && keys_ok && write_ok;
+            why_a = "zero_prefix=" + std::to_string((int)zero_prefix) +
+                    " survivor_nonzero=" + std::to_string((int)survivor_nonzero) +
+                    " flag_set=" + std::to_string((int)flag_set) +
+                    " reason=" + std::to_string((int)reason) +
+                    " level=" + std::to_string(h.level) +
+                    " post=" + std::to_string((int)post) +
+                    " size_frozen=" + std::to_string((int)(S2 == S1)) +
+                    " refused=" + std::to_string((int)refused) + " [" + what + "]" +
+                    " repair_ok=" + std::to_string((int)repair_ok) +
+                    " keys_ok=" + std::to_string((int)keys_ok) +
+                    " write_ok=" + std::to_string((int)write_ok);
+            // (3) E4b — the WARNING must carry the repair facts.
+            const bool w_incomplete = warned.find("rollback zero-fill INCOMPLETE") != std::string::npos;
+            const bool w_refuse = warned.find("may refuse to open") != std::string::npos;
+            const bool w_seg = warned.find("wal_000001.log") != std::string::npos;
+            const bool w_offset = warned.find("truncated to offset " + std::to_string(bstart)) != std::string::npos;
+            const bool w_counts = warned.find(std::to_string(kChunk) + " of " +
+                                              std::to_string(S1 - S0) + " bytes zeroed") != std::string::npos;
+            ok_b = w_incomplete && w_refuse && w_seg && w_offset && w_counts &&
+                   attempts == 3 && nth_slot == 0 && zrun.zeroed == kChunk &&
+                   zrun.extent == (int64_t)(S1 - S0) && !zrun.fill_ok && !zrun.sync_ok &&
+                   zrun.segment_path == seg && zrun.batch_start == (int64_t)S0;
+            why_b = "INCOMPLETE=" + std::to_string((int)w_incomplete) +
+                    " may_refuse=" + std::to_string((int)w_refuse) +
+                    " segment=" + std::to_string((int)w_seg) +
+                    " offset=" + std::to_string((int)w_offset) +
+                    " counts=" + std::to_string((int)w_counts) +
+                    " attempts=" + std::to_string(attempts) +
+                    " nth_slot=" + std::to_string(nth_slot) +
+                    " zeroed=" + std::to_string(zrun.zeroed) +
+                    " extent=" + std::to_string(zrun.extent) +
+                    " fill_ok=" + std::to_string((int)zrun.fill_ok) +
+                    " sync_ok=" + std::to_string((int)zrun.sync_ok) +
+                    " path_ok=" + std::to_string((int)(zrun.segment_path == seg));
+            break;   // shape gate passed: assertions are deterministic, no retry
+        }
+        check("SRC-E4a partial fill: zeros land then fill dies — flag stays, fail-stop, LOUD corrupt refusal, truncate-at-offset repair recovers",
+              ok_a, ok_a ? ("converged at attempt " + std::to_string(attempt)) : why_a);
+        check("SRC-E4b incomplete-fill WARNING names segment, offset, zeroed count, and says the WAL may refuse to open",
+              ok_b, ok_b ? "" : why_b);
     });
 
     std::cout << (fails == 0 ? "   SRC-AUDIT REGRESSION TESTS PASSED\n"

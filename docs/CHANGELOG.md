@@ -7,6 +7,54 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **test+fix (SRC review round 2, 2026-10-10): the partial-fill zero
+  gap (SRC-E4) — the loud interior-CORRUPT refusal pinned with the
+  operator repair executed end to end; the incomplete-fill WARNING now
+  carries the repair facts.** SRC-E2/E3 armed the fill-write failure
+  against a single-record 44-byte batch, so the failed fill landed ZERO
+  bytes; the shape where SOME zeros land before the fill dies
+  (multi-chunk extent, Nth pwrite fails) was untested. New test-gated
+  one-shot hooks with consumption witnesses:
+  `wal_zerofill_fail_pwrite_nth_for_test` (fail the N-th fill pwrite
+  attempt), `wal_zerofill_short_write_for_test` (a GENUINE short write —
+  half the remaining chunk lands, the loop must continue),
+  `wal_zerofill_pwrite_attempts_for_test` + `nth_fired`/`short_fired`,
+  and the `wal_zerofill_last_run_for_test` run record {segment path,
+  batch_start, extent, bytes zeroed, fill_ok, sync_ok} — the same facts
+  the WARNING prints, which makes the repair testable; Database seam
+  `rollback_indeterminate_for_test()` reads the raw latch. SRC-E4: a
+  4×40 KiB-record batch (163,992 B = three 64 KiB fill chunks); attempt
+  1 short-writes 32,768 B, attempt 2 completes chunk 1, attempt 3 dies
+  EIO → exactly 65,536 of 163,992 bytes zeroed. Pinned: byte read-back
+  (all-zero prefix, surviving frame data right after it);
+  `rollback_indeterminate_` STAYS set (raw latch + health reason);
+  fail-stop (level 2, next put Failed, size frozen); reopen THROWS
+  `Recovery failed: WAL corruption in segment 1` (interior zeros before
+  surviving CRC-valid frames — the WAL-1 `valid_after` scan; no silent
+  replay is possible because the database does not open); and the
+  operator repair — copy aside, `truncate -s <offset>` the segment,
+  restart — recovers with acked keys intact, ALL rejected keys absent,
+  and writes working again. Only production change: the incomplete-fill
+  WARNING now names the segment, the batch offset, the
+  zeroed-of-attempted counts, and says the WAL may refuse to open until
+  the segment is manually truncated to that offset (README D2 documents
+  the procedure). Fail-first: with the OLD warning, E4b FAILED
+  (`INCOMPLETE=1 may_refuse=0 segment=0 offset=0 counts=0`) while E4a
+  passed — the refusal is pre-existing WAL-1 behavior, the observability
+  was the gap; both PASS after the upgrade (battery 90/90). Mutation M6
+  (classify a zeroed length field as TORN_TAIL despite CRC-valid frames
+  after it) → SRC-E4a FAILS with `refused=0` as the ONLY flipped bit —
+  the partial-fill reopen would silently auto-truncate instead of
+  refusing; header restored byte-identical (sha256 `c081efad…b24e`).
+  Also this round: the provenance note in the audit addendum — the
+  `scripts/lint.sh` cited by earlier chat reports never existed in any
+  ref, sandbox copy, or patch iteration (lines citing it are void; the
+  real gates are the Makefile `lint` aggregate and its four sub-targets),
+  and the fee2789-era numbers (FULL SUITE 508 PASS / 0 FAIL; ratchet
+  33=33) were re-derived by execution from a fresh worktree of the real
+  fee2789 tree on 2026-10-10 — reproduced exactly — and are superseded
+  by the 5d037ba re-run regardless (511 PASS / 0 FAIL; four lint gates
+  exit 0; CI run #80 success, 23/23 executed jobs).
 - **feat (SRC-B DECISION IMPLEMENTED 2026-10-10): zero-fill
   neutralization of the rollback-ftruncate-failure window; persisted
   marker DEFERRED to v30 M3.** The ftruncate-failure branch now zeroes

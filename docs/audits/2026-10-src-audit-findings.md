@@ -286,3 +286,132 @@ EBADF); (iv) the untouched rollback-fsync-failure branch (power-loss-only; SRC-D
 clean-restart behavior). The persisted poison marker remains the only mechanism covering
 reopen-crossing cases — deferred to v30 M3 as decided. Modeling limit unchanged: crash/model-
 level only, no power-loss claim.
+
+
+---
+
+## PROVENANCE NOTE (maintainer review round 2, 2026-10-10)
+
+**The fee2789-turn verification numbers — "make lint clean / ratchet 33=33" and "FULL SUITE
+508 PASS / 0 FAIL" (both recorded in the fee2789 commit message) — are superseded by the
+5d037ba run** (four lint gates exit 0; ratchet 33=33; release -O1 full suite 511 PASS / 0
+FAIL; CI run #80 success, 23/23 executed jobs, arena nightly skipped).
+
+Provenance, re-derived by execution on 2026-10-10 — the fee2789-era sandbox logs were
+overwritten by the 5d037ba verification window (every file in the log directory postdates
+it), so the original runs could not be re-inspected, only re-executed:
+
+* `scripts/lint.sh` — cited by earlier chat reports as the lint runner — has NEVER existed
+  in this lineage: `git log --all -- scripts/lint.sh` is empty; neither stale sandbox
+  working copy (`chronokv/`, `chronokv-work/`) contains it; neither superseded patch
+  iteration (`chronokv-fixes-v3-with-ci.diff`, `chronokv-audit2-plus-ci.patch.txt`) creates
+  it. The real gates are the Makefile `lint` aggregate (Makefile:207) and its four
+  sub-targets (`lint-conversion` runs `scripts/lint_wconversion.sh` against
+  `ci/wconversion.baseline`). Report lines citing `scripts/lint.sh` are void.
+* The 508 PASS / 33=33 numbers themselves were NOT stale-tree artifacts. A fresh
+  `git worktree add "$ARENA_WORKSPACE"/wt-fee fee2789` of the REAL tree, rebuilt and re-run on
+  2026-10-10, reproduces both exactly:
+
+      build_exit=0
+      run_exit=0            (6m05s wall)
+      PASS_count=508
+      FAIL_count=0
+      ChronoKV 0.28.1 - ALL TESTS PASSED
+      -Wconversion warnings: 33 (baseline 33, g++)
+
+  The 5d037ba suite adds exactly three checks (SRC-E1/E2/E3): 508 + 3 = 511, matching the
+  authoritative 5d037ba run (`full_release.log`: 511 PASS / 0 FAIL).
+
+---
+
+## SRC-E4 — PARTIAL-FILL GAP (maintainer review round 2, 2026-10-10): finding, fix, evidence
+
+**Finding (maintainer):** SRC-E2/E3 arm the fill-write failure against a single-record
+44-byte batch, so the failed fill writes ZERO bytes. The shape where SOME zeros land and
+THEN the fill dies (batch spanning more than one 64 KiB chunk, Nth fill pwrite fails) was
+untested; the incomplete-fill WARNING carried none of the facts an operator needs.
+
+**Shipped:**
+
+1. Test hooks (`CHRONOKV_TEST_HOOKS`-gated, one-shot, consumption witnesses):
+   `wal_zerofill_fail_pwrite_nth_for_test` (N>0: the N-th fill pwrite ATTEMPT dies EIO; the
+   slot decrements per attempt), `wal_zerofill_short_write_for_test` (the next fill pwrite
+   performs a GENUINE short write — half the remaining chunk, min 1 byte — real bytes on
+   disk; the loop must CONTINUE, not fail), `wal_zerofill_pwrite_attempts_for_test`
+   (per-run attempt counter, reset at fill start), `wal_zerofill_{nth,short}_fired_for_test`
+   (witnesses), and `wal_zerofill_last_run_for_test()` — a run record {segment path,
+   batch_start, extent, bytes zeroed, fill_ok, sync_ok}: the same facts the WARNING prints,
+   which makes the repair procedure testable. Database seam:
+   `rollback_indeterminate_for_test()` (the raw latch, not the health string).
+2. The incomplete-fill WARNING (the round's ONLY production change) now names the segment,
+   the batch offset, the zeroed-of-attempted byte counts, and says the WAL may refuse to
+   open until the segment is manually truncated to that offset.
+3. SRC-E4a/E4b: 4-record group-commit batch of 40 KiB values (`'P'`-filled, so survivors
+   are visible) = 163,992 B = three 64 KiB fill chunks, collected deterministically via the
+   SRC-E1 `leader_pre_drain_hook_` seam; the full batch lands (16 MiB pwrite budget), the
+   rollback ftruncate fails (armed `TruncateFail`), fill attempt 1 short-writes 32,768 B,
+   attempt 2 completes chunk 1, attempt 3 dies EIO (nth=3). Asserted: exactly 65,536 of
+   163,992 bytes zeroed; `[batch_start, +64K)` reads back ALL ZERO from the file with
+   surviving frame data at `+64K`; `rollback_indeterminate_` STAYS set (raw latch + health
+   reason); instance fail-stopped (level 2, next put `Failed`, size frozen); reopen THROWS
+   (loud interior-CORRUPT refusal — no silent replay is possible because the database does
+   not open); operator repair — copy aside, truncate at the offset, restart — recovers
+   (clean open, acked keys intact with correct values, ALL rejected keys absent, writes
+   work again).
+4. README D2: partial-fill paragraph + the repair procedure; "Pinned by" extended with
+   SRC-E4. CHANGELOG bullet added.
+
+**Why the refusal (not a silent repair) is the correct pinned behavior:** the zeros are
+INTERIOR — surviving CRC-valid frames of the rejected batch follow them — and
+`wal_recover_buf`'s WAL-1 scan (`valid_after`) classifies that CORRUPT by design: an
+interior hole must never be auto-truncated, because in general valid acked frames can live
+after it. Here the fail-stop guarantees the tail is only the rejected batch, so the manual
+truncate-at-offset is safe — and it is a human decision, taken with the WARNING's facts.
+
+**Fail-first:** with hooks + test in place and the OLD warning text, SRC-E4b FAILED while
+SRC-E4a passed — the refusal/repair behavior is pre-existing (WAL-1), the observability was
+the gap:
+
+    SRC-E4a partial fill: ... :  PASS
+    SRC-E4b incomplete-fill WARNING names segment, offset, zeroed count, and says the WAL may refuse to open:  FAIL
+       (INCOMPLETE=1 may_refuse=0 segment=0 offset=0 counts=0 attempts=3 nth_slot=0 zeroed=65536 extent=163992 fill_ok=0 sync_ok=0 path_ok=1)
+    SRC-AUDIT REGRESSION FAILURES: 1
+
+After the WARNING upgrade both PASS (remediation battery 90/90, exit 0).
+
+**Raw output (release -O1, this sandbox, 2026-10-10; the test captures the leader's stderr
+during the failed rollback and prints it):**
+
+    WARNING: ftruncate failed after WAL durability failure (errno=5) — non-durable record may persist in the WAL file
+    WARNING: rollback zero-fill INCOMPLETE (fill=0 fdatasync=0 errno=5; 65536 of 163992 bytes zeroed at offset 86 of /tmp/ckv_src_e4.LQAZg2/wal/wal_000001.log) — rollback-indeterminate stays set; the rejected batch's surviving frames may persist, and the WAL may refuse to open (interior-CORRUPT) until the segment is manually truncated to offset 86 (README D2 repair procedure)
+    [witnesses] attempts=3 nth_slot=0 short_fired=1 nth_fired=1 zeroed=65536/163992 fill_ok=0 sync_ok=0 batch_start=86 segment=/tmp/ckv_src_e4.LQAZg2/wal/wal_000001.log
+    [reopen] threw=1 refused=1 what="recovery failed: Recovery failed: WAL corruption in segment 1"
+    [repair] copy aside + truncate -s 86 /tmp/ckv_src_e4.LQAZg2/wal/wal_000001.log + restart -> reopen_ok=1 acked_intact_rejected_absent=1 writes_work=1
+    SRC-E4a partial fill: zeros land then fill dies — flag stays, fail-stop, LOUD corrupt refusal, truncate-at-offset repair recovers:  PASS
+    SRC-E4b incomplete-fill WARNING names segment, offset, zeroed count, and says the WAL may refuse to open:  PASS
+
+**Mutation M6 (anti-vacuity for the refusal):** classify a zeroed length field as TORN_TAIL
+even when CRC-valid frames survive after the zeros (`valid_after && !m6_zeros`) → SRC-E4a
+FAILS with `refused=0` as the ONLY flipped bit — the partial-fill reopen silently
+auto-truncates instead of refusing — and nothing else in the remediation battery moves:
+
+    [reopen] threw=0 refused=0 what=""
+    SRC-E4a ...:  FAIL
+       (zero_prefix=1 survivor_nonzero=1 flag_set=1 reason=1 level=2 post=6 size_frozen=1 refused=0 [] repair_ok=1 keys_ok=1 write_ok=1)
+    SRC-E4b ...:  PASS
+    SRC-AUDIT REGRESSION FAILURES: 1
+
+Header restored byte-identical after the mutation (sha256
+`c081efad931e72a6bbd1b127b53415dc3c6a13cc1a092461219f3da41a38b24e`, verified) and the
+battery re-run green (90/90).
+
+**Operator procedure (documented in README D2, executed by SRC-E4):** on
+`rollback-indeterminate` with an INCOMPLETE zero-fill WARNING — (1) the instance is already
+fail-stopped: no further writes can extend the damage; (2) stop the process cleanly; (3)
+copy the named segment aside; (4) `truncate -s <offset> <segment>` using the offset from the
+WARNING — everything at/after it belongs to the rejected batch (the fail-stop guarantees
+nothing appended after it; every acked record precedes it); (5) restart: recovery opens
+clean, acked data intact, rejected batch absent. If the WARNING instead reports a full
+zero-fill failure (0 bytes zeroed) the segment tail may still hold CRC-valid rejected
+frames — restore from backup or apply the same truncate-at-offset repair after verifying
+the offset.
