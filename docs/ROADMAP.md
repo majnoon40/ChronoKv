@@ -248,7 +248,7 @@ What 0.28.1 did *not* do, and v29 inherits:
 | v29 M0 closure | **DONE 2026-10-08** — reconstructed report + tag `v0.28.1` + delta confirmation round, verdict **B+ (clean)**: 20/20 probes, one Low doc-truth finding fixed in the closure commit; **M3+ gate lifted** | `docs/audits/2026-10-delta-confirmation-0.28.1.md` (+ probes) |
 | v29 M1 — benchmark arena | **STARTED** — steps 1–3 COMPLETE (D/E/F adapters + version pins with sha256/fetch recipe); step-4 vehicle: split (#68–#75 green) then RE-MERGED to one same-hardware job after #75's headers caught the two-runner CPU split — green-week clock restarts on the merged vehicle (rule 9 over sunk nights); soak vehicle NAMED (rolling nightly chain). Remaining: green week (7 nights), noise bands + gate enablement, ledger-promotion decision, CI build cache | `bench/`, `bench/third_party/versions.txt`, ci.yml `arena` |
 | v29 CI hardening (adjacent, unplanned-in-9/27) | **SHIPPED + PROMOTED** — lint/ratchet/hygiene gates, build-shared; the 4 experimental sanitizer legs went green ×3 (#64/#65/#66) → flags deleted, all 12 legs gating | `5cd74b5`; promotion `0027fe0` |
-| v29 M2 — catcher hardening | **STARTED** — item 1 (write-skew checker, 2026-10-08, live pre-fix-flag/post-fix-pass proof) + item 5 (test-suite TU split, 2026-10-10: 1 GiB release/stress `-O1` bare, ASan `-O0` possible, 503/0 full suite; found+fixed the `dst::my_tid` non-inline thread_local, now stress-gated) shipped; items 2–4 pending | `check_write_skew`; `tests/`, Makefile template |
+| v29 M2 — catcher hardening | **STARTED** — item 1 (write-skew checker, 2026-10-08, live pre-fix-flag/post-fix-pass proof) + item 5 (test-suite TU split, 2026-10-10: 1 GiB release/stress `-O1` bare, ASan `-O0` possible, 503/0 full suite; found+fixed the `dst::my_tid` non-inline thread_local, now stress-gated) + item 2 (DST grammar growth, 2026-10-11: S5 `tree_merge_cascade` (M4 grammar) + S6 `reclaim_retire_pin` (M3 grammar), green vs the merge-free tree, 600/600 children at PR scale, four-mutant fail-first matrix; nightly seeds/shard rebalanced 3,125→2,083 to hold N=100k and the wall-time band at six scenarios) shipped; items 3–4 pending | `check_write_skew`; `dstscn::s5/s6`; `tests/`, Makefile template |
 | v29 M3–M7 — the overhaul | not started — M0 CLOSED 2026-10-08; order still governed by constraints 2–3 (arena green week, catchers first) | — |
 | v30 M0–M5 — the challenge, 1.0.0 | not started | — |
 
@@ -470,7 +470,7 @@ comparison; the README performance section exists and links the
 methodology; the nightly ledger shows one full green week. No engine
 changes in this milestone.
 
-## M2 — Catcher hardening  **[M] — STARTED (items 1 + 5 shipped 2026-10-08/10)**
+## M2 — Catcher hardening  **[M] — STARTED (items 1 + 2 + 5 shipped 2026-10-08/10/11)**
 
 **Anchor** (upgraded by Audit-2): remediation spec §11 predicted lincheck's
 SSI blindness; TXN-1 *demonstrated* it — a real write-skew-class anomaly
@@ -505,6 +505,83 @@ the remaining audit-enumerated vacuous tests, plus the build-memory wall.
 2. The DST plan grammar grows merge/rebalance/cascade and
    reclamation-retirement scenarios *before that code exists* — scenarios
    written against the design; the implementation must survive them.
+   **DONE 2026-10-11**: `dstscn::s5_merge_cascade` (M4 grammar) +
+   `dstscn::s6_reclaim_retire` (M3 grammar), registered at scenario
+   indices 4–5 — appended AFTER the v27 four so historical
+   `(seed, op-count)` replay handles keep their meaning. S5 composes a
+   SEEDED delete-window grammar over a prebuilt multi-leaf tree (640
+   keys x 2 versions, ~4-6 leaves + interior root): THIN (every-other-key
+   windows = the sibling-borrow shape), RUN (contiguous windows =
+   emptied-leaf merges), STRIDE (range-wide boundary-ish hits = the
+   separator/interior-key-delete shape), REVIVE (re-puts into the
+   shrinking tree = the split x merge interleave), and — 1/4 of seeds —
+   a final SWEEP-ALL (cascade-to-root + collapse); a concurrent
+   latest-scanner checks order/uniqueness/legitimacy in flight, an
+   as-of prober checks the pinned view is BYTE-STABLE across every
+   window, and quiescence closes with differential-vs-`std::map` (the
+   M4 acceptance sentence, applied at rest), sampled point reads, and
+   drain-to-empty + regrow-from-empty (the root-collapse and
+   split-from-root shapes). S6 pins the M3 contract at the version
+   layer where retirement exists today: 8 keys x 6 versions + 240
+   page-churn e-keys (120 pre-deleted into `[tombstone, v1]`
+   retirement material) under a main-held `SnapshotGuard`; oracles:
+   capture control (V0 == the deterministic pre-history), in-flight
+   pinned-view stability, a DETERMINISTIC SAFETY WITNESS
+   (`retired_pending() >= NK` after every gc pass ran under the pin —
+   reclamation blocked), post-unpin DRAIN (`retired_pending() == 0`
+   within 8 passes — the liveness direction of M3's P1 at the version
+   layer) with non-vacuity controls (`retired > 0` cumulative,
+   reclaimed-delta `> 0` across the unpin), differential, and health.
+   Both scenarios are green against the current tree BY CONSTRUCTION —
+   today's deletes are tombstone versions (no physical leaf removal,
+   no page retirement/reuse) — so M3/M4 inherit them as must-pass
+   gates, exactly the item's "the implementation must survive them".
+   FAIL-FIRST MATRIX (four scratch-build mutants, three seeds each,
+   all caught 3/3 where targeted): (B) `gc_threshold()` without the
+   reader-slot floor — the v19-M2-fix defect class re-introduced — is
+   caught by BOTH scenarios (pinned scans silently lose keys once a
+   tombstone above the pin makes the visible version severable);
+   (D) `reclaim_retired()` neutered is caught by S6's drain oracle
+   (`retired_pending=208` after unpin+8 passes) with S5 correctly
+   unaffected (oracle scoping — S5 asserts no drain); (E) `retire()`
+   neutered is caught by S6's witness + retired-count control; (A) the
+   epoch-gate off-by-one (`retired_epoch < min_epoch` → `<=`) is
+   caught by S6 **by the witness alone** (measured
+   `pending_under_pin=0`; every stability scan stays green) — below-
+   anchor Version suffixes are unreachable from any legal snapshot
+   walk today, which is exactly why the witness pins the gate contract
+   BEFORE M3's page retirement makes the same off-by-one a
+   use-after-free (cursors hold raw page pointers across latch gaps,
+   where the reachability argument no longer holds). Two first-cut
+   harness lessons, now permanent comments in `tests/tests_dst.cpp`:
+   scenario `model_mu` must be brace-scoped one-liners — the first
+   S6 cut's unbraced guard lived into the same thread's second
+   acquisition (self-deadlock on a non-recursive mutex; the steal
+   window cannot break it; EVERY seed hung to the 20 s fork deadline,
+   triaged by gdb on an in-process scratch driver); and flag-gated
+   wait loops polled through `dst::point` self-grant the baton and
+   hot-spin whenever the waiting set is just the poller (first cut:
+   S5 burned 32k–47k scheduling ops for ~6k of real work and S6
+   ground to the deadline) — hence the main-as-pinner structure: the
+   pin is captured quiescent before `dst::arm`, no gates exist, and
+   bounded prober threads carry the in-flight oracles. MEASURED
+   (1 GiB sandbox, `-O0` bare + `ggc-min-expand=5` — this box does
+   not fit `-O1` main.cpp; floors, not ledger material): DST 6
+   scenarios x 100 seeds = 600/600 children green in 109 s;
+   alternate seed base 6 x 25 = 150/150; S5 ~6.0–7.3k ops/child
+   (max steals 96 — this box's overlayfs fsync tails, S1/S3 steal
+   here too), S6 ~2.9k ops/child (~100 ms); release full suite 513
+   PASS / 0 FAIL, exit 0, banner 0.28.1 (the non-stress count is
+   unchanged by design — the battery compiles only under STRESS, the
+   release build's dst line stays the single skip-check); `make lint`
+   green (all four TUs, both hook modes, ratchet 33=33, STRESS 2-TU
+   leg). CI MATH adjusted for six scenarios: nightly per-shard
+   `CKV_DST_SEEDS` 3,125 → 2,083 (8 x 2,083 x 6 = 99,984 ≈ the
+   roadmap's N=100k scenario-runs; per-shard child count 12,498 ≈
+   the old 12,500, so the measured wall-time band and the
+   shard-disjointness argument — 2,083 < 1,000,003 — both stand);
+   push/PR unchanged at 100/scenario (now 600 children, +71 s
+   measured locally at `-O0`). Engine UNCHANGED (test-side only).
 3. De-vacuate the remainder: v17 GC-boundedness, v18 LSN-contiguity,
    `m2_phase1` size-rotation, the 30 s soak's oracle. Each upgraded test
    proven once by temporary reversion in a scratch build.
@@ -843,10 +920,13 @@ benchmarks, not dependencies. Four new rules, each paid for:
    in the closure commit); M3 unlocked. **M2 item 1 (the write-skew
    checker) landed the same day** — validated live against the TXN-1 PoC
    history on both engines, before any M3+ rewrite starts (constraint 3
-   honored). Remaining catcher work: M2 items 2–4 (DST grammar growth,
-   de-vacuation, crash-fuzz composition) — item 5 (TU pressure relief)
-   shipped early on 2026-10-10 because the wall kept biting (bare `-O0`
-   monolith builds were already dying on the confirmation sandbox).
+   honored). Remaining catcher work: M2 items 3–4 (de-vacuation,
+   crash-fuzz composition) — item 2 (DST grammar growth) shipped
+   2026-10-11 (S5 `tree_merge_cascade` + S6 `reclaim_retire_pin`, green
+   vs the merge-free tree, four-mutant fail-first matrix), and item 5
+   (TU pressure relief) shipped early on 2026-10-10 because the wall
+   kept biting (bare `-O0` monolith builds were already dying on the
+   confirmation sandbox).
 
 ---
 

@@ -7,6 +7,74 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **test (v29 M2 item 2, 2026-10-11): the DST plan grammar grows
+  merge/rebalance/cascade and reclamation-retirement scenarios —
+  written BEFORE the code they gate, green against the current
+  (merge-free) tree, four-mutant fail-first matrix.** New fork-isolated,
+  seed-replayable scenarios at registry indices 4–5 (appended after the
+  v27 four so historical `(seed, op-count)` replay handles keep their
+  meaning): **S5 `tree_merge_cascade`** (M4 grammar) composes a seeded
+  delete-window grammar over a prebuilt multi-leaf tree — THIN
+  (sibling-borrow shape), RUN (emptied-leaf merge shape), STRIDE
+  (separator/interior-key shape), REVIVE (split x merge interleave),
+  SWEEP-ALL on 1/4 of seeds (cascade-to-root + collapse) — with a
+  concurrent latest scanner (order/uniqueness/legitimacy in flight), an
+  as-of prober under a main-held pin (the pinned view must be
+  BYTE-STABLE across every window — M4's "concurrent cursor +
+  concurrent merge" acceptance, and M3's epoch-pin safety contract at
+  the version layer), and quiescence oracles: differential-vs-`std::map`
+  (M4's acceptance sentence applied at rest), sampled point reads,
+  drain-to-empty + regrow-from-empty. **S6 `reclaim_retire_pin`** (M3
+  grammar) runs deep version chains (8 keys x 6 versions) plus 240
+  page-churn e-keys (120 pre-deleted into `[tombstone, v1]` retirement
+  material) under a pinned reader: capture control, in-flight pinned-view
+  stability, a deterministic SAFETY WITNESS (`retired_pending() >= NK`
+  after every gc pass ran under the pin — reclamation blocked), post-unpin
+  DRAIN (`retired_pending() == 0` within 8 passes — the liveness
+  direction of M3's P1, observable today at the version layer) with
+  non-vacuity controls (`retired > 0` cumulative; reclaimed-delta `> 0`
+  across the unpin), differential, and health. Engine UNCHANGED
+  (test-side only; today's deletes are tombstone versions — nothing
+  physically merges or retires pages yet — so both scenarios are green
+  by construction and become must-pass gates when M3/M4 land).
+  FAIL-FIRST (scratch builds, 3 seeds each, all caught 3/3 where
+  targeted): reintroducing the v19-M2-fix defect class (`gc_threshold`
+  without the reader-slot floor) is caught by BOTH scenarios — pinned
+  scans silently lose keys once a tombstone above the pin makes the
+  visible version severable; neutering `reclaim_retired` is caught by
+  S6's drain oracle (`retired_pending=208` after unpin+8 passes) with S5
+  correctly unaffected (oracle scoping); neutering `retire()` is caught
+  by S6's witness; and the epoch-gate off-by-one (`<` → `<=`) is caught
+  by S6 **by the witness alone** (measured `pending_under_pin=0`,
+  stability scans all green) — below-anchor Version suffixes are
+  unreachable from any legal snapshot walk today, which is exactly why
+  the witness pins the gate contract before M3's page retirement makes
+  the same off-by-one a use-after-free (cursors hold raw page pointers
+  across latch gaps). Two first-cut harness lessons recorded as
+  permanent comments in `tests/tests_dst.cpp`: scenario `model_mu` must
+  be brace-scoped (the first S6 cut's unbraced guard reached a second
+  acquisition in the same thread — a non-recursive-mutex self-deadlock
+  the steal window cannot break; every seed hung to the 20 s fork
+  deadline, triaged via gdb on an in-process scratch driver), and
+  flag-gated wait loops polled through `dst::point` self-grant the baton
+  and hot-spin (first cut: S5 burned 32k–47k scheduling ops for ~6k of
+  real work; S6 ground to the deadline) — hence the main-as-pinner
+  structure (pin captured quiescent before `dst::arm`, zero gates,
+  bounded probers). MEASURED (1 GiB sandbox, `-O0` bare +
+  `ggc-min-expand=5`; floors, not ledger material): DST 6 x 100 seeds =
+  600/600 children green (109 s) + alternate base 6 x 25 = 150/150; S5
+  ~6.0–7.3k ops/child, S6 ~2.9k ops/child (~100 ms); release full suite
+  513 PASS / 0 FAIL, exit 0, banner 0.28.1 (non-stress count unchanged
+  by design — the battery compiles only under STRESS); `make lint` green
+  (four TUs, both hook modes, ratchet 33=33, STRESS 2-TU leg). CI: the
+  nightly `dst` per-shard `CKV_DST_SEEDS` rebalanced 3,125 → 2,083 (8 x
+  2,083 x 6 = 99,984 ≈ the roadmap's N=100k scenario-runs; per-shard
+  child count ~12.5k unchanged, so the wall-time band and the
+  shard-disjointness argument both stand); push/PR unchanged at
+  100/scenario. Docs in the same commit: ROADMAP M2 item 2 → DONE with
+  the numbers and both harness lessons, progress row + next-commits
+  updated (remaining catcher work: items 3–4), README's DST paragraphs
+  de-staled four → six, ci.yml dst-job comments de-staled.
 - **test+fix (SRC review round 2, 2026-10-10): the partial-fill zero
   gap (SRC-E4) — the loud interior-CORRUPT refusal pinned with the
   operator repair executed end to end; the incomplete-fill WARNING now

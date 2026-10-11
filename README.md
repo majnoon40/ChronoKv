@@ -66,15 +66,23 @@ before the DST harness is green") is met.
   set algebra (`check_set_adds`) on recorded histories — covering the
   sync, transactional, async, batch and scan APIs — and it found the
   publication-prefix lag it now guards on its first engine run.
-- **Reproducible concurrency testing (v27 M0)** — under `CHRONOKV_STRESS`,
+- **Reproducible concurrency testing (v27 M0, grammar grown by v29 M2)** —
+  under `CHRONOKV_STRESS`,
   a seeded baton scheduler (`dst::`) turns every instrumentation point in
   the WAL group-commit, GC/epoch-vs-scan and B+ tree cursor-vs-split paths
   into a deterministic scheduling decision; failures reproduce from
-  `(seed, op-count)`. The fork-isolated harness runs four scenarios
-  (including the C1 leader-hang and H3 mixed-durability-crash classes) at
-  100 seeds/scenario on PRs and 100k nightly, and its acceptance was proven
+  `(seed, op-count)`. The fork-isolated harness runs six scenarios
+  (including the C1 leader-hang and H3 mixed-durability-crash classes,
+  plus — written *before* the code they will gate — the
+  merge/rebalance/cascade and reclamation-retirement grammars for the
+  planned leaf-merge (M4) and page-reclamation (M3) milestones) at
+  100 seeds/scenario on PRs and ~100k scenario-runs nightly, and its
+  acceptance was proven
   by reintroducing both historical bugs on scratch trees: the harness
-  caught the C1 hang and the H3 SEGV every run.
+  caught the C1 hang and the H3 SEGV every run; the two grammar scenarios
+  caught all four scratch-build mutants of the pinning/retirement
+  machinery at introduction — including an epoch-gate off-by-one that is
+  behaviorally silent through the public paths today.
 - **Crash-safe WAL** — CRC-checked, segmented (64 MiB) WAL with torn-tail
   truncation (interior corruption fails loud instead of being silently
   cut), batch group-commit, per-segment LSN continuity validation, and
@@ -504,9 +512,13 @@ long-run config; a push can no longer cancel a nightly run mid-flight):
   run id and every base is echoed to the log, so a failing plan replays
   deterministically from the log alone; preserved crash scenes are
   uploaded as artifacts on failure
-- **`dst` (v27 M0+M2)**: the real deterministic-scheduler harness — four
-  fork-isolated scenarios over the bug-dense paths at `CKV_DST_SEEDS=N`
-  per scenario (100 on PR; 25,000 nightly = the roadmap's 100k), failures
+- **`dst` (v27 M0+M2, grammar grown by v29 M2)**: the real
+  deterministic-scheduler harness — six
+  fork-isolated scenarios over the bug-dense paths (including the
+  merge/rebalance/cascade and reclamation-retirement grammars written
+  before the M3/M4 code they gate) at `CKV_DST_SEEDS=N`
+  per scenario (100 on PR; 16,664 nightly = 8 shards x 2,083 ≈ the
+  roadmap's 100k scenario-runs), failures
   reported with the `(seed, op-count, last point)` replay handle — plus
   the M2 seeded regimes: the full suite under `CHRONOKV_STRESS` across
   interleaving seeds (`CKV_STRESS_SEED`, echoed; 1 seed on PR, 3 nightly)

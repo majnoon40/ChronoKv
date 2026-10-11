@@ -414,15 +414,21 @@ jobs:
   # The roadmap names this job `dst`. As of 0.26.3 it runs the REAL v27 M0
   # deterministic-scheduler harness (the M2 placeholder regimes stay as
   # complementary coverage):
-  #   1. DST HARNESS (primary): four fork-isolated scenarios over the three
+  #   1. DST HARNESS (primary): six fork-isolated scenarios over the three
   #      bug-dense areas + the two historical anchors (wal_mixed_handoff =
   #      H3 class, wal_leader_fault = C1 class, gc_epoch_scan,
-  #      tree_cursor_split), N seeds each — push/PR: 100 (single shard);
-  #      nightly/dispatch: 8 shards x 3,125 = 25,000 per scenario (= 100k
-  #      scenario-runs total, the roadmap's N), sharded because a single
-  #      job measured ~225 min at that scale vs the 240-min timeout, and
-  #      8-way because runner variance gave one 4-way shard 2h15m+ while
-  #      its siblings finished in ~50 min. Failures
+  #      tree_cursor_split) + the two v29-M2-item-2 grammar scenarios
+  #      written BEFORE the code they gate (tree_merge_cascade = M4's
+  #      merge/rebalance/cascade, reclaim_retire_pin = M3's
+  #      reclamation/retirement), N seeds each — push/PR: 100 (single
+  #      shard); nightly/dispatch: 8 shards x 2,083 = 16,664 per scenario
+  #      (x 6 scenarios = 99,984 scenario-runs ≈ the roadmap's N=100k;
+  #      the per-shard seed count was rebalanced from 3,125 when item 2
+  #      grew the grammar 4 -> 6 so the per-shard child count — and with
+  #      it the wall-time band — stays at ~12.5k), sharded because a
+  #      single job measured ~225 min at that scale vs the 240-min
+  #      timeout, and 8-way because runner variance gave one 4-way shard
+  #      2h15m+ while its siblings finished in ~50 min. Failures
   #      print (scenario, seed, op-count, last point): the replay handle.
   #      Acceptance was proven by reintroducing C1 (hang, caught on >=3/10
   #      seeds per run) and H3 (SEGV, caught on 12/12 seeds) — see the
@@ -473,14 +479,19 @@ jobs:
       - name: DST harness, N seeds per scenario (bounded PR / sharded nightly)
         env:
           CKV_ONLY_DST: "1"
-          # Nightly: 8 shards x 3,125 = 25,000 seeds per scenario = 100k
-          # scenario-runs total (the roadmap's N). Shard bases are 911 +
+          # Nightly: 8 shards x 2,083 = 16,664 seeds per scenario x 6
+          # scenarios = 99,984 scenario-runs ≈ the roadmap's N=100k
+          # (rebalanced from 8 x 3,125 x 4 when v29 M2 item 2 grew the
+          # grammar to six scenarios — per-shard child count stays
+          # ~12.5k, preserving the wall-time band). Shard bases are 911 +
           # shard*1000003 (literal table — the expression lexer rejects
           # inline '+'); the binary's per-scenario seed offset is a
           # multiple of the same prime and the per-seed step is a larger
-          # prime, so shards are provably disjoint within each scenario.
+          # prime, so shards are provably disjoint within each scenario
+          # (the argument needs seeds-per-shard < 1000003; 2,083 keeps
+          # it with the same margin as 3,125 did).
           CKV_DST_SEED: ${{ fromJSON('[911, 1000914, 2001817, 3002720, 4003623, 5004526, 6005429, 7006332]')[matrix.shard] }}
-          CKV_DST_SEEDS: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '100' || '3125' }}
+          CKV_DST_SEEDS: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '100' || '2083' }}
         run: |
           set -o pipefail
           ./build/stress/test 2>&1 | tee dst-seeds-shard${{ matrix.shard }}.log
