@@ -9033,6 +9033,7 @@ class ReadWriteTransaction {
     // so the recorded real-time interval stays an over-approximation of
     // the true call interval (the sound direction for real-time checks).
     uint64_t commit_cts_ = 0;
+#ifdef CHRONOKV_TEST_HOOKS
     // v27 M1 (scan recording): txnrec id of the OWNING public Transaction,
     // plumbed via set_rec_txn_id() so range_scan emissions attach to the
     // parent txn. Attachment matters for soundness: the txn's BEGIN — not
@@ -9042,7 +9043,13 @@ class ReadWriteTransaction {
     // would read as stale-start violations). 0 = engine-level RWT use:
     // the scan records as its own standalone txn (sound for one-shot
     // Database::range_scan, whose snapshot IS taken at call time).
+    // clang leg: the declaration is gated exactly like the
+    // chronokv::Transaction wrapper's own rec_txn_id_ (the same v27 M1
+    // feature) — both consumers (set_rec_txn_id and the range_scan
+    // recording block) are hooks-only, so under hooks-off an ungated
+    // field is unreferenced (-Wunused-private-field).
     uint64_t rec_txn_id_ = 0;
+#endif
     bool slot_released_ = false;
     bool phantom_registered_ = true;
     // v24 fix: when created via chronokv::Transaction (public API),
@@ -10116,11 +10123,18 @@ public:
         // — flagged ack_deferred; from_txnrec drops end_ns so no real-time
         // ack edge is derived from it (unsound direction). Everything else
         // (cts order, snapshot soundness, begin-side freshness) applies.
+        // clang lint leg: the declaration and the lambda capture are gated
+        // TOGETHER — under hooks-off the in-lambda recording block compiles
+        // out, so an unconditional rec_t0 capture is an unused capture
+        // (-Wunused-lambda-capture; g++ has no such warning, which is why
+        // only the clang leg ever saw it). The old #else-branch zero-decl
+        // existed solely to keep the capture list mode-independent.
         const uint64_t rec_t0 = txnrec::is_armed() ? txnrec::now_ns() : 0;
-#else
-        const uint64_t rec_t0 = 0;
 #endif
-        return std::async(std::launch::async, [eng, w, obs_cap = obs_, rec_t0,
+        return std::async(std::launch::async, [eng, w, obs_cap = obs_,
+#ifdef CHRONOKV_TEST_HOOKS
+                          rec_t0,
+#endif
                           key = std::move(key), value = std::move(value)]() {
             if (auto sp = w.lock(); !sp || !*sp) return Status::Failed;
             // v28 CKV-016: the public async contract is "errors via
@@ -10166,10 +10180,12 @@ public:
         std::weak_ptr<std::atomic<bool>> w = alive_;
 #ifdef CHRONOKV_TEST_HOOKS
         const uint64_t rec_t0 = txnrec::is_armed() ? txnrec::now_ns() : 0;  // v27 M1: see put_async
-#else
-        const uint64_t rec_t0 = 0;
 #endif
-        return std::async(std::launch::async, [eng, w, rec_t0, key = std::move(key)]()
+        return std::async(std::launch::async, [eng, w,
+#ifdef CHRONOKV_TEST_HOOKS
+                          rec_t0,   // clang leg: gated with its decl (see put_async)
+#endif
+                          key = std::move(key)]()
                               -> Result<std::optional<std::string>> {
             if (auto sp = w.lock(); !sp || !*sp)
                 return Result<std::optional<std::string>>::failure(Status::Failed);
@@ -10205,10 +10221,12 @@ public:
         std::weak_ptr<std::atomic<bool>> w = alive_;
 #ifdef CHRONOKV_TEST_HOOKS
         const uint64_t rec_t0 = txnrec::is_armed() ? txnrec::now_ns() : 0;  // v27 M1: see put_async
-#else
-        const uint64_t rec_t0 = 0;
 #endif
-        return std::async(std::launch::async, [eng, w, obs_cap = obs_, rec_t0, key = std::move(key)]() {
+        return std::async(std::launch::async, [eng, w, obs_cap = obs_,
+#ifdef CHRONOKV_TEST_HOOKS
+                          rec_t0,   // clang leg: gated with its decl (see put_async)
+#endif
+                          key = std::move(key)]() {
             if (auto sp = w.lock(); !sp || !*sp) return Status::Failed;
             // v28 CKV-016: same containment contract as put_async — engine
             // exceptions resolve the future with Status::Failed, never as a

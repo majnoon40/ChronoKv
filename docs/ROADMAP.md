@@ -1023,10 +1023,25 @@ benchmarks, not dependencies. Four new rules, each paid for:
    **DONE** (`b5a7eee`).
 2. **Promote the experimental legs**: delete the four `experimental: true`
    flags (condition met: green ×3 in #64/#65/#66) — **DONE** (`0027fe0`).
-   Still open: fix the four clang warnings (3× `-Wunused-lambda-capture`,
-   1× `-Wunused-private-field`) so the clang *lint* leg loses its
-   `continue-on-error` too — needs a clang-18 environment to fix verified
-   (no unverified warning fixes); tracked here until landed.
+   The clang *lint* leg's `continue-on-error` is now gone too —
+   **DONE 2026-10-11**, fixed verified on clang-18 18.1.8 (CI runs
+   18.1.3; no unverified warning fixes): the four standing hooks-off
+   header warnings (3× `-Wunused-lambda-capture` on the async wrappers'
+   `rec_t0`, 1× `-Wunused-private-field` on
+   `ReadWriteTransaction::rec_txn_id_`) were each a declaration that
+   outlived its hooks-gated consumers — fixed by gating decl/capture
+   exactly like the uses (the `chronokv::Transaction` wrapper's own
+   `rec_txn_id_` was already gated this way; the RWT copy was the
+   oversight). The recorded "4 errors" had only ever been the FIRST lint
+   pass — make stops at the first failure — so fixing the header pass
+   unmasked three suite-pass errors: the ckpt corruptor's case-0
+   one-liner (`-Wmisleading-indentation`; loop body braced, semantics
+   unchanged), an unused `t` capture in the v21 retry test, and a
+   constexpr `OPS` capture the constant-expression use never required.
+   Verification: all four clang passes clean; g++ `make lint` green
+   (ratchet 33=33); release full suite 515 PASS / 0 FAIL, exit 0,
+   banner 0.28.1 (count unchanged by construction — the diff adds and
+   removes no checks); hooks-off smoke green. The leg is now gating.
 3. **M0 closure, part 1**: publish the Audit-2 report under `docs/audits/`
    (rule 8) and tag `v0.28.1` (rule 2) — **DONE 2026-10-08**, with the
    report committed as a labeled reconstruction (the original session was

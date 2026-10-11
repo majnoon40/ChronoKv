@@ -7,6 +7,42 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **build (clang lint leg PROMOTED, 2026-10-11): the last
+  `continue-on-error` in CI is gone — `make lint-werror CXX=clang++-18`
+  is clean across all four passes and now gates.** The leg had been
+  informational since the v29 CI hardening with a recorded debt of
+  "4 errors" — a count that had only ever seen the FIRST pass (make
+  stops at the first failing command). Fixed verified on clang-18
+  18.1.8 (CI runs 18.1.3; project rule: no unverified warning fixes).
+  The four header errors were all declarations outliving their
+  hooks-gated consumers under `-DCHRONOKV_TEST_HOOKS`-off: 3×
+  `-Wunused-lambda-capture` — `put_async`/`get_async`/`erase_async`
+  captured the v27-M1 txnrec `rec_t0` unconditionally while the
+  in-lambda recording blocks that use it compile out (the old
+  `#else const uint64_t rec_t0 = 0;` branches existed solely to keep
+  the capture lists mode-independent; g++ has no unused-capture
+  warning, which is why only clang ever saw this) — and 1×
+  `-Wunused-private-field` — `ReadWriteTransaction::rec_txn_id_`, whose
+  both consumers (`set_rec_txn_id`, the `range_scan` recording block)
+  are hooks-gated while the `chronokv::Transaction` wrapper's own
+  `rec_txn_id_` for the SAME feature was already gated (the RWT copy
+  was the oversight). Fix: gate each declaration/capture exactly like
+  its consumers — behavior identical in both modes (under hooks-off
+  the removed `rec_t0` was a zero-initialized dead local feeding a
+  compile-time-absent `if`; under hooks-on every use remains). Fixing
+  the header pass unmasked three suite-pass errors: the checkpoint
+  corruptor's case-0 one-liner (`-Wmisleading-indentation` — the
+  bodyless `for` followed by `break;` on one line; loop body braced,
+  semantics unchanged), an unused `t` capture in the v21
+  retry-on-conflict test, and a constexpr `OPS` capture in the m16
+  concurrent-split test that the constant-expression use never
+  required. Verified: clang-18 all four lint passes clean; g++
+  `make lint` green (ratchet 33=33, header hygiene incl. the STRESS
+  2-TU leg); release full suite 515 PASS / 0 FAIL, exit 0, banner
+  0.28.1 — the count is unchanged by construction (the diff adds and
+  removes no checks); hooks-off public-API smoke green. Engine
+  behavior UNCHANGED (preprocessor gating + capture-list hygiene
+  only). ROADMAP next-commits item 2 closed with the same record.
 - **test+build (v29 M2 item 4, 2026-10-11): the crash-fuzz plan grammar
   COMPOSES — the fixed-shape Plan struct becomes a seeded window-sequence
   grammar with seven named composition templates covering the roadmap's

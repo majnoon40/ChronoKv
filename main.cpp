@@ -3549,7 +3549,7 @@ return 0;
             uint64_t r = lcg();
             if (input.empty()) input.push_back((uint8_t)r);
             else switch (r % 3) {
-                case 0: { int fl=(r>>8)%6; for (int f=0;f<fl;++f) input[lcg()%input.size()] ^= (uint8_t)(1<<(lcg()%8)); break; }
+                case 0: { int fl=(r>>8)%6; for (int f=0;f<fl;++f) { input[lcg()%input.size()] ^= (uint8_t)(1<<(lcg()%8)); } break; }
                 case 1: { input.resize(lcg()%input.size()); break; }
                 case 2: { size_t n=(r>>8)%24; for (size_t k=0;k<n;++k) input.push_back((uint8_t)lcg()); break; }
             }
@@ -6894,7 +6894,7 @@ return 0;
      std::atomic<int> successes{0};
 
      for (int t = 0; t < T; ++t) {
-         workers.emplace_back([&, t] {
+         workers.emplace_back([&] {   // clang leg: t was captured unused (the retry loop is t-independent)
              for (int i = 0; i < OPS; ++i) {
                  for (int retry = 0; retry < 1000; ++retry) {
                      auto txn = db.begin();
@@ -8695,7 +8695,7 @@ static int run_m16_phase1_test() {
         std::atomic<int> ok{0};
         std::vector<std::thread> threads;
         for (int t = 0; t < N_THREADS; ++t) {
-            threads.emplace_back([&db, t, OPS, &ok]() {
+            threads.emplace_back([&db, t, &ok]() {   // clang leg: OPS is constexpr — constant-expression uses need no capture
                 for (int i = 0; i < OPS; ++i) {
                     std::string key = "key" + std::to_string(i);
                     if (db.put(key, "v" + std::to_string(t)) == Status::OK) ++ok;
