@@ -7,6 +7,57 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **test (v29 M2 item 3, 2026-10-11): the audit's four remaining vacuous
+  tests de-vacuated — v17 GC-boundedness, v18 LSN-contiguity,
+  `m2_phase1` size-rotation, the 30 s soak — each upgraded in place and
+  proven by scratch-build reversion (old check GREEN / new check RED on
+  every mutant, old blocks extracted from HEAD and run side by side).**
+  **v17 GC-boundedness** asserted only that latest values read back
+  ("cannot fail on unbounded version or entry growth" — the audit's
+  words); it now asserts the reclamation ACCOUNTING via `gc_stats()`
+  after two 5,000-commit churn rounds with deterministic explicit gc
+  passes (no sleep): live == KEYS exactly (created − reclaimed),
+  `retired_pending() == 0`, and round 2 does not ratchet; readback kept.
+  Mutant `reclaim_retired() → return 0`: new FAILS ("round 0:
+  retired_pending=4990 …; round 1: retired_pending=9990"), old GREEN.
+  **v18 LSN-contiguity** asserted only that `recover()` does not throw;
+  it now writes unique per-key values and checks replay accounting
+  (`recovery_records() == 2000`, `published_watermark() == 2000`) plus a
+  full 2,000-key differential readback. Mutant: `recover()` silently
+  skips APPLYING every 1000th record (contiguity gate intact, no throw):
+  new FAILS ("key b0_259 missing/wrong after recovery"), old GREEN.
+  **`m2_phase1` size-rotation** never exceeded SEGMENT_MAX_BYTES (its
+  own comment admitted it) and asserted "WAL has >= 1 segment"; a
+  hooks-gated knob (`WalSegments::segment_max_bytes_`,
+  `Database::set_wal_segment_max_bytes_for_test` — mirroring the public
+  `set_rebase_threshold` pattern; production behavior unchanged,
+  `force_rotation_for_test` saturates against the same member) lowers
+  the cap to 64 KiB, and 448 ~1-KiB puts rotate through the SIZE
+  admission ALONE to 8 segments (asserted ≥ 4) with byte-exact
+  cross-segment recovery of every key. Mutant: size admission neutered:
+  new FAILS (seg_count=1), old GREEN (≥1 holds). **The 30 s soak** was
+  "a hang/crash detector with no oracle" (check 1 tolerated any value;
+  check 2's unpadded writer keys mostly fell outside its own padded scan
+  bounds; check 3 ignored recovered values); writers now own disjoint
+  padded key ranges with lock-free shadow models, and the oracle is a
+  full differential (every point read AND the whole-range scan) against
+  the merged model on the LIVE engine and again through checkpoint+WAL
+  RECOVERY, plus every-op-committed and health-level-0 assertions.
+  Mutant: `recover_with_checkpoint` skips applying the last 3 WAL
+  records: new FAILS ("recovered engine: key sk119 expected 'tail:17'
+  got ABSENT"), old GREEN. The soak's fail-first run additionally
+  exposed a SECOND vacuity in the upgrade's own recovery leg: the ckpt
+  thread's loop shape (`while(!stop){ sleep; checkpoint; }`) always
+  takes one final post-stop checkpoint capturing the entire final state,
+  so the WAL delta was empty on every run and the first mutation run
+  passed — fixed with a post-join tail-write phase (20 commits) that
+  guarantees a non-empty delta, the lesson recorded as a permanent
+  comment. Engine changes: the one hooks-gated segment-size knob only.
+  Suite: release **513 → 514 PASS / 0 FAIL**, exit 0, banner 0.28.1;
+  `make lint` green (ratchet 33=33) — measured on the 1 GiB sandbox at
+  `-O0 + ggc-min-expand=5`. The audit's other two vacuous-test findings
+  (never-compiled `verify_full`; the `conc: no crash` noise flag) remain
+  recorded beyond-arc remainder.
 - **test (v29 M2 item 2, 2026-10-11): the DST plan grammar grows
   merge/rebalance/cascade and reclamation-retirement scenarios —
   written BEFORE the code they gate, green against the current

@@ -4004,29 +4004,71 @@ return 0;
     }
 
     // Regression test 2: memory boundedness.
-    // Writing many versions to a small key set must not cause unbounded
-    // version growth. After GC runs, live version count should be bounded.
+    // DE-VACUATED (v29 M2 item 3). The audit's finding: the old check
+    // asserted ONLY that the latest values read back — it could not fail on
+    // unbounded version or entry growth (with reclamation neutered, every
+    // version ever written stays live and the readback is still correct).
+    // The upgraded oracle asserts the boundedness accounting ITSELF via
+    // gc_stats(): after each churn round, every version except the per-key
+    // visible anchor must be retired AND reclaimed — live == KEYS exactly,
+    // retired_pending == 0 — and round 2 must NOT ratchet (the same live
+    // bound after doubling the write history). The value-readback assertion
+    // is kept. Deterministic by construction: no sleep, no reliance on the
+    // background thread's timing — explicit gc passes (serialized with the
+    // bg thread under gc_active_mu_) do the work; the cumulative counters
+    // are order-independent.
+    // Fail-first: in a scratch build with reclaim_retired() neutered
+    // (`return 0`), live == created (5,000, then 10,000) and this check
+    // FAILS on the accounting while the OLD readback-only version stays
+    // GREEN (values are untouched by reclamation) — measured both ways.
     {
         const std::string wd = "/tmp/v17_gc_bounded";
         std::filesystem::remove_all(wd);
         ChronoKV kv(wd); kv.start_gc();
 
-        // Write 500 versions to each of 10 keys.
-        for (int round = 0; round < 500; ++round)
-            for (int k = 0; k < 10; ++k)
-                kv.commit("bk" + std::to_string(k), "v" + std::to_string(round));
+        constexpr int ROUNDS = 500, KEYS = 10;
+        bool bounded = true;
+        std::string detail;
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int r = 0; r < ROUNDS; ++r)
+                for (int k = 0; k < KEYS; ++k)
+                    kv.commit("bk" + std::to_string(k),
+                              "v" + std::to_string(pass) + ":" + std::to_string(r));
 
-        // Give GC time to reclaim.
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            // Deterministic reclamation: no pinned readers exist here, 10
+            // keys < GC_KEYS_PER_PASS so one pass is a full sweep; the
+            // second pass proves the steady state (nothing left to do).
+            kv.gc_pass_for_test();
+            kv.gc_pass_for_test();
 
-        // All keys must read the latest value.
-        bool all_latest = true;
-        for (int k = 0; k < 10; ++k) {
-            auto v = kv.read("bk" + std::to_string(k));
-            if (!v || *v != "v499") { all_latest = false; break; }
+            auto st = kv.gc_stats();
+            const uint64_t live = st.created - st.reclaimed;
+            if (st.retired_pending != 0) {
+                bounded = false;
+                detail += (detail.empty() ? "" : "; ") +
+                          std::string("round ") + std::to_string(pass) + ": retired_pending=" +
+                          std::to_string(st.retired_pending) + " after passes (drain failed)";
+            } else if (live != (uint64_t)KEYS) {
+                bounded = false;
+                detail += (detail.empty() ? "" : "; ") +
+                          std::string("round ") + std::to_string(pass) + ": live versions=" +
+                          std::to_string(live) + " want " + std::to_string(KEYS) +
+                          " (created=" + std::to_string(st.created) +
+                          " retired=" + std::to_string(st.retired) +
+                          " reclaimed=" + std::to_string(st.reclaimed) + ")";
+            }
         }
 
-        report("v17 gc: memory boundedness under sustained writes", all_latest);
+        // The original (sound but insufficient) half: latest values read back.
+        bool all_latest = true;
+        for (int k = 0; k < KEYS; ++k) {
+            auto v = kv.read("bk" + std::to_string(k));
+            if (!v || *v != "v1:499") { all_latest = false; break; }
+        }
+
+        report("v17 gc: memory boundedness under sustained writes", all_latest && bounded);
+        if (!bounded) std::cout << "    (" << detail << ")\n";
+        if (!all_latest) std::cout << "    (latest-value readback mismatch)\n";
     }
 
     // Regression test 3: GC + checkpoint consistency.
@@ -4301,6 +4343,22 @@ return 0;
     // v18 Work Stream 3: batch commit optimization test.
     // Verifies that batch LSN allocation produces contiguous LSNs
     // under concurrent multi-thread commits.
+    //
+    // DE-VACUATED (v29 M2 item 3). The audit's finding: the old check
+    // asserted only that recover() does not throw — it never read a key
+    // back, so a replay that silently DROPPED or MISAPPLIED records (the
+    // contiguity gate intact, the state wrong) passed. Upgraded oracles,
+    // in addition to the kept no-throw contiguity assertion:
+    //   * unique per-key values ("v{t}_{i}"), so cross-key misapplication
+    //     is visible, not just loss;
+    //   * replay accounting: recovery_records() == W*PER (every record
+    //     applied exactly once — the I2 contiguity invariant's countable
+    //     half) and published_watermark() == W*PER;
+    //   * full differential readback of all W*PER keys after recovery.
+    // Fail-first: in a scratch build whose recover() skips the APPLICATION
+    // of every 1000th record (contiguity accounting untouched, no throw),
+    // this check FAILS (two keys absent) while the OLD no-throw version
+    // stays GREEN — measured both ways.
     // =====================================================================
     {
         const std::string wd = "/tmp/v18_batch_lsn";
@@ -4312,20 +4370,47 @@ return 0;
             for (int t = 0; t < W; ++t)
                 th.emplace_back([&, t] {
                     for (int i = 0; i < PER; ++i)
-                        kv.commit("b" + std::to_string(t) + "_" + std::to_string(i), "v");
+                        kv.commit("b" + std::to_string(t) + "_" + std::to_string(i),
+                                  "v" + std::to_string(t) + "_" + std::to_string(i));
                 });
             for (auto& x : th) x.join();
         }
         // Recovery verifies LSN contiguity: any gap means batch LSN broke.
-        bool recovered = false;
+        bool ok = false;
+        std::string detail;
         try {
             ChronoKV kv2(wd);
             kv2.recover(wd);
-            recovered = true;
+            ok = true;
+            const uint64_t want = (uint64_t)W * PER;
+            const uint64_t recs = kv2.recovery_records();
+            const uint64_t pub  = kv2.published_watermark();
+            if (recs != want) {
+                ok = false;
+                detail = "recovery_records=" + std::to_string(recs) + " want " + std::to_string(want);
+            } else if (pub != want) {
+                ok = false;
+                detail = "published_watermark=" + std::to_string(pub) + " want " + std::to_string(want);
+            } else {
+                for (int t = 0; t < W && ok; ++t)
+                    for (int i = 0; i < PER; ++i) {
+                        const std::string k = "b" + std::to_string(t) + "_" + std::to_string(i);
+                        auto v = kv2.read(k);
+                        if (!v || *v != "v" + std::to_string(t) + "_" + std::to_string(i)) {
+                            ok = false;
+                            detail = "key " + k + " missing/wrong after recovery";
+                        }
+                    }
+            }
+        } catch (const std::exception& e) {
+            ok = false;
+            detail = std::string("recover threw: ") + e.what();
         } catch (...) {
-            recovered = false;
+            ok = false;
+            detail = "recover threw";
         }
-        report("v18 batch: concurrent LSN contiguity", recovered);
+        report("v18 batch: concurrent LSN contiguity", ok);
+        if (!ok) std::cout << "    (" << detail << ")\n";
     }
 
 
@@ -4751,43 +4836,135 @@ return 0;
         std::filesystem::remove_all(wd);
         unlink(cp.c_str());
 
+        // DE-VACUATED (v29 M2 item 3). The audit's finding: the old soak
+        // asserted only no-throw — "a hang/crash detector with no oracle".
+        // Its check 1 explicitly tolerated any value ("Value can be present
+        // or absent (deleted). Just check no crash."), check 2 only bounded
+        // the scan range (and with UNPADDED writer keys vs padded scan
+        // bounds most of the keyspace fell outside the checked range), and
+        // check 3 ignored the recovered values entirely. Upgraded: the
+        // writers own DISJOINT key ranges and keep a lock-free per-writer
+        // shadow model of the last committed op per key; after the stop
+        // flag the merged model becomes a full differential oracle —
+        // point reads AND the whole-range scan must equal it exactly, the
+        // engine must be healthy, every op must have committed, and the
+        // checkpoint+WAL recovery must reproduce the same final state
+        // key-for-key (the recovery leg is what makes this a durability
+        // oracle, not just a live-engine one). Keys are now padded
+        // ("sk%03d") so the scan bounds actually cover the keyspace.
+        // Fail-first: in a scratch build whose recover_with_checkpoint
+        // skips applying the LAST THREE WAL records, check 3 FAILS with a
+        // named stale key while every old assertion (no-throw reads, scan
+        // bounds, no-throw recovery) stays GREEN — measured both ways. (The
+        // first mutation run passed: the post-stop final checkpoint left
+        // the WAL delta empty — see the tail-write phase below. The oracle
+        // caught a vacuity in its own recovery leg.)
         bool ok = true;
         std::string fail_detail;
         int soak_commits = 0, soak_reads = 0, soak_scans = 0, soak_checkpoints = 0;
+        auto keyname = [](int id) {
+            char b[8]; snprintf(b, sizeof b, "sk%03d", id); return std::string(b);
+        };
+        constexpr int W = 4, R = 4, KEYS = 200, PER_WRITER = KEYS / W;
+        // Shadow model: writer t exclusively owns keys [t*PER_WRITER,
+        // (t+1)*PER_WRITER) — disjoint ownership makes the per-writer map
+        // lock-free. nullopt = deleted/absent. Declared OUTSIDE the engine
+        // scope: the post-close recovery leg (check 3) diffs against it too.
+        std::vector<std::map<int, std::optional<std::string>>> model(W);
+        std::map<std::string, std::string> expected_live;
+        std::map<std::string, bool> expected_state;   // key -> present?
+
+        // The full-state differential, reused by the live and recovered
+        // engines alike (declared BEFORE the engine scope so the live
+        // and recovered legs share one oracle body).
+        auto diff_oracle = [&](ChronoKV& eng, const char* phase) {
+            // Point reads: every owned key matches the model exactly.
+            for (int i = 0; i < KEYS; ++i) {
+                const std::string key = keyname(i);
+                auto got = eng.read(key);
+                auto st = expected_state.find(key);
+                const bool want_present = (st != expected_state.end() && st->second);
+                if (want_present) {
+                    if (!got || *got != expected_live[key]) {
+                        ok = false;
+                        fail_detail = std::string(phase) + ": key " + key + " expected '" +
+                                      expected_live[key] + "' got " +
+                                      (got ? "'" + *got + "'" : "ABSENT");
+                        return;
+                    }
+                } else if (got) {
+                    ok = false;
+                    fail_detail = std::string(phase) + ": deleted key " + key +
+                                  " resurrected with '" + *got + "'";
+                    return;
+                }
+            }
+            // Whole-range scan: exactly the live set, in order.
+            auto rs = eng.range_scan(UINT64_MAX, "sk000", "sk199");
+            if (rs.size() != expected_live.size()) {
+                ok = false;
+                fail_detail = std::string(phase) + ": scan returned " +
+                              std::to_string(rs.size()) + " keys, model has " +
+                              std::to_string(expected_live.size());
+                return;
+            }
+            size_t j = 0;
+            for (auto& [k, v] : expected_live) {
+                if (rs[j].first != k || rs[j].second != v) {
+                    ok = false;
+                    fail_detail = std::string(phase) + ": scan mismatch at " + k +
+                                  " (got " + rs[j].first + ")";
+                    return;
+                }
+                ++j;
+            }
+        };
+
+
+
+
         {
         ChronoKV kv(wd);
         kv.start_gc();
 
-        constexpr int W = 4, R = 4, KEYS = 200;
         std::atomic<bool> stop{false};
         std::atomic<int> commits{0}, reads{0}, scans{0}, checkpoints{0};
-
-        // Writer threads: random commits and deletes.
+        std::atomic<int> noncommitted{0}, threw{0};
+        // Writer threads: random commits and deletes over owned keys.
         std::vector<std::thread> writers;
         for (int t = 0; t < W; ++t) {
             writers.emplace_back([&, t] {
                 std::mt19937_64 rng(0x50A0 + t);
-                std::uniform_int_distribution<int> key_dist(0, KEYS - 1);
+                std::uniform_int_distribution<int> key_dist(0, PER_WRITER - 1);
                 std::uniform_int_distribution<int> val_dist(0, 9999);
                 std::uniform_int_distribution<int> op_dist(0, 99);
+                auto& my = model[t];
                 while (!stop.load(std::memory_order_acquire)) {
-                    int key_id = key_dist(rng);
-                    std::string key = "sk" + std::to_string(key_id);
-                    if (op_dist(rng) < 85) {
-                        // 85% commit
-                        std::string val = "t" + std::to_string(t) + ":" + std::to_string(val_dist(rng));
-                        kv.commit(key, val);
-                        commits.fetch_add(1, std::memory_order_relaxed);
-                    } else {
-                        // 15% delete
-                        kv.del(key);
-                        commits.fetch_add(1, std::memory_order_relaxed);
+                    const int key_id = t * PER_WRITER + key_dist(rng);
+                    const std::string key = keyname(key_id);
+                    try {
+                        if (op_dist(rng) < 85) {
+                            // 85% commit
+                            std::string val = "t" + std::to_string(t) + ":" +
+                                              std::to_string(val_dist(rng));
+                            if (kv.commit(key, val) == TxnResult::Committed) my[key_id] = val;
+                            else noncommitted.fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            // 15% delete
+                            if (kv.del(key) == TxnResult::Committed) my[key_id] = std::nullopt;
+                            else noncommitted.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    } catch (...) {
+                        threw.fetch_add(1, std::memory_order_relaxed);
                     }
+                    commits.fetch_add(1, std::memory_order_relaxed);
                 }
             });
         }
 
-        // Reader threads: random reads and range scans.
+        // Reader threads: random reads and range scans (stress; the oracle
+        // is the post-join differential — in-flight reads race the writers
+        // legitimately).
         std::vector<std::thread> readers;
         for (int t = 0; t < R; ++t) {
             readers.emplace_back([&, t] {
@@ -4797,8 +4974,7 @@ return 0;
                 while (!stop.load(std::memory_order_acquire)) {
                     if (op_dist(rng) < 70) {
                         // 70% point read
-                        std::string key = "sk" + std::to_string(key_dist(rng));
-                        auto got = kv.read(key);
+                        auto got = kv.read(keyname(key_dist(rng)));
                         (void)got;
                         reads.fetch_add(1, std::memory_order_relaxed);
                     } else {
@@ -4837,36 +5013,65 @@ return 0;
         for (auto& r : readers) r.join();
         ckpt_thread.join();
 
-        // Post-run invariant checks.
-
-        // Check 1: all keys are readable (no crashes, no corruption).
-        for (int i = 0; i < KEYS && ok; ++i) {
-            std::string key = "sk" + std::to_string(i);
+        // Tail-write phase (found by the fail-first run, not predicted):
+        // the ckpt thread's loop is `while(!stop){ sleep; checkpoint; }` —
+        // the predicate is NOT re-checked between the sleep and the
+        // checkpoint, so the stop flag always lets it take ONE FINAL
+        // checkpoint that captures the entire final writer state. Without
+        // this tail phase the recovery leg's WAL delta was EMPTY on every
+        // run — check 3 exercised only the checkpoint chain and the
+        // last-3-records mutation sailed through. Twenty commits after
+        // every join guarantee a non-empty delta; the mutation then
+        // failed the differential deterministically, as designed.
+        for (int i = 0; i < 20 && ok; ++i) {
+            const int key_id = i * 7;                    // spread across owners
+            const std::string val = "tail:" + std::to_string(i);
             try {
-                auto got = kv.read(key);
-                // Value can be present or absent (deleted). Just check no crash.
-            } catch (...) {
-                ok = false;
-                fail_detail = "read threw for key " + key;
-            }
-        }
-
-        // Check 2: range scan returns consistent results.
-        if (ok) {
-            try {
-                auto got = kv.range_scan(UINT64_MAX, "sk000", "sk199");
-                // All returned keys should be in [sk000, sk199].
-                for (auto& [k, v] : got) {
-                    if (k < "sk000" || k > "sk199") {
-                        ok = false;
-                        fail_detail = "range_scan returned out-of-range key: " + k;
-                        break;
-                    }
+                if (kv.commit(keyname(key_id), val) != TxnResult::Committed) {
+                    ok = false;
+                    fail_detail = "tail commit " + std::to_string(i) + " not committed";
+                    break;
                 }
             } catch (...) {
                 ok = false;
-                fail_detail = "range_scan threw";
+                fail_detail = "tail commit threw";
+                break;
             }
+            model[key_id / PER_WRITER][key_id] = val;    // writers joined: safe
+        }
+
+        // Merge the per-writer models (disjoint ranges) into the expected
+        // final state: expected_live = ordered key -> value; deleted keys
+        // must be absent.
+        for (int t = 0; t < W; ++t)
+            for (auto& [id, v] : model[t]) {
+                expected_state[keyname(id)] = v.has_value();
+                if (v) expected_live[keyname(id)] = *v;
+            }
+
+        // Post-run invariant checks.
+        // Check 0: a clean soak has no failed ops (any non-Commit means the
+        // engine latched or threw — the oracle below assumes every recorded
+        // model op landed).
+        if (noncommitted.load() != 0 || threw.load() != 0) {
+            ok = false;
+            fail_detail = "soak ops failed: noncommitted=" + std::to_string(noncommitted.load()) +
+                          " threw=" + std::to_string(threw.load());
+        }
+        // Check 1+2 (upgraded): live-engine differential — point reads AND
+        // the whole-range scan against the shadow model.
+        if (ok) {
+            try {
+                diff_oracle(kv, "live engine");
+            } catch (...) {
+                ok = false;
+                fail_detail = "live-engine differential threw";
+            }
+        }
+        // Check 2b: no fail-stop latch tripped during a clean soak.
+        if (ok && kv.health().level != 0) {
+            ok = false;
+            fail_detail = "health level " + std::to_string(kv.health().level) + " after clean soak";
         }
 
         soak_commits = commits.load();
@@ -4874,17 +5079,14 @@ return 0;
         soak_scans = scans.load();
         soak_checkpoints = checkpoints.load();
         }  // kv destroyed, flock released
-        // Check 3: recovery from checkpoint + WAL succeeds.
+
+        // Check 3 (upgraded): recovery from checkpoint + WAL must reproduce
+        // the SAME final state — the durability leg of the oracle.
         if (ok) {
             try {
                 ChronoKV kv2(wd);
                 kv2.recover_with_checkpoint(wd, cp);
-                // Verify a few keys are readable after recovery.
-                for (int i = 0; i < 10; ++i) {
-                    std::string key = "sk" + std::to_string(i);
-                    auto got = kv2.read(key);
-                    // Just check no crash.
-                }
+                diff_oracle(kv2, "recovered engine");
             } catch (...) {
                 ok = false;
                 fail_detail = "recovery after soak threw";
@@ -8335,7 +8537,28 @@ static int run_m2_phase1_test() {
         if (!ok) ++fails;
     };
 
-    // Phase 1a: write enough data to force rotation, verify recovery.
+    // Phase 1a: SIZE-based rotation admission — DE-VACUATED (v29 M2 item 3).
+    // The old 1a wrote 100 small keys and asserted "WAL has >= 1 segment":
+    // its own comment block admitted it never exceeded SEGMENT_MAX_BYTES
+    // ("64 MiB is too much for the 2-CPU VM ... PRACTICAL: just verify the
+    // multi-segment recovery path works by using the existing checkpoint
+    // mechanism"), so the size admission — maybe_rotate_segment's byte
+    // accounting, the MANIFEST chain across size rotations, cross-segment
+    // replay — was never exercised, and the check passed with the admission
+    // deleted. (Checkpoint-driven rotation is a DIFFERENT mechanism, covered
+    // by Phase 1b and the rotc_* crash points; the audit named exactly this
+    // gap.) Upgraded: a test hook (set_wal_segment_max_bytes_for_test,
+    // mirroring the public set_rebase_threshold knob's pattern) lowers the
+    // segment cap to 64 KiB; ~448 KiB of ~1 KiB-value puts must then rotate
+    // through the SIZE path alone — no checkpoint anywhere — producing >= 4
+    // segments, and recovery must replay the whole chain with byte-exact
+    // readback of every key.
+    // Fail-first: in a scratch build with the size admission reverted
+    // (maybe_rotate_segment returns immediately), seg_count stays 1 and the
+    // rotation check FAILS while the old ">= 1 segment" version stays GREEN;
+    // in a scratch build whose replay skips records, the readback FAILS while
+    // the old 100-key readback (below the skip threshold) stays GREEN —
+    // measured both ways.
     {
         const std::string wd = "/tmp/v25_m2_multi_seg";
         std::filesystem::remove_all(wd);
@@ -8344,57 +8567,20 @@ static int run_m2_phase1_test() {
         opts.auto_start_gc = false;
         opts.recover_on_open = false;  // don't recover yet — we'll verify manually
 
-        // Write enough keys to exceed SEGMENT_MAX_BYTES (64 MiB).
-        // Each record is ~50 bytes (key + value + framing). 64 MiB / 50 ≈ 1.3M records.
-        // But that's too many for a test. Instead, use larger values to fill faster.
-        // A 1KB value per record → 64 MiB / 1KB ≈ 64K records. Still a lot.
-        // Use 10KB values → 64 MiB / 10KB ≈ 6.4K records. Feasible.
-        // But 10K records × 10KB = 100 MB — too much for the 2-CPU VM.
-        // Instead, just verify the WAL has multiple segments after a moderate write.
-        // We write 2000 keys with 32KB values = ~64 MB — enough for one rotation.
-        // Actually, 2000 × 32KB = 64 MB. That's exactly SEGMENT_MAX_BYTES.
-        // Let's use 1000 keys × 32KB = 32 MB (half) — should NOT trigger rotation.
-        // Then 2500 keys × 32KB = 80 MB — should trigger rotation.
-        // But 80 MB is a lot for the 2-CPU VM. Let me just verify the test compiles
-        // and the mechanism works conceptually — the actual rotation threshold
-        // can be tested with a smaller threshold for testing.
-
-        // Actually, let's just write a few keys, close, reopen, and verify
-        // recovery works. The rotation mechanism is tested by the existing
-        // checkpoint/recovery tests (which call rotate_after_checkpoint).
-        // The NEW behavior is size-based rotation, which we test by writing
-        // enough to exceed SEGMENT_MAX_BYTES.
-
-        // For the 2-CPU VM, let's write 1000 keys × 64KB values = 64 MB.
-        // That should trigger one rotation (segment 1 fills up, segment 2 created).
-        // But 64 MB is too much for the VM. Let's use a smaller test:
-        // write 500 keys × 64KB = 32 MB (no rotation), verify recovery.
-        // Then write 1500 more × 64KB = 96 MB total (rotation).
-        // But the VM can't handle 96 MB of WAL writes in a reasonable time.
-        //
-        // PRACTICAL: just verify the multi-segment recovery path works by
-        // using the existing checkpoint mechanism (which rotates) and
-        // verifying recovery. The size-based rotation is a minor addition
-        // to the existing rotation mechanism — the recovery path is unchanged.
-
         auto db = Database::open(opts);
-        // Write 100 keys (small, no rotation expected).
-        for (int i = 0; i < 100; ++i) {
-            db.put("mk" + std::to_string(i), "v" + std::to_string(i));
+        db.set_wal_segment_max_bytes_for_test(64 * 1024);   // 64 KiB segments
+        constexpr int N = 448;                              // ~448 KiB of records
+        const std::string fill(1024, 'x');
+        bool puts_ok = true;
+        for (int i = 0; i < N; ++i) {
+            if (db.put("mk" + std::to_string(i), fill + std::to_string(i)) !=
+                    chronokv::Status::OK) { puts_ok = false; break; }
         }
+        check("m2: size-rotation: all puts acknowledged", puts_ok);
         db.close();
 
-        // Reopen with recovery and verify all keys are present.
-        opts.recover_on_open = true;
-        auto db2 = Database::open(opts);
-        bool all_ok = true;
-        for (int i = 0; i < 100; ++i) {
-            auto v = db2.get("mk" + std::to_string(i));
-            if (!v || *v != ("v" + std::to_string(i))) { all_ok = false; break; }
-        }
-        check("m2: multi-segment recovery: 100 keys recovered", all_ok);
-
-        // Verify WAL has at least 1 segment.
+        // The rotations must have come from the SIZE admission alone: no
+        // checkpoint was taken in this phase (Phase 1b owns that mechanism).
         int seg_count = 0;
         for (auto& entry : std::filesystem::directory_iterator(wd)) {
             std::string fn = entry.path().filename().string();
@@ -8402,8 +8588,22 @@ static int run_m2_phase1_test() {
                 ++seg_count;
             }
         }
-        check("m2: multi-segment recovery: WAL has >= 1 segment", seg_count >= 1);
-        std::cout << "    (WAL segments: " << seg_count << ")\n";
+        check("m2: size-rotation: WAL rotated by SIZE alone (>= 4 segments)", seg_count >= 4);
+        std::cout << "    (WAL segments after " << N
+                  << " x ~1KiB puts under a 64 KiB cap: " << seg_count << ")\n";
+
+        // Cross-segment recovery with byte-exact differential readback.
+        opts.recover_on_open = true;
+        auto db2 = Database::open(opts);
+        bool all_ok = true;
+        int first_bad = -1;
+        for (int i = 0; i < N; ++i) {
+            auto v = db2.get("mk" + std::to_string(i));
+            if (!v || *v != fill + std::to_string(i)) { all_ok = false; first_bad = i; break; }
+        }
+        check("m2: size-rotation: cross-segment recovery reads back all keys exactly", all_ok);
+        if (!all_ok)
+            std::cout << "    (first mismatch at mk" << first_bad << ")\n";
     }
 
     // Phase 1b: verify recovery across a checkpoint-rotated WAL (multiple segments).

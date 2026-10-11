@@ -215,10 +215,17 @@ What 0.28.1 did *not* do, and v29 inherits:
   and **tag `v0.28.1` does not exist** (rule 2: only `v0.28.0` is tagged).
   The rewrite milestones (M3+) stay gated until M0 closes — the gate did
   its job once already this arc; it does not get waved through now.
-- **The suite still carries the vacuous tests** the first audit enumerated
-  beyond the arc's scope (v17 GC-boundedness, v18 LSN-contiguity,
-  `m2_phase1` size-rotation admission, the 30 s soak's missing oracle).
-  v29 M2.
+- **The vacuous tests the first audit enumerated beyond the arc's scope
+  are de-vacuated** (v29 M2 item 3, 2026-10-11): v17 GC-boundedness now
+  asserts the reclamation accounting itself, v18 LSN-contiguity does
+  replay accounting + a full 2,000-key differential readback,
+  `m2_phase1` exercises the size-rotation admission for real (a
+  hooks-gated segment cap; 8 segments, byte-exact cross-segment
+  recovery), and the 30 s soak carries a shadow-model differential over
+  the live engine AND the checkpoint+WAL recovery — each proven by a
+  scratch-build reversion the OLD check passed. The audit's remaining
+  two (the never-compiled `verify_full`, the `conc: no crash` noise
+  flag) stay recorded as beyond-arc remainder.
 - **The structural debt is untouched except where Audit-2 hardened its
   edges**: the monotonic page pool remains (exhaustion is pre-mutation and
   loud via BT-1's headroom check, feeding the same D4 latch — one health
@@ -248,7 +255,7 @@ What 0.28.1 did *not* do, and v29 inherits:
 | v29 M0 closure | **DONE 2026-10-08** — reconstructed report + tag `v0.28.1` + delta confirmation round, verdict **B+ (clean)**: 20/20 probes, one Low doc-truth finding fixed in the closure commit; **M3+ gate lifted** | `docs/audits/2026-10-delta-confirmation-0.28.1.md` (+ probes) |
 | v29 M1 — benchmark arena | **STARTED** — steps 1–3 COMPLETE (D/E/F adapters + version pins with sha256/fetch recipe); step-4 vehicle: split (#68–#75 green) then RE-MERGED to one same-hardware job after #75's headers caught the two-runner CPU split — green-week clock restarts on the merged vehicle (rule 9 over sunk nights); soak vehicle NAMED (rolling nightly chain). Remaining: green week (7 nights), noise bands + gate enablement, ledger-promotion decision, CI build cache | `bench/`, `bench/third_party/versions.txt`, ci.yml `arena` |
 | v29 CI hardening (adjacent, unplanned-in-9/27) | **SHIPPED + PROMOTED** — lint/ratchet/hygiene gates, build-shared; the 4 experimental sanitizer legs went green ×3 (#64/#65/#66) → flags deleted, all 12 legs gating | `5cd74b5`; promotion `0027fe0` |
-| v29 M2 — catcher hardening | **STARTED** — item 1 (write-skew checker, 2026-10-08, live pre-fix-flag/post-fix-pass proof) + item 5 (test-suite TU split, 2026-10-10: 1 GiB release/stress `-O1` bare, ASan `-O0` possible, 503/0 full suite; found+fixed the `dst::my_tid` non-inline thread_local, now stress-gated) + item 2 (DST grammar growth, 2026-10-11: S5 `tree_merge_cascade` (M4 grammar) + S6 `reclaim_retire_pin` (M3 grammar), green vs the merge-free tree, 600/600 children at PR scale, four-mutant fail-first matrix; nightly seeds/shard rebalanced 3,125→2,083 to hold N=100k and the wall-time band at six scenarios) shipped; items 3–4 pending | `check_write_skew`; `dstscn::s5/s6`; `tests/`, Makefile template |
+| v29 M2 — catcher hardening | **STARTED** — item 1 (write-skew checker, 2026-10-08, live pre-fix-flag/post-fix-pass proof) + item 5 (test-suite TU split, 2026-10-10: 1 GiB release/stress `-O1` bare, ASan `-O0` possible, 503/0 full suite; found+fixed the `dst::my_tid` non-inline thread_local, now stress-gated) + item 2 (DST grammar growth, 2026-10-11: S5 `tree_merge_cascade` (M4 grammar) + S6 `reclaim_retire_pin` (M3 grammar), green vs the merge-free tree, 600/600 children at PR scale, four-mutant fail-first matrix; nightly seeds/shard rebalanced 3,125→2,083 to hold N=100k and the wall-time band at six scenarios) + item 3 (de-vacuation, 2026-10-11: v17 GC-boundedness / v18 LSN-contiguity / m2_phase1 size-rotation / 30 s soak all upgraded to real oracles — accounting, differential readbacks, size-rotation admission exercised via a lowered segment cap, shadow-model differential over live AND recovered state; each proven old-GREEN/new-RED against its scratch-build reversion; the soak run additionally exposed and fixed its own empty-WAL-delta hole; release suite 513→514/0) shipped; item 4 pending | `check_write_skew`; `dstscn::s5/s6`; `tests/`, Makefile template |
 | v29 M3–M7 — the overhaul | not started — M0 CLOSED 2026-10-08; order still governed by constraints 2–3 (arena green week, catchers first) | — |
 | v30 M0–M5 — the challenge, 1.0.0 | not started | — |
 
@@ -470,7 +477,7 @@ comparison; the README performance section exists and links the
 methodology; the nightly ledger shows one full green week. No engine
 changes in this milestone.
 
-## M2 — Catcher hardening  **[M] — STARTED (items 1 + 2 + 5 shipped 2026-10-08/10/11)**
+## M2 — Catcher hardening  **[M] — STARTED (items 1 + 2 + 3 + 5 shipped 2026-10-08/10/11)**
 
 **Anchor** (upgraded by Audit-2): remediation spec §11 predicted lincheck's
 SSI blindness; TXN-1 *demonstrated* it — a real write-skew-class anomaly
@@ -585,6 +592,64 @@ the remaining audit-enumerated vacuous tests, plus the build-memory wall.
 3. De-vacuate the remainder: v17 GC-boundedness, v18 LSN-contiguity,
    `m2_phase1` size-rotation, the 30 s soak's oracle. Each upgraded test
    proven once by temporary reversion in a scratch build.
+   **DONE 2026-10-11** — all four upgraded in place (same check names;
+   net +1 check: m2 phase 1a now carries three), each proven by a
+   scratch-build reversion with the OLD block extracted from HEAD and run
+   side by side against the same mutant header: old GREEN / new RED on
+   every mutant, with the failing oracle named in the diagnostic.
+   * **v17 GC-boundedness** (was readback-only — "cannot fail on
+     unbounded version or entry growth"): now asserts the reclamation
+     ACCOUNTING itself via `gc_stats()` after two 5,000-commit churn
+     rounds with deterministic explicit passes (no sleep): live ==
+     KEYS exactly (created − reclaimed), `retired_pending() == 0`, and
+     round 2 does NOT ratchet; the latest-value readback is kept.
+     Mutant: `reclaim_retired()` neutered → FAILS with "round 0:
+     retired_pending=4990 …; round 1: retired_pending=9990"; old check
+     green (values are untouched by reclamation).
+   * **v18 LSN-contiguity** (was recover()-does-not-throw): now unique
+     per-key values + replay accounting (`recovery_records() == 2000`,
+     `published_watermark() == 2000` — invariant I2's countable half) +
+     full 2,000-key differential readback after recovery. Mutant:
+     `recover()` silently skips APPLYING every 1000th record (the
+     contiguity gate intact, no throw) → FAILS "key b0_259
+     missing/wrong after recovery"; old check green.
+   * **`m2_phase1` size-rotation** (its own comment admitted it never
+     exceeded SEGMENT_MAX_BYTES and asserted "WAL has >= 1 segment"):
+     a hooks-gated knob (`WalSegments::segment_max_bytes_` +
+     `Database::set_wal_segment_max_bytes_for_test`, mirroring the
+     public `set_rebase_threshold` pattern; production value and
+     behavior unchanged — `force_rotation_for_test` now saturates
+     against the same member) lowers the cap to 64 KiB; 448 ~1-KiB
+     puts then rotate through the SIZE admission ALONE (no checkpoint)
+     to **8 segments** (asserted ≥ 4) with byte-exact cross-segment
+     recovery of all 448 keys. Mutant: the size admission neutered
+     (`maybe_rotate_segment` early-return) → FAILS at seg_count=1;
+     old check green (≥ 1 still holds).
+   * **30 s soak** (was "a hang/crash detector with no oracle": check 1
+     tolerated ANY value, check 2's unpadded writer keys mostly fell
+     outside its own padded scan bounds, check 3 ignored the recovered
+     values): writers now own DISJOINT padded key ranges and keep
+     lock-free per-writer shadow models; the oracle is a full
+     differential (every point read AND the whole-range scan, order and
+     values exact) against the merged model — on the LIVE engine and
+     again through checkpoint+WAL recovery — plus every-op-committed
+     and health-level-0 assertions. Mutant:
+     `recover_with_checkpoint` skips applying the LAST 3 WAL records →
+     FAILS "recovered engine: key sk119 expected 'tail:17' got
+     ABSENT"; old check green. **The fail-first run found a SECOND
+     vacuity, in the upgrade's own recovery leg**: the ckpt thread's
+     loop shape (`while(!stop){ sleep; checkpoint; }` — the predicate
+     is not re-checked between sleep and checkpoint) always takes one
+     final post-stop checkpoint that captures the entire final writer
+     state, so the WAL delta was EMPTY on every run and the first
+     mutation sailed through. Fixed with a post-join tail-write phase
+     (20 commits after every thread joined) that guarantees a
+     non-empty delta; the lesson is a permanent comment in the test.
+   Suite: release **513 → 514 PASS / 0 FAIL**, exit 0, banner 0.28.1,
+   `make lint` green (ratchet 33=33) — measured on the 1 GiB sandbox at
+   `-O0 + ggc-min-expand=5`. The audit's other two vacuous-test findings
+   (the never-compiled `verify_full`, the `conc: no crash` noise flag)
+   remain recorded beyond-arc remainder.
 4. The crash-fuzz plan grammar composes GC sweeps, checkpoint, rotation
    and merge windows — and now also the Audit-2 surfaces: segment-creation
    dir-fsync windows (WAL-2), the recovery offset-scan classifier
@@ -920,12 +985,15 @@ benchmarks, not dependencies. Four new rules, each paid for:
    in the closure commit); M3 unlocked. **M2 item 1 (the write-skew
    checker) landed the same day** — validated live against the TXN-1 PoC
    history on both engines, before any M3+ rewrite starts (constraint 3
-   honored). Remaining catcher work: M2 items 3–4 (de-vacuation,
-   crash-fuzz composition) — item 2 (DST grammar growth) shipped
-   2026-10-11 (S5 `tree_merge_cascade` + S6 `reclaim_retire_pin`, green
-   vs the merge-free tree, four-mutant fail-first matrix), and item 5
-   (TU pressure relief) shipped early on 2026-10-10 because the wall
-   kept biting (bare `-O0` monolith builds were already dying on the
+   honored). Remaining catcher work: M2 item 4 (crash-fuzz composition)
+   — item 2 (DST grammar growth) shipped 2026-10-11 (S5
+   `tree_merge_cascade` + S6 `reclaim_retire_pin`, green vs the
+   merge-free tree, four-mutant fail-first matrix), item 3
+   (de-vacuation) shipped the same day (all four audit-named vacuous
+   tests upgraded to real oracles, each proven old-GREEN/new-RED by
+   scratch-build reversion; release suite 513→514/0), and item 5 (TU
+   pressure relief) shipped early on 2026-10-10 because the wall kept
+   biting (bare `-O0` monolith builds were already dying on the
    confirmation sandbox).
 
 ---

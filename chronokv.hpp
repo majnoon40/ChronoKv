@@ -3589,6 +3589,16 @@ class WalSegments {
     // v25.1 M2 Phase 1: multi-segment WAL. Fixed-size segments (64 MiB).
     static constexpr size_t SEGMENT_MAX_BYTES = 64ULL * 1024 * 1024;
     size_t active_segment_bytes_ = 0;
+    // v29 M2 item 3: runtime size-rotation limit. In production this equals
+    // SEGMENT_MAX_BYTES and is never written after construction; a test hook
+    // lowers it so the SIZE-BASED rotation admission (maybe_rotate_segment's
+    // byte accounting, the multi-segment MANIFEST chain and cross-segment
+    // recovery) can be exercised without writing 64 MiB. force_rotation_for_
+    // test saturates against the SAME limit, so forced and natural rotations
+    // share one byte-accounting truth. Read under batch_mu_ exactly like
+    // active_segment_bytes_ (the leader's maybe_rotate_segment call site and
+    // both setters hold it).
+    size_t segment_max_bytes_ = SEGMENT_MAX_BYTES;
 
     // v25.1 M2 Phase 2: io_uring for WAL writes + offset-pinned fallback.
     // io_uring submits write+fsync as a chain. If io_uring is unavailable
@@ -3616,7 +3626,16 @@ class WalSegments {
     // is under it (the leader's own updates moved under the lock too).
     void force_rotation_for_test() {
         std::lock_guard<std::mutex> lk(batch_mu_);
-        active_segment_bytes_ = SEGMENT_MAX_BYTES;
+        active_segment_bytes_ = segment_max_bytes_;
+    }
+
+    // v29 M2 item 3: lower the size-rotation limit so the admission itself
+    // is exercisable (0 restores the 64 MiB production constant). Mirrors
+    // the public set_rebase_threshold knob's "tests lower this to exercise
+    // the trigger quickly" pattern.
+    void set_segment_max_bytes_for_test(size_t bytes) {
+        std::lock_guard<std::mutex> lk(batch_mu_);
+        segment_max_bytes_ = bytes ? bytes : SEGMENT_MAX_BYTES;
     }
 
     // v26 M0 (invariant D2): the active segment's byte accounting, so a test
@@ -4010,7 +4029,7 @@ private:
     // segment, write MANIFEST. Batches never span segments — the current
     // batch completes on the old segment before rotation.
     void maybe_rotate_segment() {
-        if (active_segment_bytes_ < SEGMENT_MAX_BYTES) return;
+        if (active_segment_bytes_ < segment_max_bytes_) return;
         // Active segment is full — rotate.
         // v26 M1 (invariant D3): every durability result on this path is now
         // checked and fail-stops the instance, matching what
@@ -9997,6 +10016,16 @@ public:
     void force_wal_rotation_for_test() {
         auto eng = api_engine();
         if (eng->wal_) eng->wal_->force_rotation_for_test();
+    }
+    // v29 M2 item 3: lower the WAL size-rotation limit (0 restores the
+    // production 64 MiB) so m2_phase1 can exercise the SIZE-based rotation
+    // admission end to end — force_wal_rotation_for_test forces ONE rotation
+    // but leaves the byte-accounting admission itself untested, which is
+    // exactly the vacuity the audit named ("never exercises size-based
+    // rotation — its own comment admits it").
+    void set_wal_segment_max_bytes_for_test(size_t bytes) {
+        auto eng = api_engine();
+        if (eng->wal_) eng->wal_->set_segment_max_bytes_for_test(bytes);
     }
     bool wal_failed_for_test() const {
         auto eng = api_engine();
