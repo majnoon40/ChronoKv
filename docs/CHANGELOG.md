@@ -7,6 +7,67 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **test+build (v29 M2 item 4, 2026-10-11): the crash-fuzz plan grammar
+  COMPOSES — the fixed-shape Plan struct becomes a seeded window-sequence
+  grammar with seven named composition templates covering the roadmap's
+  list (GC sweeps x checkpoint x rotation x the merge-window slot) and the
+  three Audit-2 surfaces (WAL-2 segment-creation dir-fsync, WAL-1
+  offset-scan classifier, EXTRA-1 reservation-throw under batch pressure);
+  kAll grows 26 → 28; the fault matrix widens to all 12 kinds — M2
+  COMPLETE with this item.** The v25.7 lesson (H1 bricked the database in
+  a regime COMBINATION the grammar could not express; the fix bolted on
+  one `rotate_after_ckpt` flag) is now the grammar's structure: plans are
+  sequences over {Puts, BigPuts (~70 KiB values — batch extents span
+  multiple 64 KiB fill chunks, the WAL-1 classifier's multi-chunk
+  surface), PressurePuts (concurrent committers — EXTRA-1's batch
+  pressure, composed with AllocFail's reservation-window throw),
+  Structural (split-forcing insert bursts — THE MERGE-WINDOW SLOT: when
+  M4 lands borrow/merge/cascade, this window grows the merge forcing and
+  its compositions are already in the plan space), Rotate, Ckpt, GcSweep
+  (new `Database::gc_pass_for_test` seam), Backup}, and seven templates
+  splice named compositions into the stream: gc x ckpt; rotate-after-ckpt
+  (the H1 shape, guaranteed); Structural x Ckpt x Structural;
+  PressurePuts x AllocFail; BigPuts x WriteFail/WriteShort; Rotate x
+  DirFsyncFail (WAL-2) WITH A FIRED-WITNESS — the child asserts its armed
+  charge was consumed before a clean exit (rc 22 = vacuous composition;
+  sampled BEFORE `fault::disarm()` zeroes `remaining` — the first cut
+  read it after and could never fire, caught by the W2V mutation run
+  staying green when it had to go red, recorded in the comment) — and
+  the gc x rotate x ckpt three-way. Fault-bearing templates splice at
+  position 1 so no earlier window's dir-fsync/write site can eat the
+  charge. Round 1 of every stream cycles all seven templates
+  deterministically (point-index % 7); the composition ledger is
+  published and asserted (a named composition that never occurs = a
+  regime the grammar lost). Parent-side classification: the documented
+  loud-refusal outcomes of {BigPuts x write-fault} plans (interior zeros
+  before surviving CRC-valid frames — the SRC-E4 shape family) are
+  counted and published instead of mis-scored as violations, narrowly —
+  a corruption signature qualifies, "interior gap" (the EXTRA-1
+  regression signal) NEVER does. Two new crash points instrument the
+  WAL-2 window itself: `seg_before_dir_fsync` / `seg_after_dir_fsync`
+  bracket `open_segment`'s fresh-path dir fsync (reachable through any
+  rotation regime; the reachability assert now covers 28 points). The
+  Ledger is mutex-serialized with a short-write loop (pressure windows
+  commit from several threads; big-record lines are ~70 KiB). Background
+  fault sampling widened Kind 1..8 → 1..12 (AllocFail, ManifestOpenFail,
+  TruncateFail, RotFinalDirFsyncFail join); the per-kind anti-vacuity
+  assert counts all twelve. FAIL-FIRST (scratch builds, full 336-plan
+  streams, measured): reverting the empty-orphan tolerance → **16
+  violations** concentrated in the seg_after_dir_fsync /
+  rot_before_manifest / man_after_tmp_write plans — the new windows bind
+  the recovery contract they were written for; removing the DirFsyncFail
+  hook from `fsync_dir` → **exactly 7 rc-22 witness violations**. Clean
+  stream (1 GiB sandbox, `-O0`): 336 plans / 28 s, 182 reached an armed
+  point, compositions gc_x_ckpt=56 rot_after_ckpt=190 structural=132
+  pressure_x_alloc=18 bigrec_x_writefault=18 dirfsync_probe=17, all 12
+  kinds planned, **0 violations**; loud_refusals=0 at this scale
+  (published, not asserted — the deterministic refusal pin lives in
+  SRC-E4). CI cost config unchanged (PR: 2 bases x 24 rounds x 28
+  points = 1,344 plans). Suite: release 514 → 515 PASS / 0 FAIL (+1:
+  the composition-ledger assert), exit 0, banner 0.28.1; `make lint`
+  green (ratchet 33=33). With this item v29 M2 is COMPLETE — all five
+  items shipped; constraint 3 (catchers before rewrites) is satisfied
+  for the arc.
 - **test (v29 M2 item 3, 2026-10-11): the audit's four remaining vacuous
   tests de-vacuated — v17 GC-boundedness, v18 LSN-contiguity,
   `m2_phase1` size-rotation, the 30 s soak — each upgraded in place and

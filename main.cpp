@@ -1143,6 +1143,11 @@ namespace crashfuzz {
 
 struct Ledger {
     int fd = -1;
+    // v29 M2 item 4: PressurePuts windows commit from several threads, and
+    // BigPuts windows write ~70 KiB lines — the record path is now
+    // mutex-serialized and loops over short writes (a torn ledger line
+    // would read back as a phantom LOSS violation in the parent).
+    std::mutex mu;
     void open(const std::string& path) {
         fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_APPEND | O_TRUNC, 0644);
     }
@@ -1150,8 +1155,13 @@ struct Ledger {
     void record(const std::string& key, const std::string& val) {
         if (fd < 0) return;
         std::string line = key + "\t" + val + "\n";
-        ssize_t w = ::write(fd, line.data(), line.size());
-        (void)w;
+        std::lock_guard<std::mutex> g(mu);
+        size_t off = 0;
+        while (off < line.size()) {
+            ssize_t w = ::write(fd, line.data() + off, line.size() - off);
+            if (w <= 0) break;
+            off += (size_t)w;
+        }
         ::fsync(fd);
     }
     void close() { if (fd >= 0) { ::fsync(fd); ::close(fd); fd = -1; } }
@@ -1169,59 +1179,164 @@ static std::vector<std::pair<std::string,std::string>> read_ledger(const std::st
     return out;
 }
 
-// Seeded plan. Deliberately covers the four regimes needed to reach every
-// crash point: plain commits (wal_*), forced segment rotation (rot_*, man_*),
-// checkpoint (ckpt_*), and checkpoint-driven rotation (rotc_*).
+// =====================================================================
+// v29 M2 item 4: the plan grammar COMPOSES. The v25.7 lesson — the H1
+// brick hid in a regime COMBINATION (checkpoint-then-size-rotation) the
+// old fixed-shape grammar could not express — is now the grammar's
+// structure instead of one bolted-on flag: a plan is a seeded SEQUENCE of
+// windows, and named compositions (the roadmap's list: GC sweeps x
+// checkpoint x rotation x the structural-change windows, plus the three
+// Audit-2 surfaces) are first-class templates spliced into the sequence:
+//   T0 Ckpt -> Puts -> GcSweep        gc x checkpoint
+//   T1 Ckpt -> Puts -> Rotate -> Puts rotation AFTER checkpoint (the H1
+//                                     lesson kept as a guaranteed shape)
+//   T2 Structural -> Ckpt -> Structural  structural change around a
+//                                     checkpoint. THIS IS THE MERGE-WINDOW
+//                                     SLOT: today Structural forces leaf
+//                                     SPLITS (the only structural tree
+//                                     mutation that exists); when M4 lands
+//                                     borrow/merge/cascade, this window
+//                                     grows the merge forcing and the
+//                                     compositions around it are already
+//                                     in the plan space — the grammar
+//                                     grows the window, not a new grammar.
+//   T3 PressurePuts x AllocFail       EXTRA-1: reservation-window throws
+//                                     UNDER BATCH PRESSURE (concurrent
+//                                     committers + the CKV-012 throw in
+//                                     the reservation window). The oracle
+//                                     is the ledger pair: a pre-EXTRA-1
+//                                     latch lets a concurrent committer
+//                                     write past the burned cts — an
+//                                     interior gap the parent's reopen
+//                                     refuses loudly (violation).
+//   T4 BigPuts x WriteFail/WriteShort WAL-1: ~70 KiB values make batch
+//                                     extents span MULTIPLE 64 KiB fill
+//                                     chunks — the offset-scan
+//                                     classifier's torn-tail-vs-interior
+//                                     decision surface. Outcomes: clean
+//                                     rollback (usual), or the documented
+//                                     LOUD REFUSAL shapes, which the
+//                                     parent classifies (see below)
+//                                     instead of mis-scoring them as
+//                                     violations.
+//   T5 Rotate x DirFsyncFail          WAL-2: the segment-creation dir-
+//          (+ require_fault_fired)    fsync window. The charge MUST be
+//                                     consumed (open_segment's fresh-path
+//                                     fsync_dir is the only site that can
+//                                     take it in this plan); the child
+//                                     asserts fault::remaining()==0
+//                                     before a clean exit (rc 22 =
+//                                     vacuous composition). This is the
+//                                     mechanism that makes the WAL-2
+//                                     window non-vacuous under _exit
+//                                     fuzzing, where the missing fsync
+//                                     itself is invisible (page cache).
+//   T6 GcSweep -> Rotate -> Puts -> Ckpt  the three-way composition.
+// Every stream also DETERMINISTICALLY forces each template: round r==1
+// of point pi uses template pi % 7 (the parent), so composition coverage
+// does not ride the seeded dice at the default round count.
+//
+// Fault matrix widened with the grammar: background faults now sample
+// Kind 1..12 — the v25.8 eight plus AllocFail (CKV-012), ManifestOpenFail
+// (SRC-A), TruncateFail (SRC-B) and RotFinalDirFsyncFail (SRC-C); the
+// per-kind anti-vacuity assert counts all twelve.
+// =====================================================================
+enum class Win : uint8_t { Puts, BigPuts, PressurePuts, Structural, Rotate, Ckpt, GcSweep, Backup };
+
 struct Plan {
-    int puts_before;
-    bool rotate;
-    int puts_after_rotate;
-    bool checkpoint;
-    int puts_after_ckpt;
-    bool second_checkpoint;
-    // v25.7 (review H1): a SIZE-based rotation AFTER the checkpoint(s).
-    // The pre-fix plan grammar only ever rotated BEFORE checkpointing, so
-    // the fuzzer could not reach the state that bricked the database:
-    // checkpoint deletes segments -> size rotation zeroes the MANIFEST
-    // ckpt_ts -> recovery rejects the legitimately-deleted segments as
-    // "missing". With this flag the parent-side verification (reopen +
-    // ledger diff) covers that regime on ~half of all checkpoint plans.
-    bool rotate_after_ckpt;
-    // v25.8 (adversarial review rank 2): an online backup AFTER the
-    // checkpoint regime, so the six bk_* crash points are reachable by the
-    // fuzzer's plan grammar and join kAll's anti-vacuity coverage. On a
-    // CLEAN run the child leaves a bk_ok sentinel and the parent asserts
-    // verify_backup() accepts (B1 machine-check on the fuzz path).
-    bool backup;
+    std::vector<Win> wins;      // the composed window sequence
+    int puts_scale;             // puts per Puts-class window (2..6)
+    int gc_passes;              // per GcSweep window (1..3)
+    int pressure_threads;       // per PressurePuts window (2..4)
     // v25.8 (adversarial review rank 3): compound plans — a seeded fault
-    // kind (fault::Kind 1..8) armed for 1-2 charges, ORTHOGONAL to the
-    // crash point. This begins the {fault kind} x {crash point} matrix the
-    // v26 M1 acceptance criteria called for: the child must still honour
-    // D2/D3 under the fault (rejected puts go to the rejected ledger, the
-    // instance fail-stops), and the parent's recovery assertions must hold
-    // for the COMBINATION. Exhaustive-matrix publication (every cell
-    // exercised by name) remains an open ROADMAP item; this is seeded
-    // sampling of the space on every fuzz run.
+    // kind armed for 1-2 charges, ORTHOGONAL to the crash point. Widened
+    // to 1..10 by v29 M2 item 4 (AllocFail, ManifestOpenFail).
     int fault_kind;      // 0 = none, else fault::Kind value
     int fault_charges;
+    // v29 M2 item 4 (WAL-2 template): the child must witness its armed
+    // charge firing before exiting clean — an unfired charge means the
+    // composition never reached the surface it names (vacuous plan).
+    bool require_fault_fired;
     int occurrence;      // which hit of the target point dies
+    bool has_ckpt() const {
+        for (auto w : wins) if (w == Win::Ckpt || w == Win::Backup) return true;
+        return false;
+    }
+    bool has_backup() const {
+        for (auto w : wins) if (w == Win::Backup) return true;
+        return false;
+    }
+    bool has_big() const {
+        for (auto w : wins) if (w == Win::BigPuts) return true;
+        return false;
+    }
 };
 
-static Plan make_plan(uint64_t seed) {
+static Plan make_plan(uint64_t seed, int force_template = -1) {
     std::mt19937_64 rng(seed);
     Plan p;
-    p.puts_before        = 1 + (int)(rng() % 8);
-    p.rotate             = (rng() % 2) == 0;
-    p.puts_after_rotate  = (int)(rng() % 5);
-    p.checkpoint         = (rng() % 2) == 0;
-    p.puts_after_ckpt    = (int)(rng() % 5);
-    p.second_checkpoint  = p.checkpoint && (rng() % 3) == 0;
-    p.rotate_after_ckpt  = p.checkpoint && (rng() % 2) == 0;
-    p.backup             = p.checkpoint && (rng() % 2) == 0;
-    p.fault_kind         = 0;
-    p.fault_charges      = 0;
-    if ((rng() % 4) == 0) {
-        p.fault_kind    = 1 + (int)(rng() % 8);   // fault::Kind 1..8
+    p.puts_scale       = 2 + (int)(rng() % 5);
+    p.gc_passes        = 1 + (int)(rng() % 3);
+    p.pressure_threads = 2 + (int)(rng() % 3);
+    p.fault_kind       = 0;
+    p.fault_charges    = 0;
+    p.require_fault_fired = false;
+    p.occurrence       = 0;
+    p.wins.push_back(Win::Puts);                 // every plan starts with puts
+    const int n_extra = 2 + (int)(rng() % 4);    // 2..5 more windows
+    for (int i = 0; i < n_extra; ++i) {
+        const uint64_t pick = rng() % 100;
+        Win w;
+        if      (pick < 22) w = Win::Puts;
+        else if (pick < 34) w = Win::BigPuts;
+        else if (pick < 46) w = Win::PressurePuts;
+        else if (pick < 58) w = Win::Structural;
+        else if (pick < 72) w = Win::Rotate;
+        else if (pick < 85) w = Win::Ckpt;
+        else if (pick < 94) w = Win::GcSweep;
+        else                w = p.has_ckpt() ? Win::Backup : Win::Ckpt;
+        p.wins.push_back(w);
+    }
+    // Named compositions: ~1/3 of plans splice one at a seeded position,
+    // or the parent forces it (round 1: template = point-index % 7).
+    int tmpl = force_template;
+    if (tmpl < 0 && (rng() % 3) == 0) tmpl = (int)(rng() % 7);
+    if (tmpl >= 0) {
+        std::vector<Win> ins;
+        switch (tmpl) {
+        case 0: ins = {Win::Ckpt, Win::Puts, Win::GcSweep}; break;
+        case 1: ins = {Win::Ckpt, Win::Puts, Win::Rotate, Win::Puts}; break;
+        case 2: ins = {Win::Structural, Win::Ckpt, Win::Structural}; break;
+        case 3: ins = {Win::PressurePuts, Win::Ckpt};
+                p.fault_kind = (int)fault::Kind::AllocFail;
+                p.fault_charges = 1 + (int)(rng() % 2);
+                break;
+        case 4: ins = {Win::BigPuts, Win::Rotate, Win::Puts};
+                p.fault_kind = (rng() % 2) ? (int)fault::Kind::WriteFail
+                                           : (int)fault::Kind::WriteShort;
+                p.fault_charges = 1;
+                break;
+        case 5: ins = {Win::Rotate, Win::Puts};
+                p.fault_kind = (int)fault::Kind::DirFsyncFail;
+                p.fault_charges = 1;
+                p.require_fault_fired = true;
+                break;
+        case 6: ins = {Win::GcSweep, Win::Rotate, Win::Puts, Win::Ckpt}; break;
+        }
+        // T3/T4/T5 carry ARMED FAULTS: they splice at position 1 so the
+        // charge cannot be consumed by an earlier window (a Ckpt's dir
+        // fsync or an ordinary put's write would otherwise eat it and the
+        // composition — and T5's fired-witness — would be vacuous). The
+        // fault-free templates splice at a seeded position so they compose
+        // with whatever random state precedes them.
+        size_t at = 1 + (size_t)(rng() % p.wins.size());
+        if (tmpl == 3 || tmpl == 4 || tmpl == 5) at = 1;
+        p.wins.insert(p.wins.begin() + (long)at, ins.begin(), ins.end());
+    }
+    // Background compound fault (when no template armed one).
+    if (p.fault_kind == 0 && (rng() % 4) == 0) {
+        p.fault_kind    = 1 + (int)(rng() % 12);   // Kind 1..12 (was 1..8; SRC's
+                                                   // TruncateFail + RotFinalDirFsyncFail join)
         p.fault_charges = 1 + (int)(rng() % 2);
     }
     // occurrence is filled in by the caller: round 0 must always use 0, so a
@@ -1231,7 +1346,6 @@ static Plan make_plan(uint64_t seed) {
     // did, reporting 6 of 20 points never hit. Randomising the occurrence is
     // still valuable (it targets the 2nd/3rd batch or rotation), just not on
     // the round that carries the coverage guarantee.
-    p.occurrence         = 0;
     return p;
 }
 
@@ -1240,8 +1354,10 @@ static Plan make_plan(uint64_t seed) {
 // Drives the PUBLIC chronokv::Database API rather than the engine directly:
 // the crash points sit in engine code, but exercising them through the public
 // surface means the fuzzer also covers the wrapper paths a real embedder uses.
+// v29 M2 item 4: the body is now the window-sequence interpreter.
 static int child_body(const std::string& base, const Plan& plan,
-                      const char* point, bool use_ckpt) {
+                      const char* point) {
+    const bool use_ckpt = plan.has_ckpt();
     const std::string wd = base + "/wal";
     Ledger acked, rejected;
     acked.open(base + "/ledger");
@@ -1267,54 +1383,101 @@ static int child_body(const std::string& base, const Plan& plan,
         if (plan.fault_kind != 0)
             fault::arm(static_cast<fault::Kind>(plan.fault_kind), plan.fault_charges);
 
-        auto do_put = [&](const std::string& k) {
-            std::string v = "v_" + k;
+        auto do_put = [&](const std::string& k, const std::string& v) {
             chronokv::Status st = chronokv::Status::Failed;
             try { st = db.put(k, v); } catch (...) { st = chronokv::Status::Failed; }
             if (st == chronokv::Status::OK) acked.record(k, v);
             else                            rejected.record(k, "");
         };
 
-        for (int i = 0; i < plan.puts_before; ++i)
-            do_put("a" + std::to_string(i));
-
-        if (plan.rotate) {
-            db.force_wal_rotation_for_test();
-            for (int i = 0; i < std::max(1, plan.puts_after_rotate); ++i)
-                do_put("b" + std::to_string(i));
-        }
-        if (use_ckpt) {
-            try { db.checkpoint(); } catch (...) { /* may legitimately fail */ }
-            for (int i = 0; i < plan.puts_after_ckpt; ++i)
-                do_put("c" + std::to_string(i));
-            if (plan.second_checkpoint) {
-                try { db.checkpoint(); } catch (...) {}
-            }
-            // v25.7 (review H1): size-based rotation AFTER the checkpoint(s)
-            // — the regime whose combination with segment deletion bricked
-            // the pre-fix database at the next open.
-            if (plan.rotate_after_ckpt) {
+        int win_no = 0;
+        for (const Win w : plan.wins) {
+            const std::string pfx = "w" + std::to_string(win_no++) + "_";
+            switch (w) {
+            case Win::Puts:
+                for (int i = 0; i < plan.puts_scale; ++i)
+                    do_put(pfx + "a" + std::to_string(i), "v_" + pfx + std::to_string(i));
+                break;
+            case Win::BigPuts: {
+                // ~70 KiB values: batch extents span MULTIPLE 64 KiB fill
+                // chunks — the WAL-1 classifier's multi-chunk surface and
+                // the SRC-E4 zero-fill machinery's input shape.
+                const int n = 2 + plan.puts_scale / 2;
+                for (int i = 0; i < n; ++i) {
+                    const std::string k = pfx + "g" + std::to_string(i);
+                    do_put(k, std::string(70 * 1024, 'G') + "_" + k);
+                }
+                break; }
+            case Win::PressurePuts: {
+                // EXTRA-1's surface: concurrent committers in the group
+                // batch window. A crash point may fire from ANY thread
+                // (crashpt counts hits process-wide) — that is the point.
+                std::vector<std::thread> ts;
+                for (int t = 0; t < plan.pressure_threads; ++t)
+                    ts.emplace_back([&, t] {
+                        for (int i = 0; i < plan.puts_scale; ++i) {
+                            const std::string k = pfx + "p" + std::to_string(t) +
+                                                  "_" + std::to_string(i);
+                            do_put(k, "v_" + k);
+                        }
+                    });
+                for (auto& x : ts) x.join();
+                break; }
+            case Win::Structural:
+                // The merge-window SLOT (see the grammar comment): today a
+                // split-forcing insert burst (padded keys + ~180 B values =>
+                // >= one leaf split per window); when M4 lands this window
+                // grows merge/rebalance forcing.
+                for (int i = 0; i < 24; ++i) {
+                    char kb[32];
+                    snprintf(kb, sizeof kb, "%ss%02d", pfx.c_str(), i);
+                    do_put(kb, std::string(180, 'S') + kb);
+                }
+                break;
+            case Win::Rotate:
                 db.force_wal_rotation_for_test();
-                do_put("d0");
-            }
-            // v25.8 (rank 2): backup regime. A crash at any bk_* point
-            // leaves an incomplete copy — source recoverability is asserted
-            // by the parent as usual; per-copy rejection is
-            // run_backup_test's deterministic job. On a CLEAN run the
-            // backup must VERIFY, signalled by the bk_ok sentinel (a backup
-            // that legitimately THREW — e.g. under an armed fault — leaves
-            // no sentinel and asserts nothing).
-            if (plan.backup) {
+                do_put(pfx + "r0", "v_r0");   // drive the leader through it
+                break;
+            case Win::Ckpt:
+                try { db.checkpoint(); } catch (...) { /* may legitimately fail */ }
+                break;
+            case Win::GcSweep:
+                for (int i = 0; i < plan.gc_passes; ++i) {
+                    try { db.gc_pass_for_test(); } catch (...) {}
+                }
+                break;
+            case Win::Backup:
+                // v25.8 (rank 2): backup regime. A crash at any bk_* point
+                // leaves an incomplete copy — source recoverability is asserted
+                // by the parent as usual; per-copy rejection is
+                // run_backup_test's deterministic job. On a CLEAN run the
+                // backup must VERIFY, signalled by the bk_ok sentinel (a backup
+                // that legitimately THREW — e.g. under an armed fault — leaves
+                // no sentinel and asserts nothing).
                 try {
                     db.backup(base + "/bk");
                     int sfd = ::open((base + "/bk_ok").c_str(),
                                      O_CREAT | O_WRONLY | O_TRUNC, 0644);
                     if (sfd >= 0) ::close(sfd);
                 } catch (...) { /* legitimate under fault injection */ }
+                break;
             }
         }
+        // v29 M2 item 4 (WAL-2 template): the armed charge must have fired —
+        // an unfired DirFsyncFail means the plan never reached the segment-
+        // creation dir-fsync it claims to compose (vacuous). rc 22, which
+        // the parent scores as a violation naming the composition.
+        // Sampled BEFORE disarm: disarm() zeroes remaining (the first cut
+        // read it after, so the witness could never fire — caught by the
+        // W2V mutation run staying green when it had to go red).
+        const int leftover_charges =
+            plan.fault_kind != 0 ? fault::remaining.load() : 0;
         fault::disarm();
         crashpt::disarm();
+        if (plan.require_fault_fired && leftover_charges != 0) {
+            acked.close(); rejected.close();
+            return 22;
+        }
     } catch (...) {
         acked.close(); rejected.close();
         return 21;
@@ -1336,8 +1499,9 @@ static int run_crash_fuzz() {
     };
 
     // Rounds per crash point per seed base. Total iterations =
-    // seeds * rounds * kAllCount (26 points since v25.8 folded in the six
-    // bk_*; the "(20)" that stood here was stale). The default keeps the
+    // seeds * rounds * kAllCount (28 points since v29 M2 item 4 added the
+    // two seg_* segment-creation dir-fsync points — the WAL-2 surface;
+    // 26 since v25.8 folded in the six bk_*). The default keeps the
     // always-run suite fast (~10s); round 0 of every point uses occurrence
     // 0, so full coverage of all 26 boundaries is guaranteed even at
     // rounds=1. Raise CKV_CRASHFUZZ_ROUNDS for a long run -- 40 gives 1040
@@ -1365,9 +1529,18 @@ static int run_crash_fuzz() {
     const size_t npts = crashpt::kAllCount;
     std::vector<int> hits(npts, 0);          // coverage: did the point ever fire?
     std::vector<int> clean_runs(npts, 0);    // plan completed without hitting it
-    std::vector<int> fault_kind_plans(9, 0); // v25.8 (rank 3): per-kind plan coverage
+    std::vector<int> fault_kind_plans(13, 0); // v25.8 (rank 3): per-kind plan
+                                              // coverage; v29 M2 item 4: all 12
     std::vector<std::string> first_failure;
     int violations = 0;
+    // v29 M2 item 4: composition counters (the grammar's anti-vacuity —
+    // a composition the plan space never contains is a regime the fuzzer
+    // does not actually cover, whatever the point-hit table says) and the
+    // loud-refusal tally (documented SRC-E4-class outcomes under
+    // write-fault x big-record plans: refused, not lost).
+    int comp_gc_ckpt = 0, comp_rot_after_ckpt = 0, comp_structural = 0,
+        comp_pressure_alloc = 0, comp_big_writefault = 0, comp_dirfsync_probe = 0,
+        loud_refusals = 0;
 
     uint64_t seed_base = 0xC0FFEEULL;
     if (const char* e = getenv("CKV_CRASHFUZZ_SEED")) seed_base = strtoull(e, nullptr, 10);
@@ -1389,31 +1562,43 @@ static int run_crash_fuzz() {
         const char* point = crashpt::kAll[pi];
         for (int r = 0; r < rounds; ++r) {
             uint64_t seed = eff_base + pi * 1000003ULL + (uint64_t)r * 7919ULL;
-            crashfuzz::Plan plan = crashfuzz::make_plan(seed);
+            // v29 M2 item 4: round 1 DETERMINISTICALLY cycles the seven
+            // named composition templates (pi % 7), so composition coverage
+            // never rides the seeded dice at the default round count; the
+            // other rounds take the ~1/3 seeded template chance.
+            crashfuzz::Plan plan = crashfuzz::make_plan(seed, r == 1 ? (int)(pi % 7) : -1);
             // Reachability: force the plan regimes the TARGET point needs, so
             // coverage does not depend on the seeded plan happening to rotate
             // or checkpoint. Without this the first run reported 6 of 20 points
             // never hit -- not because they were unreachable, but because the
             // random plan skipped the code path they sit on.
             {
+                using crashfuzz::Win;
                 std::string pn(point);
+                auto append = [&](std::initializer_list<Win> ws) {
+                    for (auto w : ws) plan.wins.push_back(w);
+                };
                 if (pn.rfind("rot_", 0) == 0 || pn.rfind("man_", 0) == 0) {
-                    plan.rotate = true;
-                    plan.puts_after_rotate = std::max(1, plan.puts_after_rotate);
+                    append({Win::Rotate, Win::Puts});
                 }
-                if (pn.rfind("rotc_", 0) == 0 || pn.rfind("ckpt_", 0) == 0) {
-                    plan.checkpoint = true;
-                    // rotc_* needs rotate_after_checkpoint, which only runs when
-                    // a checkpoint is taken on a WAL that has segments to rotate.
-                    plan.rotate = true;
-                    plan.puts_after_ckpt = std::max(1, plan.puts_after_ckpt);
+                if (pn.rfind("seg_", 0) == 0) {
+                    // v29 M2 item 4 (WAL-2): the segment-creation window is
+                    // entered through any rotation (or checkpoint rotation).
+                    append({Win::Rotate, Win::Puts});
+                }
+                if (pn.rfind("rotc_", 0) == 0) {
+                    // rotc_* lives in rotate_after_checkpoint's unlink step,
+                    // which only executes when a PRIOR size rotation left
+                    // more than one segment to unlink — the pre-grammar
+                    // forcing had the same shape (rotate BEFORE checkpoint).
+                    append({Win::Puts, Win::Rotate, Win::Puts, Win::Ckpt, Win::Puts});
+                } else if (pn.rfind("ckpt_", 0) == 0) {
+                    append({Win::Puts, Win::Ckpt, Win::Puts});
                 }
                 if (pn.rfind("bk_", 0) == 0) {
                     // v25.8 (rank 2): backup points need a checkpoint path
                     // (use_ckpt) and the backup regime.
-                    plan.checkpoint = true;
-                    plan.backup = true;
-                    plan.puts_after_ckpt = std::max(1, plan.puts_after_ckpt);
+                    append({Win::Puts, Win::Ckpt, Win::Backup});
                 }
             }
             if (r > 0) {
@@ -1430,9 +1615,33 @@ static int run_crash_fuzz() {
                 // random for rounds > 0.
                 plan.fault_kind = 0;
                 plan.fault_charges = 0;
+                plan.require_fault_fired = false;
             }
-            if (plan.fault_kind >= 1 && plan.fault_kind <= 8)
+            if (plan.fault_kind >= 1 && plan.fault_kind <= 12)
                 fault_kind_plans[plan.fault_kind]++;
+            // v29 M2 item 4: composition counters, counted AFTER the
+            // round-0 clearing so they only tally plans that actually arm
+            // what they claim to compose.
+            {
+                using crashfuzz::Win;
+                bool seen_ckpt = false, seen_pressure = false, seen_structural = false;
+                for (auto w : plan.wins) {
+                    if (w == Win::Ckpt || w == Win::Backup) seen_ckpt = true;
+                    else if (w == Win::GcSweep && seen_ckpt) comp_gc_ckpt++;
+                    else if (w == Win::Rotate && seen_ckpt) comp_rot_after_ckpt++;
+                    if (w == Win::PressurePuts) seen_pressure = true;
+                    if (w == Win::Structural) seen_structural = true;
+                }
+                if (seen_structural) comp_structural++;
+                if (seen_pressure && plan.fault_kind == (int)fault::Kind::AllocFail)
+                    comp_pressure_alloc++;
+                if (plan.has_big() && (plan.fault_kind == (int)fault::Kind::WriteFail ||
+                                       plan.fault_kind == (int)fault::Kind::WriteShort))
+                    comp_big_writefault++;
+                if (plan.require_fault_fired &&
+                        plan.fault_kind == (int)fault::Kind::DirFsyncFail)
+                    comp_dirfsync_probe++;
+            }
             const std::string base = "/tmp/ckv_cf_" + std::to_string(getpid()) +
                                      "_" + std::to_string(pi) + "_" + std::to_string(r);
             std::filesystem::remove_all(base);
@@ -1444,7 +1653,7 @@ static int run_crash_fuzz() {
             pid_t child = fork();
             if (child < 0) { first_failure.push_back(std::string(point) + ": fork failed"); break; }
             if (child == 0) {
-                _exit(crashfuzz::child_body(base, plan, point, plan.checkpoint));
+                _exit(crashfuzz::child_body(base, plan, point));
             }
             int wst = 0;
             if (waitpid(child, &wst, 0) != child) {
@@ -1463,6 +1672,17 @@ static int run_crash_fuzz() {
             int rc = WIFEXITED(wst) ? WEXITSTATUS(wst) : -1;
             if (rc == crashpt::kExitCode)      hits[pi]++;
             else if (rc == 0)                  clean_runs[pi]++;
+            else if (rc == 22) {
+                // v29 M2 item 4: the child's armed-fault witness — the
+                // composition never reached the surface it names (e.g. the
+                // WAL-2 template's DirFsyncFail charge was not consumed:
+                // open_segment's fresh-path dir fsync no longer exists).
+                violations++;
+                first_failure.push_back(std::string(point) + " seed=" + std::to_string(seed) +
+                                        ": armed fault charge never fired — composition vacuous (rc 22)");
+                std::filesystem::remove_all(base);
+                continue;
+            }
             else {
                 violations++;
                 first_failure.push_back(std::string(point) + " seed=" + std::to_string(seed) +
@@ -1479,7 +1699,7 @@ static int run_crash_fuzz() {
 
             if (!ChronoKV::verify_wal_dir(wd, &reason)) {
                 err = "verify_wal_dir: " + reason;
-            } else if (plan.checkpoint && std::filesystem::exists(cp) &&
+            } else if (plan.has_ckpt() && std::filesystem::exists(cp) &&
                        !ChronoKV::verify_checkpoint_chain(cp, &reason)) {
                 err = "verify_checkpoint_chain: " + reason;
             }
@@ -1492,7 +1712,7 @@ static int run_crash_fuzz() {
             // on the fuzz path. Backups that legitimately threw (armed
             // faults) leave no sentinel and assert nothing; copies killed
             // mid-backup are covered deterministically by run_backup_test.
-            if (err.empty() && rc == 0 && plan.backup &&
+            if (err.empty() && rc == 0 && plan.has_backup() &&
                 std::filesystem::exists(base + "/bk_ok")) {
                 std::string breason;
                 if (!ChronoKV::verify_backup(base + "/bk", &breason))
@@ -1502,7 +1722,7 @@ static int run_crash_fuzz() {
             if (err.empty()) {
                 try {
                     ChronoKV kv2(wd);
-                    if (plan.checkpoint && std::filesystem::exists(cp))
+                    if (plan.has_ckpt() && std::filesystem::exists(cp))
                         kv2.recover_with_checkpoint(wd, cp);
                     else
                         kv2.recover(wd);
@@ -1538,7 +1758,35 @@ static int run_crash_fuzz() {
                 }
             }
 
+            // v29 M2 item 4 (WAL-1 template): loud-refusal classification.
+            // A {BigPuts x WriteFail/WriteShort} plan can legitimately land
+            // in the documented refusal state — interior zeros before
+            // surviving CRC-valid frames (the SRC-E4 shape family): a WAL
+            // that REFUSES to open is the contract there, not a fuzz
+            // violation. The classification is deliberately narrow: only
+            // corruption-signature messages qualify, and "interior gap"
+            // NEVER does — that message is the EXTRA-1 regression signal
+            // (a concurrent committer wrote past the burned cts) and must
+            // stay a violation even under faults. Loss/resurrection oracles
+            // are untouched: they only run when the database OPENS, and a
+            // silent wrong answer there is always a violation.
+            const bool writefault_big = plan.has_big() &&
+                (plan.fault_kind == (int)fault::Kind::WriteFail ||
+                 plan.fault_kind == (int)fault::Kind::WriteShort);
+            auto is_torn_shape_refusal = [](const std::string& m) {
+                std::string lo;
+                lo.reserve(m.size());
+                for (char c : m) lo.push_back((char)std::tolower((unsigned char)c));
+                if (lo.find("interior gap") != std::string::npos) return false;
+                if (lo.find("not reconstructable") != std::string::npos) return false;
+                return lo.find("corruption") != std::string::npos;
+            };
             if (!err.empty()) {
+                if (writefault_big && is_torn_shape_refusal(err)) {
+                    loud_refusals++;
+                    std::filesystem::remove_all(base);
+                    continue;
+                }
                 violations++;
                 if (first_failure.size() < 12)
                     first_failure.push_back(std::string(point) + " seed=" + std::to_string(seed) +
@@ -1568,7 +1816,7 @@ static int run_crash_fuzz() {
     {
         int armed_plans = 0, kinds_seen = 0;
         std::string dist;
-        for (int k = 1; k <= 8; ++k) {
+        for (int k = 1; k <= 12; ++k) {
             armed_plans += fault_kind_plans[k];
             if (fault_kind_plans[k]) ++kinds_seen;
             dist += " k" + std::to_string(k) + "=" + std::to_string(fault_kind_plans[k]);
@@ -1577,9 +1825,35 @@ static int run_crash_fuzz() {
                   << total_iters << ";" << dist << " )\n";
         if (total_iters >= 200)
             report("v25.8: every fault kind appears in the fuzz plan space",
-                   kinds_seen == 8,
-                   kinds_seen == 8 ? std::string()
-                                   : "only " + std::to_string(kinds_seen) + " of 8 kinds planned");
+                   kinds_seen == 12,
+                   kinds_seen == 12 ? std::string()
+                                    : "only " + std::to_string(kinds_seen) + " of 12 kinds planned");
+    }
+
+    // v29 M2 item 4: the composition ledger — published, and asserted at
+    // default-or-larger run sizes (round 1's deterministic template cycle
+    // guarantees every named composition occurs; a zero means the grammar
+    // lost a regime the roadmap item names).
+    std::cout << "    (compositions: gc_x_ckpt=" << comp_gc_ckpt
+              << " rot_after_ckpt=" << comp_rot_after_ckpt
+              << " structural=" << comp_structural
+              << " pressure_x_alloc=" << comp_pressure_alloc
+              << " bigrec_x_writefault=" << comp_big_writefault
+              << " dirfsync_probe=" << comp_dirfsync_probe
+              << "; loud_refusals=" << loud_refusals << ")\n";
+    if (total_iters >= 200) {
+        const bool all_comp = comp_gc_ckpt > 0 && comp_rot_after_ckpt > 0 &&
+                              comp_structural > 0 && comp_pressure_alloc > 0 &&
+                              comp_big_writefault > 0 && comp_dirfsync_probe > 0;
+        std::string miss;
+        if (!comp_gc_ckpt) miss += " gc_x_ckpt";
+        if (!comp_rot_after_ckpt) miss += " rot_after_ckpt";
+        if (!comp_structural) miss += " structural";
+        if (!comp_pressure_alloc) miss += " pressure_x_alloc";
+        if (!comp_big_writefault) miss += " bigrec_x_writefault";
+        if (!comp_dirfsync_probe) miss += " dirfsync_probe";
+        report("v29 M2 item 4: every named composition occurs in the plan space",
+               all_comp, all_comp ? std::string() : "never composed:" + miss);
     }
 
     std::cout << "    (" << total_iters << " iterations, " << total_hits

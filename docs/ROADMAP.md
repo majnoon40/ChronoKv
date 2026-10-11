@@ -255,7 +255,7 @@ What 0.28.1 did *not* do, and v29 inherits:
 | v29 M0 closure | **DONE 2026-10-08** — reconstructed report + tag `v0.28.1` + delta confirmation round, verdict **B+ (clean)**: 20/20 probes, one Low doc-truth finding fixed in the closure commit; **M3+ gate lifted** | `docs/audits/2026-10-delta-confirmation-0.28.1.md` (+ probes) |
 | v29 M1 — benchmark arena | **STARTED** — steps 1–3 COMPLETE (D/E/F adapters + version pins with sha256/fetch recipe); step-4 vehicle: split (#68–#75 green) then RE-MERGED to one same-hardware job after #75's headers caught the two-runner CPU split — green-week clock restarts on the merged vehicle (rule 9 over sunk nights); soak vehicle NAMED (rolling nightly chain). Remaining: green week (7 nights), noise bands + gate enablement, ledger-promotion decision, CI build cache | `bench/`, `bench/third_party/versions.txt`, ci.yml `arena` |
 | v29 CI hardening (adjacent, unplanned-in-9/27) | **SHIPPED + PROMOTED** — lint/ratchet/hygiene gates, build-shared; the 4 experimental sanitizer legs went green ×3 (#64/#65/#66) → flags deleted, all 12 legs gating | `5cd74b5`; promotion `0027fe0` |
-| v29 M2 — catcher hardening | **STARTED** — item 1 (write-skew checker, 2026-10-08, live pre-fix-flag/post-fix-pass proof) + item 5 (test-suite TU split, 2026-10-10: 1 GiB release/stress `-O1` bare, ASan `-O0` possible, 503/0 full suite; found+fixed the `dst::my_tid` non-inline thread_local, now stress-gated) + item 2 (DST grammar growth, 2026-10-11: S5 `tree_merge_cascade` (M4 grammar) + S6 `reclaim_retire_pin` (M3 grammar), green vs the merge-free tree, 600/600 children at PR scale, four-mutant fail-first matrix; nightly seeds/shard rebalanced 3,125→2,083 to hold N=100k and the wall-time band at six scenarios) + item 3 (de-vacuation, 2026-10-11: v17 GC-boundedness / v18 LSN-contiguity / m2_phase1 size-rotation / 30 s soak all upgraded to real oracles — accounting, differential readbacks, size-rotation admission exercised via a lowered segment cap, shadow-model differential over live AND recovered state; each proven old-GREEN/new-RED against its scratch-build reversion; the soak run additionally exposed and fixed its own empty-WAL-delta hole; release suite 513→514/0) shipped; item 4 pending | `check_write_skew`; `dstscn::s5/s6`; `tests/`, Makefile template |
+| v29 M2 — catcher hardening | **COMPLETE** — item 1 (write-skew checker, 2026-10-08, live pre-fix-flag/post-fix-pass proof) + item 5 (test-suite TU split, 2026-10-10: 1 GiB release/stress `-O1` bare, ASan `-O0` possible, 503/0 full suite; found+fixed the `dst::my_tid` non-inline thread_local, now stress-gated) + item 2 (DST grammar growth, 2026-10-11: S5 `tree_merge_cascade` (M4 grammar) + S6 `reclaim_retire_pin` (M3 grammar), green vs the merge-free tree, 600/600 children at PR scale, four-mutant fail-first matrix; nightly seeds/shard rebalanced 3,125→2,083 to hold N=100k and the wall-time band at six scenarios) + item 3 (de-vacuation, 2026-10-11: v17 GC-boundedness / v18 LSN-contiguity / m2_phase1 size-rotation / 30 s soak all upgraded to real oracles — accounting, differential readbacks, size-rotation admission exercised via a lowered segment cap, shadow-model differential over live AND recovered state; each proven old-GREEN/new-RED against its scratch-build reversion; the soak run additionally exposed and fixed its own empty-WAL-delta hole; release suite 513→514/0) + item 4 (crash-fuzz composition, 2026-10-11: window-sequence plan grammar + seven named templates incl. the Audit-2 surfaces and the Structural merge-window slot, kAll 26→28 with the `seg_*` WAL-2 window, fault matrix widened to all 12 kinds, composition ledger published+asserted; both reversion proofs red — orphan-tolerance revert 16 violations, DirFsyncFail-site removal 7 rc-22 witness violations — clean stream 0 violations) — all five items shipped | `check_write_skew`; `dstscn::s5/s6`; `crashfuzz` grammar; `tests/`, Makefile template |
 | v29 M3–M7 — the overhaul | not started — M0 CLOSED 2026-10-08; order still governed by constraints 2–3 (arena green week, catchers first) | — |
 | v30 M0–M5 — the challenge, 1.0.0 | not started | — |
 
@@ -477,7 +477,7 @@ comparison; the README performance section exists and links the
 methodology; the nightly ledger shows one full green week. No engine
 changes in this milestone.
 
-## M2 — Catcher hardening  **[M] — STARTED (items 1 + 2 + 3 + 5 shipped 2026-10-08/10/11)**
+## M2 — Catcher hardening  **[M] — COMPLETE (items 1 + 5: 2026-10-08/10; items 2 + 3 + 4: 2026-10-11)**
 
 **Anchor** (upgraded by Audit-2): remediation spec §11 predicted lincheck's
 SSI blindness; TXN-1 *demonstrated* it — a real write-skew-class anomaly
@@ -654,6 +654,56 @@ the remaining audit-enumerated vacuous tests, plus the build-memory wall.
    and merge windows — and now also the Audit-2 surfaces: segment-creation
    dir-fsync windows (WAL-2), the recovery offset-scan classifier
    (WAL-1), reservation-window throws under batch pressure (EXTRA-1).
+   **DONE 2026-10-11**: the fixed-shape Plan struct (whose only composed
+   pair was the `rotate_after_ckpt` flag the v25.7 H1 lesson bolted on)
+   is now a seeded WINDOW-SEQUENCE grammar — Puts / BigPuts /
+   PressurePuts / Structural / Rotate / Ckpt / GcSweep / Backup — plus
+   SEVEN named composition templates spliced into the stream: gc x
+   checkpoint; rotation-after-checkpoint (the H1 lesson kept as a
+   guaranteed shape); Structural x Ckpt x Structural; PressurePuts x
+   AllocFail (EXTRA-1: reservation-window throws under concurrent batch
+   pressure — a regressed latch surfaces as the interior gap the
+   parent's reopen refuses, and that message is NEVER classifiable as
+   an acceptable refusal); BigPuts x WriteFail/WriteShort (WAL-1:
+   ~70 KiB values make extents span multiple 64 KiB fill chunks — the
+   classifier's multi-chunk decision surface; the documented loud-refusal
+   outcomes are classified narrowly by a corruption signature, counted
+   and published); Rotate x DirFsyncFail WITH A FIRED-WITNESS (WAL-2:
+   the child asserts its armed charge was consumed before a clean exit —
+   rc 22 = vacuous composition — and the template splices at position 1
+   so no earlier window's dir fsync can eat the charge); and the
+   gc x rotate x checkpoint three-way. THE MERGE WINDOW: Structural is
+   the merge-window slot — today it forces leaf splits (the only
+   structural tree mutation that exists); when M4 lands
+   borrow/merge/cascade the window grows merge forcing and its
+   compositions are already in the plan space (the grammar grows the
+   window, not a new grammar). Round 1 of every stream cycles all seven
+   templates deterministically (point-index % 7), so composition
+   coverage never rides the seeded dice; the composition ledger is
+   published and asserted. The fault matrix widened to ALL TWELVE kinds
+   (v25.8's eight plus AllocFail/ManifestOpenFail and SRC's
+   TruncateFail/RotFinalDirFsyncFail). Two new crash points instrument
+   the WAL-2 window itself — `seg_before_dir_fsync` /
+   `seg_after_dir_fsync` bracketing open_segment's fresh-path dir fsync
+   (kAll 26 → 28), reachable through any rotation regime. The Ledger is
+   mutex-serialized with a short-write loop (pressure windows commit
+   from several threads; big-record lines are ~70 KiB). FAIL-FIRST
+   (scratch builds, full 336-plan streams, measured): reverting the
+   empty-orphan tolerance → 16 violations concentrated in the
+   seg_after_dir_fsync / rot_before_manifest / man_after_tmp_write
+   plans — the new windows bind the recovery contract; removing the
+   DirFsyncFail hook from fsync_dir → exactly 7 rc-22 witness
+   violations. The W2V run also caught the witness's own first-cut bug:
+   it sampled fault::remaining AFTER disarm() zeroed it, so it could
+   never fire — recorded in the child's comment. MEASURED (1 GiB
+   sandbox, `-O0`): 336 plans in 28 s; 182 reached an armed point;
+   composition ledger gc_x_ckpt=56, rot_after_ckpt=190, structural=132,
+   pressure_x_alloc=18, bigrec_x_writefault=18, dirfsync_probe=17; all
+   12 fault kinds planned; 0 violations; loud_refusals=0 at this scale
+   (published, not asserted — the refusal shapes are rare and the
+   deterministic pin lives in SRC-E4). CI plan-cost config unchanged
+   (PR: 2 bases x 24 rounds x 28 points = 1,344 plans ≈ 2 min at local
+   `-O0`).
 5. **NEW — TU pressure relief (test-side split).** Anchor: the 28,016-line
    TU OOMs 1 GiB at `-O1` where 0.28.0 fit, and ASan doesn't build there
    at all; every arc raises the wall; the experimental-leg policy (sanitizer
@@ -687,6 +737,14 @@ the remaining audit-enumerated vacuous tests, plus the build-memory wall.
 checker; every de-vacuated test fails against a reintroduction of its
 defect class; the merge/reclaim DST scenarios run green against the
 current (merge-free) tree; plus item 5's build acceptance.
+**MET 2026-10-11 (milestone complete)**: item 1 proven live against the
+TXN-1 PoC on both engines (pre-fix flag / post-fix pass); item 2 green
+against the merge-free tree at 600/600 children (PR scale) with its own
+four-mutant matrix; item 3's four upgraded tests each measured
+old-GREEN/new-RED against their scratch-build reversions; item 4's
+grammar proven by two reversion runs (16 and 7 violations) with the
+full clean stream at 0 violations, 28/28 points and 12/12 kinds; item 5
+as recorded above.
 
 ## M3 — Page reclamation  **[L]**  *(M0 gate lifted 2026-10-08)*
 
@@ -985,16 +1043,21 @@ benchmarks, not dependencies. Four new rules, each paid for:
    in the closure commit); M3 unlocked. **M2 item 1 (the write-skew
    checker) landed the same day** — validated live against the TXN-1 PoC
    history on both engines, before any M3+ rewrite starts (constraint 3
-   honored). Remaining catcher work: M2 item 4 (crash-fuzz composition)
-   — item 2 (DST grammar growth) shipped 2026-10-11 (S5
-   `tree_merge_cascade` + S6 `reclaim_retire_pin`, green vs the
-   merge-free tree, four-mutant fail-first matrix), item 3
-   (de-vacuation) shipped the same day (all four audit-named vacuous
-   tests upgraded to real oracles, each proven old-GREEN/new-RED by
-   scratch-build reversion; release suite 513→514/0), and item 5 (TU
-   pressure relief) shipped early on 2026-10-10 because the wall kept
-   biting (bare `-O0` monolith builds were already dying on the
-   confirmation sandbox).
+   honored). Remaining catcher work: NONE — v29 M2 is COMPLETE. Item 2
+   (DST grammar growth) shipped 2026-10-11 (S5 `tree_merge_cascade` +
+   S6 `reclaim_retire_pin`, green vs the merge-free tree, four-mutant
+   fail-first matrix), item 3 (de-vacuation) the same day (all four
+   audit-named vacuous tests upgraded to real oracles, each proven
+   old-GREEN/new-RED by scratch-build reversion; the soak run exposed
+   and fixed its own empty-WAL-delta hole), item 4 (crash-fuzz
+   composition) the same day (window-sequence grammar + seven named
+   templates over the Audit-2 surfaces, kAll 26→28, 12/12 fault kinds,
+   both reversion proofs red), and item 5 (TU pressure relief) shipped
+   early on 2026-10-10 because the wall kept biting (bare `-O0`
+   monolith builds were already dying on the confirmation sandbox).
+   Constraint 3 (catchers before rewrites) is now satisfied for the
+   whole arc; rewrite sequencing rests on constraint 2 (the M1 arena
+   green week) alone.
 
 ---
 

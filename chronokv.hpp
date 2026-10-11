@@ -1585,6 +1585,10 @@ namespace crashpt {
         // size-based segment rotation
         "rot_before_old_fsync", "rot_after_new_open",
         "rot_before_manifest", "rot_after_manifest", "rot_after_dir_fsync",
+        // segment-creation dir-fsync window (v29 M2 item 4: the WAL-2
+        // surface, Audit-2 — a new segment's directory entry vs the
+        // records acknowledged inside it)
+        "seg_before_dir_fsync", "seg_after_dir_fsync",
         // MANIFEST write (tmp -> fsync -> rename -> dir fsync)
         "man_after_tmp_write", "man_after_tmp_fsync",
         "man_after_rename", "man_after_dir_fsync",
@@ -4011,11 +4015,18 @@ private:
         // A still-empty segment is therefore synced exactly like a new one.
         std::error_code sz_ec;
         const bool fresh = !existed || std::filesystem::file_size(p, sz_ec) == 0;
+        // v29 M2 item 4: the WAL-2 window as crash-fuzz grammar — a kill
+        // between the segment file's creation and its durable directory
+        // entry (or right after it, before the MANIFEST names the segment)
+        // leaves exactly the orphan shapes recover_all's tolerance rules
+        // exist for. Reachable through any rotation regime.
+        if (fresh) CKV_CRASH_POINT("seg_before_dir_fsync");
         if (fresh && !fsync_dir(p)) {
             (void)checked_close(active_fd_);
             active_fd_ = -1;
             return false;
         }
+        if (fresh) CKV_CRASH_POINT("seg_after_dir_fsync");
         active_id_ = id;
         // v25.1 M2: track segment size for size-based rotation.
         // The file may have existing content (reopened after restart).
@@ -10016,6 +10027,13 @@ public:
     void force_wal_rotation_for_test() {
         auto eng = api_engine();
         if (eng->wal_) eng->wal_->force_rotation_for_test();
+    }
+    // v29 M2 item 4: forwarder for the crash-fuzz grammar's GcSweep window
+    // (the engine-level gc_pass_for_test has always existed; the fuzzer
+    // drives the public Database surface by design, so the window needs the
+    // same seam).
+    void gc_pass_for_test() {
+        api_engine()->gc_pass_for_test();
     }
     // v29 M2 item 3: lower the WAL size-rotation limit (0 restores the
     // production 64 MiB) so m2_phase1 can exercise the SIZE-based rotation

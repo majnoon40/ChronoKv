@@ -138,11 +138,19 @@ before the DST harness is green") is met.
   history recorder, and per-fault-kind error-path coverage with an
   untested-lines ledger (v27 M3) — all run under a four-config sanitizer
   matrix (Release / ASan+UBSan / TSan / Stress) plus the gcov build.
-- **Crash-consistent recovery** — 20 instrumented crash points cover the whole
-  durability state machine (WAL leader, segment rotation, MANIFEST
-  write/rename, checkpoint, rebase). The fuzzer forks a child, kills it at a
+- **Crash-consistent recovery** — 28 instrumented crash points cover the whole
+  durability state machine (WAL leader, segment rotation, segment-creation
+  dir-fsync window, MANIFEST write/rename, checkpoint, rebase, backup). The
+  fuzzer forks a child, kills it at a
   seeded point, then reopens and asserts the database is recoverable with no
-  lost acknowledged write and no resurrected rejected one. It also asserts
+  lost acknowledged write and no resurrected rejected one. Plans are a seeded
+  COMPOSITION of windows (puts, ~70 KiB big records, concurrent batch
+  pressure, structural tree churn, rotation, checkpoint, GC sweeps, backup)
+  with named templates for the audit-named surfaces (gc x checkpoint,
+  rotation-after-checkpoint, reservation-throw-under-pressure, big-record x
+  write-fault, rotation x dir-fsync-failure with a fired-witness); the
+  composition ledger and per-fault-kind coverage (all 12 kinds) are published
+  and asserted. It also asserts
   *every* crash point is actually reached, so coverage cannot silently rot.
   Note this exercises the recovery state machine, not power loss — `_exit()`
   does not discard the kernel page cache (see Known limitations).
@@ -506,7 +514,8 @@ long-run config; a push can no longer cancel a nightly run mid-flight):
 - **hooks-off matrix**: public-API smoke under `release`, `asan+ubsan`,
   `tsan`, and `stress` — proves the header is usable without any test
   hooks defined
-- **`crashfuzz` (v27 M2)**: the crash-fuzz regime alone
+- **`crashfuzz` (v27 M2, grammar composed by v29 M2)**: the crash-fuzz
+  regime alone
   (`CKV_ONLY_CRASHFUZZ`), seed-scaled via `CKV_CRASHFUZZ_SEEDS` — 2 bases ×
   24 rounds on push/PR, 8 × 120 nightly. The base seed derives from the
   run id and every base is echoed to the log, so a failing plan replays
