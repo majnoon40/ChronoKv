@@ -256,7 +256,7 @@ What 0.28.1 did *not* do, and v29 inherits:
 | v29 M1 — benchmark arena | **STARTED** — steps 1–3 COMPLETE (D/E/F adapters + version pins with sha256/fetch recipe); step-4 vehicle: split (#68–#75 green) then RE-MERGED to one same-hardware job after #75's headers caught the two-runner CPU split — green-week clock restarts on the merged vehicle (rule 9 over sunk nights); soak vehicle NAMED (rolling nightly chain). Remaining: green week (7 nights), noise bands + gate enablement, ledger-promotion decision, CI build cache | `bench/`, `bench/third_party/versions.txt`, ci.yml `arena` |
 | v29 CI hardening (adjacent, unplanned-in-9/27) | **SHIPPED + PROMOTED** — lint/ratchet/hygiene gates, build-shared; the 4 experimental sanitizer legs went green ×3 (#64/#65/#66) → flags deleted, all 12 legs gating | `5cd74b5`; promotion `0027fe0` |
 | v29 M2 — catcher hardening | **COMPLETE** — item 1 (write-skew checker, 2026-10-08, live pre-fix-flag/post-fix-pass proof) + item 5 (test-suite TU split, 2026-10-10: 1 GiB release/stress `-O1` bare, ASan `-O0` possible, 503/0 full suite; found+fixed the `dst::my_tid` non-inline thread_local, now stress-gated) + item 2 (DST grammar growth, 2026-10-11: S5 `tree_merge_cascade` (M4 grammar) + S6 `reclaim_retire_pin` (M3 grammar), green vs the merge-free tree, 600/600 children at PR scale, four-mutant fail-first matrix; nightly seeds/shard rebalanced 3,125→2,083 to hold N=100k and the wall-time band at six scenarios) + item 3 (de-vacuation, 2026-10-11: v17 GC-boundedness / v18 LSN-contiguity / m2_phase1 size-rotation / 30 s soak all upgraded to real oracles — accounting, differential readbacks, size-rotation admission exercised via a lowered segment cap, shadow-model differential over live AND recovered state; each proven old-GREEN/new-RED against its scratch-build reversion; the soak run additionally exposed and fixed its own empty-WAL-delta hole; release suite 513→514/0) + item 4 (crash-fuzz composition, 2026-10-11: window-sequence plan grammar + seven named templates incl. the Audit-2 surfaces and the Structural merge-window slot, kAll 26→28 with the `seg_*` WAL-2 window, fault matrix widened to all 12 kinds, composition ledger published+asserted; both reversion proofs red — orphan-tolerance revert 16 violations, DirFsyncFail-site removal 7 rc-22 witness violations — clean stream 0 violations) — all five items shipped | `check_write_skew`; `dstscn::s5/s6`; `crashfuzz` grammar; `tests/`, Makefile template |
-| v29 M3–M7 — the overhaul | not started — M0 CLOSED 2026-10-08; order still governed by constraints 2–3 (arena green week, catchers first) | — |
+| v29 M3–M7 — the overhaul | not started — M0 CLOSED 2026-10-08; constraint 3 SATISFIED 2026-10-11 (M2 COMPLETE, all five items); order now governed by constraint 2 (the arena green week) alone. M3's decide-before-build HP4/ABA decision doc landed 2026-10-12: generation-tagged page slots + immediate free-list return; heap nodes stay on the epoch reclaimer; HP machinery to be deleted, not wired | `docs/audits/2026-10-12-m3-hp4-aba-decision.md` |
 | v30 M0–M5 — the challenge, 1.0.0 | not started | — |
 
 ---
@@ -781,7 +781,7 @@ grammar proven by two reversion runs (16 and 7 violations) with the
 full clean stream at 0 violations, 28/28 points and 12/12 kinds; item 5
 as recorded above.
 
-## M3 — Page reclamation  **[L]**  *(M0 gate lifted 2026-10-08)*
+## M3 — Page reclamation  **[L]**  *(M0 gate lifted 2026-10-08; HP4/ABA decision MADE 2026-10-12)*
 
 Carried unchanged from the 2026-09-27 plan (appendix §M3): wire
 `PagePool::free()`, give the hazard-pointer machinery its consumers,
@@ -795,6 +795,34 @@ already half-built; and TXN-2 removed the negative-lookup leak that would
 otherwise have polluted the reclamation numbers (absent reads no longer
 materialize index entries at all). `stats()` gains pool utilization and
 high-water mark; `health()` degrades at 80%, fails at 95%.
+
+**The decide-before-build requirement is DISCHARGED (2026-10-12):**
+`docs/audits/2026-10-12-m3-hp4-aba-decision.md`. The HP4 disjunction in
+`PagePool::free()`'s own v25.1 comment ("the free-list reuse is tagged or
+Version allocations are never reused") resolves to the tagged horn,
+generalized: **generation-tagged page slots** (a pool-side per-slot
+`atomic<uint32_t>` table, bumped under the pool mutex before the alloc
+memset; verified after every latch handoff and before any content trust —
+exactly two verification sites, because crabbing is latch-coupled within
+descents and cursor residency is latch-protected) with **immediate
+free-list return** (deferral would re-couple reuse latency to the slowest
+reader pin — a long-lived `RangeScanStream` would ratchet the high-water,
+against this milestone's own acceptance). The heap layer (`Version*`
+today, `KeyEntry*` with M3's purge) **stays on the v23 Phase C epoch-pinned
+reclaimer** — value-identity references get verification, address-identity
+references get deferral, and the split is proposed as canonical invariants
+G1–G3 for the v30 M0 matrix. The **hazard-pointer machinery is deleted,
+not wired** (both audits demanded redesign-over-wiring; the redesign that
+survives review IS the generation check; the machinery's own HP registry
+never covered the cursor's leaf-switch gap — the HP is cleared *before*
+the gap — and suite inventory at `33aab1b` shows zero test consumers).
+The doc carries the full window inventory (W1–W6, anchored), the
+ordering/wrap arguments, the CKV-008 orthogonality record (mut_epoch =
+content staleness of live pages; generation = slot identity across reuse),
+the no-format-change proof (pages are never persisted; recovery rebuilds
+fresh), the measure-first plan, and the fail-first mutation gates for M3's
+landing — including the honest note that the fence-gen mutant is
+UNREACHABLE until M4 supplies frees, recorded rather than faked.
 
 **Acceptance** (unchanged): delete-then-reinsert workload's high-water mark
 stabilizes instead of ratcheting; TSan-clean; no use-after-free under ASan

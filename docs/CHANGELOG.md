@@ -7,6 +7,58 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **docs (v29 M3 decide-before-build, 2026-10-12): the HP4 / page-reuse
+  ABA decision is MADE and in-tree —
+  `docs/audits/2026-10-12-m3-hp4-aba-decision.md`.** ROADMAP §M3 requires
+  "the ABA (HP4) decision made **before** implementation"; this discharges
+  it while constraint 2 (the arena green week) still gates the milestone
+  itself. Decision, grounded in a full read of the reference windows at
+  `33aab1b`: **generation-tagged page slots** — a pool-side per-slot
+  `atomic<uint32_t>` table (fixed at construction; `alloc()` bumps under
+  the pool mutex BEFORE the memset), verified after every latch handoff
+  and before any content trust — which is exactly TWO sites, because the
+  window inventory (W1–W6, function-anchored) shows crabbing is
+  latch-coupled within descents and cursor residency is latch-protected;
+  the unprotected windows are the cursor's leaf-switch gap (where the HP
+  machinery — cleared *before* the gap — never even covered its own
+  headline case) and the writers' shared→exclusive upgrade gap (where
+  reuse can alias the full CKV-008 fence quadruple: `alloc()`'s memset
+  restarts `mut_epoch` at 0). **`free()` returns slots immediately** —
+  epoch-deferred page reuse was rejected because writer descents do not
+  pin reader slots (covering them means `reader_mu_` on the commit hot
+  path or a second barrier protocol) and because deferral couples reuse
+  latency to the slowest pin (a long-lived `RangeScanStream` would
+  ratchet the high-water — against M3's own acceptance). The heap layer
+  (`Version*` today, `KeyEntry*` with M3's purge) **stays on the v23
+  Phase C epoch-pinned reclaimer**, with the E-series argument re-derived
+  for entries (reclamation is gc-pass-internal; readers and checkpoints
+  pin slots; unlink-under-latch precedes `retire()`), not assumed. The
+  governing split, proposed as canonical invariants **G1–G3** for the v30
+  M0 matrix: *value-identity references are made safe by verification;
+  address-identity references by deferral.* The **hazard-pointer machinery
+  is deleted in M3, not wired** — both audits demanded redesign over
+  wiring, the redesign that survives review IS the generation check, and
+  the suite inventory shows zero test consumers (one historical comment).
+  Also recorded: no format change anywhere (page images are never
+  persisted — checkpoints serialize logical entries — so the gen table is
+  memory-only and recovery rebuilds fresh; v29's first format change
+  remains M6's PITR deltas); the latch-entry ABA argument (wake on a
+  recycled slot's mutex ⇒ check gen AFTER latch, BEFORE content — G2's
+  ordering is load-bearing); the 32-bit wrap argument (one bump per
+  slot-reuse vs CKV-008's per-mutation epoch — eleven more orders of
+  headroom); the measure-first plan (handoff-check overhead in the arena
+  legs, delete-churn high-water with `cursor_restarts` published beside
+  it, latch-table bound, stream immunity as a measured property); and the
+  fail-first mutation gates for M3's landing — including the honest
+  record that the fence-gen mutant is UNREACHABLE until M4 supplies the
+  frees (recorded, not faked, per the S5-grammar lesson). Explicitly
+  deferred to M3 implementation: the purge-trigger shape (with the PITR-
+  horizon eligibility caveat — v26.1's delta-filtering lesson applies to
+  physical purge), cursor-restart positioning cost, and the
+  capture-vs-second-read detail. ROADMAP: M3 header + decision paragraph
+  + progress row updated; the implementation itself remains gated on
+  constraint 2.
+
 - **test (v29 M2 post-item hardening, 2026-10-12): the v18.2
   dirty-clear filter gets a dedicated regression — the guard the
   de-vacuated soak provably cannot reach.** Measured, not argued: a
