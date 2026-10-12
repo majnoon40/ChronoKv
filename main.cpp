@@ -582,6 +582,7 @@ static int run_m16_phase1_test();
 static int run_m2_phase1_test();
 static int run_m2_phase2_test();
 static int run_m2_phase3_test();
+static int run_v182_dirty_filter_test();   // v29 M2 post-item: v18.2 dirty-clear filter regression
 static int run_async_benchmark();
 #endif
 
@@ -8015,6 +8016,7 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     fails += run_m2_phase1_test();
     fails += run_m2_phase2_test();
     fails += run_m2_phase3_test();
+    fails += run_v182_dirty_filter_test();
     fails += run_async_test();
     fails += run_batch_test();
     fails += run_observer_test();
@@ -8803,6 +8805,132 @@ static int run_m16_phase1_test() {
 // then verifies recovery across multiple segments. The test would fail on
 // the old single-segment code because rotation didn't exist — recovery would
 // only find one segment and miss the data in the rotated-out segment.
+// =====================================================================
+// v29 M2 post-item hardening (2026-10-12): the v18.2 dirty-clear filter
+// — dedicated regression.
+//
+// THE MEASURED GAP THIS CLOSES: a scratch revert of the filter (clear
+// dirty_since_ckpt_ unconditionally instead of only dcts <= ckpt cts)
+// passes the ENTIRE 515-check suite unmoved, the upgraded v19 soak
+// included (253k commits / 58 checkpoints in the measurement that found
+// it): at ~40 writes/s/key a wrongly-cleared key is re-dirtied within
+// milliseconds and the surviving WAL segment re-covers every hot key.
+// The deeper reason no behavioral test can reach it: the race the filter
+// closes — a commit marking key K dirty with dcts > cts BETWEEN the
+// checkpoint's dirty-key capture and its post-write clear — is
+// structurally closed under the current locks. commit_txn holds
+// checkpoint_mu_ SHARED across its whole span INCLUDING the dirty
+// marking; checkpoint() holds it EXCLUSIVE across the entire
+// checkpoint_locked body; the FairSharedMutex is writer-preferring, so
+// in-flight commits drain before the capture and new ones queue behind
+// the checkpoint. A dcts > cts entry cannot arise from any interleaving.
+// The filter is defense-in-depth — lock scopes are implementation, not
+// frozen contract, and backup_to() already drives checkpoint_locked
+// under a different call shape — so the regression pins it WHITE-BOX,
+// through hooks-gated seams, in the exact shape of the v24 Fix-12
+// phantom-race test (construct the state, assert the protection, keep a
+// control that fails if the assertion is trivial).
+//
+// The construction is a faithful rebuild of the race's end state, not an
+// arbitrary poke: the mark's dcts is published()+1 — EXACTLY the cts the
+// next real commit will take — so oracle C's post-race commit steps into
+// the retained mark the way the racing commit's value would have.
+//
+// Flow: ckpt#1 BASE {base_k=v1, race_k=old}; decoy=d1 committed (a real
+// dirty entry — forces ckpt#2 onto the delta path, and its dcts equals
+// ckpt#2's cts EXACTLY: the <= boundary); mark race_k with the future
+// dcts; ckpt#2 (delta): the capture excludes race_k (dcts > cts) and the
+// CKV-004R coverage check must NOT refuse because of it; then the clear:
+// clean => race_k RETAINED (filter), decoy CLEARED (captured). Oracle C:
+// race_k=new committed (dcts == the retained mark), ckpt#3 captures it
+// legitimately, rotations ran twice, close, reopen, recover — every value
+// exact.
+//
+// Mutants proven (scratch builds, driver-level): unconditional clear
+// (the v18.2 revert) => oracle A RED, B/C green; `<=` -> `<` => oracle B
+// RED at the dcts == cts boundary; no-op clear => oracle B RED. The pair
+// (A, B) pins the filter line from both sides — neither a too-eager nor
+// a too-shy clear survives.
+// =====================================================================
+static int run_v182_dirty_filter_test() {
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) {
+            ++fails;
+            if (!detail.empty()) std::cout << "      (" << detail << ")\n";
+        }
+    };
+
+    const std::string dir = "/tmp/v182_dirty_filter";
+    const std::string wd = dir + "/wal";
+    const std::string cp = dir + "/ck.ckpt";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(wd);
+
+    {
+        ChronoKV kv(wd);
+        kv.commit("base_k", "v1");
+        kv.commit("race_k", "old");
+        kv.checkpoint(cp);                    // ckpt#1: BASE captures both
+
+        kv.commit("decoy", "d1");             // real dirty; its dcts == ckpt#2's cts
+        const uint64_t fut = kv.published_watermark() + 1;
+        kv.mark_dirty_for_test("race_k", fut);
+        check("v18.2: witness: future-dcts dirty mark pending pre-checkpoint",
+              kv.dirty_pending_for_test("race_k") == fut &&
+              kv.dirty_pending_for_test("decoy") != 0);
+
+        bool threw = false;
+        try { kv.checkpoint(cp); }            // ckpt#2: delta path
+        catch (...) { threw = true; }
+        check("v18.2: future-dcts entry passes the CKV-004R coverage check (no refusal)",
+              !threw);
+
+        // Oracle A — the filter holds: the raced entry survives the clear,
+        // retained for the next round (an unconditional clear — the v18.2
+        // revert — loses it here).
+        const uint64_t race_after = kv.dirty_pending_for_test("race_k");
+        check("v18.2 regression: future-dcts dirty entry survives the checkpoint clear",
+              race_after == fut,
+              "pending=" + std::to_string(race_after) + " want=" + std::to_string(fut));
+
+        // Oracle B — the control: the captured entry WAS cleared. Proves
+        // the clear step actually ran (a no-op clear would pass A
+        // trivially and die here) and pins the <= boundary: decoy's dcts
+        // is exactly ckpt#2's cts (`<` instead of `<=` retains it).
+        const uint64_t decoy_after = kv.dirty_pending_for_test("decoy");
+        check("v18.2 regression control: captured entry cleared (clear ran; <= boundary pinned)",
+              decoy_after == 0,
+              "decoy pending=" + std::to_string(decoy_after) + " want=0");
+
+        // Oracle C setup — the real post-race update: its dcts lands
+        // exactly on the retained mark, ckpt#3 captures it legitimately,
+        // and its rotation deletes the segment the record rode in.
+        kv.commit("race_k", "new");
+        kv.checkpoint(cp);                    // ckpt#3
+    }
+    {
+        ChronoKV kv2(wd);
+        bool rec_ok = true;
+        std::string rec_detail;
+        try {
+            kv2.recover_with_checkpoint(wd, cp);
+            auto r = kv2.read("race_k"), d = kv2.read("decoy"), b = kv2.read("base_k");
+            if (!r || *r != "new")       { rec_ok = false; rec_detail = "race_k wrong/absent"; }
+            else if (!d || *d != "d1")   { rec_ok = false; rec_detail = "decoy wrong/absent"; }
+            else if (!b || *b != "v1")   { rec_ok = false; rec_detail = "base_k wrong/absent"; }
+        } catch (const std::exception& e) {
+            rec_ok = false;
+            rec_detail = std::string("recovery threw: ") + e.what();
+        }
+        check("v18.2 regression: post-race chain + rotations recover every value exactly",
+              rec_ok, rec_detail);
+    }
+    std::filesystem::remove_all(dir);
+    return fails;
+}
+
 static int run_m2_phase1_test() {
     using namespace chronokv;
     int fails = 0;

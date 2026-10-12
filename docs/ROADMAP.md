@@ -650,6 +650,41 @@ the remaining audit-enumerated vacuous tests, plus the build-memory wall.
    `-O0 + ggc-min-expand=5`. The audit's other two vacuous-test findings
    (the never-compiled `verify_full`, the `conc: no crash` noise flag)
    remain recorded beyond-arc remainder.
+
+   **Post-item hardening (2026-10-12): the v18.2 dirty-clear filter gets
+   its dedicated regression** — the one guard the soak upgrade provably
+   cannot reach, established by measurement, not argument: a scratch
+   revert of the filter passed the 30 s soak (253k commits, 58
+   checkpoints — at ~40 writes/s/key a wrongly-cleared key is re-dirtied
+   within milliseconds and the surviving WAL segment re-covers every hot
+   key) AND the full 515-check suite unmoved. Root cause (read, then
+   confirmed): the capture→clear race the filter closes is STRUCTURALLY
+   CLOSED under the current locks — `commit_txn` holds `checkpoint_mu_`
+   SHARED across its whole span including the dirty marking, and
+   `checkpoint()` holds it EXCLUSIVE across the entire `checkpoint_locked`
+   body (writer-preferring), so no interleaving can produce a dcts > cts
+   dirty entry any more. The filter stays as defense-in-depth (lock scopes
+   are implementation, not frozen contract; `backup_to()` already drives
+   `checkpoint_locked` under a different call shape), so
+   `run_v182_dirty_filter_test` pins it WHITE-BOX through two
+   hooks-gated seams (`mark_dirty_for_test` / `dirty_pending_for_test`,
+   TEST_HOOKS-only, zero production behavior change) in the v24 Fix-12
+   phantom-race test's own shape — construct the raced map state (the
+   future dcts is `published()+1`, EXACTLY where the next real commit
+   lands, so the end-to-end leg steps into the retained mark the way the
+   racing commit's value would have), then assert the protection plus a
+   control that fails if the assertion is trivial: witness (mark pending
+   pre-checkpoint), CKV-004R coverage must NOT refuse the future-dcts
+   entry, oracle A (the entry SURVIVES the clear — the revert dies here),
+   oracle B control (the captured entry whose dcts == the checkpoint cts
+   IS cleared — proves the clear ran and pins the `<=` boundary), oracle C
+   (real post-race update + ckpt#3 + two rotations + recovery: every
+   value exact). Three mutants, driver-level, each reddening exactly its
+   intended oracle and nothing else: unconditional clear (the v18.2
+   revert) → A RED (`pending=0 want=4`); `<=` → `<` → B RED at the
+   boundary (`decoy pending=3 want=0`); no-op clear → B RED. Suite with
+   the addendum: release **515 → 520 PASS / 0 FAIL** (five new checks),
+   `make lint` green (ratchet 33=33).
 4. The crash-fuzz plan grammar composes GC sweeps, checkpoint, rotation
    and merge windows — and now also the Audit-2 surfaces: segment-creation
    dir-fsync windows (WAL-2), the recovery offset-scan classifier

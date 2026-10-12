@@ -7,6 +7,48 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **test (v29 M2 post-item hardening, 2026-10-12): the v18.2
+  dirty-clear filter gets a dedicated regression — the guard the
+  de-vacuated soak provably cannot reach.** Measured, not argued: a
+  scratch revert of the filter (clear `dirty_since_ckpt_`
+  unconditionally instead of only `dcts <= ckpt cts`) passed the 30 s
+  soak — 253k commits, 58 checkpoints — and then the FULL 515-check
+  suite unmoved. Two reasons, both verified: at ~40 writes/s/key a
+  wrongly-cleared key is re-dirtied within milliseconds and the
+  surviving WAL segment re-covers every hot key; and, deeper, the
+  capture→clear race the filter closes is STRUCTURALLY CLOSED under the
+  current locks — `commit_txn` holds `checkpoint_mu_` SHARED across its
+  whole span including the dirty marking while `checkpoint()` holds it
+  EXCLUSIVE across the entire `checkpoint_locked` body (writer-
+  preferring), so no interleaving can produce a `dcts > cts` dirty entry
+  any more. The filter remains load-bearing as defense-in-depth (lock
+  scopes are implementation, not frozen contract, and `backup_to()`
+  already drives `checkpoint_locked` under a different call shape), so
+  the regression pins it WHITE-BOX through two hooks-gated seams —
+  `ChronoKV::mark_dirty_for_test` (replicates the commit-side max-dcts
+  merge rule) and `dirty_pending_for_test` — in the v24 Fix-12
+  phantom-race test's own shape: construct the state the race used to
+  produce, assert the protection, and keep a control that fails if the
+  assertion is trivial. The construction is faithful rather than
+  arbitrary: the injected dcts is `published()+1`, exactly where the
+  next real commit lands, so the end-to-end leg steps into the retained
+  mark the way the racing commit's value would have. Five checks:
+  witness (future-dcts mark pending pre-checkpoint), CKV-004R coverage
+  must NOT refuse the future-dcts entry, oracle A (the entry SURVIVES
+  the clear), oracle B control (the captured entry whose dcts equals the
+  checkpoint cts IS cleared — proves the clear ran and pins the `<=`
+  boundary), oracle C (real post-race update + a third checkpoint + two
+  rotations + recovery reads every value exactly). THREE mutants,
+  driver-level, each reddening exactly its own oracle and nothing else:
+  unconditional clear (the v18.2 revert) → A RED (`pending=0 want=4`);
+  `<=` → `<` → B RED at the boundary (`decoy pending=3 want=0`); no-op
+  clear → B RED. Engine change is the two TEST_HOOKS-gated accessors
+  (zero production behavior change; lint ratchet 33=33). Suite: release
+  **515 → 520 PASS / 0 FAIL**, exit 0, banner 0.28.1, `make lint` green
+  — measured on the 1 GiB sandbox at `-O0 + ggc-min-expand=5` (floors,
+  not ledger material). Docs: ROADMAP M2 item 3 gains a post-item
+  hardening addendum with the structural finding and the mutant matrix.
+
 - **build (clang lint leg PROMOTED, 2026-10-11): the last
   `continue-on-error` in CI is gone — `make lint-werror CXX=clang++-18`
   is clean across all four passes and now gates.** The leg had been

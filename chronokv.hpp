@@ -8553,6 +8553,32 @@ public:
         return phantom_tracker_.has_phantom_in_range(lo, hi, read_ts);
     }
 
+    // v29 M2 post-item hardening (v18.2 dirty-clear filter regression):
+    // white-box seams letting the dedicated test construct the map state
+    // the capture->clear race used to produce — a dirty entry whose dcts
+    // is GREATER than the cts the next checkpoint will take. The race
+    // itself is structurally closed under the current locks (commit_txn
+    // holds checkpoint_mu_ SHARED across its whole span including the
+    // dirty marking; checkpoint() holds it EXCLUSIVE across the entire
+    // checkpoint_locked body, writer-preferring), so no public-API
+    // interleaving can produce this state any more — measured: a scratch
+    // revert of the filter passed the ENTIRE 515-check suite unmoved.
+    // mark_dirty_for_test replicates the commit-side merge rule (max dcts
+    // wins, same as commit_txn's marking); dirty_pending_for_test returns
+    // the pending dcts (0 = not dirty). TEST_HOOKS-only; zero production
+    // behavior change.
+    void mark_dirty_for_test(const std::string& k, uint64_t dcts) {
+        std::lock_guard<std::mutex> dlk(dirty_mu_);
+        auto it = dirty_since_ckpt_.find(k);
+        if (it == dirty_since_ckpt_.end() || dcts > it->second)
+            dirty_since_ckpt_[k] = dcts;
+    }
+    uint64_t dirty_pending_for_test(const std::string& k) {
+        std::lock_guard<std::mutex> dlk(dirty_mu_);
+        auto it = dirty_since_ckpt_.find(k);
+        return it == dirty_since_ckpt_.end() ? 0 : it->second;
+    }
+
 /*
  * =================================================================
  * CHRONOKV_PHASE_D_TESTS
