@@ -7,6 +7,48 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **bench-tooling (v29 M1 remainder, pre-built 2026-10-13):
+  `scripts/arena_bands.py` — the noise-band computation and regression
+  checker for the arena ledger, staged ahead of the green week's
+  completion so "noise bands + gate enablement" is a calibration
+  exercise, not a design one.** Stdlib-only, transport-agnostic (inputs
+  are local directories of ledger TSVs, e.g. extracted
+  `arena-ledger-<run_id>` artifacts); subcommands `band` (compute +
+  JSON), `check` (verdicts against a band file; exit 1 = REGRESSION,
+  2 = geometry mismatch — CI-ready but UNWIRED by design: no ci.yml
+  change during the green week), `report` (cross-night digest).
+  THE DESIGN FACT ITS FIRST RUN MEASURED (rule 13 applied to the
+  tooling itself, over the three banked nights #82/#88/#91 downloaded
+  from the run artifacts): the nightly runner CPU differs NIGHT TO NIGHT
+  even on the re-merged single-job vehicle — AMD EPYC 9V45, Intel Xeon
+  Platinum 8573C, AMD EPYC 7763 across the three headers. Same-night
+  cross-engine fairness holds by construction (one job, one machine —
+  the headers are the enforcement, and they caught the earlier two-runner
+  split); cross-night RAW throughput is a hardware lottery (observed
+  ratio spreads 4–55% per workload). Bands are therefore two-tier:
+  PRIMARY ratio bands (ChronoKV ops/s ÷ the same-night baseline geomean
+  — hardware-normalized because numerator and denominator ran on the
+  same CPU), SECONDARY raw bands grouped by (cpu model, engine,
+  workload) — degenerate at one night per CPU and stamped as such, not
+  hidden. The RSS tier bands cross-night directly (memory is
+  hardware-independent: the first three nights' ckptload/coldrecovery
+  RSS varied 0.0%) and carries a ratchet-watch (WARN above band max ×
+  factor) whose deletechurn series is P1's before-column — M3's
+  acceptance ("stabilizes instead of ratcheting") will tighten it into a
+  gate. Provenance discipline per rule 9: every band records its nights,
+  CPUs and pinned geometry; geometry mismatches REFUSE to mix (the
+  arena job's own comment is the authority: "geometry changes are
+  ledger-format changes"); everything below `--min-nights` (default 7 =
+  the green week) stamps PROVISIONAL — reportable, not gateable. Validated
+  end-to-end on the real artifacts: bands from nights 1–2, night 3
+  checked against them (30 series, 0 regressions, advisory note),
+  three-night digest printed. Calibration choices left honestly open for
+  the M1 owner after the week: the floor formula (band min − tolerance)
+  and the tolerance default (15%) are provisional knobs, and the
+  gate-wiring shape (in-job step vs a ledger-promotion consumer) rides
+  the promotion decision. No engine/test/CI change; the 519-check suite
+  state of `52fd43c` is untouched.
+
 - **docs (v30 M0 seeded early, 2026-10-13): `docs/INVARIANTS.md` — the
   living invariant→checker→CI-job matrix exists ahead of its milestone.**
   38 rows across 8 families (publication/replay order, durability/WAL,

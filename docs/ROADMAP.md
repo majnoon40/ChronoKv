@@ -258,7 +258,28 @@ What 0.28.1 did *not* do, and v29 inherits:
 | v29 M0 deliverable zero (audit docs in-tree) | **DONE** | `docs/audits/` (2026-09-23, 2026-09-24) |
 | v29 M0 re-audit commission (Audit-2 over 0.28.0) | **EXECUTED** — 13 findings, all remediated fail-first | PR #2 (`5cd74b5`, merged `b6fb181`) = 0.28.1 |
 | v29 M0 closure | **DONE 2026-10-08** — reconstructed report + tag `v0.28.1` + delta confirmation round, verdict **B+ (clean)**: 20/20 probes, one Low doc-truth finding fixed in the closure commit; **M3+ gate lifted** | `docs/audits/2026-10-delta-confirmation-0.28.1.md` (+ probes) |
-| v29 M1 — benchmark arena | **STARTED** — steps 1–3 COMPLETE (D/E/F adapters + version pins with sha256/fetch recipe); step-4 vehicle: split (#68–#75 green) then RE-MERGED to one same-hardware job after #75's headers caught the two-runner CPU split — green-week clock restarts on the merged vehicle (rule 9 over sunk nights); soak vehicle NAMED (rolling nightly chain). Remaining: green week (7 nights), noise bands + gate enablement, ledger-promotion decision, CI build cache | `bench/`, `bench/third_party/versions.txt`, ci.yml `arena` |
+| v29 M1 — benchmark arena | **STARTED** — steps 1–3 COMPLETE (D/E/F adapters + version pins with sha256/fetch recipe); step-4 vehicle: split (#68–#75 green) then RE-MERGED to one same-hardware job after #75's headers caught the two-runner CPU split — green-week clock restarts on the merged vehicle (rule 9 over sunk nights); soak vehicle NAMED (rolling nightly chain). 2026-10-13: the noise-band
+   TOOLING is pre-built (`scripts/arena_bands.py`, stdlib-only, transport-
+   agnostic) and its first run over the three banked nights (#82/#88/#91)
+   measured a design fact: the nightly runner CPU DIFFERS NIGHT TO NIGHT
+   even on the re-merged single job (EPYC 9V45 / Xeon 8573C / EPYC 7763) —
+   same-night cross-engine comparisons stay fair by construction, but
+   cross-night RAW numbers are a hardware lottery (ratio spreads 4–55%).
+   Primary bands are therefore RATIO-normalized (ChronoKV ops/s ÷ same-
+   night baseline geomean), raw bands are hardware-conditional secondary
+   (degenerate at one night per CPU, reported honestly as such), and the
+   RSS tier carries the deletechurn ratchet-watch (P1's before-column).
+   All bands stamp PROVISIONAL below min-nights=7; the `check` subcommand
+   is CI-ready (exit 1 on REGRESSION, 2 on geometry mismatch — mixed
+   geometries refuse to band) but the wiring waits for the week. Remaining:
+   green week (7 nights — nights 1–3 banked 2026-10-11/12/13, ledger
+   artifacts up), noise-band CALIBRATION + gate enablement (tool staged),
+   ledger-promotion decision, CI build cache (test-suite side already
+   delivered by build-shared with the ccache rejection recorded in ci.yml;
+   the true remainder is arena-side baseline caching, fairness-protocol
+   material for the M1 owner; the actions v4→v5 bumps ride along post-
+   week by explicit deferral) | `bench/`, `bench/third_party/versions.txt`,
+   `scripts/arena_bands.py`, ci.yml `arena` |
 | v29 CI hardening (adjacent, unplanned-in-9/27) | **SHIPPED + PROMOTED** — lint/ratchet/hygiene gates, build-shared; the 4 experimental sanitizer legs went green ×3 (#64/#65/#66) → flags deleted, all 12 legs gating | `5cd74b5`; promotion `0027fe0` |
 | v29 M2 — catcher hardening | **COMPLETE** — item 1 (write-skew checker, 2026-10-08, live pre-fix-flag/post-fix-pass proof) + item 5 (test-suite TU split, 2026-10-10: 1 GiB release/stress `-O1` bare, ASan `-O0` possible, 503/0 full suite; found+fixed the `dst::my_tid` non-inline thread_local, now stress-gated) + item 2 (DST grammar growth, 2026-10-11: S5 `tree_merge_cascade` (M4 grammar) + S6 `reclaim_retire_pin` (M3 grammar), green vs the merge-free tree, 600/600 children at PR scale, four-mutant fail-first matrix; nightly seeds/shard rebalanced 3,125→2,083 to hold N=100k and the wall-time band at six scenarios) + item 3 (de-vacuation, 2026-10-11: v17 GC-boundedness / v18 LSN-contiguity / m2_phase1 size-rotation / 30 s soak all upgraded to real oracles — accounting, differential readbacks, size-rotation admission exercised via a lowered segment cap, shadow-model differential over live AND recovered state; each proven old-GREEN/new-RED against its scratch-build reversion; the soak run additionally exposed and fixed its own empty-WAL-delta hole; release suite 513→514/0) + item 4 (crash-fuzz composition, 2026-10-11: window-sequence plan grammar + seven named templates incl. the Audit-2 surfaces and the Structural merge-window slot, kAll 26→28 with the `seg_*` WAL-2 window, fault matrix widened to all 12 kinds, composition ledger published+asserted; both reversion proofs red — orphan-tolerance revert 16 violations, DirFsyncFail-site removal 7 rc-22 witness violations — clean stream 0 violations) — all five items shipped | `check_write_skew`; `dstscn::s5/s6`; `crashfuzz` grammar; `tests/`, Makefile template |
 | v29 M3–M7 — the overhaul | not started — M0 CLOSED 2026-10-08; constraint 3 SATISFIED 2026-10-11 (M2 COMPLETE, all five items); order now governed by constraint 2 (the arena green week) alone. M3's decide-before-build HP4/ABA decision doc landed 2026-10-12: generation-tagged page slots + immediate free-list return; heap nodes stay on the epoch reclaimer; HP machinery to be deleted, not wired | `docs/audits/2026-10-12-m3-hp4-aba-decision.md` |
