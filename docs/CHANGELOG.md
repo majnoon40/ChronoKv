@@ -7,6 +7,50 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **test+docs (v30 M0 gap closures G-3 + G-1, 2026-10-13): the `[k,k]`
+  point-range equivalence row gets its release-mode checker, and the
+  WAL-3 row's CONFIRM resolves by indexing — the INVARIANTS.md gap list
+  shrinks 8 → 6, by evidence only.** G-3: `run_kk_equivalence_test`
+  (7 legs) states the Audit-2 matrix row's OWN claim as a named checker
+  — the value half (single-key range scan == point read at latest, at
+  absence, at deletion, and at a transaction snapshot under version
+  churn) and the conflict half (a user-API transactional `range_scan`
+  over an absent key conflicts with a concurrent insert — the TXN-2
+  route's user-level twin — with a no-false-positive control for inserts
+  outside `[k,k]` and the v20.1-blocker-3 inclusive-upper-bound pin at
+  the user API). Both halves mutation-proven with exact leg isolation:
+  cursor hi made exclusive → legs A/D RED, conflict legs green;
+  `has_phantom_in_range`'s `<=` made `<` → legs E1/E3 RED, value legs
+  green. MEASURED co-flip sets (scratch, `CKV_ONLY_REMEDIATION`): the
+  hi-exclusive mutant also reddens CKV-002a/e, CKV-006, CKV-003c,
+  CKV-005; the boundary mutant reddens A2's TXN-1 scan/update detector
+  — and A2's get-based check-then-insert detector does NOT flip: its
+  absent-key route is evidently not validated through the range
+  predicate, contradicting the TXN-2 fix-summary prose. The prose stays
+  unrewritten (historical record); the test comment and the matrix row
+  carry the measured truth — the battery is the truth. Honest scoping:
+  the co-flips show the underlying LINES were not unguarded; what was
+  missing was a checker stating the row's own equivalence claim
+  (invariant → checker, not invariant → some test that happens to
+  break), which is exactly what v30 M0's mapping deliverable demands.
+  G-1 (WAL-3): resolved WITHOUT new code, by indexing — the SRC-C
+  remediation leg arms `RotFinalDirFsyncFail` at the very call site the
+  WAL-3 fix corrected (`fsync_dir(manifest_path())`, anchor comment on
+  the line) with a fired-witness (`charge_remaining==0`) and pins the
+  counted-not-fail-stop contract; the target-directory half is marked
+  STRUCTURAL with the honest boundary: the fault fires regardless of the
+  fsync_dir ARGUMENT, and no in-process proof of a wrong/missing fsync
+  can exist (`_exit()` testing keeps the page cache — the decision doc's
+  WAL-2 boundary sentence applies verbatim), so the mechanical
+  target-level proof is v30 M3's dm-flakey leg. Docs: INVARIANTS.md
+  `[k,k]` row → PROVEN with both mutants and co-flip sets named; WAL-3
+  row → CHECKED (handling) + STRUCTURAL (target) with the boundary
+  recorded; §5 G-1/G-3 → CLOSED with evidence (entries retained per the
+  file's own never-delete rule). Suite: release **519 → 526 PASS / 0
+  FAIL**, exit 0, banner 0.28.1; `make lint` green (ratchet 33=33,
+  header hygiene); measured on the 1 GiB sandbox at `-O0 +
+  ggc-min-expand=5`. Engine: zero change (test + docs only).
+
 - **bench-tooling (v29 M1 remainder, pre-built 2026-10-13):
   `scripts/arena_bands.py` — the noise-band computation and regression
   checker for the arena ledger, staged ahead of the green week's

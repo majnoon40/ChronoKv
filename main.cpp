@@ -583,6 +583,7 @@ static int run_m2_phase1_test();
 static int run_m2_phase2_test();
 static int run_m2_phase3_test();
 static int run_v182_dirty_filter_test();   // v29 M2 post-item: v18.2 dirty-clear filter regression
+static int run_kk_equivalence_test();      // v30 M0 gap G-3: [k,k] point-range equivalence (release mode)
 static int run_async_benchmark();
 #endif
 
@@ -8014,6 +8015,7 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     fails += run_m2_phase2_test();
     fails += run_m2_phase3_test();
     fails += run_v182_dirty_filter_test();
+    fails += run_kk_equivalence_test();
     fails += run_async_test();
     fails += run_batch_test();
     fails += run_observer_test();
@@ -8805,6 +8807,157 @@ static int run_m16_phase1_test() {
 // then verifies recovery across multiple segments. The test would fail on
 // the old single-segment code because rotation didn't exist — recovery would
 // only find one segment and miss the data in the rotated-out segment.
+// =====================================================================
+// v30 M0 gap G-3 CLOSED (2026-10-13): the Audit-2 matrix row "[k,k]
+// point-range equivalence" gets its release-mode checker.
+//
+// The row's two halves, and what was already pinned: the TXN-2 fix routes
+// absent read-set keys through [k,k] point range reads validated by the
+// phantom tracker; A2's detectors pin the get()-based negative-lookup
+// CONFLICT semantics ("check-then-insert conflicts") and the leak side,
+// and the v17 phantom battery pins WIDE-range scan conflicts. What no
+// release-mode test pinned: (a) the VALUE half of the equivalence — a
+// single-key range scan must return exactly what the point read returns
+// (latest, absent, deleted, and at a transaction snapshot under version
+// churn) — and (b) the USER-API shape of the conflict half: an explicit
+// transactional range_scan([k,k]) over an absent key must conflict with a
+// concurrent insert exactly like the internal get() route does. Both
+// halves are structural today (one read_at_idx resolution path; one
+// RangeRead{lo,hi} registration feeding has_phantom_in_range) — which is
+// precisely why v30 M0 wants them machine-checked rather than argued
+// ("a runtime checker, a CI job, or a reviewed checked-by-construction
+// argument" — this is the checker). The stress vehicle carries the as-of
+// variant under churn (DST S6's per-round single-key probe); this is the
+// release-mode leg the INVARIANTS.md row was missing.
+//
+// Mutants proven (scratch builds, driver-level): the cursor's inclusive
+// upper bound made exclusive (per-key `k > hi_` -> `k >= hi_`) => legs A
+// and D RED (scan returns empty where the point read returns the value)
+// with the conflict legs green — the value half; has_phantom_in_range's
+// `*kit <= hi` -> `< hi` (the v20.1-blocker-3 boundary class) => legs E1
+// and E3 RED with the value legs green — the conflict half. MEASURED
+// co-flip sets (scratch, CKV_ONLY_REMEDIATION): the hi-exclusive cursor
+// mutant also reddens CKV-002a/e, CKV-006, CKV-003c and CKV-005; the
+// boundary mutant reddens A2's TXN-1 scan/update detector — while A2's
+// get-based check-then-insert detector does NOT flip (its absent-key
+// route is evidently not validated through the range predicate; the
+// TXN-2 fix-summary prose suggested it would be — the battery is the
+// truth, and the prose stays unrewritten as the historical record). So
+// what this test adds is not the first-ever guard on those lines but the
+// matrix row's OWN claim as a named checker: cross-API equivalence in
+// all four value states (latest / absent / deleted / as-of-under-churn)
+// and the user-API single-key conflict shape with its no-false-positive
+// control — invariant -> checker, not invariant -> some test that
+// happens to break.
+// =====================================================================
+static int run_kk_equivalence_test() {
+    using namespace chronokv;
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) {
+            ++fails;
+            if (!detail.empty()) std::cout << "      (" << detail << ")\n";
+        }
+    };
+
+    const std::string wd = "/tmp/v30m0_kk_equiv";
+    std::filesystem::remove_all(wd);
+    Options o;
+    o.wal_dir = wd;
+    o.auto_start_gc = false;   // deterministic version chains for leg D
+    {
+        auto db = Database::open(o);
+
+        // Leg A — value equivalence at latest: point read == single-key scan.
+        db.put("kk", "v1");
+        {
+            auto g = db.get("kk");
+            auto sc = db.range_scan("kk", "kk");
+            check("[k,k] A: latest-value equivalence (get == single-key scan)",
+                  g && *g == "v1" && sc.size() == 1 &&
+                  sc[0].first == "kk" && sc[0].second == "v1",
+                  "get=" + (g ? *g : std::string("<absent>")) + " scan_n=" + std::to_string(sc.size()));
+        }
+        // Leg B — absence equivalence.
+        {
+            auto g = db.get("nope_x");
+            auto sc = db.range_scan("nope_x", "nope_x");
+            check("[k,k] B: absent-key equivalence (nullopt == empty scan)",
+                  !g && sc.empty(), "scan_n=" + std::to_string(sc.size()));
+        }
+        // Leg C — deleted-key equivalence.
+        db.erase("kk");
+        {
+            auto g = db.get("kk");
+            auto sc = db.range_scan("kk", "kk");
+            check("[k,k] C: deleted-key equivalence (nullopt == empty scan)",
+                  !g && sc.empty(), "scan_n=" + std::to_string(sc.size()));
+        }
+        // Leg D — as-of equivalence under version churn: both reads resolve
+        // at the transaction's snapshot, not at latest.
+        db.put("dk", "v2");
+        {
+            auto t = db.begin();
+            db.put("dk", "v3");            // blind write ABOVE t's snapshot
+            auto g = t.get("dk");
+            auto sc = t.range_scan("dk", "dk");
+            check("[k,k] D: as-of equivalence under churn (both == snapshot value)",
+                  g && *g == "v2" && sc.size() == 1 && sc[0].second == "v2",
+                  "get=" + (g ? *g : std::string("<absent>")) + " scan_n=" + std::to_string(sc.size()) +
+                  (sc.empty() ? "" : " scan_v=" + sc[0].second));
+            (void)t.commit();
+        }
+        // Leg E1 — conflict equivalence: a scan-based negative lookup must
+        // conflict with a concurrent insert (the user-API twin of A2's
+        // get-based check-then-insert detector).
+        {
+            auto t1 = db.begin();
+            const bool empty = t1.range_scan("ex", "ex").empty();
+            auto t2 = db.begin();
+            t2.put("ex", "new");
+            const Status s2 = t2.commit();
+            t1.put("w", "1");
+            const Status s1 = t1.commit();
+            check("[k,k] E1: scan-based negative lookup conflicts with insert",
+                  empty && s2 == Status::OK && s1 == Status::Conflict,
+                  "s2=" + std::to_string((int)s2) + " s1=" + std::to_string((int)s1));
+        }
+        // Leg E2 — control: an insert OUTSIDE the registered point range
+        // must not conflict (the equivalence is not a blanket conflict).
+        {
+            auto t1 = db.begin();
+            (void)t1.range_scan("cy", "cy");
+            auto t2 = db.begin();
+            t2.put("cyz", "out");          // "cyz" > "cy": outside [cy,cy]
+            const Status s2 = t2.commit();
+            t1.put("w", "2");
+            const Status s1 = t1.commit();
+            check("[k,k] E2 control: insert outside the point range does not conflict",
+                  s2 == Status::OK && s1 == Status::OK,
+                  "s2=" + std::to_string((int)s2) + " s1=" + std::to_string((int)s1));
+        }
+        // Leg E3 — the inclusive-upper-bound pin at the user API (the
+        // v20.1-blocker-3 shape): an insert exactly AT a registered
+        // range's hi must conflict.
+        {
+            auto t1 = db.begin();
+            (void)t1.range_scan("ka", "kc");
+            auto t2 = db.begin();
+            t2.put("kc", "boundary");
+            const Status s2 = t2.commit();
+            t1.put("w", "3");
+            const Status s1 = t1.commit();
+            check("[k,k] E3: insert at the inclusive upper bound conflicts",
+                  s2 == Status::OK && s1 == Status::Conflict,
+                  "s2=" + std::to_string((int)s2) + " s1=" + std::to_string((int)s1));
+        }
+        db.close();
+    }
+    std::filesystem::remove_all(wd);
+    return fails;
+}
+
 // =====================================================================
 // v29 M2 post-item hardening (2026-10-12): the v18.2 dirty-clear filter
 // — dedicated regression.

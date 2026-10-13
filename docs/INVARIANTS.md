@@ -79,7 +79,7 @@ historical documents; the disambiguation lives from this file forward.
 | **D4** | index-side failure latches fail-stop pre-mutation; checkpoint/backup refuse while latched | `index_failed_` latch; BT-1 headroom throw → catch latches; `checkpoint_locked` refusal | CKV-003b/016 battery; refusal legs in checkpoint tests; S6 health oracle | engine-tests; dst | PROVEN | 0.28.0-wave fail-first (battery is fail-first by construction) |
 | **WAL-1** | recovery offset-scan classifier: interior zeros before surviving CRC-valid frames = CORRUPT (loud), never silent truncation | `recover_all` `valid_after` scan; `truncate_torn_tail` refusal path | SRC-E4a/E4b; CKV-004R tightened status pin | engine-tests | **PROVEN** | `e075a47` M6 mutant (above); item-4 T4 grammar composes multi-chunk extents × write faults around the classifier |
 | **WAL-2** | segment creation's dir-fsync window is crash-safe (empty-orphan residue tolerated; non-empty orphans refused loudly) | `open_segment` fresh-path fsync_dir; `recover_all` orphan classification | crash points `seg_before_dir_fsync`/`seg_after_dir_fsync` (kAll 28) + crash-fuzz T5 template with FIRED-WITNESS (rc-22) | crashfuzz | **PROVEN** | `7d74627` MUT-W2T (empty-orphan tolerance reverted → 16 violations at the seg_*/man_* plans) and MUT-W2V (DirFsyncFail wiring removed → 7 witness violations; clean 0) |
-| **WAL-3** | the rotation dir-fsync syncs the RIGHT directory | `maybe_rotate_segment`/`rotate_after_checkpoint` fsync_dir targets (comment-anchored "WAL-3: a file IN dir_") | crash-fuzz rotation regimes (`rot_*` points); RotFsyncFail/RotFinalDirFsyncFail fault kinds | crashfuzz; coverage job forces the kinds | CHECKED | CONFIRM whether a named reversion proof exists pre-arc; §5 gap |
+| **WAL-3** | the rotation dir-fsync syncs the RIGHT directory (`fsync_dir(path)` syncs path's PARENT) | `rotate_after_checkpoint`'s final `fsync_dir(manifest_path())` — the fixed call carries the anchor comment "WAL-3: a file IN dir_, so dir_ itself is synced" | SRC-C remediation leg arms `RotFinalDirFsyncFail` AT that call site with a fired-witness (`charge_remaining==0`) + counted-not-fail-stop contract; crash-fuzz rotation regimes; fault matrix per-kind anti-vacuity | engine-tests; crashfuzz; coverage | CHECKED (handling) + STRUCTURAL (target) | G-1 CLOSED 2026-10-13 by indexing, with the honest boundary: the fired-witness proves the call exists and its failure contract holds, but the fault fires regardless of the fsync_dir ARGUMENT — target-dir correctness is comment-anchored and was verified by reading (Audit-2's own method), and NO in-process proof of it can exist (a missing/wrong fsync is invisible to `_exit()`-based testing — the page cache survives; the decision doc's WAL-2 boundary sentence applies verbatim). The mechanical target-level proof is v30 M3's dm-flakey leg. |
 | **R-REBASE** | rotation/rebase never deletes WAL needed for recovery | `rotate_after_checkpoint` under `batch_mu_` + ckpt ordering; H1: size rotation PRESERVES `last_ckpt_ts_` in the MANIFEST | m2p1 phase-1b (≥2 segments + pre/post-ckpt keys); H1 regression; crash-fuzz T1 (Ckpt→Rotate, "guaranteed forever"); size-rotation admission via the hooks-gated cap (8 segments, byte-exact) | engine-tests; crashfuzz | **PROVEN** | H1 historical (the bricked-database incident); `79c4490` mutant (`maybe_rotate_segment` early-return → seg_count=1, old GREEN); `7d74627` T1/W2T |
 
 ### 2.3 MVCC, SSI, epoch-pinned reclamation
@@ -91,7 +91,7 @@ historical documents; the disambiguation lives from this file forward.
 | **SSI claim** (serializability, not just SI) | committed histories are serializable | commit validation (rs under `commit_mu` + phantom re-check under `batch_mu_`) | the five lincheck checkers (cts-order, real-time, list-append, scan-exactness, set-algebra) + write-skew; every engine workload history must pass all and be non-vacuous | dst lincheck leg (4 seeds PR / 64 nightly) | PROVEN | item-1 battery + mutation legs (checker flags fabricated anomalies) |
 | **E-series (E1–E16)** | epoch-pinned reclamation safety: pins before a sever block reclamation; pins after cannot reach severed suffixes | `acquire_slot_locked` (snapshot+pinned_epoch under `reader_mu_`), `retire()` epoch tagging, `reclaim_retired()` `retired_epoch < min_active_pin_epoch()` | v23 Phase A/C battery; DST S3; **DST S6 `reclaim_retire_pin`** (capture control, in-flight pinned stability, pinned-block WITNESS `retired_pending()>=NK`, post-unpin DRAIN, retired/reclaimed controls); v17 boundedness accounting | dst (6 scenarios × seeds); engine-tests | **PROVEN** | `f64dfb6` S6 mutants: epoch-gate off-by-one `<=` → witness-only RED (`pending_under_pin=0`, stability green — the gate is defense-in-depth at the version layer and the witness pins it before M3 makes it UAF-class); reclaim neutered → drain RED (`retired_pending=208`); retire neutered → witness RED. v17 threshold mutant → boundedness RED (`live=5000 want<=10`, legacy half green — the vacuity made visible) |
 | **Reader-slot bookkeeping** (CKV-015 class) | free slots are snapshot-0/epoch-0, no dup/OOB indices | `release_slot` under `reader_mu_` | `verify_reader_slots()`; Fix-12 test WITH post-release prune control | engine-tests | PROVEN | Fix-12's control leg (prune erased after release — "a detector that has never failed is not a detector") |
-| **[k,k] point-range equivalence** (Audit-2 row) | a single-key range scan equals the point read at the same snapshot | `range_scan` resolution path shared with `read_at` | DST S6 prober's per-round single-key as-of probe; CONFIRM a release-mode dedicated leg | dst (stress only) | CHECKED (partial) | §5 gap G-3 |
+| **[k,k] point-range equivalence** (Audit-2 row) | a single-key range scan equals the point read at the same snapshot AND a scan-based negative lookup conflicts like the get-based route | one `read_at_idx` resolution path; one `RangeRead{lo,hi}` registration feeding `has_phantom_in_range` | **`run_kk_equivalence_test`** (release mode, 7 legs: latest/absent/deleted/as-of value equivalence + scan-based negative-lookup conflict + outside-range control + inclusive-upper-bound pin) + DST S6 prober's per-round single-key as-of probe (stress) | engine-tests; dst | **PROVEN** | 2026-10-13: cursor hi-exclusive mutant → legs A/D RED; phantom-bound `<` mutant → legs E1/E3 RED; measured co-flips recorded at the test (CKV-002a/e, 006, 003c, 005; A2 TXN-1 — and A2's get-based TXN-2 detector does NOT flip, prose corrected by measurement) |
 
 ### 2.4 Tree & pages
 
@@ -188,14 +188,20 @@ docs, indexed here by milestone rather than sha):
 
 ## 5. Gap list for v30 M0 calibration (honest CONFIRM/pending cells)
 
-- **G-1 (WAL-3):** confirm whether a named scratch-reversion proof exists
-  for the wrong-directory fsync class, or record the crash-fuzz regime
-  coverage as its proof shape.
+- **G-1 (WAL-3): CLOSED 2026-10-13** — resolved by indexing: no
+  in-process reversion proof exists or CAN exist (wrong-target fsync is
+  invisible to `_exit()` testing — the decision doc's boundary); the
+  row now names the SRC-C fired-witness leg as the handling-contract
+  checker, marks the target half STRUCTURAL with its anchor, and defers
+  the mechanical proof to v30 M3's dm-flakey leg.
 - **G-2 (I3, R1):** assert-class invariants lack a modern indexed
   break-demo; v30 M0 owes one each (a corrupted-record scratch build for
   I3; a publication-order mutant for R1) or a reviewed structural argument.
-- **G-3 ([k,k] equivalence):** only stress-vehicle coverage (S6 probe);
-  add a release-mode leg or record the DST coverage as sufficient.
+- **G-3 ([k,k] equivalence): CLOSED 2026-10-13** — release-mode checker
+  landed (`run_kk_equivalence_test`, 7 legs across the row's value and
+  conflict halves), row upgraded to PROVEN with both mutants and the
+  measured co-flip sets recorded (including the prose correction: A2's
+  get-based TXN-2 detector does not ride the range predicate).
 - **G-4 (delta-chain integrity):** index the 6-boundary crash matrix's
   per-boundary proofs into §3's ledger shape.
 - **G-5 (T1):** overlay semantics are battery-checked but have no indexed
