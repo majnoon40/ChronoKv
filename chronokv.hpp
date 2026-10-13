@@ -6169,44 +6169,21 @@ class ChronoKV {
     }
 
 public:
-#ifdef CHRONOKV_VERIFY_FULL
-    // Expensive-tier sweep: O(total versions) across the whole database.
-    // For every key's version chain, checks:
-    //   (a) acyclicity       - no pointer visited twice
-    //   (b) unique commit_ts - no duplicate commit_ts within one chain
-    //   (c) strict ordering  - commit_ts strictly decreases head -> tail
-    // NEVER call in the commit hot path. Periodic / slow-CI only.
-    void verify_full() {
-        // v24 M-cleanup: this function used unqualified shared_lock, set,
-        // and memory_order_acquire, relying on the header-wide
-        // 'using namespace std;' that was removed in an earlier v24 fix.
-        // CHRONOKV_VERIFY_FULL has therefore been a dead, non-compiling
-        // build configuration since that removal -- nothing in this
-        // project's own sanitizer matrix ever defines it, so this was
-        // never caught. Restored explicit std:: qualification.
-        SnapshotGuard pin(*this);
-        // v25.1 M1.6: walk the tree instead of name2idx_ + entries_.
-        auto pairs = tree_scan_all();
-        for (auto& [k, v] : pairs) {
-            KeyEntry* e = decode_ptr(v);
-            if (!e) continue;
-            std::set<const Version*> visited;
-            std::set<uint64_t> seen_ts;
-            Version* cur = e->head.load(std::memory_order_acquire);
-            uint64_t prev_ts = UINT64_MAX;
-            while (cur) {
-                assert(visited.insert(cur).second && "verify_full: cycle in version chain");
-                uint64_t c = cur->commit_ts.load(std::memory_order_acquire);
-                if (c != 0) {
-                    assert(seen_ts.insert(c).second && "verify_full: duplicate commit_ts in chain");
-                    assert(c < prev_ts && "verify_full: chain not strictly decreasing");
-                    prev_ts = c;
-                }
-                cur = cur->prev.load(std::memory_order_acquire);
-            }
-        }
-    }
-#endif
+    // Audit finding (5) CLOSED BY DELETION (2026-10-13, beyond-arc
+    // remainder): verify_full() lived here behind CHRONOKV_VERIFY_FULL —
+    // a define no build ever set (the audit: "compiled never"; it had
+    // even been non-COMPILING dead code between the v24 using-directive
+    // removal and its v24 M-cleanup repair). It is not wired in because
+    // it is SUBSUMED: verify_version_chains() below checks the same
+    // chain contract in reportable (bool + reason) form, and its strict
+    // descent rule mathematically implies the other two verify_full
+    // checks — a cycle must revisit a node, and a revisit with any ts
+    // violates "strictly descending" (equal fires ts >= prev_ts; higher
+    // fires the same; lower-than-all is impossible on a finite revisit),
+    // and a duplicate commit_ts is the equality case of the same rule.
+    // One chain verifier, wired in two places (crash-fuzz child
+    // verification + the v23 Phase C battery), beats two where the
+    // second aborts on assert and compiles nowhere.
 
 public:
     explicit ChronoKV(const std::string& wal_dir = "",
@@ -6590,6 +6567,10 @@ public:
 
     // v23 Phase C: a local pin protects every Version dereference while
     // GC may reclaim. v25.1 M1.6: walk the tree instead of entries_.
+    // 2026-10-13: the SOLE version-chain verifier (see the deletion note
+    // where verify_full() used to stand): strict descent + the
+    // committed-above-uncommitted rule, which together imply acyclicity
+    // and ts-uniqueness within a chain.
     bool verify_version_chains(std::string* reason = nullptr) {
         SnapshotGuard pin(*this);
         auto pairs = tree_scan_all();

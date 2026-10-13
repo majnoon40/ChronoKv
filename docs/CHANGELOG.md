@@ -7,6 +7,47 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **engine-cleanup+test (post-M2 hardening round 2, 2026-10-13): the
+  audit's vacuous-test enumeration is now EMPTY — both beyond-arc
+  remainders closed, by deletion with proof.** Finding (5):
+  `verify_full()` — the assert-based expensive-tier chain sweep behind
+  `CHRONOKV_VERIFY_FULL`, a define no build ever set ("compiled never",
+  per the audit; and non-compiling dead code between the v24
+  using-directive removal and its M-cleanup repair) — is DELETED rather
+  than wired, because it is SUBSUMED: `verify_version_chains()` (bool +
+  reason; wired into the crash-fuzz child verification and the v23
+  Phase C battery) enforces strict descent + committed-above-
+  uncommitted, which mathematically imply its other two checks — a
+  cycle must revisit a node, and any revisit violates strict descent
+  (equal ts trips `ts >= prev_ts`, higher trips it, and a finite chain
+  cannot descend forever), while a duplicate commit_ts is the equality
+  case of the same rule. One wired verifier that REPORTS beats two
+  where the second aborts on assert and compiles nowhere; the deletion
+  site carries the subsumption argument as a permanent comment, and
+  `verify_version_chains` gains the sole-verifier note. The dead call
+  site (v15 concurrent-commits test, behind the same never-set define)
+  goes with it. Finding (7): the `conc: no crash` check read a `crash`
+  flag no code path ever set — noise, not an oracle: the process
+  reaching the real checks IS the no-crash proof. Deleted with its
+  flag; the test's four real oracles (duplicate / fabricated /
+  key-value pairing / observed-count) are untouched. Suite: release
+  **520 → 519 PASS / 0 FAIL** (the noise line removed), exit 0, banner
+  0.28.1; `make lint` green (ratchet 33=33 — the header changed — and
+  header hygiene incl. the STRESS 2-TU leg); STRESS-mode syntax gate
+  green over all four TUs; measured on the 1 GiB sandbox at `-O0 +
+  ggc-min-expand=5`. The engine diff is deletion-only (dead code +
+  comments). Adjacent CI hygiene DEFERRED by explicit decision: the
+  actions v4→v5 bumps (which would clear the 37 Node-20 deprecation
+  warnings every run emits) wait until the arena green week completes —
+  the nightly vehicle is constraint 2's clock and a cosmetic infra swap
+  is not worth any mid-week perturbation; they fold into the M1
+  remainder, which also owns the true open piece of "CI build cache"
+  (the test-suite side is already delivered by build-shared with the
+  ccache rejection recorded in ci.yml; what is left is arena-side
+  baseline caching, M1-owner material). ROADMAP: the v29 state bullet's
+  "remaining two beyond-arc remainder" sentence rewritten to the
+  closed state with both proofs named.
+
 - **docs (v29 M3 decide-before-build, 2026-10-12): the HP4 / page-reuse
   ABA decision is MADE and in-tree —
   `docs/audits/2026-10-12-m3-hp4-aba-decision.md`.** ROADMAP §M3 requires

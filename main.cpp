@@ -2716,9 +2716,6 @@ return 0;
             for (auto& t : ts) t.join();
         }
         ChronoKV kv(wd); kv.recover(wd);
-#ifdef CHRONOKV_VERIFY_FULL
-        kv.verify_full();
-#endif
         int present = 0;
         for (int w = 0; w < W; ++w)
             for (int i = 0; i < M; ++i)
@@ -8545,7 +8542,6 @@ static int run_concurrent_cursor_test() {
 
     // Reader thread: opens a cursor over the full range and iterates slowly.
     std::set<std::string> observed_keys;
-    bool crash = false;
     bool duplicate = false;
     bool fabricated = false;
     bool pairing_mismatch = false;
@@ -8590,7 +8586,11 @@ static int run_concurrent_cursor_test() {
     stop_writing = true;
     writer.join();
 
-    check("conc: no crash", !crash);
+    // (audit finding (7) CLOSED 2026-10-13: the "conc: no crash" check
+    // read a flag no code path ever set — the process reaching these
+    // checks at all IS the no-crash proof, so the line was noise, not an
+    // oracle. Deleted with its flag; the four real oracles below carry
+    // the test.)
     check("conc: no duplicate keys", !duplicate);
     check("conc: no fabricated keys", !fabricated);
     check("conc: no key-value mismatch", !pairing_mismatch);

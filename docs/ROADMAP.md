@@ -224,8 +224,13 @@ What 0.28.1 did *not* do, and v29 inherits:
   recovery), and the 30 s soak carries a shadow-model differential over
   the live engine AND the checkpoint+WAL recovery — each proven by a
   scratch-build reversion the OLD check passed. The audit's remaining
-  two (the never-compiled `verify_full`, the `conc: no crash` noise
-  flag) stay recorded as beyond-arc remainder.
+  two beyond-arc remainders are now CLOSED as well (2026-10-13):
+  `verify_full()` — which no build ever compiled — is DELETED as
+  subsumed (`verify_version_chains`'s strict-descent rule mathematically
+  implies its cycle and duplicate-ts checks, and reports instead of
+  aborting), and the `conc: no crash` noise check is deleted with the
+  flag nothing ever set (the process reaching the real oracles IS the
+  no-crash proof). The vacuous-test enumeration is now empty.
 - **The structural debt is untouched except where Audit-2 hardened its
   edges**: the monotonic page pool remains (exhaustion is pre-mutation and
   loud via BT-1's headroom check, feeding the same D4 latch — one health
