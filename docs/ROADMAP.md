@@ -932,6 +932,19 @@ bound) — the canonical ID set extends, per the reading rules, when new
 invariants land. The lint ratchet (0.28.1) is the first invariant of this
 kind already machine-checked in CI; v30 M0 generalizes the pattern.
 
+**Seeded early (2026-10-13): `docs/INVARIANTS.md`.** The living matrix
+exists ahead of this milestone — 38 rows across 8 families, every cell
+read out of the tree at `52fd43c` (enforcement anchor → checker → CI
+vehicle → status), the P1-PITR/P1-PAGE ID collision recorded with a
+resolution proposal, §3's ledger indexing every recorded scratch-break
+proof of the v29 arc (item 1's live TXN-1 demonstration through the
+v18.2 three-mutant isolation), §4's ID→vehicle map, §5's eight-item
+calibration gap list (the honest CONFIRM cells), and §6's same-commit
+maintenance rule. v30 M0 therefore inherits rather than authors: its job
+is to empty the gap list, run the per-invariant scratch-break acceptance,
+and drive the untested-error-lines ledger to zero for the durability
+path.
+
 **Acceptance** (unchanged): intentionally breaking any invariant in a
 scratch build fails at least one CI gate — proven once per invariant,
 recorded in the audit trail.

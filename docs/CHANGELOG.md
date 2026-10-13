@@ -7,6 +7,39 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **docs (v30 M0 seeded early, 2026-10-13): `docs/INVARIANTS.md` — the
+  living invariant→checker→CI-job matrix exists ahead of its milestone.**
+  38 rows across 8 families (publication/replay order, durability/WAL,
+  MVCC-SSI-epoch, tree/pages, checkpoint/recovery, backup/PITR,
+  health/lifecycle/API, measurement), every cell read out of the tree at
+  `52fd43c` rather than transcribed from the audits: enforcement anchor
+  (function-scope, as-of tagged per the reading rules), the machine
+  checker, the CI vehicle that would catch a break, and an honest status
+  (PROVEN / CHECKED / STRUCTURAL / PENDING / CONFIRM). Contents the seed
+  could only write now, after this arc: the **P1 ID collision** recorded
+  with a resolution proposal (audit §16's PITR-read-only P1 vs the v29 M4
+  page-steady-state P1 the reading rules reserve — disambiguated
+  P1-PITR/P1-PAGE from this file forward, re-anchor owed to v30 M0);
+  the **break-proof ledger** (§3) indexing every recorded scratch-build
+  demonstration from the v29 arc — item 1's live pre-fix-flag/post-fix-pass
+  TXN-1 proof, item 2's four-mutant DST matrix (incl. the epoch-gate
+  off-by-one caught by the pinned-block witness alone), item 3's
+  old-GREEN/new-RED side-by-side proofs, item 4's W2T/W2V witness
+  mutations, the v18.2 three-mutant isolation, SRC-E4's M6 — plus the
+  0.28.0/v25.x/v26.1 arcs by milestone; the **G1–G3 rows** carrying the
+  M3 decision doc's proposed invariants with their pre-recorded fail-first
+  plan; and the **§5 gap list** (eight items — WAL-3's proof indexing,
+  I3/R1 assert-class demos, [k,k] release-mode coverage, delta-matrix
+  indexing, T1's demo, the P1 re-anchor, the error-lines ledger, G1–G3
+  activation) which is v30 M0's inherited worklist: the milestone's own
+  acceptance ("breaking any invariant in a scratch build fails at least
+  one CI gate — proven once per invariant, recorded in the audit trail")
+  now has a document to record into. §6 is the maintenance rule that makes
+  it living: any commit touching an invariant, checker, proof or vehicle
+  updates its row in the same commit; rows are never deleted; the gap list
+  shrinks only by evidence. ROADMAP: v30 M0 section gains the
+  seeded-early pointer (the milestone inherits rather than authors).
+
 - **engine-cleanup+test (post-M2 hardening round 2, 2026-10-13): the
   audit's vacuous-test enumeration is now EMPTY — both beyond-arc
   remainders closed, by deletion with proof.** Finding (5):
