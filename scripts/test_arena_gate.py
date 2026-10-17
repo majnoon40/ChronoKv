@@ -24,6 +24,16 @@ four is in the gate-hardening commit's message and the CHANGELOG entry):
   defect 4  synthetic-regression controls: chronokv ops_per_sec x0.5 must exit
             1 with REGRESSION verdicts; x0.95 must exit 0 with none (WARN is
             acceptable).
+  defect 5  half-dead BASELINE legs (found by the M1 owner reviewing the
+            hardening itself): dropping ONE baseline workload row must fail
+            verify-ledger (workload-set comparison against the calibrated
+            reference) and make check REFUSE the affected ratios (BASELINE-
+            GAP, fail tier) with ZERO REGRESSION verdicts — before the fix,
+            probe 1 passed the whole gate while the ratio silently shifted
+            -15.9%, and probe 2 (truncated rocksdb-sync) produced two FALSE
+            fillrandom REGRESSIONs. Includes the masking direction (dropping
+            a FAST baseline row) and the extras direction (an unexpected new
+            workload is a ledger-format change and must fail too).
 
 Meta-controls: the committed inputs (bench/arena_bands.json and the promoted
 week) are hashed before and after — the tests must never mutate what they
@@ -124,7 +134,7 @@ def main():
     bands_hash_before = hashlib.sha256(open(BANDS, "rb").read()).hexdigest()
     week_hash_before = tree_hash(WEEK)
 
-    print("# arena gate self-tests (controls for the four hardened defects)")
+    print("# arena gate self-tests (controls for the five hardened defects)")
 
     # ---------------- defect 1: verify-ledger ----------------
     print("## defect 1 — verify-ledger (positive controls must exit nonzero)")
@@ -200,6 +210,69 @@ def main():
            rc == 0 and "REGRESSION " not in out.replace("0 REGRESSION", ""),
            f"exit={rc}")
     shutil.rmtree(os.path.dirname(night))
+
+    # ---------------- defect 5: half-dead baseline legs ----------------
+    print("## defect 5 — half-dead BASELINE legs (set comparison + ratio refusal)")
+
+    def summary_field(out, field):
+        for line in out.splitlines():
+            if line.startswith("# ") and " series checked:" in line:
+                for tok in line.split(":")[1].split(","):
+                    tok = tok.strip()
+                    if tok.endswith(field):
+                        return int(tok.split()[0])
+        return None
+
+    # probe 1: drop ONE workload row from a baseline leg
+    night = tmp_night(); drop_row(night, "sqlite-full", "fillseq")
+    rc_v, out_v = run("verify-ledger", "--night", night)
+    expect("probe 1 (dropped sqlite-full fillseq): verify-ledger exit 1 naming the engine+workload",
+           rc_v == 1 and "sqlite-full" in out_v and "fillseq" in out_v, f"exit={rc_v}")
+    rc_c, out_c = run("check", "--bands", BANDS, "--night", night)
+    expect("probe 1: check refuses the ratios (exit 1, 2 BASELINE-GAP, 0 REGRESSION — no silent shift)",
+           rc_c == 1 and summary_field(out_c, "BASELINE-GAP") == 2
+           and summary_field(out_c, "REGRESSION") == 0,
+           f"exit={rc_c} gaps={summary_field(out_c, 'BASELINE-GAP')} regs={summary_field(out_c, 'REGRESSION')}")
+    shutil.rmtree(os.path.dirname(night))
+
+    # probe 2: truncate a baseline leg to 1 row (the false-REGRESSION shape)
+    night = tmp_night(); truncate(night, "rocksdb-sync", 1)
+    rc_v, out_v = run("verify-ledger", "--night", night)
+    expect("probe 2 (rocksdb-sync truncated to 1 row): verify-ledger exit 1 listing missing workloads",
+           rc_v == 1 and "rocksdb-sync" in out_v and "missing=" in out_v, f"exit={rc_v}")
+    rc_c, out_c = run("check", "--bands", BANDS, "--night", night)
+    gaps = summary_field(out_c, "BASELINE-GAP")
+    expect("probe 2: check exit 1 with BASELINE-GAPs and ZERO false REGRESSIONs (was: 2 false fillrandom REGRESSIONs)",
+           rc_c == 1 and gaps is not None and gaps >= 28
+           and summary_field(out_c, "REGRESSION") == 0,
+           f"exit={rc_c} gaps={gaps} regs={summary_field(out_c, 'REGRESSION')}")
+    shutil.rmtree(os.path.dirname(night))
+
+    # masking direction: drop a FAST baseline's row (lmdb owns readrandom)
+    night = tmp_night(); drop_row(night, "lmdb", "readrandom")
+    rc_v, _ = run("verify-ledger", "--night", night)
+    rc_c, out_c = run("check", "--bands", BANDS, "--night", night)
+    gap_lines = [l for l in out_c.splitlines() if l.startswith("  BASELINE-GAP") and "readrandom" in l]
+    ratio_lines = [l for l in out_c.splitlines()
+                   if "readrandom" in l and not l.startswith("  BASELINE-GAP")
+                   and not l.startswith("#")]
+    expect("masking direction (lmdb readrandom row dropped): refused, never computed inflated",
+           rc_v == 1 and rc_c == 1 and len(gap_lines) == 2 and not ratio_lines,
+           f"verify={rc_v} check={rc_c} gaps={len(gap_lines)} computed_ratio_lines={len(ratio_lines)}")
+    shutil.rmtree(os.path.dirname(night))
+
+    # extras direction: an unexpected NEW workload row is a ledger-format change
+    night = tmp_night()
+    with open(os.path.join(night, "sqlite-normal.tsv"), "a") as f:
+        f.write("brandnew\t1000\t1.0\t1000.0\t-\t-\t10.0\tinjected\n")
+    rc_v, out_v = run("verify-ledger", "--night", night)
+    expect("extras direction (unexpected workload row): verify-ledger exit 1 with 'unexpected='",
+           rc_v == 1 and "unexpected=" in out_v, f"exit={rc_v}")
+    shutil.rmtree(os.path.dirname(night))
+
+    rc, out = run("check", "--bands", BANDS, "--night", N7)
+    expect("pristine night under the strict geomean: exit 0, 0 BASELINE-GAP (no false refusals)",
+           rc == 0 and summary_field(out, "BASELINE-GAP") == 0, f"exit={rc}")
 
     # ---------------- meta controls ----------------
     print("## meta — the tests never mutate what they judge")

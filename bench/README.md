@@ -168,8 +168,34 @@ in the CHANGELOG entry and the commit message):**
   chronokv `ops_per_sec` × 0.5 over a promoted night must exit 1 with
   REGRESSION verdicts (measured: 27), × 0.95 must stay exit 0 (WARN
   allowed). 
-* **All of the above are wired into `scripts/test_arena_gate.py`** (14
-  controls + 2 meta-controls that the suite never mutates the bands or
+* **Defect 5 (found by the M1 owner reviewing the hardening itself,
+  fixed the same day): a half-dead BASELINE leg wasn't caught.**
+  `verify-ledger`'s ≥1-valid-row rule and `check`'s ChronoKV-only
+  MISSING verdicts left baseline workloads unguarded, in BOTH
+  directions — measured on copies of promoted night N7: dropping ONE
+  `sqlite-full` fillseq row passed the whole gate (verify 0, check 0)
+  while the geomean denominator fell from five baselines to four and
+  `chronokv-group/fillseq` silently shifted **-15.9%** (0.2069 →
+  0.1740; dropping a FAST baseline shifts the other way and can MASK a
+  real regression); truncating `rocksdb-sync` to one row passed
+  verify-ledger and turned the nightly red with **two FALSE
+  `fillrandom` REGRESSIONs** — a vehicle failure misattributed to the
+  engine. Fixed in two layers: `verify-ledger` now compares each
+  engine's valid-workload SET to the calibrated one (reference: the
+  most recent committed `bench/results/promoted/` week — a workload
+  list change is a ledger-format change and owes a recalibration
+  commit, exactly like a geometry change; extras fail too), and
+  `check`'s geomean is STRICT: a ratio is REFUSED whenever any of the
+  five baseline legs lacks a valid row for that workload — fail-tier
+  `BASELINE-GAP` verdict naming the offending engines ("a vehicle
+  failure, not an engine regression"), never a computed ratio.
+  Ratio-less-by-design workloads (the chronokv-exclusive family) are
+  unaffected; the committed bands are untouched (recomputation over
+  the seven nights is identical to 1.1e-14 relative — geomean
+  summation-order float noise, zero verdict drift on all seven).
+* **All of the above are wired into `scripts/test_arena_gate.py`** (19
+  controls + 2 meta-controls — 21 checks; the meta pair proves the suite
+  never mutates the bands or
   the promoted TSVs it judges), running as the `arena-gate-selftest`
   job on EVERY push/PR (committed fixtures, no runner hardware needed)
   and in `ci-passed`'s needs with no skip tolerance. Red there means

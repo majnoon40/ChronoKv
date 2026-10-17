@@ -7,6 +7,78 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **fix+test (v29 M1 gate hardening round 2, 2026-10-17): DEFECT 5 —
+  half-dead BASELINE legs weren't caught: one dropped baseline workload
+  row passed the whole gate while silently shifting ratios (-15.9%
+  measured), and a truncated baseline leg reddened the nightly with
+  FALSE engine regressions. Found by the M1 owner reviewing the
+  hardening itself; reproduced with fixtures before the fix; fixed in
+  two layers; five new controls (selftest now 19 controls + 2 meta =
+  21 checks).** The
+  previous entry's hardening left a hole: `verify-ledger` required only
+  >=1 valid row per engine, and `check`'s MISSING verdicts covered
+  ChronoKV series only — baseline workload completeness was unguarded.
+  BEFORE (both probes on copies of promoted night N7, pre-fix tool):
+  *probe 1* — drop the single `fillseq` row from `sqlite-full.tsv`:
+  verify-ledger exit 0 ("all 7 engines carry >= 1 valid data row"),
+  check exit 0 ("30 series checked: 0 REGRESSION, 2 WARN") — while the
+  geomean denominator fell from five engines to four and
+  `chronokv-group/fillseq` silently moved 0.2069 -> 0.1740, a
+  **-15.9% ratio shift** (it surfaced only as a WARN; the same drop on
+  a FAST baseline — lmdb owns readrandom — shifts ratios UP and can
+  MASK a real regression, the direction that motivated refusal over
+  recomputation). *Probe 2* — truncate `rocksdb-sync.tsv` to 1 data
+  row: verify-ledger exit 0, check exit 1 with **two FALSE
+  REGRESSIONs** (`chronokv-async/fillrandom 0.206 < floor 0.231`,
+  `chronokv-group/fillrandom 0.204 < floor 0.218`) — the geomean lost
+  its slowest member and a dead vehicle leg would have been reported as
+  an engine regression (cry-wolf: the re-run policy would have burned
+  its one dispatch on nothing). FIX, two layers: (1) `verify-ledger`
+  compares each engine's valid-workload SET to the calibrated one —
+  reference: the most recent committed `bench/results/promoted/` week,
+  resolved script-relative (any CWD; `--expect-from` overrides; an
+  internally-inconsistent reference is a hard tool error, never a
+  silent pick). Equality is BOTH directions: missing workloads fail and
+  an UNEXPECTED new workload fails too — a workload-list change is a
+  ledger-format change that owes a recalibration commit (the promoted
+  reference updates with it), the same rule the geometry refusal
+  already enforces. (2) `check`'s geomean went STRICT
+  (`baseline_geo_strict`): a ratio is REFUSED whenever any of the five
+  baseline legs lacks a valid row for that workload — fail-tier
+  `BASELINE-GAP` verdict naming the offending engines and saying what
+  it is ("a vehicle failure, not an engine regression"); the summary
+  line gains the count; MISSING never double-counts a series already
+  flagged BASELINE-GAP (attribution stays exact); ratio-less-by-design
+  workloads (the chronokv-exclusive family — no baseline rows even in a
+  pristine night, no band series) are explicitly NOT gaps. AFTER (same
+  fixtures): probe 1 -> verify-ledger exit 1 (`WORKLOAD-SET
+  sqlite-full.tsv 14 valid rows ... missing=['fillseq']`) and check
+  exit 1 with exactly 2 BASELINE-GAP (both ckv fillseq series,
+  sqlite-full named), **0 REGRESSION**; probe 2 -> verify-ledger exit 1
+  listing all 14 missing workloads, check exit 1 with **28 BASELINE-GAP
+  and 0 REGRESSION** (both false verdicts eliminated); masking-direction
+  control (lmdb's readrandom row dropped) -> both ckv ratios refused,
+  never computed inflated; extras-direction control (injected `brandnew`
+  row) -> exit 1 `unexpected=`; pristine night -> 0 BASELINE-GAP (no
+  false refusals). NEGATIVE controls: all seven promoted nights re-run
+  through BOTH layers — verify-ledger 0, check 0, WARN counts identical
+  to pre-fix (N1:6 N2:14 N3:0 N4:1 N5:1 N6:6 N7:1), 0 MISSING, 0
+  BASELINE-GAP. Invariants honored: `bench/arena_bands.json` UNTOUCHED
+  (sha256 unchanged; recomputation over the seven nights identical in
+  keys/n/provisional flags with max relative float drift 1.143e-14 —
+  the strict geomean sums in BASELINE_ENGINES order instead of parse
+  order; zero verdict drift), tolerance untouched (0.15), LOO output
+  unchanged (same 6 held-out regressions on N2/N6 — recorded, awaiting
+  the band-policy decision, NOT widened), no engine file touched.
+  Selftest: `scripts/test_arena_gate.py` grows the defect-5 section
+  (both owner probes + masking + extras + pristine controls, asserting
+  parsed verdict COUNTS from the summary line rather than substrings)
+  -> 19 controls + 2 meta-controls (21 checks), all green in ~1 s; the `arena-gate-selftest`
+  push/PR job picks it up with no workflow change (its comment now says
+  five). Docs: bench/README gate-hardening record gains the defect-5
+  bullet with the measured numbers; ROADMAP item-4 addendum gains
+  paragraph (5), owner-review provenance kept honest.
+
 - **fix+test (v29 M1 gate HARDENING, 2026-10-17): four verified defects
   in the arena regression gate enabled earlier the same day — each
   reproduced with fixtures BEFORE the fix, each fixed behind fail-first

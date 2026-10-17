@@ -661,13 +661,18 @@ jobs:
 
   # ---- v29 M1 gate hardening (2026-10-17): self-tests for the arena gate ----
   # The gate that judges the ledger must itself be judged. Runs
-  # scripts/test_arena_gate.py: the positive/negative controls for the four
+  # scripts/test_arena_gate.py: the positive/negative controls for the five
   # hardened gate defects — verify-ledger fixtures (empty / comment-only /
   # stderr-only / missing-file must go red; pristine night green), MISSING-
   # series verdicts (dropped row / deleted TSV / truncated TSV must exit 1),
   # leave-one-out cross-validation structure (the in-sample self-consistency
-  # claim it replaces was vacuous by construction), and the synthetic
-  # regressions (chronokv ops x0.5 must exit 1, x0.95 must stay green) — plus
+  # claim it replaces was vacuous by construction), the synthetic
+  # regressions (chronokv ops x0.5 must exit 1, x0.95 must stay green), and
+  # the half-dead BASELINE legs (a single dropped baseline workload row must
+  # fail verify-ledger's calibrated-workload-set comparison and make check
+  # REFUSE the affected ratios as BASELINE-GAP with zero REGRESSION verdicts —
+  # before the fix it passed the whole gate while the ratio shifted -15.9%,
+  # and a truncated rocksdb-sync faked two fillrandom REGRESSIONs) — plus
   # meta-controls that the suite never mutates the bands or the promoted TSVs
   # it judges. Uses only committed fixtures: no runner hardware, no arena run,
   # so it gates EVERY push/PR (unlike the nightly-only arena job). Red here

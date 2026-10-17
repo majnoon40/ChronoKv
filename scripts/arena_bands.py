@@ -40,15 +40,26 @@ week) are stamped PROVISIONAL: reportable, not gateable.
 Subcommands:
   band           --nights DIR [DIR ...] [--out bands.json]  compute + print bands
   check          --bands bands.json --night DIR [--tolerance F] [--rss-factor F]
-                     verdicts + exit code (1 = REGRESSION or MISSING series,
-                     2 = geometry mismatch: CI-ready). MISSING (gate hardening,
-                     defect 2): every band series absent from the night's
-                     ledger is a failing verdict — a leg that dies mid-run
-                     used to just yield fewer verdicts and exit 0.
-  verify-ledger  --night DIR
-                     completeness gate (hardening, defect 1): every one of the
-                     seven engine TSVs must exist and carry >= 1 VALID data row
-                     (>= 7 tab-separated fields, numeric ops_per_sec > 0).
+                     verdicts + exit code (1 = REGRESSION / MISSING series /
+                     BASELINE-GAP, 2 = geometry mismatch: CI-ready). MISSING
+                     (gate hardening, defect 2): every band series absent from
+                     the night's ledger is a failing verdict — a leg that dies
+                     mid-run used to just yield fewer verdicts and exit 0.
+                     BASELINE-GAP (defect 5): a ratio is REFUSED — fail-tier,
+                     offending engines named — whenever any of the five
+                     baseline legs lacks a valid row for that workload; the
+                     permissive geomean it replaces silently shifted ratios
+                     (one dropped sqlite-full row: -15.9% on group/fillseq,
+                     gate green) or faked regressions (truncated rocksdb-sync:
+                     two false fillrandom REGRESSIONs).
+  verify-ledger  --night DIR [--expect-from REF]
+                     completeness gate (hardening, defects 1+5): every one of
+                     the seven engine TSVs must exist, carry >= 1 VALID data
+                     row (>= 7 tab-separated fields, numeric ops_per_sec > 0),
+                     AND carry EXACTLY the calibrated workload set (reference:
+                     the most recent committed promoted week; a half-dead
+                     baseline leg — one dropped row — passes any row count
+                     while silently shifting every ratio it feeds).
                      Replaces the ci.yml shell count, which passed green on
                      empty/comment-only files (grep -c prints 0 AND exits 1, so
                      `|| echo 0` produced "0\n0" and `[ -lt ]` errored to rc=2
@@ -163,22 +174,44 @@ def cpu_of(night):
     return cpus.pop()
 
 
-def baselines_geo_mean(night, workload):
-    vals = []
-    for eng, wl in night["rows"].items():
-        if eng in ENGINES_CKV:
-            continue
-        r = wl.get(workload)
+BASELINE_ENGINES = tuple(e for e in ENGINE_FILES if e not in ENGINES_CKV)
+
+
+def baseline_geo_strict(night, workload):
+    """(geomean, missing) over the FIVE baseline engines for one workload.
+
+    Gate hardening (defect 5): the geomean is REFUSED (None) unless every
+    baseline engine carries a valid row (ops_per_sec > 0) for the workload.
+    The permissive predecessor averaged whatever was present, so a half-dead
+    baseline leg silently shifted every ratio for the missing workload —
+    measured: dropping sqlite-full's fillseq row moved chronokv-group/fillseq
+    from 0.2069 to 0.1740 (-15.9%) with the whole gate green, and dropping a
+    FAST baseline would inflate ratios and mask a real regression; truncating
+    rocksdb-sync to one row produced two FALSE fillrandom REGRESSIONs (the
+    geomean lost its slowest member). `missing` names the offending engines so
+    the verdict can be diagnostic instead of misattributed.
+    """
+    vals, missing = [], []
+    for eng in BASELINE_ENGINES:
+        r = night["rows"].get(eng, {}).get(workload)
         if r and r["ops_per_sec"] and r["ops_per_sec"] > 0:
             vals.append(r["ops_per_sec"])
-    if not vals:
-        return None
-    return math.exp(sum(math.log(v) for v in vals) / len(vals))
+        else:
+            missing.append(eng)
+    if missing or not vals:
+        return None, missing
+    return math.exp(sum(math.log(v) for v in vals) / len(vals)), []
 
 
-def ratios_of(night):
-    """engine -> workload -> ratio vs same-night baseline geomean."""
-    out = {}
+def ratios_and_gaps(night):
+    """(ratios, gaps): engine -> workload -> ratio vs same-night baseline
+    geomean, plus the refused ratios as {(engine, workload): [missing
+    baselines]}. Ratio-less-by-design workloads (chronokv-exclusive: the
+    rangescan/deletechurn/ckptload/coldrecovery/memory family — no baseline
+    rows even in a pristine night) land in gaps too; the consumer decides
+    whether a gap is a verdict (run_check: only for series the bands carry).
+    """
+    out, gaps = {}, {}
     for eng in ENGINES_CKV:
         if eng not in night["rows"]:
             continue
@@ -186,10 +219,17 @@ def ratios_of(night):
         for w, r in night["rows"][eng].items():
             if not r["ops_per_sec"]:
                 continue
-            base = baselines_geo_mean(night, w)
-            if base:
-                out[eng][w] = r["ops_per_sec"] / base
-    return out
+            base, missing = baseline_geo_strict(night, w)
+            if base is None:
+                gaps[(eng, w)] = missing
+                continue
+            out[eng][w] = r["ops_per_sec"] / base
+    return out, gaps
+
+
+def ratios_of(night):
+    """Ratio map only (report/loo convenience); see ratios_and_gaps."""
+    return ratios_and_gaps(night)[0]
 
 
 def _stats(xs):
@@ -285,7 +325,8 @@ def run_check(bands, night, tolerance, rss_factor):
     """
     verdicts, worst = [], 0
     seen_ratio = set()
-    for eng, wl in ratios_of(night).items():
+    ratios, gaps = ratios_and_gaps(night)
+    for eng, wl in ratios.items():
         for w, r in wl.items():
             key = f"{eng}/{w}"
             seen_ratio.add(key)
@@ -303,14 +344,31 @@ def run_check(bands, night, tolerance, rss_factor):
                 worst = max(worst, 1)
             else:
                 verdicts.append(("OK", key, r, st, ""))
+    # Gate hardening (defect 5): a ratio the geomean REFUSED because a
+    # baseline leg lacks the workload is a fail-tier BASELINE-GAP verdict
+    # with the offending engines named — but only for series the bands
+    # actually carry (chronokv-exclusive workloads have no baseline rows by
+    # design and no band series; those gaps are not verdicts).
+    for (eng, w), missing in sorted(gaps.items()):
+        key = f"{eng}/{w}"
+        if key not in bands["ratio"]:
+            continue
+        st = bands["ratio"][key]
+        verdicts.append(("BASELINE-GAP", key, None, st,
+                         f"ratio REFUSED — baseline leg(s) missing a valid '{w}' row: "
+                         f"{', '.join(missing)} (a half-dead baseline shifts or fakes "
+                         f"ratios; this is a vehicle failure, not an engine regression)"))
+        worst = max(worst, 2)
+    gap_keys = {f"{e}/{w}" for (e, w) in gaps}
     # Gate hardening (defect 2): a band series ABSENT from the night is a
     # failing verdict, not silence. Before this, a leg that died mid-run just
     # produced fewer verdicts and the check exited 0 (measured: dropping one
     # workload row -> "29 series checked", deleting chronokv-async.tsv ->
     # "15 series checked", truncating chronokv-group.tsv to 3 rows ->
-    # "18 series checked" — all exit 0).
+    # "18 series checked" — all exit 0). Series already flagged BASELINE-GAP
+    # are not double-counted as MISSING — attribution stays exact.
     for key, st in bands["ratio"].items():
-        if key not in seen_ratio:
+        if key not in seen_ratio and key not in gap_keys:
             verdicts.append(("MISSING", key, None, st,
                              "band series absent from this night's ledger (dead or truncated leg?)"))
             worst = max(worst, 2)
@@ -353,10 +411,11 @@ def cmd_check(args):
         print(f"  {v:<11} {k:<34} {vs:>10}{med}  {why}")
     nreg = sum(1 for v in verdicts if v[0] == "REGRESSION")
     nmiss = sum(1 for v in verdicts if v[0].startswith("MISSING"))
+    ngap = sum(1 for v in verdicts if v[0] == "BASELINE-GAP")
     print(f"# {len(verdicts)} series checked: {nreg} REGRESSION, "
           f"{sum(1 for v in verdicts if v[0]=='WARN')} WARN, "
           f"{sum(1 for v in verdicts if v[0]=='RSS-RATCHET')} RSS-RATCHET, "
-          f"{nmiss} MISSING")
+          f"{nmiss} MISSING, {ngap} BASELINE-GAP")
     if prov and worst < 2:
         print("# NOTE: bands PROVISIONAL — verdicts are advisory until the green week calibrates them")
     return 1 if worst >= 2 else 0
@@ -384,8 +443,74 @@ def valid_data_rows(path):
     return n
 
 
+def valid_workload_set(path):
+    """The set of workload names carried by valid data rows of one TSV
+    (same validity rule as valid_data_rows: >=7 tab fields, numeric
+    ops_per_sec > 0)."""
+    ws = set()
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 7:
+                continue
+            v = _num(parts[3])
+            if v is not None and v > 0:
+                ws.add(parts[0].strip())
+    return ws
+
+
+def default_reference_week():
+    """The most recent committed promoted week (script-relative, so it works
+    from any CWD). The promoted rows are the calibration ground truth the
+    bands were computed from — the workload sets MUST match them, because a
+    workload list change is a ledger-format change (the band-update policy's
+    own rule: recalibrate in a dedicated commit, which re-promotes)."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    promoted = os.path.join(root, "bench", "results", "promoted")
+    if not os.path.isdir(promoted):
+        return None
+    weeks = sorted(d for d in os.listdir(promoted)
+                   if os.path.isdir(os.path.join(promoted, d)))
+    return os.path.join(promoted, weeks[-1]) if weeks else None
+
+
+def reference_workload_sets(ref):
+    """Per-engine valid-workload sets from the reference. `ref` is either a
+    promoted WEEK dir (every night must agree — inconsistency is a tool
+    error, never a silent pick) or a single NIGHT dir via --expect-from."""
+    nights = []
+    if os.path.isdir(ref):
+        subs = sorted(d for d in os.listdir(ref)
+                      if os.path.isdir(os.path.join(ref, d)))
+        nights = [os.path.join(ref, d) for d in subs] if subs else [ref]
+    sets = []
+    for nd in nights:
+        per_engine = {}
+        for eng in ENGINE_FILES:
+            path = os.path.join(nd, eng + ".tsv")
+            if not os.path.isfile(path):
+                sys.exit(f"error: reference night {nd} lacks {eng}.tsv — cannot derive expected workload sets")
+            per_engine[eng] = valid_workload_set(path)
+        sets.append((nd, per_engine))
+    first = sets[0][1]
+    for nd, se in sets[1:]:
+        if se != first:
+            diff = {e: (first[e] ^ se[e]) for e in ENGINE_FILES if first[e] != se[e]}
+            sys.exit(f"error: reference {ref} is internally inconsistent ({sets[0][0]} vs {nd}: {diff}) — fix the promoted reference before gating against it")
+    return first
+
+
 def cmd_verify_ledger(args):
     print(f"# verify-ledger night={args.night}")
+    ref = args.expect_from or default_reference_week()
+    if not ref:
+        print("# error: no workload-set reference found (no committed promoted week; pass --expect-from DIR)")
+        return 1
+    expected = reference_workload_sets(ref)
+    print(f"# workload-set reference: {ref}")
     bad = []
     for eng in ENGINE_FILES:
         path = os.path.join(args.night, eng + ".tsv")
@@ -399,12 +524,30 @@ def cmd_verify_ledger(args):
                 head = [ln.rstrip()[:80] for ln in f if ln.strip()][:2]
             print(f"  ZERO-VALID-ROWS  {eng}.tsv  first lines: {head}")
             bad.append(eng)
+            continue
+        # Gate hardening (defect 5): >=1 valid row is NOT completeness — a
+        # half-dead leg (one dropped row, a truncated file) passes the row
+        # count while every ratio it feeds silently shifts (measured: -15.9%
+        # on chronokv-group/fillseq from ONE dropped sqlite-full row, whole
+        # gate green) or fakes regressions (truncated rocksdb-sync -> two
+        # false fillrandom REGRESSIONs). The workload set must EQUAL the
+        # calibrated one, both directions (extras are ledger-format changes
+        # that owe a recalibration commit, same as geometry changes).
+        actual = valid_workload_set(path)
+        missing = expected[eng] - actual
+        extra = actual - expected[eng]
+        if missing or extra:
+            print(f"  WORKLOAD-SET     {eng}.tsv  {n} valid rows but workload set != calibrated "
+                  f"(expected {len(expected[eng])}): "
+                  + (f"missing={sorted(missing)} " if missing else "")
+                  + (f"unexpected={sorted(extra)}" if extra else ""))
+            bad.append(eng)
         else:
-            print(f"  ok               {eng}.tsv  {n} valid data rows")
+            print(f"  ok               {eng}.tsv  {n} valid rows, workload set == calibrated ({len(actual)})")
     if bad:
-        print(f"# VERIFY-LEDGER FAILED: {len(bad)} engine(s) without valid data rows: {', '.join(bad)}")
+        print(f"# VERIFY-LEDGER FAILED: {len(bad)} engine(s) incomplete: {', '.join(bad)}")
         return 1
-    print(f"# verify-ledger: all {len(ENGINE_FILES)} engines carry >= 1 valid data row")
+    print(f"# verify-ledger: all {len(ENGINE_FILES)} engines complete (>=1 valid row AND workload set == calibrated)")
     return 0
 
 
@@ -477,6 +620,9 @@ def main():
     r.add_argument("--nights", nargs="+", required=True)
     vl = sub.add_parser("verify-ledger")
     vl.add_argument("--night", required=True)
+    vl.add_argument("--expect-from", default=None,
+                    help="reference night/week dir for the expected workload sets "
+                         "(default: the most recent committed bench/results/promoted/ week)")
     lo = sub.add_parser("loo")
     lo.add_argument("--nights", nargs="+", required=True)
     lo.add_argument("--min-nights", type=int, default=None,
