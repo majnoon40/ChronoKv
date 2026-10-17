@@ -7,6 +7,77 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **feat (v29 M3 slice 1/3, 2026-10-17): the pool-side slot-generation
+  mechanism lands — invariant G1 is live in `PagePool::alloc()`, the
+  HP4/ABA decision's chosen horn, with six unit controls and a measured
+  no-bump mutant proof (4/6 red, driver rc 9). Production behavior
+  UNCHANGED by construction; the G2 consumers (fence + cursor
+  verification, HP deletion) are slice 2, inside the same milestone.**
+  Per `docs/audits/2026-10-12-m3-hp4-aba-decision.md` checklist items
+  1–2: `PagePool` gains a fixed-size per-slot generation table
+  (`std::vector<std::atomic<uint32_t>>`, `capacity_/PAGE_SIZE` entries
+  — 256 KiB at the engine's 256 MiB default, 1 MiB at PagePool's own
+  1 GiB default; never grown). Pool-side, not header-side, by the
+  decision's recorded rationale: the 32-byte `static_assert`-guarded
+  `PageHeader`'s reserved bytes are already spent (CKV-008 took both
+  halves for `mut_epoch`), and the generation belongs where its only
+  mutator already is — the pool mutex in `alloc()`. **G1**: every
+  alloc transition (free-list reuse AND virgin bump) bumps the slot's
+  generation exactly once, under `mu_`, BEFORE the memset that makes
+  the slot's contents reachable — release-ordered, pairing with the
+  verifiers' acquire load after their latch acquisition (the ordering +
+  32-bit-wrap arguments are the decision doc's §3, to be transcribed
+  into the header's memory-ordering audit section with slice 2's
+  consumers). Read side: `PagePool::slot_generation(id)` — null id
+  reports 0 and live slots count from 1, so a zero-initialized capture
+  can never alias a live slot; same no-bounds-check hot-path contract as
+  `get()` — and `BTree::slot_generation(id)` forwarding through the
+  tree face (consumers never touch the pool directly; documented as
+  distinct from the TREE-wide `generation()` debug counter). `free()`'s
+  v25.1 HP4 deferral comment ("the free-list reuse is tagged or Version
+  allocations are never reused") is replaced by the decision's
+  resolution: tagged horn, immediate free-list return, epoch deferral
+  rejected (writer descents don't pin; deferral re-couples reuse to the
+  slowest pin), HP machinery deletion scheduled for slice 2. The
+  mechanism does NOT sit dead the way the HP registry did: it lands
+  with its controls, and its production consumers land in the same
+  milestone — the no-consumer-yet window is one slice, by plan, and
+  `alloc()`'s only new instruction is a `fetch_add` under a mutex it
+  already holds. CONTROLS (six, in `run_page_pool_selftest`): null id →
+  0; virgin slots start at 1 with independent counters; free→alloc
+  reuse hands back the same slot id; reuse bumps exactly once with
+  siblings untouched; per-slot monotonic across repeated free/alloc
+  cycles; and the ABA pair itself — a generation captured before a free
+  is stale (`gen+1`, `!= captured`) against the reincarnated slot.
+  FAIL-FIRST, measured (scratch build, driver-level): deleting alloc's
+  bump line reddens 4 of the 6 (all four generation-value controls; the
+  2 green — null-id and same-slot-id reuse — don't consult the counter
+  by construction), `fails=4`, driver rc 9; clean tree 6/6, rc 0.
+  SELF-CORRECTION recorded: the ABA control's first cut asserted
+  `slot_generation(e) != 1` — true under the no-bump mutant (0 != 1),
+  i.e. VACUOUS exactly where it mattered; caught by running the mutant,
+  strengthened to capture-then-compare, re-proven in both directions
+  (this is the fifth time this arc's discipline paid: the m2 stale-id
+  mutant that was a no-op, the soak's empty-delta hole, the v18.2
+  revert that survived, the in-sample band claim — detectors must be
+  run against their mutants, not reasoned about). Suite: release
+  **526 → 532 PASS / 0 FAIL**, exit 0, banner 0.28.1, measured on the
+  1 GiB sandbox at `-O0 + ggc-min-expand=5`. BASELINE CORRECTION,
+  recorded honestly: the gate-hardening entry above says "the
+  519-check C++ suite" — that cited 52fd43c's count; 6bcb212's [k,k]
+  release-mode checker added 7 legs AFTER it, so the pre-slice baseline
+  was 526 (verified by counting 6bcb212's added check lines). `make
+  lint` green: -Werror across all four TUs both hook modes, ratchet
+  33=33 (the new header code adds zero conversion warnings), header
+  hygiene incl. the STRESS 2-TU leg; STRESS-defs syntax gate green.
+  Next: slice 2 (G2 verification sites — `LeafFence.gen` +
+  `fence_unchanged`, `Cursor::leaf_gen_` + `enter_leaf` with
+  restart-from-last-emitted-key, HP machinery deletion) then slice 3
+  (first `free()` callers: purge shape with the PITR-horizon caveat,
+  KeyEntry retirement via the epoch reclaimer with unlink-before-retire,
+  stats/health thresholds, memory-ordering audit extension, acceptance
+  battery).
+
 - **fix+test (v29 M1 gate hardening round 2, 2026-10-17): DEFECT 5 —
   half-dead BASELINE legs weren't caught: one dropped baseline workload
   row passed the whole gate while silently shifting ratios (-15.9%

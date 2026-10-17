@@ -10943,7 +10943,16 @@ public:
         : capacity_(round_up(capacity, PAGE_SIZE)),
           base_(allocate_raw(capacity_)),
           bump_(0),
-          free_list_() {}
+          free_list_(),
+          // v29 M3 slice 1 (HP4/ABA decision, invariant G1): fixed-size
+          // per-slot generation table — one atomic<uint32_t> per page slot
+          // (capacity/PAGE_SIZE entries; 256 KiB at the engine's 256 MiB
+          // default), zero-initialized, never grown. Pool-side by decision:
+          // the 32-byte static_assert-guarded PageHeader's reserved bytes
+          // are already spent (CKV-008 took both halves for mut_epoch), and
+          // the generation belongs where its only mutator already is — the
+          // pool mutex in alloc().
+          slot_gen_(capacity_ / PAGE_SIZE) {}
 
     ~PagePool() {
         release_raw(base_, capacity_);
@@ -10969,17 +10978,42 @@ public:
             id = (bump_ / PAGE_SIZE) + 1;  // 1-based; 0 is null
             bump_ += PAGE_SIZE;
         }
+        // v29 M3 slice 1 (invariant G1, decision doc
+        // docs/audits/2026-10-12-m3-hp4-aba-decision.md): EVERY alloc
+        // transition bumps the slot's generation exactly once, under the
+        // pool mutex, BEFORE the memset that makes the slot's contents
+        // reachable. Verification sites (G2 — the cursor's leaf entry and
+        // the writers' fence re-check, wired in slice 2) compare a
+        // captured (id, gen) pair after acquiring the new latch and before
+        // trusting any content; mismatch routes to re-descend, never to an
+        // error. Release ordering here pairs with the verifiers' acquire
+        // load; the wrap argument (one bump per slot-REUSE vs CKV-008's
+        // per-mutation epoch; capture-to-verify is a single latch
+        // acquisition) is in the decision doc §3.
+        slot_gen_[id - 1].fetch_add(1, std::memory_order_release);
         // Zero the page on allocation (defensive — callers shouldn't
-        // assume stale contents).
+        // assume stale contents). This memset is also why the CKV-008
+        // mut_epoch alone could never make reuse safe: it restarts at 0 on
+        // every reuse, so a pre-free fence could alias — the exact ABA the
+        // generation tag exists to kill.
         std::memset(get(id)->bytes, 0, PAGE_SIZE);
         return id;
     }
 
-    // Free a page. The page ID may be reused by a subsequent alloc();
-    // the ABA interaction with hazard pointers is specified in v25.1
-    // §6 (HP4 — the free-list reuse is tagged or Version allocations
-    // are never reused). For M1.1 (single-threaded page pool), this
-    // is straightforward.
+    // Free a page: the slot returns to the free list IMMEDIATELY and may
+    // be reused by the very next alloc(). v29 M3 (HP4/ABA decision,
+    // docs/audits/2026-10-12-m3-hp4-aba-decision.md): reuse safety is the
+    // GENERATION TAG, not deferral — alloc() bumps slot_gen_ (G1) and
+    // every consumer carrying a PageId across a latch handoff verifies the
+    // captured generation after re-latching, before trusting content (G2).
+    // Deferring reuse to the epoch reclaimer was rejected: writer descents
+    // do not pin reader slots, and deferral would re-couple reuse latency
+    // to the slowest pin (a long-lived RangeScanStream would ratchet the
+    // high-water — against M3's own acceptance). This resolves the v25.1
+    // §6 HP4 deferral note that stood here: the tagged horn of its
+    // disjunction, generalized to all slots; the hazard-pointer machinery
+    // is scheduled for deletion in M3 (it never covered the cursor's
+    // leaf-switch gap — the window that actually matters).
     void free(PageId id) {
         if (id == 0) return;
         std::lock_guard<std::mutex> lk(mu_);
@@ -11024,6 +11058,17 @@ public:
         return (bump_ / PAGE_SIZE) - free_list_.size();
     }
 
+    // v29 M3 slice 1 (invariants G1/G2): the slot's current generation —
+    // bumped exactly once per alloc() transition, acquire-loaded here to
+    // pair with alloc's release bump. The null id reports 0 and real slots
+    // count from 1 (their first alloc), so a zero-initialized capture can
+    // never alias a live slot. Same no-bounds-check hot-path contract as
+    // get(): callers pass ids that came from the tree.
+    uint32_t slot_generation(PageId id) const {
+        if (id == 0) return 0;
+        return slot_gen_[id - 1].load(std::memory_order_acquire);
+    }
+
     // Fragmentation ratio: live pages / total allocated pages.
     // 1.0 = no fragmentation (every allocated page is in use).
     // Lower = more fragmentation (more pages on the free-list).
@@ -11066,6 +11111,11 @@ private:
     void* base_;
     size_t bump_;
     std::vector<PageId> free_list_;
+    // v29 M3 slice 1 (G1): per-slot reuse generation, fixed at
+    // construction (capacity_/PAGE_SIZE entries). Declaration order after
+    // free_list_ matches the constructor init list (-Wreorder is in the
+    // -Werror lint set).
+    std::vector<std::atomic<uint32_t>> slot_gen_;
     mutable std::mutex mu_;
 };
 
@@ -11522,6 +11572,17 @@ public:
 
     // v25.1 M1.3/M1.4: generation counter accessor (for Cursor).
     uint64_t generation() const { return generation_.load(std::memory_order_relaxed); }
+
+    // v29 M3 slice 1: forward the pool's per-slot reuse generation
+    // (invariants G1/G2 — see PagePool::alloc / PagePool::slot_generation
+    // and docs/audits/2026-10-12-m3-hp4-aba-decision.md). Slice 2's
+    // verification sites (Cursor::enter_leaf after the leaf-switch gap;
+    // the writers' fence re-check after the shared->exclusive upgrade
+    // gap) consume it through the tree face — never through the pool
+    // directly — so the tree keeps ownership of its pages' identity.
+    // NOTE: distinct from generation() above, which is the TREE-wide
+    // structural-change counter (a debug tripwire), not per-slot identity.
+    uint32_t slot_generation(PageId id) const { return pool_.slot_generation(id); }
 
     // v25.1 M1.3/M1.4: Cursor — iterator-style range scan.
     //

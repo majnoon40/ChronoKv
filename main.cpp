@@ -8091,6 +8091,45 @@ static int run_page_pool_selftest() {
         pool.free(a);
         check("pp: after free, live count is 1", pool.live_count() == 1);
     }
+    // v29 M3 slice 1: the slot-generation mechanism (invariant G1,
+    // docs/audits/2026-10-12-m3-hp4-aba-decision.md). These controls are
+    // the mechanism's fail-first teeth until slice 2 wires the production
+    // verification sites (cursor leaf entry + writer fence re-check): the
+    // scratch mutant deleting alloc()'s bump reddens exactly the reuse
+    // checks below (measured; raw outputs in the slice-1 commit message).
+    // The mechanism is NOT dead code in the HP-registry sense — it lands
+    // with its controls, and its consumers land inside the same milestone.
+    {
+        PagePool pool(16 * 4096);
+        check("pp: gen — null id reports 0", pool.slot_generation(0) == 0);
+        PageId a = pool.alloc();
+        PageId b = pool.alloc();
+        check("pp: gen — virgin slots start at 1 (independent counters)",
+              pool.slot_generation(a) == 1 && pool.slot_generation(b) == 1);
+        pool.free(a);
+        PageId c = pool.alloc();          // free-list LIFO: reuses slot a
+        check("pp: gen — free->alloc reuse hands back the same slot id", c == a);
+        check("pp: gen — reuse bumps the generation exactly once (G1), siblings untouched",
+              pool.slot_generation(c) == 2 && pool.slot_generation(b) == 1);
+        pool.free(c); pool.free(b);
+        PageId d = pool.alloc();          // LIFO: reuses b (freed last)
+        PageId e = pool.alloc();          // then a/c
+        check("pp: gen — per-slot monotonic across repeated cycles",
+              d == b && e == a &&
+              pool.slot_generation(d) == 2 && pool.slot_generation(e) == 3);
+        // The reuse window the tag exists for: a (id, gen) pair captured
+        // BEFORE a free can never validate against the reincarnated slot —
+        // same id, generation strictly advanced by exactly one bump.
+        // (Detector, not illustration: the first cut compared against the
+        // constant 1 and passed vacuously under the no-bump mutant; this
+        // form reddens under it — measured, both directions below.)
+        const uint32_t g_before = pool.slot_generation(d);
+        pool.free(d);
+        const PageId f = pool.alloc();     // LIFO: reuses d
+        check("pp: gen — the ABA pair is distinguishable (captured gen stale after reuse)",
+              f == d && pool.slot_generation(f) == g_before + 1 &&
+              pool.slot_generation(f) != g_before);
+    }
     {
         PagePool pool(4 * 1024);
         PageId id = pool.alloc();

@@ -261,7 +261,7 @@ What 0.28.1 did *not* do, and v29 inherits:
 | v29 M1 — benchmark arena | **COMPLETE 2026-10-17** — steps 1–3 (workloads + YCSB A–F adapters + version pins with sha256/fetch recipe); step-4 vehicle: split (#68–#75 green) then RE-MERGED to one same-hardware job after #75's headers caught the two-runner CPU split (rule 9 over sunk nights); GREEN WEEK **7/7** (#82/#88/#91/#96/#97/#98/#99, 2026-10-11..17, all green on the re-merged vehicle; rows promoted in-tree — mid-week commits verified engine-binary-neutral, so the nights pool honestly); noise bands **CALIBRATED** from the seven nights (`bench/arena_bands.json` — ratio-normalized primary tier because calibration MEASURED four runner CPUs across the week: EPYC 9V45 ×3 / Xeon 8573C / EPYC 7763 ×2 / EPYC 9V74; raw bands hardware-conditional secondary; RSS tier carries the deletechurn ratchet-watch = P1's before-column, flat at ~201 MB) + **GATE ENABLED** per the recipe the ci.yml comment carried: `arena` in `ci-passed` needs (skip-tolerated on push/PR), completeness step (data ROWS, not file-exists) + `check` verdict (exit 1 REGRESSION / exit 2 geometry-mismatch), explicit re-run policy (once via dispatch; two consecutive REGRESSIONs = bisect) and band-update policy (dedicated commit citing the engine change; never widened in-flight); ledger-promotion rule **DECIDED** (cite ⇒ commit that night's TSVs under `bench/results/promoted/` — no bot, no nightly churn); arena-side build cache **REJECTED as measured low-value** (runs dominate the ~57–77 min; provenance-drift risk; revisit at the 120-min cap); actions v4→v5 bumps landed with the enablement (deferred past the week by 52fd43c); README §Performance shipped (acceptance's third leg); **GATE HARDENED same day** — FIVE defects (completeness step passed green on empty/comment-only/stderr TSVs; `check` ignored missing series; the in-sample self-consistency claim vacuous by construction; no synthetic-regression control; half-dead BASELINE legs shifted ratios silently (−15.9% measured) or faked REGRESSIONs — fixed by calibrated-workload-set comparison + strict-geomean BASELINE-GAP refusal), each fixed behind fail-first controls wired into `scripts/test_arena_gate.py` (19+2 = 21 checks) + the push/PR `arena-gate-selftest` job; LOO cross-validation recorded 6 held-out regressions on N2/N6 (ycsb_c/e series, cross-CPU spread) — bands and tolerance UNCHANGED, band-policy question recorded; bench/arena_bands.json untouched | `bench/`, `bench/arena_bands.json`, `bench/results/promoted/green-week-2026-10-11_17/`, `scripts/arena_bands.py`, `scripts/test_arena_gate.py`, ci.yml `arena` + `arena-gate-selftest` |
 | v29 CI hardening (adjacent, unplanned-in-9/27) | **SHIPPED + PROMOTED** — lint/ratchet/hygiene gates, build-shared; the 4 experimental sanitizer legs went green ×3 (#64/#65/#66) → flags deleted, all 12 legs gating | `5cd74b5`; promotion `0027fe0` |
 | v29 M2 — catcher hardening | **COMPLETE** — item 1 (write-skew checker, 2026-10-08, live pre-fix-flag/post-fix-pass proof) + item 5 (test-suite TU split, 2026-10-10: 1 GiB release/stress `-O1` bare, ASan `-O0` possible, 503/0 full suite; found+fixed the `dst::my_tid` non-inline thread_local, now stress-gated) + item 2 (DST grammar growth, 2026-10-11: S5 `tree_merge_cascade` (M4 grammar) + S6 `reclaim_retire_pin` (M3 grammar), green vs the merge-free tree, 600/600 children at PR scale, four-mutant fail-first matrix; nightly seeds/shard rebalanced 3,125→2,083 to hold N=100k and the wall-time band at six scenarios) + item 3 (de-vacuation, 2026-10-11: v17 GC-boundedness / v18 LSN-contiguity / m2_phase1 size-rotation / 30 s soak all upgraded to real oracles — accounting, differential readbacks, size-rotation admission exercised via a lowered segment cap, shadow-model differential over live AND recovered state; each proven old-GREEN/new-RED against its scratch-build reversion; the soak run additionally exposed and fixed its own empty-WAL-delta hole; release suite 513→514/0) + item 4 (crash-fuzz composition, 2026-10-11: window-sequence plan grammar + seven named templates incl. the Audit-2 surfaces and the Structural merge-window slot, kAll 26→28 with the `seg_*` WAL-2 window, fault matrix widened to all 12 kinds, composition ledger published+asserted; both reversion proofs red — orphan-tolerance revert 16 violations, DirFsyncFail-site removal 7 rc-22 witness violations — clean stream 0 violations) — all five items shipped | `check_write_skew`; `dstscn::s5/s6`; `crashfuzz` grammar; `tests/`, Makefile template |
-| v29 M3–M7 — the overhaul | not started — M0 CLOSED 2026-10-08; constraint 3 SATISFIED 2026-10-11 (M2 COMPLETE, all five items); **constraint 2 SATISFIED 2026-10-17 (M1 COMPLETE: green week 7/7, bands calibrated + committed, regression gate enabled) — the rewrite sequence is UNBLOCKED, M3 first**. M3's decide-before-build HP4/ABA decision doc landed 2026-10-12: generation-tagged page slots + immediate free-list return; heap nodes stay on the epoch reclaimer; HP machinery to be deleted, not wired | `docs/audits/2026-10-12-m3-hp4-aba-decision.md` |
+| v29 M3–M7 — the overhaul | **M3 STARTED 2026-10-17 — slice 1/3 landed** (pool-side slot-generation mechanism: invariant G1 live in `alloc()`, `slot_generation` accessors, six unit controls, no-bump mutant reddens 4/6 — driver rc 9; suite 526→532/0; production behavior unchanged until slice 2 wires the G2 verification sites: fence gen + cursor leaf-entry + HP deletion; slice 3 = first `free()` callers + KeyEntry retirement + stats/health). M4–M7 not started. M0 CLOSED 2026-10-08; constraint 3 SATISFIED 2026-10-11 (M2 COMPLETE); constraint 2 SATISFIED 2026-10-17 (M1 COMPLETE: green week 7/7, bands calibrated + committed, gate enabled + hardened ×2). HP4/ABA decision doc 2026-10-12: generation-tagged slots + immediate free-list return; heap nodes on the epoch reclaimer; HP machinery to be deleted, not wired | `docs/audits/2026-10-12-m3-hp4-aba-decision.md`; `PagePool::slot_generation` |
 | v30 M0–M5 — the challenge, 1.0.0 | not started | — |
 
 ---
@@ -914,7 +914,7 @@ grammar proven by two reversion runs (16 and 7 violations) with the
 full clean stream at 0 violations, 28/28 points and 12/12 kinds; item 5
 as recorded above.
 
-## M3 — Page reclamation  **[L]**  *(M0 gate lifted 2026-10-08; HP4/ABA decision MADE 2026-10-12)*
+## M3 — Page reclamation  **[L]**  *(M0 gate lifted 2026-10-08; HP4/ABA decision MADE 2026-10-12; implementation STARTED 2026-10-17 — slice 1/3 landed)*
 
 Carried unchanged from the 2026-09-27 plan (appendix §M3): wire
 `PagePool::free()`, give the hazard-pointer machinery its consumers,
@@ -956,6 +956,66 @@ the no-format-change proof (pages are never persisted; recovery rebuilds
 fresh), the measure-first plan, and the fail-first mutation gates for M3's
 landing — including the honest note that the fence-gen mutant is
 UNREACHABLE until M4 supplies frees, recorded rather than faked.
+
+**Implementation status — STARTED 2026-10-17, sliced per the decision
+doc's checklist (each slice lands green with its own fail-first proof
+before the next begins):**
+* **Slice 1/3 — LANDED (checklist items 1–2): the pool-side generation
+  mechanism.** `PagePool` gains the fixed-size per-slot table
+  (`std::vector<std::atomic<uint32_t>>`, `capacity_/PAGE_SIZE` entries —
+  256 KiB at the engine's 256 MiB default; pool-side by the decision
+  doc's rationale: the 32-byte `static_assert`-guarded `PageHeader`'s
+  reserved bytes are already spent by CKV-008, and the generation lives
+  where its only mutator already is). **Invariant G1 is live**: every
+  `alloc()` transition — free-list reuse AND virgin bump — bumps the
+  slot generation exactly once, under the pool mutex, BEFORE the memset
+  that makes the slot reachable (release; verifiers pair with an acquire
+  load after their latch). `PagePool::slot_generation(id)` (null id → 0;
+  live slots count from 1, so a zero-initialized capture can never
+  alias) and the `BTree::slot_generation` forwarder (consumers go
+  through the tree face, never the pool directly) are the read side.
+  `free()`'s v25.1 HP4 deferral comment is replaced by the decision's
+  resolution (tagged horn, immediate return, HP deletion scheduled).
+  Production behavior is UNCHANGED by construction — nothing reads
+  generations yet; the consumers (G2 verification sites) are slice 2,
+  inside the same milestone, so the mechanism never sits dead the way
+  the HP registry did. Six unit controls in `run_page_pool_selftest`
+  (null id; virgin slots start at 1; free→alloc reuse returns the same
+  slot; reuse bumps exactly once with siblings untouched; per-slot
+  monotonic across repeated cycles; and the ABA pair itself — a gen
+  captured before a free is stale against the reincarnated slot).
+  Fail-first, measured: the scratch mutant deleting alloc's bump reddens
+  **4 of the 6** controls (driver rc 9; the 2 green ones — null-id and
+  same-slot-id reuse — don't consult the counter by construction);
+  clean tree 6/6, driver rc 0. One self-correction recorded: the ABA
+  control's first cut compared against the constant 1 and passed
+  VACUOUSLY under the no-bump mutant — caught by running the mutant,
+  strengthened to capture-then-compare, re-proven both directions.
+  Suite: release **526 → 532 PASS / 0 FAIL**, exit 0, banner 0.28.1
+  (baseline correction, recorded honestly: the gate-hardening entry's
+  "519-check suite" cited 52fd43c's count; 6bcb212's [k,k] checker
+  added 7 legs, making the pre-slice baseline 526 — verified by diffing
+  6bcb212's added check lines). `make lint` green (ratchet 33=33 — the
+  new header code adds no conversion warnings; member/init-list order
+  kept -Wreorder-clean under -Werror), STRESS-defs syntax gate green.
+* **Slice 2/3 — NEXT (checklist items 3–5): the G2 verification sites +
+  HP deletion.** `LeafFence` gains `gen` (captured under the descent
+  latch, checked in `fence_unchanged` after the exclusive re-acquire —
+  closing W2/W3); `Cursor` stores `leaf_gen_` with `leaf_id_` and
+  verifies in `enter_leaf` after the latch, before any header read,
+  with restart-from-last-emitted-key on mismatch (closing W1/W6 — the
+  gap where the HP was cleared *before* the window it supposedly
+  covered); `HazardPointer`/`HPRegistry`/`Cursor::hp_` deleted. The
+  fence-gen mutant stays honestly UNREACHABLE until frees exist (slice
+  3 / M4) — recorded, not faked.
+* **Slice 3/3 (checklist items 6–8): the first `free()` callers.**
+  KeyEntry retirement through the existing epoch reclaimer (with the
+  §7.3 unlink-before-retire obligation), the purge-trigger shape (the
+  deferred design point, with the PITR-horizon eligibility caveat),
+  `stats()` pool utilization + high-water, `health()` 80/95 thresholds,
+  the memory-ordering audit extension — then the acceptance battery
+  (delete-then-reinsert high-water, ASan/TSan with reuse on, arena
+  delete-churn against the RSS ratchet-watch).
 
 **Acceptance** (unchanged): delete-then-reinsert workload's high-water mark
 stabilizes instead of ratcheting; TSan-clean; no use-after-free under ASan
