@@ -579,6 +579,7 @@ static int run_lifecycle_test();      // v25.7 review M2 detectors
 static int run_backup_test();         // v26 M3 online backup
 static int run_pitr_test();           // v26 M4 point-in-time restore
 static int run_m16_phase1_test();
+static int run_m3_gen_verification_test();   // v29 M3 slice 2: G2 verification-site controls
 static int run_m2_phase1_test();
 static int run_m2_phase2_test();
 static int run_m2_phase3_test();
@@ -2086,51 +2087,19 @@ static int run_review_regression_tests() {
         report("review H3: concurrent mixed-durability commits -> no crash, no livelock", ok, fr);
     }
 
-    // ---- H1: HP registry occupancy must stay bounded ----
-    {
-        bool ok = true;
-        std::string fr;
-        try {
-            using namespace chronokv_page;
-            using namespace chronokv_btree;
-            PagePool pool(8ULL * 1024 * 1024);
-            BTree tree(pool);
-            for (int i = 0; i < 500; ++i)
-                tree.put("k" + std::to_string(i), "v" + std::to_string(i));
+    // ---- H1 (HP registry occupancy) — DELETED with its machinery (v29 M3
+    // slice 2, 2026-10-17). This test guarded the HPRegistry slot-recycling
+    // fix (20k scans must not leak registry slots). The registry itself is
+    // gone — deleted per the HP4/ABA decision
+    // (docs/audits/2026-10-12-m3-hp4-aba-decision.md §4.3: it only ever
+    // covered cursor residency, which the leaf latch already protects, and
+    // never the leaf-switch gap) — and the leak class cannot recur without
+    // a registry: the cursor now holds no pooled resource beyond its RAII
+    // latches. The cursor-resource discipline this test indirectly exercised
+    // (20k+ scans clean) stays covered by the cursor/concurrent-cursor
+    // batteries, the m3-gen controls below, DST S3/S4/S5, and the ASan/TSan
+    // legs. Deletion-at-the-site record, per the verify_full precedent.
 
-            // 20k sequential scans. Pre-fix this leaked one registry slot
-            // (~40 bytes) per scan, forever.
-            for (int i = 0; i < 20000; ++i) { auto r = tree.range_scan("k0", "k9"); (void)r; }
-            size_t after_serial = tree.hp_slot_count_for_test();
-
-            // Concurrent scans: slots may be checked out simultaneously, so
-            // the registry may hold a few -- but it must not scale with the
-            // number of scans performed.
-            std::vector<std::thread> ts;
-            for (int t = 0; t < 4; ++t) ts.emplace_back([&] {
-                for (int i = 0; i < 5000; ++i) { auto r = tree.range_scan("k0", "k9"); (void)r; }
-            });
-            for (auto& t : ts) t.join();
-            size_t after_conc = tree.hp_slot_count_for_test();
-            size_t in_use = tree.hp_in_use_for_test();
-
-            if (after_serial > 4) {
-                ok = false;
-                fr = "serial: 20000 range_scans left " + std::to_string(after_serial) +
-                     " registry slots (expected <= 4 -- slots must be recycled)";
-            } else if (after_conc > 64) {
-                ok = false;
-                fr = "concurrent: 20000 more range_scans left " + std::to_string(after_conc) +
-                     " slots (registry scaled with op count, not concurrency)";
-            } else if (in_use != 0) {
-                ok = false;
-                fr = std::to_string(in_use) + " slots still checked out after all cursors died";
-            }
-        } catch (const std::exception& e) {
-            ok = false; fr = std::string("exception: ") + e.what();
-        }
-        report("review H1: HP registry bounded by concurrency, not by scan count", ok, fr);
-    }
 
 #ifdef CHRONOKV_STRESS
     // ---- Review (lincheck flake root cause): the range_scan snapshot must
@@ -8011,6 +7980,7 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     fails += run_concurrent_cursor_test();
     // M1.6 Phase 1 + M1.5 async/batch/observer/stream
     fails += run_m16_phase1_test();
+    fails += run_m3_gen_verification_test();
     fails += run_m2_phase1_test();
     fails += run_m2_phase2_test();
     fails += run_m2_phase3_test();
@@ -8653,6 +8623,132 @@ static int run_concurrent_cursor_test() {
 //      many keys (forcing tree splits) then reading them all back.
 //   3. Transaction commit/abort via the tree-backed index.
 //   4. Range scan via the tree-backed index.
+// =====================================================================
+// v29 M3 slice 2: the G2 verification-site controls (decision doc's W1/W2
+// windows — docs/audits/2026-10-12-m3-hp4-aba-decision.md).
+//
+// Both controls use the one-shot generation-bump seam
+// (ChronoKV::test_bump_all_slot_generations -> PagePool's TEST_HOOKS
+// bump): a CONTENT-INVARIANT invalidation — no page byte changes, so
+// mut_epoch/min/max/count comparisons all stay equal and ONLY the new
+// generation checks can observe it. That gives exact mutant isolation in
+// both directions: deleting fence_unchanged's gen check reddens control A
+// alone; deleting Cursor::enter_leaf's gen check reddens control B's
+// restart count alone — and B's transparency leg (the scan result stays
+// byte-exact through the restart) proves the restart logic itself, which
+// is the new code with real risk.
+//
+// WHY THESE ARE THE REACHABLE HALF of the reuse story: until slice 3/M4
+// give free() engine callers, no slot is ever genuinely reused, so the
+// end-to-end corruption catchers (the decision doc's §9 mutants) stay
+// honestly UNREACHABLE — recorded, not faked. What IS reachable now, and
+// what these controls pin, is the detection-and-recovery machinery: that
+// a stale (id, gen) pair is REFUSED at both windows, that the writer path
+// re-descends (counted by the existing fence_recheck_retries), and that
+// the cursor restart is transparent (exact full-scan equality, no dupes,
+// no drops, bounded restart count). STRESS-only (the gap hooks ride
+// stress_point), same gate as the m16 battery; release builds get
+// skip-PASS lines.
+// =====================================================================
+static int run_m3_gen_verification_test() {
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) {
+            ++fails;
+            if (!detail.empty()) std::cout << "      (" << detail << ")\n";
+        }
+    };
+#ifdef CHRONOKV_STRESS
+    // ---- Control A — the writer's shared->exclusive upgrade gap (W2). ----
+    // The bump lands at tree_leaf_latch_gap, exactly where the descent
+    // latch is down and the exclusive latch not yet taken: the captured
+    // fence's generation goes stale, fence_unchanged must refuse, and the
+    // put must re-descend and still land correctly.
+    {
+        const std::string wd = "/tmp/m3_gen_fence";
+        std::filesystem::remove_all(wd);
+        try {
+            ChronoKV kv(wd);
+            for (int i = 0; i < 400; ++i) {          // multi-leaf: descents fence
+                char k[16]; snprintf(k, sizeof k, "gk%05d", i);
+                kv.commit(k, "v" + std::to_string(i));
+            }
+            std::atomic<bool> fired{false};
+            stress::gap_callback_leaf_latch = [&]() {
+                if (fired.exchange(true)) return;    // one-shot
+                kv.test_bump_all_slot_generations();
+            };
+            stress::gap_hook.store(true, std::memory_order_release);
+            const uint64_t retries0 = kv.fence_recheck_retries();
+            auto r = kv.commit("gk99999", "new");    // new key -> tree put -> gap
+            stress::gap_hook.store(false, std::memory_order_release);
+            stress::gap_callback_leaf_latch = nullptr;
+            const uint64_t retries1 = kv.fence_recheck_retries();
+            check("m3-gen A: fence re-check detects the generation bump in the upgrade gap (W2)",
+                  r == TxnResult::Committed && fired.load() && retries1 > retries0,
+                  "committed=" + std::to_string(r == TxnResult::Committed) +
+                  " fired=" + std::to_string(fired.load()) +
+                  " retries_delta=" + std::to_string(retries1 - retries0));
+            auto v = kv.read("gk99999");
+            check("m3-gen A: the re-descended put landed correctly",
+                  v.has_value() && *v == "new",
+                  v ? *v : std::string("<absent>"));
+        } catch (const std::exception& e) {
+            check("m3-gen A: fence re-check detects the generation bump in the upgrade gap (W2)",
+                  false, std::string("exception: ") + e.what());
+        }
+        std::filesystem::remove_all(wd);
+    }
+    // ---- Control B — the cursor's leaf-switch gap (W1/W6). ----
+    // The bump lands at tree_cursor_leaf_switch: latch down, successor not
+    // yet latched. enter_leaf must refuse the stale (id, gen), restart the
+    // descent at the last emitted key (exclusive), and the full scan must
+    // come out byte-exact anyway — the restart is a correctness no-op.
+    {
+        const std::string wd = "/tmp/m3_gen_cursor";
+        std::filesystem::remove_all(wd);
+        try {
+            ChronoKV kv(wd);
+            std::vector<std::pair<std::string, std::string>> model;
+            for (int i = 0; i < 400; ++i) {          // ~3 leaves -> >= 2 switches
+                char k[16]; snprintf(k, sizeof k, "ck%05d", i);
+                std::string v = "val" + std::to_string(i);
+                kv.commit(k, v);
+                model.emplace_back(std::string(k), v);
+            }
+            std::atomic<bool> fired{false};
+            stress::gap_callback_cursor_switch = [&]() {
+                if (fired.exchange(true)) return;    // one-shot: first switch only
+                kv.test_bump_all_slot_generations();
+            };
+            stress::gap_hook.store(true, std::memory_order_release);
+            const uint64_t restarts0 = kv.cursor_restarts();
+            auto rs = kv.range_scan(UINT64_MAX, "ck00000", "ck99999");
+            stress::gap_hook.store(false, std::memory_order_release);
+            stress::gap_callback_cursor_switch = nullptr;
+            const uint64_t restarts1 = kv.cursor_restarts();
+            check("m3-gen B: cursor detects the bump in the leaf-switch gap and restarts (W1)",
+                  fired.load() && restarts1 == restarts0 + 1,
+                  "fired=" + std::to_string(fired.load()) +
+                  " restarts_delta=" + std::to_string(restarts1 - restarts0) + " (want exactly 1)");
+            check("m3-gen B: the restart is TRANSPARENT — full scan byte-exact (order, no dupes, no drops)",
+                  rs == model,
+                  "got " + std::to_string(rs.size()) + " rows, want " + std::to_string(model.size()) +
+                  (rs == model ? "" : " (content mismatch)"));
+        } catch (const std::exception& e) {
+            check("m3-gen B: cursor detects the bump in the leaf-switch gap and restarts (W1)",
+                  false, std::string("exception: ") + e.what());
+        }
+        std::filesystem::remove_all(wd);
+    }
+#else
+    check("m3-gen A: fence re-check vs generation bump (skipped — needs CHRONOKV_STRESS)", true);
+    check("m3-gen B: cursor leaf-switch restart (skipped — needs CHRONOKV_STRESS)", true);
+#endif
+    return fails;
+}
+
 static int run_m16_phase1_test() {
     using namespace chronokv;
     int fails = 0;

@@ -1649,6 +1649,14 @@ namespace stress {
     // stress_point) and only while gap_hook is armed, so dst scheduling and
     // the probabilistic yield are untouched.
     inline std::function<void()> gap_callback_scan{nullptr};
+    // v29 M3 slice 2: exact-name hooks for the two reuse-verification
+    // windows (decision doc W1/W2). Dispatched by FULL-NAME match — both
+    // point names start with 't', so the first-char scheme cannot separate
+    // them (nor from tree_split_begin). Same arming discipline as the
+    // existing callbacks: only while gap_hook is armed, never consulted
+    // while dst is armed.
+    inline std::function<void()> gap_callback_leaf_latch{nullptr};    // "tree_leaf_latch_gap"
+    inline std::function<void()> gap_callback_cursor_switch{nullptr}; // "tree_cursor_leaf_switch"
 }
 
 // ===================== v27 M0: deterministic scheduler =====================
@@ -1835,6 +1843,13 @@ inline void stress_point(const char* name) {
     if (stress::gap_hook.load(std::memory_order_acquire)) {
         if (name[0] == 'p' && stress::gap_callback_put_leaf) stress::gap_callback_put_leaf();
         else if (name[0] == 'e' && stress::gap_callback_ensure) stress::gap_callback_ensure();
+        // v29 M3 slice 2: exact-name dispatch for the two 't' windows.
+        else if (stress::gap_callback_leaf_latch &&
+                 std::strcmp(name, "tree_leaf_latch_gap") == 0)
+            stress::gap_callback_leaf_latch();
+        else if (stress::gap_callback_cursor_switch &&
+                 std::strcmp(name, "tree_cursor_leaf_switch") == 0)
+            stress::gap_callback_cursor_switch();
     }
 }
 #else
@@ -6278,6 +6293,8 @@ public:
     uint64_t published_watermark() const { return pub_.published(); }
     // v25.1 M1.6: debug counter for fence re-check retries (defined out-of-line after BTree).
     uint64_t fence_recheck_retries() const;
+    // v29 M3 slice 2: cursor generation-mismatch restarts (defined out-of-line after BTree).
+    uint64_t cursor_restarts() const;
     // v25.1 M1.6: debug counter for ensure_index loser-delete branch.
     uint64_t ensure_index_loser_deletes() const;
 
@@ -8559,6 +8576,14 @@ public:
         auto it = dirty_since_ckpt_.find(k);
         return it == dirty_since_ckpt_.end() ? 0 : it->second;
     }
+
+    // v29 M3 slice 2 (G2 controls): forward the pool's one-shot identity
+    // invalidation seam — bumps every slot generation WITHOUT touching page
+    // content, so only the generation comparisons can observe it (exact
+    // mutant isolation for the verification-site controls). Defined
+    // out-of-line after PagePool (incomplete type here — same pattern as
+    // ensure_index/cursor_restarts).
+    void test_bump_all_slot_generations();
 
 /*
  * =================================================================
@@ -11069,6 +11094,28 @@ public:
         return slot_gen_[id - 1].load(std::memory_order_acquire);
     }
 
+    // v29 M3 slice 2: inverse of get() — the 1-based slot id of a page
+    // pointer from THIS pool (pure pointer arithmetic; callers pass
+    // pointers obtained from get()). fence_unchanged uses it to check the
+    // captured generation without threading the id through its signature.
+    PageId id_of(const Page* p) const {
+        return static_cast<PageId>(
+            (reinterpret_cast<const uint8_t*>(p) -
+             static_cast<const uint8_t*>(base_)) / PAGE_SIZE) + 1;
+    }
+
+#ifdef CHRONOKV_TEST_HOOKS
+    // v29 M3 slice 2 (G2 controls): artificially bump EVERY slot's
+    // generation — the one-shot invalidation seam for the verification-site
+    // controls. Content-invariant by design: no page byte changes, so
+    // mut_epoch/min/max/count comparisons all stay equal and ONLY the
+    // generation checks can observe the bump — exact mutant isolation.
+    void bump_all_slot_generations_for_test() {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto& g : slot_gen_) g.fetch_add(1, std::memory_order_release);
+    }
+#endif
+
     // Fragmentation ratio: live pages / total allocated pages.
     // 1.0 = no fragmentation (every allocated page is in use).
     // Lower = more fragmentation (more pages on the free-list).
@@ -11285,93 +11332,32 @@ private:
     std::unordered_map<PageId, std::unique_ptr<std::shared_mutex>> latches_;
 };
 
-// ======================== Hazard pointer (M1.4) ========================
+// ============ Hazard pointers (v25.1 M1.4) — DELETED (v29 M3 slice 2, 2026-10-17) ============
 //
-// A single hazard pointer per reader slot. Published before dereferencing
-// a page; cleared after. A page cannot be freed while any HP points to it.
-//
-// M1.4 implementation: the HP is a raw PageId (not a Page*). The
-// reclamation check scans all published HPs before freeing a page.
-// This is simpler than a full HP array and sufficient for M1.4's
-// single-reader concurrent-writer model.
-struct HazardPointer {
-    std::atomic<PageId> hp{0};  // 0 = not published
-
-    void publish(PageId id) { hp.store(id, std::memory_order_seq_cst); }
-    void clear() { hp.store(0, std::memory_order_seq_cst); }
-    PageId load() const { return hp.load(std::memory_order_seq_cst); }
-};
-
-// HP registry — one per BTree (NOT a process-wide singleton).
-// A page is safe to free only if no HP in the registry points to it.
-//
-// H1 fix: this used to be a Meyers singleton whose register_hp() only ever
-// push_back'd. BTree::range_scan() builds an internal Cursor per call, and
-// each Cursor registered one HazardPointer that was never removed -- a
-// measured ~40 byte permanent leak per range_scan (11.6 MiB over 300k
-// scans), i.e. unbounded growth on the read hot path. Two further problems:
-//   * PageIds are per-PagePool, so a process-global registry made
-//     is_hazardous() produce cross-instance false positives;
-//   * is_hazardous() scanned every HP ever registered under one global
-//     mutex shared by all BTree instances.
-// Slots are now recycled through a free list, so the registry is bounded by
-// PEAK CURSOR CONCURRENCY rather than by total operations, and it is owned
-// by the BTree whose PageIds it protects.
-class HPRegistry {
-public:
-    // Acquire an HP slot (recycled where possible). The caller MUST hand it
-    // back via release_hp() -- Cursor does so in its destructor.
-    HazardPointer& register_hp() {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (!free_.empty()) {
-            HazardPointer* hp = free_.back();
-            free_.pop_back();
-            hp->clear();
-            return *hp;
-        }
-        hps_.push_back(std::make_unique<HazardPointer>());
-        return *hps_.back();
-    }
-
-    // Return a slot to the free list. Idempotent for nullptr.
-    void release_hp(HazardPointer* hp) {
-        if (!hp) return;
-        hp->clear();
-        std::lock_guard<std::mutex> lk(mu_);
-        free_.push_back(hp);
-    }
-
-    // Check if any published HP points to `id`.
-    bool is_hazardous(PageId id) const {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (auto& hp : hps_) {
-            if (hp->load() == id) return true;
-        }
-        return false;
-    }
-
-    // Diagnostics: slots allocated / currently checked out.
-    size_t slot_count() const {
-        std::lock_guard<std::mutex> lk(mu_);
-        return hps_.size();
-    }
-    size_t in_use() const {
-        std::lock_guard<std::mutex> lk(mu_);
-        return hps_.size() - free_.size();
-    }
-
-private:
-    mutable std::mutex mu_;
-    std::vector<std::unique_ptr<HazardPointer>> hps_;   // owns every slot
-    std::vector<HazardPointer*> free_;                  // recycled slots
-};
+// HazardPointer and HPRegistry lived here from v25.1 M1.4 until v29 M3
+// slice 2. Deleted per the HP4/ABA decision
+// (docs/audits/2026-10-12-m3-hp4-aba-decision.md §4.3): the registry only
+// ever covered cursor RESIDENCY — which the leaf's shared latch already
+// protects, because any freer must take that latch exclusive to unlink —
+// and it never covered the window that actually matters, the leaf-SWITCH
+// gap: leave_leaf() cleared the HP BEFORE the latch-free window opened.
+// Extending HPs to that window would mean the classic publish-then-
+// revalidate protocol on seq_cst stores in the descent hot path — strictly
+// more machinery than the generation tag that replaced it (PagePool::
+// slot_generation, invariant G1; Cursor::enter_leaf and fence_unchanged
+// are the G2 verification sites). The H1 registry-leak fix (slot
+// recycling) and its 20k-scan review test are deleted WITH the machinery:
+// the leak class cannot recur without a registry, and the cursor now holds
+// no pooled resource beyond its RAII latches. Both audits demanded
+// "redesigned, not merely wired"; the redesign converged on a value
+// comparison, so the publication protocol stopped existing (M5 culture:
+// the code stops existing; it does not get rewritten more carefully).
 
 class BTree {
     friend class ::ChronoKV;  // v25.1 M1.6: for fence_recheck_retries_ access
 public:
-    // H1 fix: per-tree HP registry (see HPRegistry). mutable because
-    // Cursor holds a const BTree& and must acquire/release slots.
-    mutable HPRegistry hps_;
+    // (v29 M3 slice 2: the per-tree HP registry member was deleted — see
+    // the HazardPointer removal note above.)
 
     explicit BTree(PagePool& pool) : pool_(pool), root_id_(0) {
         // Create an empty leaf as the root.
@@ -11394,6 +11380,7 @@ public:
         std::string min_key, max_key;
         uint16_t key_count = 0;
         uint32_t mut_epoch = 0;
+        uint32_t gen = 0;   // v29 M3 slice 2: slot generation (G2)
     };
     TestFence capture_leaf_fence_for_test(PageId id) const {
         TestFence tf;
@@ -11406,6 +11393,7 @@ public:
         }
         tf.key_count = h->key_count;
         tf.mut_epoch = page_mut_epoch(h);
+        tf.gen = pool_.slot_generation(id);   // v29 M3 slice 2 (G2)
         return tf;
     }
     bool leaf_fence_unchanged_for_test(PageId id, const TestFence& tf) const {
@@ -11415,6 +11403,7 @@ public:
         f.max_key = tf.max_key;
         f.key_count = tf.key_count;
         f.mut_epoch = tf.mut_epoch;
+        f.gen = tf.gen;   // v29 M3 slice 2 (G2)
         const Page* p = pool_.get(id);
         return fence_unchanged(p, header(p), f);
     }
@@ -11567,11 +11556,15 @@ public:
     // Review fix H1: registry occupancy, so a test can assert the HP slot
     // count is bounded by peak cursor concurrency rather than growing with
     // the total number of cursors ever created.
-    size_t hp_slot_count_for_test() const { return hps_.slot_count(); }
-    size_t hp_in_use_for_test() const { return hps_.in_use(); }
 
     // v25.1 M1.3/M1.4: generation counter accessor (for Cursor).
     uint64_t generation() const { return generation_.load(std::memory_order_relaxed); }
+
+    // v29 M3 slice 2 (W1/W6): count of generation-mismatch restarts taken
+    // by cursors — the decision doc's cursor_restarts diagnostic (published
+    // beside fence_recheck_retries; the delete-churn table reads both).
+    uint64_t cursor_restarts() const { return cursor_restarts_.load(std::memory_order_relaxed); }
+    void note_cursor_restart() const { cursor_restarts_.fetch_add(1, std::memory_order_relaxed); }
 
     // v29 M3 slice 1: forward the pool's per-slot reuse generation
     // (invariants G1/G2 — see PagePool::alloc / PagePool::slot_generation
@@ -11616,7 +11609,7 @@ public:
             : tree_(tree), lo_(lo), hi_(hi), hi_unbounded_(hi_unbounded),
               gen_(tree.generation()),
               leaf_id_(0), slot_idx_(0), exhausted_(false),
-              key_count_snapshot_(0) {
+              key_count_snapshot_(0), leaf_gen_(0), lo_exclusive_(false) {
             if (!hi_unbounded_ && lo_ > hi_) {
                 exhausted_ = true;
                 return;
@@ -11631,19 +11624,21 @@ public:
 
         ~Cursor() {
             leave_leaf();
-            // H1 fix: hand the HP slot back so the registry stays bounded
-            // by peak cursor concurrency instead of total cursors created.
-            if (hp_) { tree_.hps_.release_hp(hp_); hp_ = nullptr; }
+            // v29 M3 slice 2: the HP slot hand-back was deleted with the
+            // machinery — the cursor's only pooled resource is the RAII
+            // latch, released by leave_leaf() (see the HazardPointer
+            // removal note above the BTree class).
         }
 
         Cursor(const Cursor&) = delete;
         Cursor& operator=(const Cursor&) = delete;
 
-        // H1 fix: the defaulted move left the source owning hp_,
-        // leaf_latch_mu_/owns_latch_ and initial_latch_, so its destructor
-        // would release the same HP slot twice and unlock the same latch
-        // twice. Every current use site is covered by C++17 guaranteed
-        // elision, but the type advertised a move that was unsafe.
+        // H1-fix-era note (kept as the rationale; the HP half died with
+        // the machinery in v29 M3 slice 2): the defaulted move left the
+        // source owning leaf_latch_mu_/owns_latch_ and initial_latch_, so
+        // its destructor would unlock the same latch twice. Every current
+        // use site is covered by C++17 guaranteed elision, but the type
+        // advertised a move that was unsafe.
         Cursor(Cursor&& o) noexcept
             : tree_(o.tree_), lo_(std::move(o.lo_)), hi_(std::move(o.hi_)),
               hi_unbounded_(o.hi_unbounded_),
@@ -11652,13 +11647,12 @@ public:
               cur_value_(std::move(o.cur_value_)),
               exhausted_(o.exhausted_),
               key_count_snapshot_(o.key_count_snapshot_),
+              leaf_gen_(o.leaf_gen_), lo_exclusive_(o.lo_exclusive_),
               leaf_latch_mu_(o.leaf_latch_mu_), owns_latch_(o.owns_latch_),
-              hp_(o.hp_),
               initial_latch_(std::move(o.initial_latch_)) {
             o.leaf_id_ = 0;
             o.leaf_latch_mu_ = nullptr;
             o.owns_latch_ = false;
-            o.hp_ = nullptr;          // source must not release our slot
             o.exhausted_ = true;
         }
         Cursor& operator=(Cursor&&) = delete;   // const BTree& member
@@ -11693,8 +11687,20 @@ public:
         std::string cur_key_, cur_value_;
         bool exhausted_;
         uint16_t key_count_snapshot_;  // captured at leaf entry
+        // v29 M3 slice 2 (invariants G1/G2): the SLOT GENERATION of
+        // leaf_id_ — captured under the latch that made the id visible
+        // (initial crabbing descent, or the predecessor leaf's latch at
+        // switch time) and re-verified inside enter_leaf() after its latch
+        // acquisition, before any content is trusted. Distinct from gen_
+        // above, which is the TREE-wide structural counter (debug
+        // tripwire), not per-slot identity.
+        uint32_t leaf_gen_;
+        // Set by a generation-mismatch restart: lo_ becomes the last
+        // emitted key and is treated as EXCLUSIVE (keys are unique and
+        // ordered — the successor seek can neither re-emit nor skip).
+        bool lo_exclusive_;
 
-        // Per-page latch and HP. The latch is held while reading the
+        // Per-page latch. The latch is held while reading the
         // current leaf; released when moving to the next leaf.
         //
         // v25.1 M1.4: manual latch management instead of optional<shared_lock>.
@@ -11705,22 +11711,25 @@ public:
         // leave_leaf() releases and clears both.
         std::shared_mutex* leaf_latch_mu_ = nullptr;
         bool owns_latch_ = false;
-        HazardPointer* hp_ = nullptr;  // published while on a leaf
         // v25.1 M1.6: shared latch from the initial crabbing descent.
         // Held until the Cursor moves to the next leaf or is destroyed.
         std::shared_lock<std::shared_mutex> initial_latch_;
 
         // v25.1 M1.6: enter_leaf variant for the initial crabbing descent.
-        // The latch is already held (in initial_latch_); just set up HP +
-        // snapshot key_count.
+        // The latch is already held (in initial_latch_); snapshot key_count
+        // and (v29 M3 slice 2) the slot generation.
         void enter_leaf_from_crabbing() {
             if (leaf_id_ == 0) return;
             // The latch is held via initial_latch_. Set up the manual members
             // for consistency with leave_leaf.
             leaf_latch_mu_ = tree_.latches_.get_or_create(leaf_id_);
             owns_latch_ = false;  // initial_latch_ owns it, not the manual path
-            if (!hp_) hp_ = &tree_.hps_.register_hp();
-            hp_->publish(leaf_id_);
+            // v29 M3 slice 2 (G2): NO verification needed on this path — the
+            // crabbing descent held latches continuously from the root, so
+            // no latch-free window existed in which the slot could be
+            // reused. Capture the current generation as the baseline the
+            // NEXT switch will be verified against.
+            leaf_gen_ = tree_.pool_.slot_generation(leaf_id_);
             const Page* p = tree_.pool_.get(leaf_id_);
             key_count_snapshot_ = tree_.header(p)->key_count;
         }
@@ -11731,10 +11740,34 @@ public:
             leaf_latch_mu_ = tree_.latches_.get_or_create(leaf_id_);
             leaf_latch_mu_->lock_shared();
             owns_latch_ = true;
-            // Publish HP (prevents the page from being freed while we
-            // read it — important for future merge/rebalance).
-            if (!hp_) hp_ = &tree_.hps_.register_hp();
-            hp_->publish(leaf_id_);
+            // v29 M3 slice 2 (invariant G2, windows W1/W6 — the leaf-switch
+            // gap): leaf_id_ was read under the PREDECESSOR's latch, and
+            // this latch was acquired after a latch-free window in which
+            // the slot could have been freed and re-allocated (once slice 3
+            // / M4 give free() its callers). The latch gives mutual
+            // exclusion from here on but NOT identity — verify the
+            // generation captured at switch time BEFORE trusting any byte
+            // of the page: the decision doc's latch-then-gen-then-content
+            // ordering, which also covers the latch-entry ABA (a thread
+            // blocked on the latch of a freed-then-reused slot wakes
+            // holding the NEW occupant's latch). Mismatch => different page
+            // lifetime => restart the descent at the last emitted key
+            // (exclusive): keys are unique and ordered, so the restart can
+            // neither re-emit nor skip. The old HP publish at this spot
+            // protected residency the latch already protects and never
+            // covered the gap — deleted (see the removal note).
+            if (tree_.pool_.slot_generation(leaf_id_) != leaf_gen_) {
+                leaf_latch_mu_->unlock_shared();
+                owns_latch_ = false;
+                leaf_latch_mu_ = nullptr;
+                tree_.note_cursor_restart();
+                if (!cur_key_.empty()) { lo_ = cur_key_; lo_exclusive_ = true; }
+                leaf_id_ = tree_.find_leaf_for_scan_crabbing(lo_, initial_latch_);
+                slot_idx_ = 0;
+                if (leaf_id_ == 0) { exhausted_ = true; return; }
+                enter_leaf_from_crabbing();   // latch-continuous: no gap, no re-check
+                return;
+            }
             // Capture snapshot of key_count (per-page snapshot semantic).
             const Page* p = tree_.pool_.get(leaf_id_);
             key_count_snapshot_ = tree_.header(p)->key_count;
@@ -11748,7 +11781,6 @@ public:
         }
 
         void leave_leaf() {
-            if (hp_) hp_->clear();
             if (owns_latch_) {
                 leaf_latch_mu_->unlock_shared();
                 owns_latch_ = false;
@@ -11793,7 +11825,10 @@ public:
                     std::string k(
                         reinterpret_cast<const char*>(p) + slots[slot_idx_].key_off,
                         slots[slot_idx_].key_len);
-                    if (k < lo_) {
+                    if (k < lo_ || (lo_exclusive_ && k == lo_)) {
+                        // v29 M3 slice 2: lo_exclusive_ is set by a
+                        // generation-mismatch restart — lo_ is then the last
+                        // emitted key itself, which must not re-emit.
                         ++slot_idx_;
                         continue;
                     }
@@ -11811,8 +11846,16 @@ public:
                 // Exhausted this leaf — move to the next.
                 // Read next_leaf_id UNDER the current latch (before releasing).
                 PageId next = tree_.get_next_leaf(p);
+                // v29 M3 slice 2 (G2): capture the successor's slot
+                // generation under THIS latch, too — while the successor is
+                // linked from a latched page it cannot be freed (freeing
+                // requires unlinking under this page's exclusive latch), so
+                // the (id, gen) pair is sound; enter_leaf re-verifies it
+                // after the latch-free switch window.
+                const uint32_t next_gen = next ? tree_.pool_.slot_generation(next) : 0;
                 leave_leaf();
                 leaf_id_ = next;
+                leaf_gen_ = next_gen;
                 slot_idx_ = 0;
                 // v27 M0 (dst): cursor leaf-switch — latch released, next
                 // leaf not yet latched: the window where a split can extend
@@ -12262,6 +12305,7 @@ private:
     // unchanged (M1.4 allows concurrent writes to other pages). The
     // per-page latch is the actual consistency mechanism.
     std::atomic<uint64_t> generation_{0};
+    mutable std::atomic<uint64_t> cursor_restarts_{0};   // v29 M3 slice 2 (W1/W6 restarts)
     // v25.1 M1.6: debug counter for fence re-check retries (concurrent-split detection).
     // Public so ChronoKV/Database can read it for test verification.
     mutable std::atomic<uint64_t> fence_recheck_retries_{0};
@@ -13322,6 +13366,13 @@ private:
         // validity field (see fence_unchanged for why count/min/max alone
         // cannot answer "was this leaf mutated").
         uint32_t mut_epoch = 0;
+        // v29 M3 slice 2 (invariants G1/G2, decision doc): the SLOT
+        // GENERATION at capture. mut_epoch identifies in-place mutation of
+        // ONE page lifetime; gen identifies the lifetime itself — free+
+        // realloc restarts mut_epoch at 0 (alloc's memset), so a captured
+        // epoch CAN alias after reuse (the HP4 ABA); the generation cannot
+        // (monotonic per slot, one bump per reuse).
+        uint32_t gen = 0;
     };
     PageId find_leaf_crabbing_with_fence(PageId root, const std::string& key,
                                           std::shared_lock<std::shared_mutex>& held_latch,
@@ -13340,6 +13391,7 @@ private:
                 }
                 fence.key_count = h->key_count;
                 fence.mut_epoch = page_mut_epoch(h);   // v28 CKV-008
+                fence.gen = pool_.slot_generation(id); // v29 M3 slice 2 (G2): identity captured under the same shared latch
                 return id;
             }
             const InteriorSlot* slots = interior_slots(p);
@@ -13377,6 +13429,16 @@ private:
         // since descent", and the v29 merge/rebalance consumers will rely on
         // it literally. The count/min/max checks stay as a redundant
         // fast-fail.
+        // v29 M3 slice 2 (invariant G2, windows W2/W3): the slot generation
+        // check comes FIRST — identity before content. If the slot was freed
+        // and re-allocated between the descent's capture and this exclusive
+        // re-acquisition, the page is a DIFFERENT LIFETIME: its mut_epoch
+        // restarted at 0 (alloc's memset) and can alias the captured value
+        // (the HP4 ABA), and min/max/count are a foreign page's content.
+        // The caller's existing re-descend path handles the mismatch
+        // (fence_recheck_retries counts it); per the decision doc it is a
+        // normal control-flow event — never an error, never a health signal.
+        if (pool_.slot_generation(pool_.id_of(p)) != desc_fence.gen) return false;
         const uint32_t cur_epoch = page_mut_epoch(h);
         if (cur_epoch != desc_fence.mut_epoch) return false;
         if (h->key_count != desc_fence.key_count) return false;
@@ -13582,6 +13644,16 @@ inline size_t ChronoKV::tree_size() const {
 inline uint64_t ChronoKV::fence_recheck_retries() const {
     return tree_->fence_recheck_retries_.load(std::memory_order_relaxed);
 }
+
+inline uint64_t ChronoKV::cursor_restarts() const {
+    return tree_ ? tree_->cursor_restarts() : 0;
+}
+
+#ifdef CHRONOKV_TEST_HOOKS
+inline void ChronoKV::test_bump_all_slot_generations() {
+    pool_->bump_all_slot_generations_for_test();
+}
+#endif
 
 inline uint64_t ChronoKV::ensure_index_loser_deletes() const {
     return tree_->ensure_index_loser_deletes_.load(std::memory_order_relaxed);

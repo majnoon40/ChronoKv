@@ -7,6 +7,95 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **feat (v29 M3 slice 2/3, 2026-10-17): the G2 verification sites are
+  live — `fence_unchanged` checks the slot generation FIRST (identity
+  before content, W2/W3 closed), `Cursor::enter_leaf` verifies
+  `leaf_gen_` after its latch and restarts from the last emitted key on
+  mismatch (W1/W6 closed) — and the hazard-pointer machinery is
+  DELETED, not wired. Two one-shot bump controls with exact mutant
+  isolation; release suite 532→533/0; DST 150/150.** Per the HP4/ABA
+  decision doc checklist items 3–5. FENCE SIDE: `LeafFence` gains
+  `uint32_t gen` (captured in `find_leaf_crabbing_with_fence` under the
+  same shared latch as the content fields); `fence_unchanged` compares
+  `pool_.slot_generation(pool_.id_of(p))` before `mut_epoch`/count/min/
+  max — the ordering is the point: a reused slot's `mut_epoch` restarts
+  at 0 (alloc's memset) and CAN alias a captured epoch (the HP4 ABA),
+  while the generation cannot; a mismatch rides the callers' existing
+  re-descend path (`fence_recheck_retries` counts it; per the decision
+  doc it is a normal control-flow event, never an error, never a health
+  signal). `TestFence` + its capture/compare helpers carry `gen` too,
+  so the CKV-008 remediation battery keeps working unchanged. CURSOR
+  SIDE: `leaf_gen_` is captured latch-continuously in
+  `enter_leaf_from_crabbing` (no gap ⇒ nothing to verify, just the
+  baseline for the next switch) and under the PREDECESSOR's latch at
+  switch time (sound: freeing the successor requires unlinking under
+  this page's exclusive latch); `enter_leaf` verifies AFTER the latch,
+  BEFORE any content read — the latch-then-gen-then-content ordering
+  that also covers the decision doc's §7.2 latch-entry ABA (a thread
+  blocked on a freed-then-reused slot's latch wakes holding the NEW
+  occupant's latch). Mismatch ⇒ `note_cursor_restart()` + re-descend at
+  the last emitted key under a new `lo_exclusive_` bound (keys are
+  unique and ordered ⇒ the exclusive successor seek can neither
+  re-emit nor skip; iterative by construction — the restart re-enters
+  through the latch-continuous crabbing path, so no recursion; an
+  empty descent sets `exhausted_`). `cursor_restarts` counter: BTree
+  mutable atomic + `ChronoKV::cursor_restarts()` delegate beside
+  `fence_recheck_retries` (the delete-churn table reads both). **HP
+  MACHINERY DELETED** (decision §4.3 — both audits demanded
+  redesign-not-wiring; the registry only ever covered cursor RESIDENCY,
+  which the leaf latch already protects because any freer must take it
+  exclusive to unlink, and it never covered the window that matters —
+  `leave_leaf()` cleared the HP BEFORE the latch-free switch gap):
+  `HazardPointer`, `HPRegistry` (incl. the H1 slot-recycling fix),
+  `BTree::hps_`, `Cursor::hp_` + publish/clear/register/release, the
+  two `hp_*_for_test` accessors, and the H1 review test — deleted WITH
+  the machinery, recorded at both deletion sites (the leak class cannot
+  recur without a registry; the cursor now holds no pooled resource
+  beyond its RAII latches; discipline stays covered by the cursor
+  batteries, the new controls, DST S3/S4/S5, and the sanitizer legs).
+  SEAMS (TEST_HOOKS/STRESS only, zero production behavior change):
+  `PagePool::bump_all_slot_generations_for_test` +
+  `ChronoKV::test_bump_all_slot_generations` — CONTENT-INVARIANT
+  invalidation (no page byte changes, so mut_epoch/min/max/count all
+  stay equal and ONLY the generation checks can observe the bump: exact
+  mutant isolation); the stress gap-hook dispatch gains exact-name
+  strcmp branches — `gap_callback_leaf_latch` at `tree_leaf_latch_gap`
+  and `gap_callback_cursor_switch` at `tree_cursor_leaf_switch` (both
+  names start with 't', so the first-char scheme cannot separate them,
+  nor from `tree_split_begin`). CONTROLS
+  (`run_m3_gen_verification_test`, 4 checks, STRESS-gated like the m16
+  battery, skip-PASS lines on release): **A (W2)** — one-shot bump at
+  the writer's shared→exclusive gap: the fence refuses (hook fired,
+  `fence_recheck_retries` delta ≥ 1) and the re-descended put lands
+  byte-correct; **B (W1)** — one-shot bump at the cursor's leaf-switch
+  gap: `cursor_restarts` delta EXACTLY 1 and the full 400-key scan
+  stays byte-exact — the transparency leg doubles as the correctness
+  proof of the restart logic (the risky new code). FAIL-FIRST, measured
+  (scratch builds, driver-level): MUT-FENCE (the gen check deleted from
+  `fence_unchanged`) → control A RED ALONE (`committed=1 fired=1
+  retries_delta=0` — the silent-pass shape: the put "succeeds" on a
+  fence that no longer detects reuse) with B fully green, rc 9;
+  MUT-CURSOR (the `enter_leaf` check disabled) → control B's restart
+  count RED ALONE (`restarts_delta=0`; transparency still green — with
+  a content-invariant bump the data was never at risk, proving the gen
+  check is the SOLE detector) with A green, rc 9; clean tree 4/4, rc 0.
+  HONEST BOUND (decision doc §9, kept): the end-to-end
+  reuse-corruption catchers stay UNREACHABLE until slice 3/M4 give
+  `free()` its engine callers — slice 2 proves the detection-and-
+  recovery machinery; the corruption mutants get run when the frees
+  exist, recorded not faked. MEASURED (1 GiB sandbox, `-O0` bare +
+  `ggc-min-expand=5`; floors, not ledger material): release full suite
+  **532 → 533 PASS / 0 FAIL** (−1 the deleted H1 line, +2 the release
+  skip lines), exit 0, banner 0.28.1; **DST 6 scenarios × 25 seeds =
+  150/150 children green** (S3 gc-vs-scan, S4 cursor-vs-split and S5
+  merge-grammar hammer the cursor paths under the baton scheduler — the
+  restart machinery's first concurrency exposure); `make lint` green
+  (all four TUs both hook modes, ratchet 33=33 — the new header code
+  adds zero conversion warnings, member/init-list order -Wreorder-clean);
+  STRESS-defs four-TU syntax gate green. Docs: ROADMAP M3 header →
+  slices 1–2/3 landed, slice-2 record with the full control/mutant
+  numbers, slice 3 → NEXT, progress row updated.
+
 - **feat (v29 M3 slice 1/3, 2026-10-17): the pool-side slot-generation
   mechanism lands — invariant G1 is live in `PagePool::alloc()`, the
   HP4/ABA decision's chosen horn, with six unit controls and a measured
