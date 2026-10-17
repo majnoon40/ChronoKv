@@ -101,12 +101,16 @@ before the DST harness is green") is met.
   containers, `CKV_IOURING_DISABLED` compile-out).
 - **Paged B+ tree index** — 4 KiB pages with a 256 MiB (configurable)
   page pool, per-page shared latches, and incremental range-scan cursors.
-  Hazard-pointer slots are maintained per tree and recycled (bounded by
-  peak cursor concurrency); page *reclamation* is not implemented yet —
+  Page slots carry reuse generation tags (v29 M3): every verification
+  site checks slot identity before trusting content across a latch
+  handoff. Page *reclamation* is not implemented yet (no merge/unlink) —
   see Known limitations.
-- **Lock-free reclamation of MVCC versions** — epoch-pinned deferred GC of
-  old *versions*; no GC-vs-scan lock contention on the read path. (This
-  covers version chains only, not B+ tree pages — see Known limitations.)
+- **Epoch-pinned deferred reclamation** — of MVCC versions AND (v29 M3)
+  of physically purged index entries: a key dead for every live snapshot
+  (tombstone at or below the GC horizon) is unlinked and its `KeyEntry`
+  epoch-reclaimed, so the index tracks the live key set. No GC-vs-scan
+  lock contention on the read path. (B+ tree *pages* are not reclaimed
+  yet — see Known limitations.)
 - **Rich public API** — sync + async operations, atomic batches,
   prefix observers, streaming range scans, and read-only health/stats
   diagnostics.
@@ -624,14 +628,20 @@ E1–E16 safety argument and the v24 fix log at the top of the file).
 
 ## Known limitations
 
-- **No B+ tree page reclamation**: `PagePool::free()` has no callers and the
-  tree has no merge/rebalance — splits only ever add pages. The page pool is
-  therefore a **monotonic ceiling**: once it is exhausted
-  (`Options::page_pool_bytes`, 256 MiB by default) `alloc()` throws
-  `std::bad_alloc`, and delete-heavy workloads never get space back. Size the
-  pool for the index's *lifetime* high-water mark, not its current size.
-  Implementing leaf merge/rebalance (and wiring the existing hazard-pointer
-  slots into a real reclamation check) is the tracked follow-up.
+- **No B+ tree page reclamation (yet)**: dead keys ARE physically purged
+  since v29 M3 — a tombstoned key at or below the GC horizon loses its
+  index entry, its tree slot, and its versions (epoch-reclaimed), so the
+  index tracks the LIVE key set, not lifetime distinct keys, and erased
+  slot space is reused by later inserts. But `PagePool::free()` still has
+  no engine callers and the tree has no merge/rebalance: emptied leaves
+  stay linked and splits only ever add pages, so under a monotonic
+  new-key frontier the pool remains a **creeping ceiling** (measured:
+  ~2 pages/round of frontier churn; flat under delete-then-reinsert on a
+  fixed working set). On exhaustion (`Options::page_pool_bytes`, 256 MiB
+  by default) `alloc()` throws `std::bad_alloc`; `pool_stats()` exposes
+  live/peak/utilization and `health()` degrades at ≥80% and fails at
+  ≥95%. Leaf unlink/merge (M4) gives `free()` its callers and closes
+  the monotonic shape.
 - **`~Transaction()` aborts the process** if the transaction is still active
   and the `Database` is alive. This is deliberate (see Safety properties), but
   it means an exception propagating out of a scope that holds a `Transaction`

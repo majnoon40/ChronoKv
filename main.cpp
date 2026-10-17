@@ -580,6 +580,7 @@ static int run_backup_test();         // v26 M3 online backup
 static int run_pitr_test();           // v26 M4 point-in-time restore
 static int run_m16_phase1_test();
 static int run_m3_gen_verification_test();   // v29 M3 slice 2: G2 verification-site controls
+static int run_m3_purge_test();              // v29 M3 slice 3: physical purge controls
 static int run_m2_phase1_test();
 static int run_m2_phase2_test();
 static int run_m2_phase3_test();
@@ -7981,6 +7982,7 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     // M1.6 Phase 1 + M1.5 async/batch/observer/stream
     fails += run_m16_phase1_test();
     fails += run_m3_gen_verification_test();
+    fails += run_m3_purge_test();
     fails += run_m2_phase1_test();
     fails += run_m2_phase2_test();
     fails += run_m2_phase3_test();
@@ -9090,6 +9092,337 @@ static int run_kk_equivalence_test() {
         db.close();
     }
     std::filesystem::remove_all(wd);
+    return fails;
+}
+
+// =====================================================================
+// v29 M3 slice 3: PHYSICAL PURGE — the index stops growing with lifetime
+// distinct keys (README limitation #1). A key whose head version is a
+// tombstone at or below the GC pass threshold is dead for EVERY live
+// snapshot (threshold = min over live slots): the purge path flags the
+// KeyEntry under commit_mu, unlinks its tree slot (unlink-before-retire),
+// and retires it through the epoch reclaimer — the same pin algebra that
+// protects Version nodes now protects entries, and commit_txn takes a
+// SnapshotGuard pin so blind writers' ensure→lock window is covered too.
+//
+// BEFORE/AFTER evidence (scratch driver, 30-round churn, steady live set
+// of 400 keys, 8 explicit gc passes per round, in-memory, -O0):
+//   BEFORE (c3bdf29): live_versions ratchets 200 → 6200 (+200/round =
+//     exactly the churn rate; immortal tombstone heads + entries + slots)
+//   AFTER  (slice 3): live_versions FLAT at 200 every round — the exact
+//     steady-state live set. Driver wall time 19.1s → 0.9s (shorter
+//     chains to walk). Raw outputs in the slice-3 commit message.
+//
+// Mutants (scratch trees, driver + suite): PURGE-OFF (eligibility short-
+// circuit) reddens controls 1/2/3, leaves 4 (stats/health surface) green;
+// NO-RETIRE (unlink without retire_entry) reddens 1/3 on the entry
+// counters AND the version-accounting identity (the tombstone anchor is
+// destroyed with the entry — skipping the retire leaks both); NO-UNLINK
+// (retire without unlink) is a dangling-pointer mutant: the suite build
+// may survive it on stale-heap luck or hang in the commit retry loop, so
+// it is proven under ASan instead (UAF on the tree's encoded pointer —
+// raw output in the commit message). The commit-pin/flag-retry window is
+// concurrency-only by construction: no single-threaded interleaving
+// reaches it, so its teeth are the TSan CI legs + the recorded argument
+// (memory-ordering audit, GC SAFETY), stated here honestly rather than
+// faked with a vacuous control.
+// =====================================================================
+static int run_m3_purge_test() {
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) {
+            ++fails;
+            if (!detail.empty()) std::cout << "      (" << detail << ")\n";
+        }
+    };
+
+    // ---- Control 1: basic purge lifecycle (flag → unlink → retire → reclaim) ----
+    {
+        chronokv::Options o;
+        o.auto_start_gc = false;
+        auto db = chronokv::Database::open(o);
+        db.put("pk", "v1");
+        db.put("other", "x");       // a survivor: keeps accounting non-trivial
+        db.erase("pk");             // tombstone head
+        for (int i = 0; i < 4; ++i) db.gc_pass_for_test();
+        auto g = db.gc_stats();
+        check("purge: dead key's entry retired", g.entries_retired == 1,
+              "entries_retired=" + std::to_string(g.entries_retired));
+        check("purge: entry reclaimed with no pins, queue drained",
+              g.entries_reclaimed == 1 && g.retired_pending == 0,
+              "reclaimed=" + std::to_string(g.entries_reclaimed) +
+              " pending=" + std::to_string(g.retired_pending));
+        check("purge: latest read of dead key is absent", !db.get("pk").has_value());
+        // created = 3 (v1, tombstone, other); reclaimed = 2 (v1 via chain
+        // walk, tombstone via the entry's destruction) -> live = 1 ("other").
+        check("purge: version accounting exact (created-reclaimed == live set)",
+              g.created - g.reclaimed == 1,
+              "created=" + std::to_string(g.created) +
+              " reclaimed=" + std::to_string(g.reclaimed));
+        db.put("pk", "v2");         // resurrection: fresh entry, fresh lifecycle
+        auto v = db.get("pk");
+        check("purge: re-insert after purge reads back", v.has_value() && *v == "v2");
+        for (int i = 0; i < 4; ++i) db.gc_pass_for_test();
+        g = db.gc_stats();
+        check("purge: resurrected (live-head) key NOT re-purged",
+              g.entries_retired == 1,
+              "entries_retired=" + std::to_string(g.entries_retired));
+    }
+
+    // ---- Control 2: pin protection — eligibility threshold is min live pin ----
+    {
+        chronokv::Options o;
+        o.auto_start_gc = false;
+        auto db = chronokv::Database::open(o);
+        db.put("k", "v1");
+        {
+            auto txn = db.begin();      // pins a slot at ts0 (>= v1's cts)
+            db.erase("k");              // tombstone cts2 > ts0
+            for (int i = 0; i < 4; ++i) db.gc_pass_for_test();
+            auto g = db.gc_stats();
+            check("purge: BLOCKED while an older snapshot is live",
+                  g.entries_retired == 0,
+                  "entries_retired=" + std::to_string(g.entries_retired));
+            auto rv = txn.get("k");
+            check("purge: pinned txn still reads its pre-tombstone value",
+                  rv.has_value() && *rv == "v1");
+            txn.abort();
+        }
+        for (int i = 0; i < 4; ++i) db.gc_pass_for_test();
+        auto g = db.gc_stats();
+        check("purge: proceeds once the pin is released",
+              g.entries_retired == 1 && g.entries_reclaimed == 1,
+              "retired=" + std::to_string(g.entries_retired) +
+              " reclaimed=" + std::to_string(g.entries_reclaimed));
+        check("purge: post-purge latest read absent", !db.get("k").has_value());
+    }
+
+    // ---- Control 3: delete-then-reinsert churn — the M3 acceptance shape ----
+    //
+    // Fixed working set (the roadmap's "delete-then-reinsert"): erased slots
+    // are unlinked by purge and the SAME leaves absorb the re-inserts, so
+    // pages, entries, and versions all flatten at the live-set size.
+    //
+    // SCOPE NOTE, measured not assumed: under a MONOTONIC new-key frontier
+    // (each round inserts fresh lexicographically-later keys), slice 3
+    // flattens the HEAP side exactly (entries/versions — the BEFORE/AFTER
+    // driver numbers above) but live PAGES still creep (measured 11 → 50
+    // pages over 25 rounds): erase frees slots, but emptied frontier leaves
+    // stay linked until M4's unlink+merge gives PagePool::free() its engine
+    // callers. Recorded here and in the ROADMAP; the page-level high-water
+    // acceptance for the monotonic shape is an M4 battery item.
+    {
+        chronokv::Options o;
+        o.auto_start_gc = false;
+        o.page_pool_bytes = 32ULL * 1024 * 1024;   // 8192 pages
+        auto db = chronokv::Database::open(o);
+        const std::string val(400, 'v');
+        const int KS = 400;
+        for (int i = 0; i < KS; ++i)
+            db.put("k_" + std::to_string(i), val);
+        for (int p = 0; p < 4; ++p) db.gc_pass_for_test();
+        size_t live_early = 0, peak_early = 0;
+        for (int r = 1; r <= 24; ++r) {
+            for (int i = 0; i < KS; ++i)
+                db.erase("k_" + std::to_string(i));
+            for (int p = 0; p < 10; ++p) db.gc_pass_for_test();  // >= ceil(400/64) purges + coverage
+            for (int i = 0; i < KS; ++i)
+                db.put("k_" + std::to_string(i), val);
+            for (int p = 0; p < 2; ++p) db.gc_pass_for_test();
+            if (r == 5) {
+                auto ps = db.pool_stats();
+                live_early = ps.live_pages;
+                peak_early = ps.peak_live_pages;
+            }
+        }
+        for (int p = 0; p < 10; ++p) db.gc_pass_for_test();   // full drain
+        auto ps = db.pool_stats();
+        auto g = db.gc_stats();
+        const size_t bound = live_early * 3 / 2 + 8;
+        check("churn: live pages FLAT across 19 delete-then-reinsert rounds",
+              ps.live_pages <= bound,
+              "live r5=" + std::to_string(live_early) +
+              " r24=" + std::to_string(ps.live_pages) +
+              " bound=" + std::to_string(bound));
+        check("churn: HIGH-WATER stabilizes (peak == steady footprint)",
+              ps.peak_live_pages <= bound,
+              "peak r5=" + std::to_string(peak_early) +
+              " r24=" + std::to_string(ps.peak_live_pages) +
+              " bound=" + std::to_string(bound));
+        // Exact oracles: created = 400 (seed) + 24 rounds x (400 tombstones
+        // + 400 puts) = 19600; the live set at the end is the last round's
+        // 400 puts. Every dead key's entry is retired AND reclaimed.
+        check("churn: version accounting exact (created-reclaimed == 400)",
+              g.created - g.reclaimed == 400,
+              "created=" + std::to_string(g.created) +
+              " reclaimed=" + std::to_string(g.reclaimed));
+        check("churn: all 9600 dead entries retired AND reclaimed, queue empty",
+              g.entries_retired == 9600 && g.entries_reclaimed == 9600 &&
+              g.retired_pending == 0,
+              "retired=" + std::to_string(g.entries_retired) +
+              " reclaimed=" + std::to_string(g.entries_reclaimed) +
+              " pending=" + std::to_string(g.retired_pending));
+        auto scan = db.range_scan("", "\xff");
+        bool scan_ok = scan.size() == static_cast<size_t>(KS);
+        for (auto& [k, v] : scan)
+            if (k.rfind("k_", 0) != 0 || v != val) { scan_ok = false; break; }
+        check("churn: post-churn full scan is exactly the working set", scan_ok,
+              "scan size=" + std::to_string(scan.size()));
+    }
+
+    // ---- Control 4: pool_stats surface + health() utilization thresholds ----
+    //
+    // Sized against require_split_headroom() (BT-1): put throws once
+    // pages_available() < 5*(height+1)+1, so the 95% band is only legally
+    // reachable on a pool whose 5% margin exceeds that headroom AT THE
+    // FILLED HEIGHT. Measured lesson (first cut, 512 pages): the ~490-byte
+    // keys fatten interior nodes too (fanout ~8), the tree hit height >= 5
+    // and headroom (31) tripped at 94% (live 482, available 30). 1024 pages
+    // (4 MiB): fill to 973 live (95.02%) leaves 51 available — headroom-safe
+    // up to height 9. The big keys keep the put count in the low thousands
+    // (~3 slots/leaf measured) — cheap for the TSan legs.
+    {
+        chronokv::Options o;
+        o.auto_start_gc = false;
+        o.page_pool_bytes = 1024 * 4096;   // 1024 pages
+        auto db = chronokv::Database::open(o);
+        auto ps0 = db.pool_stats();
+        check("stats: fresh pool — capacity/live/peak/utilization sane",
+              ps0.capacity_pages == 1024 && ps0.live_pages >= 1 &&
+              ps0.peak_live_pages == ps0.live_pages && ps0.free_pages == 0 &&
+              ps0.utilization > 0.0 && ps0.utilization <= 1.0);
+        check("stats: fresh pool health is level 0", db.health().level == 0);
+        const std::string tail(480, 'x');
+        bool seen80 = false, broke = false;
+        chronokv::Health h80{0, {}};
+        int keys = 0;
+        while (db.pool_stats().live_pages < 973) {   // 973/1024 = 95.02%
+            char kb[16];
+            snprintf(kb, sizeof(kb), "F%05d", keys++);
+            try {
+                db.put(std::string(kb) + tail, "v");
+            } catch (...) { broke = true; break; }
+            auto ps = db.pool_stats();
+            if (!seen80 && ps.live_pages >= 820) {   // 820/1024 = 80.1%
+                h80 = db.health();
+                seen80 = true;
+            }
+        }
+        auto ps = db.pool_stats();
+        check("stats: fill reached the 95% band without tripping BT-1 headroom",
+              !broke && ps.live_pages >= 973,
+              "live=" + std::to_string(ps.live_pages) + " broke=" + (broke ? "1" : "0"));
+        bool h80_reason = false;
+        for (auto& r : h80.reasons)
+            if (r.find("utilization >= 80%") != std::string::npos) h80_reason = true;
+        check("health: utilization >= 80% degrades (level 1 + reason)",
+              seen80 && h80.level == 1 && h80_reason,
+              "seen80=" + std::to_string(seen80) + " level=" + std::to_string(h80.level));
+        auto h95 = db.health();
+        bool h95_reason = false;
+        for (auto& r : h95.reasons)
+            if (r.find("utilization >= 95%") != std::string::npos) h95_reason = true;
+        check("health: utilization >= 95% fails (level 2 + reason)",
+              h95.level == 2 && h95_reason);
+        check("stats: high-water tracks the fill (peak == live at 973+ pages)",
+              ps.peak_live_pages == ps.live_pages && ps.peak_live_pages >= 973,
+              "peak=" + std::to_string(ps.peak_live_pages) +
+              " live=" + std::to_string(ps.live_pages));
+    }
+
+    // ---- Control 5: purge x checkpoint integration (the soak's find) ----
+    //
+    // FOUND BY THE v19 SOAK, not predicted: slice 3's first full-suite run
+    // failed "v19 soak: randomized concurrency soak" with
+    // noncommitted=5653351 threw=0 and checkpoints=1 (of ~60). Mechanism:
+    // a writer deletes key K (dirty_since_ckpt_[K] = tombstone cts); a GC
+    // pass physically purges K; the next DELTA checkpoint's dirty-coverage
+    // validation (v28 CKV-003c) finds K dirty but absent from the index,
+    // reads it as divergence, latches invariant D4 and throws — the ckpt
+    // thread swallows the throw, and every subsequent commit fast-fails
+    // DatabaseFailed. The validation was RIGHT to fire: pre-v28 the silent
+    // skip lost the delete permanently (the base still holds K's pre-delete
+    // value; the checkpoint's WAL rotation truncates the delete record; K
+    // RESURRECTS on recovery). Slice 3 created a third state the v28 binary
+    // absent-vs-captured check could not express: absent-BECAUSE-PURGED.
+    // Fix: purge_dead_key records (K -> tombstone cts) in
+    // purged_since_ckpt_ under dirty_mu_ before the unlink; the coverage
+    // validation synthesizes the delta entry (K, cts, "", deleted) from the
+    // record; the checkpoint tail clears records under the same cts filter
+    // as the dirty map. Fail-first, measured both ways: a deterministic
+    // 2s driver on the PRE-fix tree threw "checkpoint aborted: 1 dirty
+    // key(s) absent from the index ... first missing key: dk", the next
+    // put returned status 6 and health() latched level 2; post-fix all
+    // checks pass and the recovery leg proves the synthesized tombstone
+    // covers the delete across WAL rotation (no resurrection). A
+    // MUT-SYNTH-OFF mutant (validation reverts to the unconditional latch)
+    // reddens exactly the checks below while C1-C4 stay green.
+    {
+        const std::string wd = "/tmp/ckv_m3_c5_wd";
+        const std::string cp = "/tmp/ckv_m3_c5.ckpt";
+        std::filesystem::remove_all(wd);
+        for (int i = 0; i < 64; ++i)
+            std::filesystem::remove(cp + (i == 0 ? "" : ".delta." + std::to_string(i)));
+        {
+            chronokv::Options o;
+            o.wal_dir = wd;
+            o.checkpoint_path = cp;
+            o.auto_start_gc = false;
+            o.recover_on_open = false;
+            auto db = chronokv::Database::open(o);
+            db.put("survivor", "s");
+            db.put("dk", "v1");
+            db.checkpoint();                       // BASE captures dk=v1 LIVE
+            db.erase("dk");                        // tombstone; dirty[dk]
+            for (int i = 0; i < 4; ++i) db.gc_pass_for_test();
+            auto g = db.gc_stats();
+            check("purge×ckpt: purge fired before the delta checkpoint",
+                  g.entries_retired == 1 && !db.get("dk").has_value(),
+                  "retired=" + std::to_string(g.entries_retired));
+            bool ckpt_ok = true;
+            std::string msg;
+            try { db.checkpoint(); }
+            catch (const std::exception& e) { ckpt_ok = false; msg = e.what(); }
+            check("purge×ckpt: delta checkpoint over a purged key succeeds",
+                  ckpt_ok, msg);
+            auto st = db.put("after", "a");
+            check("purge×ckpt: commits acknowledged after that checkpoint",
+                  st == chronokv::Status::OK, "status=" + std::to_string((int)st));
+            auto h = db.health();
+            check("purge×ckpt: health stays level 0 (no D4 latch)", h.level == 0,
+                  "level=" + std::to_string(h.level) +
+                  (h.reasons.empty() ? std::string() : " reason=" + h.reasons[0]));
+            check("purge×ckpt: exactly one tombstone synthesized into the delta",
+                  db.synthesized_tombstones_for_test() == 1,
+                  "count=" + std::to_string(db.synthesized_tombstones_for_test()));
+            db.close();
+        }
+        {
+            chronokv::Options o;
+            o.wal_dir = wd;
+            o.checkpoint_path = cp;
+            o.auto_start_gc = false;
+            o.recover_on_open = true;
+            auto db = chronokv::Database::open(o);
+            auto dk = db.get("dk");
+            check("purge×ckpt: recovery keeps the purged key DELETED (no resurrection)",
+                  !dk.has_value(),
+                  dk.has_value() ? "resurrected='" + *dk + "'" : "");
+            auto sv = db.get("survivor");
+            check("purge×ckpt: recovery preserves the base survivor",
+                  sv.has_value() && *sv == "s",
+                  sv.has_value() ? *sv : std::string("ABSENT"));
+            auto af = db.get("after");
+            check("purge×ckpt: recovery replays the post-checkpoint write",
+                  af.has_value() && *af == "a",
+                  af.has_value() ? *af : std::string("ABSENT"));
+        }
+        std::filesystem::remove_all(wd);
+        for (int i = 0; i < 64; ++i)
+            std::filesystem::remove(cp + (i == 0 ? "" : ".delta." + std::to_string(i)));
+    }
+
     return fails;
 }
 

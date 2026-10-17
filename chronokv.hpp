@@ -3540,6 +3540,24 @@ struct GcInstanceStats {
     uint64_t created, retired, reclaimed, retired_pending, reclaim_epoch,
              oldest_active_pin_epoch, passes, last_keys, last_steps,
              last_pass_ns, max_pass_ns;
+    // v29 M3 slice 3: physical key purge (dead-key eviction) accounting.
+    // entries_retired: KeyEntries handed to the epoch reclaimer after their
+    // tree slot was unlinked; entries_reclaimed: entries actually destroyed
+    // (epoch gate passed). A purged entry's remaining chain (the tombstone
+    // anchor) is destroyed with it and counted in `reclaimed`, keeping the
+    // version identity live == created - reclaimed exact.
+    uint64_t entries_retired = 0, entries_reclaimed = 0;
+};
+// v29 M3 slice 3 (roadmap: "stats() gains pool utilization and high-water"):
+// page-pool footprint snapshot. peak_live_pages is the high-water mark —
+// the M3 acceptance battery asserts it STABILIZES under delete/insert churn
+// instead of ratcheting with lifetime distinct keys (README limitation #1).
+struct PoolStats {
+    size_t capacity_pages = 0;
+    size_t live_pages = 0;        // allocated (bump) minus free-listed
+    size_t peak_live_pages = 0;   // high-water of live_pages since open
+    size_t free_pages = 0;        // on the free list (allocated, reusable)
+    double utilization = 0.0;     // live / capacity; 0 when capacity is 0
 };
 struct HealthInfo {
     int level;  // 0 = healthy, 1 = degraded, 2 = failing
@@ -5622,6 +5640,17 @@ struct KeyEntry {
     std::mutex commit_mu;
     std::atomic<Version*> head{nullptr};
     std::atomic<uint64_t> last_write_ts{0};
+    // v29 M3 slice 3: physical-purge flag. Set by the GC purge path UNDER
+    // commit_mu together with the death re-validation (head is a tombstone
+    // at or below the pass threshold), BEFORE the tree unlink and the
+    // retire. commit_txn checks it under the same commit_mu after locking
+    // and retries with a fresh ensure_index when set — so no new version
+    // can ever be linked onto an entry on its way out (the flag-set and
+    // the link are serialized by commit_mu). Readers of the flag outside
+    // commit_mu (none today) must pair acquire with this release store and
+    // hold a reclamation pin (commit_txn's SnapshotGuard) for memory
+    // validity — see the memory-ordering audit's GC SAFETY section.
+    std::atomic<bool> purged{false};
 };
 
 // ======================== Reusable reader slot ========================
@@ -5635,6 +5664,38 @@ struct RetiredNode {
     std::unique_ptr<Version> node;
     uint64_t retired_epoch;
     RetiredNode(Version* n, uint64_t e) : node(n), retired_epoch(e) {}
+};
+
+// v29 M3 slice 3: a physically purged KeyEntry, epoch-gated exactly like a
+// RetiredNode (same reader_mu_-linearized pin algebra; see GC SAFETY in the
+// memory-ordering audit). A KeyEntry belongs either to the tree or to
+// retired_entries_, never both: the purge path UNLINKS the tree slot BEFORE
+// retiring (the decision doc §7.3 obligation — a tree that still points at a
+// retired entry hands out dangling pointers the epoch gate cannot protect,
+// because the tree, not a pinned reader, would be the last referent). The
+// entry's remaining chain (the tombstone anchor — everything below it was
+// retired by the same pass's chain walk) is destroyed with the entry and
+// counted into the version reclaimed tally so live == created - reclaimed
+// stays exact.
+struct RetiredEntry {
+    std::unique_ptr<KeyEntry> entry;
+    uint64_t retired_epoch;
+    RetiredEntry(KeyEntry* e, uint64_t ep) : entry(e), retired_epoch(ep) {}
+    ~RetiredEntry() {
+        Version* c = entry->head.load(std::memory_order_relaxed);
+        while (c) {
+            Version* n = c->prev.load(std::memory_order_relaxed);
+            delete c;
+            c = n;
+        }
+    }
+    // chain length, for version-accounting parity (see comment above).
+    size_t chain_len() const {
+        size_t n = 0;
+        Version* c = entry->head.load(std::memory_order_relaxed);
+        while (c) { c = c->prev.load(std::memory_order_relaxed); ++n; }
+        return n;
+    }
 };
 
 // snapshot controls MVCC visibility. pinned_epoch controls physical lifetime.
@@ -5671,6 +5732,16 @@ struct ReaderSlot {
 // RELAXED (ordering supplied by a co-held mutex):
 //   KeyEntry::last_write_ts  Accessed only while holding the same KeyEntry::commit_mu on
 //                            both the validating read and the linking write.
+//   KeyEntry::purged         v29 M3 slice 3: written under commit_mu (purge path) with a
+//                            release store; read with acquire under commit_mu by
+//                            commit_txn's retry check. The mutex supplies the ordering in
+//                            both directions; the release/acquire pair additionally covers
+//                            the lock-free pre-check paths. MEMORY VALIDITY of the flag
+//                            read is not an ordering question but a lifetime one: the
+//                            entry may be retired concurrently, so every commit path holds
+//                            a reclamation pin (commit_txn's SnapshotGuard) from before
+//                            ensure_index until after the check — the epoch gate then
+//                            keeps the entry alive across the window.
 //   stress::*                Test-only seeding.
 //
 // GC SAFETY / I6 (Phase C epoch-pinned reclamation):
@@ -5684,6 +5755,38 @@ struct ReaderSlot {
 //   and traversal use release/acquire ordering. Physical destruction occurs only after
 //   retired_mu_ is released. This epoch-pin protocol is the reclamation safety mechanism;
 //   the old threshold-only argument is no longer sufficient on its own.
+//
+//   v29 M3 slice 3 extends the SAME algebra to KeyEntries (physical purge):
+//   the purge path (a) re-validates death and sets KeyEntry::purged under commit_mu,
+//   (b) unlinks the tree slot under nm_ (unlink-before-retire — after this, no
+//   ensure_index can hand the entry out again; commits already holding the pointer
+//   see the flag under commit_mu and retry), and (c) retires the entry with the
+//   current epoch. Slot-pinned readers, checkpoints, cursors, and — new in slice 3 —
+//   blind writers (commit_txn takes a SnapshotGuard for the whole commit) are all
+//   covered by min_active_pin_epoch: an entry retired while any of them is pinned is
+//   not destroyed until every pin that could have reached it is gone. Eligibility uses
+//   the pass threshold m (tombstone head commit_ts <= m): m is the minimum over live
+//   slots, so no live snapshot can observe any difference between the tombstone and
+//   the entry's absence — both read as "absent" at every ts >= tombstone cts, and no
+//   ts < tombstone cts is live. New slots acquired mid-pass pin ts >= published >= m,
+//   so m is a valid eligibility bound for the whole pass. PITR is unaffected: purge is
+//   in-memory only; on-disk coverage (checkpoints, WAL deltas, v26.1 window refusal
+//   rules) is untouched, and as-of reconstruction from base+deltas reproduces the
+//   pre-tombstone value regardless of the live index state.
+//
+//   Checkpoint integration (found by the v19 soak, closed in slice 3): "on-disk
+//   coverage untouched" has a bookkeeping half. purged_since_ckpt_ (guarded by
+//   dirty_mu_, the dirty-tracking mutex) records each purge's tombstone cts BEFORE
+//   the unlink. checkpoint_locked's dirty-coverage validation (v28 CKV-003c)
+//   consults it: a dirty key missing from the index WITH a record is a purge — the
+//   delta synthesizes (key, cts, "", deleted) so the chain still covers the delete
+//   after WAL rotation truncates the record; missing WITHOUT a record remains a
+//   divergence and latches D4 unchanged. gc passes and checkpoints both hold
+//   gc_active_mu_ end-to-end, so record/consume/clear never interleave mid-pass;
+//   the record and dirty entries share a cts and clear together in the checkpoint
+//   tail. Lock order: purge takes commit_mu, dirty_mu_, nm_ strictly sequentially
+//   (never nested), so the only existing nesting (commit_txn: commit_mu ->
+//   dirty_mu_) is unaffected — no cycle.
 
 // Phase 3 item 14: writer-preferring readers-writer lock. std::shared_mutex is
 // reader-preferring, which let a steady stream of commits (shared holders) starve
@@ -5820,15 +5923,36 @@ class ChronoKV {
     // it cannot dereference a suffix already severed from the head chain.
     std::mutex retired_mu_;
     std::vector<std::unique_ptr<RetiredNode>> retired_nodes_;
+    // v29 M3 slice 3: purged KeyEntries, same epoch gate (see RetiredEntry).
+    std::vector<std::unique_ptr<RetiredEntry>> retired_entries_;
     std::atomic<uint64_t> retired_pending_{0};
+    // v29 M3 slice 3: purge accounting (exposed via GcInstanceStats).
+    std::atomic<uint64_t> i_entries_retired{0}, i_entries_reclaimed{0};
+    // v29 M3 slice 3 (checkpoint integration): delta entries synthesized
+    // from purged_since_ckpt_ records (see checkpoint_locked's coverage
+    // validation). Exposed via synthesized_tombstones().
+    std::atomic<uint64_t> i_synthesized_tombstones{0};
 
     void retire(Version* node) {
         const uint64_t epoch = reclaim_epoch_.load(std::memory_order_acquire);
         std::lock_guard<std::mutex> lock(retired_mu_);
         retired_nodes_.push_back(std::make_unique<RetiredNode>(node, epoch));
-        retired_pending_.store(retired_nodes_.size(), std::memory_order_release);
+        retired_pending_.store(retired_nodes_.size() + retired_entries_.size(),
+                               std::memory_order_release);
         diag::gc_retired.fetch_add(1, std::memory_order_relaxed);
         i_gc_retired.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // v29 M3 slice 3: retire a physically purged KeyEntry. The caller must
+    // have UNLINKED the tree slot first (unlink-before-retire) and set the
+    // purged flag under commit_mu (see purge_dead_key).
+    void retire_entry(KeyEntry* e) {
+        const uint64_t epoch = reclaim_epoch_.load(std::memory_order_acquire);
+        std::lock_guard<std::mutex> lock(retired_mu_);
+        retired_entries_.push_back(std::make_unique<RetiredEntry>(e, epoch));
+        retired_pending_.store(retired_nodes_.size() + retired_entries_.size(),
+                               std::memory_order_release);
+        i_entries_retired.fetch_add(1, std::memory_order_relaxed);
     }
 
     void advance_reclaim_epoch() {
@@ -5858,6 +5982,7 @@ class ChronoKV {
         stress_point("gc_reclaim_begin");   // v27 M0 (dst): min-pin vs scan window
         const uint64_t min_epoch = min_active_pin_epoch();
         std::vector<std::unique_ptr<Version>> victims;
+        std::vector<std::unique_ptr<RetiredEntry>> entry_victims;
         {
             std::lock_guard<std::mutex> lock(retired_mu_);
             auto keep = retired_nodes_.begin();
@@ -5870,18 +5995,46 @@ class ChronoKV {
                 }
             }
             retired_nodes_.erase(keep, retired_nodes_.end());
-            retired_pending_.store(retired_nodes_.size(), std::memory_order_release);
+            // v29 M3 slice 3: entries ride the SAME epoch gate — a pin that
+            // could still hold a KeyEntry* (pinned reader mid-traversal,
+            // checkpoint walk, cursor, or a commit's ensure→lock window)
+            // blocks destruction exactly as it does for Version nodes.
+            auto ekeep = retired_entries_.begin();
+            for (auto it = retired_entries_.begin(); it != retired_entries_.end(); ++it) {
+                if ((*it)->retired_epoch < min_epoch) {
+                    entry_victims.push_back(std::move(*it));
+                } else {
+                    if (ekeep != it) *ekeep = std::move(*it);
+                    ++ekeep;
+                }
+            }
+            retired_entries_.erase(ekeep, retired_entries_.end());
+            retired_pending_.store(retired_nodes_.size() + retired_entries_.size(),
+                                   std::memory_order_release);
         }
 
         // Version destructors can free strings; run them after releasing every
         // engine mutex. The counter changes only once destruction is complete.
         const size_t reclaimed = victims.size();
+        // v29 M3 slice 3: version-accounting parity — each purged entry still
+        // owns its tombstone-anchor chain (counted in `created` at link
+        // time); tally those nodes into the version reclaimed counter as
+        // they are destroyed with the entry, keeping
+        // live == created - reclaimed exact for the gc_stats oracles.
+        size_t entry_chain_versions = 0;
+        for (auto& ev : entry_victims) entry_chain_versions += ev->chain_len();
+        const size_t entries_reclaimed = entry_victims.size();
         victims.clear();
-        if (reclaimed != 0) {
-            diag::gc_reclaimed.fetch_add(reclaimed, std::memory_order_relaxed);
-            i_gc_reclaimed.fetch_add(reclaimed, std::memory_order_relaxed);
+        entry_victims.clear();
+        if (reclaimed + entry_chain_versions != 0) {
+            diag::gc_reclaimed.fetch_add(reclaimed + entry_chain_versions,
+                                         std::memory_order_relaxed);
+            i_gc_reclaimed.fetch_add(reclaimed + entry_chain_versions,
+                                     std::memory_order_relaxed);
         }
-        return reclaimed;
+        if (entries_reclaimed != 0)
+            i_entries_reclaimed.fetch_add(entries_reclaimed, std::memory_order_relaxed);
+        return reclaimed + entries_reclaimed;
     }
  size_t gc_cursor_ = 0;
  int delta_count_ = 0;  // v18.2: deltas since last full base
@@ -5895,6 +6048,11 @@ class ChronoKV {
  static constexpr size_t GC_KEYS_PER_PASS = 256;
  static constexpr size_t GC_STEPS_PER_PASS = 4096;  // v18.2 NOTE: bounds new-key starts per pass; does NOT preempt
  // mid-key chain walks (full-key atomicity is preserved by design).  // v18.1: version-step budget
+ // v29 M3 slice 3: purge budget. A purge costs one tree descent + erase
+ // (leaf-exclusive latch) + one retire; bounding it per pass keeps the
+ // bounded-pass culture (v18.1) intact for delete-heavy churn — a mass
+ // deletion drains over ceil(dead/64) passes, each still O(budget).
+ static constexpr size_t GC_PURGES_PER_PASS = 64;
 
     std::unique_ptr<WalSegments> wal_;
  std::string wal_dir_;  // v18 M5: stored for replication
@@ -5916,6 +6074,26 @@ class ChronoKV {
     // v18: incremental checkpoint dirty-key tracking.
     std::unordered_map<std::string, uint64_t> dirty_since_ckpt_;  // v18.2: key -> max dirty cts
     std::mutex dirty_mu_;
+    // v29 M3 slice 3 (checkpoint integration): physically purged keys whose
+    // deletion is not yet covered by a successful checkpoint: key -> the
+    // tombstone cts the purge evicted. Guarded by dirty_mu_ (the SAME mutex
+    // as dirty_since_ckpt_ — the coverage validation and the tail clear must
+    // see both maps atomically). Written by purge_dead_key BEFORE the tree
+    // unlink; consumed by checkpoint_locked's dirty-coverage validation: a
+    // dirty key absent from the index is a DIVERGENCE (CKV-003c latch) only
+    // if it is absent here too; a purged key's deletion is instead
+    // SYNTHESIZED into the delta as a tombstone entry (key, cts, "", true).
+    // Why the delta must still cover it: the base may hold the pre-delete
+    // value and the WAL rotation at checkpoint completion truncates the
+    // delete record — without the synthesized tombstone the key would
+    // RESURRECT on recovery. (Pre-v28 that was a silent data-loss path; the
+    // v28 validation turned it into a fail-stop — which is exactly what the
+    // v19 soak hit on slice 3's first full-suite run: one delta checkpoint
+    // latched D4 on a purged key, then checkpoints=1/~60 and ~5.65M writer
+    // ops fast-failed DatabaseFailed with threw=0.) In-memory only, like
+    // dirty_since_ckpt_: after a crash, WAL replay rebuilds tombstone
+    // entries in the index, so coverage finds them without records.
+    std::unordered_map<std::string, uint64_t> purged_since_ckpt_;
     // v28 (CKV-003b) — canonical invariant D4 (index fail-stop): if a tree/
     // index mutation throws during a commit (ensure_index or version
     // install), the in-memory index may diverge from the WAL. The WAL is
@@ -6017,6 +6195,11 @@ class ChronoKV {
         return std::min(rm, p);
     }
 
+    // v29 M3 slice 3: physically evict a fully-dead key (tombstone head at
+    // or below the pass threshold). Defined out-of-line after BTree (needs
+    // tree_->erase). Returns true if the entry was flagged+unlinked+retired.
+    bool purge_dead_key(const std::string& key, KeyEntry* ent, uint64_t m);
+
     bool gc_once() {
         stress_point("gc_pass_begin");   // v27 M0 (dst): pass vs scan window
      auto gc_t0 = std::chrono::steady_clock::now();
@@ -6024,6 +6207,7 @@ class ChronoKV {
 
      size_t keys_done = 0;
      size_t steps_done = 0;
+     size_t purges_done = 0;   // v29 M3 slice 3: bounded by GC_PURGES_PER_PASS
 
      // v25.1 M1.6 (Phase 3): collect all KeyEntry* via tree range_scan.
      // The tree's range_scan uses Cursor (M1.3/M1.4: shared latches + HP),
@@ -6032,12 +6216,12 @@ class ChronoKV {
      // Returns vector<(key, encoded_ptr)>. Decode ptrs to get the entries.
      // NOTE: new keys added during this scan are not visited this pass —
      // same as the old entries_ walk (which checked idx >= entries_.size()).
-     std::vector<KeyEntry*> all_entries;
+     std::vector<std::pair<std::string, KeyEntry*>> all_entries;
      {
          auto pairs = tree_scan_all();
          all_entries.reserve(pairs.size());
          for (auto& [k, v] : pairs)
-             all_entries.push_back(decode_ptr(v));
+             all_entries.emplace_back(k, decode_ptr(v));
      }
      size_t total = all_entries.size();
 
@@ -6082,7 +6266,8 @@ class ChronoKV {
      for (size_t k = 0; k < keys_budget; ++k) {
          if (steps_done >= GC_STEPS_PER_PASS) break;  // v18.1: step budget
          if (idx >= all_entries.size()) break;
-         KeyEntry* ent = all_entries[idx];
+         const std::string& ent_key = all_entries[idx].first;
+         KeyEntry* ent = all_entries[idx].second;
          if (!ent) { ++idx; if (idx >= total) { idx = 0; wrapped = true; } continue; }
 
          Version* cur = ent->head.load(std::memory_order_acquire);
@@ -6101,6 +6286,24 @@ class ChronoKV {
              }
              if (anchor) { retire(cur); }
              cur = nxt;
+         }
+
+         // v29 M3 slice 3: physical purge of fully-dead keys. The chain walk
+         // above has already retired everything below the anchor; if the
+         // ANCHOR ITSELF is a tombstone at or below the pass threshold m,
+         // the key is dead for every live snapshot (m is the minimum over
+         // live slots; every ts >= tombstone cts reads "absent" whether via
+         // the tombstone or via the entry's absence, and no ts < tombstone
+         // cts is live). Evict it: flag under commit_mu, unlink the tree
+         // slot, retire the entry through the epoch reclaimer. Budgeted per
+         // pass; the eligibility re-check happens inside purge_dead_key.
+         if (purges_done < GC_PURGES_PER_PASS) {
+             Version* h = ent->head.load(std::memory_order_acquire);
+             if (h && h->deleted) {
+                 uint64_t hc = h->commit_ts.load(std::memory_order_acquire);
+                 if (hc != 0 && hc <= m && purge_dead_key(ent_key, ent, m))
+                     ++purges_done;
+             }
          }
 
          ++keys_done;
@@ -6288,8 +6491,16 @@ public:
             i_gc_last_keys.load(std::memory_order_relaxed),
             i_gc_last_steps.load(std::memory_order_relaxed),
             i_gc_last_pass_ns.load(std::memory_order_relaxed),
-            i_gc_max_pass_ns.load(std::memory_order_relaxed)};
+            i_gc_max_pass_ns.load(std::memory_order_relaxed),
+            i_entries_retired.load(std::memory_order_relaxed),
+            i_entries_reclaimed.load(std::memory_order_relaxed)};
     }
+    // v29 M3 slice 3 (roadmap: pool utilization + high-water in stats).
+    // Declared in-class, defined out-of-line after PagePool (pImpl).
+    PoolStats pool_stats() const;
+    // v29 M3 slice 3: health() utilization block, out-of-line for the same
+    // pImpl reason. Mutates h (level via max, reasons append).
+    void pool_health(HealthInfo& h) const;
     uint64_t published_watermark() const { return pub_.published(); }
     // v25.1 M1.6: debug counter for fence re-check retries (defined out-of-line after BTree).
     uint64_t fence_recheck_retries() const;
@@ -6369,6 +6580,13 @@ public:
  uint64_t retired_pending() const {
      return retired_pending_.load(std::memory_order_relaxed);
  }
+ // v29 M3 slice 3 (checkpoint integration): cumulative delta-checkpoint
+ // entries synthesized from purged_since_ckpt_ records — tombstones for
+ // physically purged keys, so the chain covers the deletion even though the
+ // index slot is gone (see the coverage validation in checkpoint_locked).
+ uint64_t synthesized_tombstones() const {
+     return i_synthesized_tombstones.load(std::memory_order_relaxed);
+ }
     uint64_t pub_allocated() const {
         uint64_t no_wal = i_pub_allocated_no_wal.load(std::memory_order_relaxed);
         uint64_t wal_max = wal_ ? wal_->wal_stats().pub_allocated_max : 0;
@@ -6398,6 +6616,15 @@ public:
             h.reasons.push_back("index fail-stop mode active (tree mutation failed during commit; reopen to recover)");
             return h;
         }
+        // v29 M3 slice 3 (roadmap): page-pool utilization thresholds —
+        // degraded at 80%, failing at 95%. Early warning ahead of the BT-1
+        // PageCapacityError / CKV-003b D4 territory: those fire only at
+        // exhaustion (pages_available() == 0 mid-mutation), by which point
+        // the index has already fail-stopped. Utilization is live/capacity;
+        // with M3 purge live tracks the LIVE key set, so a climbing ratio
+        // now means genuine footprint growth, not lifetime-key accumulation.
+        // Out-of-line helper: PagePool is incomplete inside the class.
+        pool_health(h);
         auto w = wal_stats();
         if (w.write_fails > 0) {
             h.level = std::max(h.level, 1);
@@ -6938,6 +7165,23 @@ public:
         // and every acknowledged write was lost on reopen.
         if (index_failed_.load(std::memory_order_acquire)) return TxnResult::DatabaseFailed;
 
+        // v29 M3 slice 3: blind-writer reclamation pin. Physical purge can
+        // now retire a KeyEntry concurrently with a commit; the commit path
+        // holds raw KeyEntry* from ensure_index across the ensure→lock
+        // window, and unlike readers it never took a slot. Without a pin the
+        // epoch reclaimer could destroy the entry inside that window — the
+        // purged-flag read itself would be use-after-free. The pin makes
+        // blind writers first-class citizens of the SAME epoch algebra that
+        // protects readers/checkpoints/cursors: an entry retired while this
+        // commit is in flight cannot be destroyed until it finishes. Cost:
+        // one reader_mu_ round-trip per commit. The pin's snapshot is the
+        // current published watermark, so it never lowers the GC threshold
+        // below what an idle engine would compute (it can only hold it at
+        // this instant's published, and only for the commit's duration).
+        // RWT commits nest a second slot on the transaction's own — legal
+        // (slots are per-acquisition, not per-thread).
+        SnapshotGuard commit_pin(*this);
+
         std::vector<std::tuple<KeyEntry*, std::string, std::string, bool>> witems;
         std::set<std::string> new_keys;
         // v20.1 BLOCKER #6: reject duplicate keys in the raw write set. Without
@@ -6958,32 +7202,8 @@ public:
         // copy of the caller's range reads + these), validated through the
         // phantom tracker instead of materializing an index entry per
         // negative lookup (which leaked pool pages without bound).
-        std::vector<RangeRead> range_reads(range_reads_in);
-        try {
-            for (auto& [k, v, d] : ws) {
-                auto [e, is_new] = ensure_index(k);
-                witems.emplace_back(e, k, v, d);
-            }
-
-            // v25.1 M1.6: lock ordering by KeyEntry* address (deterministic, avoids
-            // deadlock). Replaces the old int-index ordering (all_idx sorted ints).
-            // KeyEntry* is stable (heap-allocated, engine-owned, deferred reclamation).
-            for (auto& [e, k, v, d] : witems) all_entries.insert(e);
-            for (auto& k : rs) {
-                // Non-creating lookup (write-set keys were ensured above).
-                if (KeyEntry* e = find_index(k)) {
-                    all_entries.insert(e);
-                } else {
-                    // Absent at commit time: any write of k committed after
-                    // read_ts is recorded by the phantom tracker (TXN-1 fix
-                    // records every write), so [k,k] catches a later insert.
-                    range_reads.push_back(RangeRead{k, k, read_ts, 0});
-                }
-            }
-        } catch (...) {
-            index_failed_.store(true, std::memory_order_release);
-            throw;
-        }
+        std::vector<RangeRead> range_reads;
+        std::vector<std::unique_lock<std::mutex>> commit_locks;
 
         // v25.1 M1.6: the stress_point("after_ensure_index") guard is now MOOT.
         // It existed to catch entries_ vector reallocation hazards (v15 era).
@@ -6993,14 +7213,68 @@ public:
         // the Phase 1 test verifies single-key correctness without the old guard.
         stress_point("after_ensure_index");  // M1.6: moot, kept for test continuity
 
-        // v25.1 M1.6: no separate "fetch stable pointers under nm_" step needed.
-        // ensure_index returns KeyEntry* which IS the stable pointer (the old
-        // emap step existed because entries_[i].get() could become dangling if
-        // the vector reallocated; KeyEntry* has no such hazard).
+        // v29 M3 slice 3: ensure→lock retry loop. Between ensure_index
+        // handing out a KeyEntry* and this commit acquiring its commit_mu,
+        // a concurrent GC pass may physically purge the key (tombstone head
+        // at/below threshold): flag under commit_mu, unlink the tree slot,
+        // retire to the epoch reclaimer. The commit_pin's epoch pin keeps
+        // the entry's MEMORY valid across the window, so the flag read is
+        // safe; a flagged entry means the pointer is on its way out and
+        // must not be linked onto. Retry redoes ensure_index from scratch:
+        // the key either gets a FRESH entry (resurrection = new lifecycle —
+        // correct MVCC: the new version's chain starts above the tombstone
+        // that is being evicted) or the purge completes its unlink first
+        // and the slow path creates the entry under nm_. Bounded: the
+        // purger never waits on anything this thread holds (the flag-set
+        // needs only commit_mu — released before retry; the unlink needs
+        // nm_ — not held here), so the loop exits within one unlink.
+        for (;;) {
+            witems.clear();
+            all_entries.clear();
+            range_reads = range_reads_in;   // per-attempt reset (point-range reads must not accumulate)
+            try {
+                for (auto& [k, v, d] : ws) {
+                    auto [e, is_new] = ensure_index(k);
+                    witems.emplace_back(e, k, v, d);
+                }
 
-        std::vector<std::unique_lock<std::mutex>> commit_locks;
-     commit_locks.reserve(all_entries.size());
-     for (auto* e : all_entries) commit_locks.emplace_back(e->commit_mu);
+                // v25.1 M1.6: lock ordering by KeyEntry* address (deterministic, avoids
+                // deadlock). Replaces the old int-index ordering (all_idx sorted ints).
+                // KeyEntry* is stable (heap-allocated, engine-owned, deferred reclamation).
+                for (auto& [e, k, v, d] : witems) all_entries.insert(e);
+                for (auto& k : rs) {
+                    // Non-creating lookup (write-set keys were ensured above).
+                    if (KeyEntry* e = find_index(k)) {
+                        all_entries.insert(e);
+                    } else {
+                        // Absent at commit time: any write of k committed after
+                        // read_ts is recorded by the phantom tracker (TXN-1 fix
+                        // records every write), so [k,k] catches a later insert.
+                        range_reads.push_back(RangeRead{k, k, read_ts, 0});
+                    }
+                }
+            } catch (...) {
+                index_failed_.store(true, std::memory_order_release);
+                throw;
+            }
+
+            commit_locks.clear();
+            commit_locks.reserve(all_entries.size());
+            for (auto* e : all_entries) commit_locks.emplace_back(e->commit_mu);
+
+            // Flag check UNDER the held commit_mu locks: purge_dead_key sets
+            // the flag under the same mutex, so a commit that passes this
+            // check can never race a flag-set — and once the flag is set, no
+            // commit links onto the entry. Mutual exclusion linearizes
+            // flag-set against validate/link on both sides.
+            bool any_purged = false;
+            for (auto* e : all_entries) {
+                if (e->purged.load(std::memory_order_acquire)) { any_purged = true; break; }
+            }
+            if (!any_purged) break;
+            commit_locks.clear();
+            std::this_thread::yield();
+        }
 
         for (auto* e : all_entries) {
             if (e->last_write_ts.load(std::memory_order_relaxed) > read_ts) {
@@ -7327,12 +7601,53 @@ public:
              // complete copy of the key, and the loss became permanent and
              // invisible. Refuse loudly BEFORE any file write or rotation,
              // and latch invariant D4 (the index can no longer be trusted).
+             //
+             // v29 M3 slice 3 (checkpoint integration): a dirty key absent
+             // from the index now has TWO possible causes.
+             //   (a) The M3 purge physically evicted a fully-dead key
+             //       (tombstone head at/below a GC pass threshold). That is
+             //       not divergence — it is the purge working as designed —
+             //       but the delta STILL must cover the deletion: the base
+             //       may hold the pre-delete value, and this checkpoint's
+             //       WAL rotation truncates the delete record, so a chain
+             //       without the tombstone resurrects the key on recovery.
+             //       purged_since_ckpt_ (recorded under dirty_mu_ BEFORE
+             //       the unlink; gc passes and checkpoints are serialized
+             //       by gc_active_mu_) names exactly these keys and carries
+             //       the tombstone cts, so the entry is SYNTHESIZED here in
+             //       the same (key, vts, "", deleted) shape the index
+             //       capture produces for a tombstone head. The record's
+             //       ts equals dirty_since_ckpt_[key] (the delete was the
+             //       key's last commit — any later commit either
+             //       resurrected the head or fails the hc <= m
+             //       re-validation), so the tail clear retires both maps
+             //       under the same cts filter.
+             //   (b) Genuine divergence: no purge record -> latch D4 and
+             //       refuse, unchanged (the CKV-003c fail-first test drops
+             //       a never-purged key via ckpt_dirty_capture_hook_ and
+             //       must still trip this path).
              {
                  std::set<std::string> captured;
                  for (const auto& [ck, hc, cv, cd] : snap) captured.insert(ck);
                  std::vector<std::string> missing;
-                 for (const auto& dk : dirty_keys_to_capture)
-                     if (captured.find(dk) == captured.end()) missing.push_back(dk);
+                 {
+                     std::lock_guard<std::mutex> dlk(dirty_mu_);
+                     for (const auto& dk : dirty_keys_to_capture) {
+                         if (captured.find(dk) != captured.end()) continue;
+                         auto pit = purged_since_ckpt_.find(dk);
+                         // Defensive `<= cts`: a record above the snapshot
+                         // would mean the purge ran AFTER this snapshot was
+                         // taken — impossible under gc_active_mu_, and if it
+                         // ever happened, failing safe (divergence) is right.
+                         if (pit != purged_since_ckpt_.end() && pit->second <= cts) {
+                             snap.push_back({dk, pit->second, std::string(), true});
+                             captured.insert(dk);
+                             i_synthesized_tombstones.fetch_add(1, std::memory_order_relaxed);
+                             continue;
+                         }
+                         missing.push_back(dk);
+                     }
+                 }
                  if (!missing.empty()) {
                      index_failed_.store(true, std::memory_order_release);
                      throw std::runtime_error(
@@ -7453,6 +7768,16 @@ public:
          // Entries with cts > checkpoint cts remain dirty for the next round.
          for (auto it = dirty_since_ckpt_.begin(); it != dirty_since_ckpt_.end(); ) {
              if (it->second <= cts) it = dirty_since_ckpt_.erase(it);
+             else ++it;
+         }
+         // v29 M3 slice 3 (checkpoint integration): the purge records clear
+         // under the SAME filter — the chain written above now covers those
+         // deletions (synthesized tombstones in the delta path; the base /
+         // full-scan path legitimately omits dead keys outright). Any throw
+         // before this point leaves BOTH maps intact, so the next checkpoint
+         // re-captures and re-synthesizes the same keys (idempotent).
+         for (auto it = purged_since_ckpt_.begin(); it != purged_since_ckpt_.end(); ) {
+             if (it->second <= cts) it = purged_since_ckpt_.erase(it);
              else ++it;
          }
      }
@@ -9540,6 +9865,8 @@ struct GcStats {
              reclaim_epoch = 0, oldest_active_pin_epoch = 0, passes = 0,
              last_keys = 0, last_steps = 0, last_pass_ns = 0,
              max_pass_ns = 0;
+    // v29 M3 slice 3: physical key purge accounting (see GcInstanceStats).
+    uint64_t entries_retired = 0, entries_reclaimed = 0;
 };
 struct EpochStats {
     uint64_t entries = 0, oldest = 0, newest = 0;
@@ -10033,7 +10360,11 @@ public:
         return GcStats{g.created, g.retired, g.reclaimed, g.retired_pending,
                        g.reclaim_epoch, g.oldest_active_pin_epoch, g.passes,
                        g.last_keys, g.last_steps, g.last_pass_ns,
-                       g.max_pass_ns};
+                       g.max_pass_ns, g.entries_retired, g.entries_reclaimed};
+    }
+    // v29 M3 slice 3 (roadmap: pool utilization + high-water in stats).
+    PoolStats pool_stats() const {
+        return api_engine()->pool_stats();
     }
     EpochStats epoch_stats() const {
         auto eng = api_engine();
@@ -10116,6 +10447,13 @@ public:
             std::function<void(std::vector<std::tuple<std::string, uint64_t, std::string, bool>>&)> fn) {
         auto eng = api_engine();
         eng->ckpt_dirty_capture_hook_ = std::move(fn);
+    }
+    // v29 M3 slice 3 (checkpoint integration): delta entries synthesized
+    // for physically purged keys (see ChronoKV::purged_since_ckpt_). The
+    // C5 purge battery pins the exact count; the recovery leg proves the
+    // synthesized tombstone actually covers the delete.
+    uint64_t synthesized_tombstones_for_test() const {
+        return api_engine()->synthesized_tombstones();
     }
 #endif
     // v26 M0 (invariant D2): active-segment byte accounting, so a test can
@@ -11022,6 +11360,12 @@ public:
         // every reuse, so a pre-free fence could alias — the exact ABA the
         // generation tag exists to kill.
         std::memset(get(id)->bytes, 0, PAGE_SIZE);
+        // v29 M3 slice 3: high-water tracking (pool_stats/health + the M3
+        // acceptance battery's "stabilizes instead of ratcheting" oracle).
+        // Updated under mu_ on every alloc — the only transition that can
+        // raise the live count (free lowers it and never raises the peak).
+        const size_t live_now = (bump_ / PAGE_SIZE) - free_list_.size();
+        if (live_now > peak_live_) peak_live_ = live_now;
         return id;
     }
 
@@ -11081,6 +11425,11 @@ public:
     size_t live_count() const {
         std::lock_guard<std::mutex> lk(mu_);
         return (bump_ / PAGE_SIZE) - free_list_.size();
+    }
+    // v29 M3 slice 3: high-water of live_count() since open.
+    size_t peak_live_count() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return peak_live_;
     }
 
     // v29 M3 slice 1 (invariants G1/G2): the slot's current generation —
@@ -11163,6 +11512,10 @@ private:
     // free_list_ matches the constructor init list (-Wreorder is in the
     // -Werror lint set).
     std::vector<std::atomic<uint32_t>> slot_gen_;
+    // v29 M3 slice 3: high-water mark of live pages (bump minus free-list),
+    // updated under mu_ in alloc(). Default-initialized (not in the ctor
+    // init list) — same pattern as mu_, so -Wreorder stays quiet.
+    size_t peak_live_ = 0;
     mutable std::mutex mu_;
 };
 
@@ -11309,6 +11662,18 @@ public:
 
     // Remove a latch entry (called when a page is freed). Safe to call
     // even if no latch exists for this id.
+    //
+    // v29 M3 slice 3 (decision doc checklist item 7): deliberately STILL
+    // UNCALLED — kept, not deleted. The table is keyed by PageId and
+    // entries are created on first latch use, so its size is bounded by
+    // the number of DISTINCT slots ever latched ≤ pool capacity
+    // (capacity/PAGE_SIZE entries worst case), NOT by cumulative
+    // frees/allocs: slot REUSE (M4's free() callers) recycles the same
+    // ids and therefore the same latch entries. Erasing on free would
+    // actually be WRONG under the immediate-return free list: a concurrent
+    // holder of the raw mutex pointer (get_or_create hands one out) could
+    // outlive the erase. Both horns of item 7 were bounded; this one is
+    // also race-free by doing nothing.
     void erase(PageId id) {
         std::lock_guard<std::mutex> lk(mu_);
         latches_.erase(id);
@@ -13647,6 +14012,111 @@ inline uint64_t ChronoKV::fence_recheck_retries() const {
 
 inline uint64_t ChronoKV::cursor_restarts() const {
     return tree_ ? tree_->cursor_restarts() : 0;
+}
+
+// v29 M3 slice 3: out-of-line (PagePool complete here). See declarations.
+inline PoolStats ChronoKV::pool_stats() const {
+    PoolStats ps;
+    if (!pool_) return ps;
+    ps.capacity_pages = pool_->capacity() / chronokv_page::PAGE_SIZE;
+    ps.live_pages = pool_->live_count();
+    ps.peak_live_pages = pool_->peak_live_count();
+    ps.free_pages = pool_->free_count();
+    ps.utilization = ps.capacity_pages
+        ? static_cast<double>(ps.live_pages) / static_cast<double>(ps.capacity_pages)
+        : 0.0;
+    return ps;
+}
+
+inline void ChronoKV::pool_health(HealthInfo& h) const {
+    if (!pool_) return;
+    const size_t cap_pages = pool_->capacity() / chronokv_page::PAGE_SIZE;
+    if (cap_pages == 0) return;
+    const size_t live = pool_->live_count();
+    const double util = static_cast<double>(live) / static_cast<double>(cap_pages);
+    if (util >= 0.95) {
+        h.level = std::max(h.level, 2);
+        h.reasons.push_back("page pool utilization >= 95% (" +
+                            std::to_string(live) + "/" +
+                            std::to_string(cap_pages) + " pages)");
+    } else if (util >= 0.80) {
+        h.level = std::max(h.level, 1);
+        h.reasons.push_back("page pool utilization >= 80% (" +
+                            std::to_string(live) + "/" +
+                            std::to_string(cap_pages) + " pages)");
+    }
+}
+
+// v29 M3 slice 3: physical purge of a fully-dead key (see declaration and
+// the GC SAFETY section of the memory-ordering audit for the full argument).
+// Sequence — order matters, each step is a control's mutant target:
+//   1. Under ent->commit_mu: RE-VALIDATE death (head is still a tombstone
+//      with 0 != commit_ts <= m — a concurrent commit may have resurrected
+//      the key between the sweep's collection and here) and set the purged
+//      flag. Once the flag is set under commit_mu, no commit can link a new
+//      version onto this entry: commit_txn checks the flag under the same
+//      mutex after locking and retries with a fresh ensure_index.
+//   2. Under dirty_mu_: RECORD the tombstone in purged_since_ckpt_ BEFORE
+//      the unlink — the checkpoint-integration half of slice 3. Delta
+//      checkpoints must cover every state change since the base; a purged
+//      key's delete record is truncated by the checkpoint's WAL rotation,
+//      so the coverage validation synthesizes the delta tombstone from this
+//      record instead of latching D4 (see checkpoint_locked). Record-
+//      before-unlink: any scan that misses the slot sees the record.
+//   3. Under nm_ (the ensure_index slow-path serializer): UNLINK the tree
+//      slot (BTree::erase → erase_recursive, leaf-exclusive latch; empty
+//      leaves stay linked until M4 merges them — freeing pages needs the
+//      interior-separator surgery that is M4's merge machinery). nm_ makes
+//      unlink atomic against new-entry creation for this key, so a
+//      resurrection either fully precedes the flag (re-validation catches
+//      it: head is no longer a tombstone) or fully follows the unlink
+//      (fresh entry, fresh lifecycle).
+//   4. Retire the entry through the epoch reclaimer (UNLINK-BEFORE-RETIRE,
+//      decision doc §7.3: the tree must never point at a retired entry —
+//      that reference is not epoch-pinned and would dangle after
+//      reclamation). Holders of the raw pointer (in-flight commits) are
+//      covered by commit_txn's SnapshotGuard pin + the flag; slot-pinned
+//      readers/checkpoints/cursors by the epoch gate itself.
+// m is the pass threshold: a valid eligibility bound for the whole pass
+// because new slots pin ts >= published >= m and published is monotone.
+// PITR caveat, resolved: purge is IN-MEMORY only — on-disk coverage
+// (checkpoints, WAL deltas) and the v26.1 window-refusal rules are
+// untouched; an as-of reconstruction below the tombstone replays the value
+// from base+deltas regardless of live-index state.
+inline bool ChronoKV::purge_dead_key(const std::string& key, KeyEntry* ent,
+                                     uint64_t m) {
+    uint64_t dead_ts = 0;
+    {
+        std::lock_guard<std::mutex> g(ent->commit_mu);
+        Version* h = ent->head.load(std::memory_order_acquire);
+        if (!h || !h->deleted) return false;                 // resurrected
+        uint64_t hc = h->commit_ts.load(std::memory_order_acquire);
+        if (hc == 0 || hc > m) return false;                 // not dead for all live snapshots
+        dead_ts = hc;
+        ent->purged.store(true, std::memory_order_release);
+    }
+    // v29 M3 slice 3 (checkpoint integration): record the evicted tombstone
+    // BEFORE the unlink, under dirty_mu_. A delta checkpoint whose dirty set
+    // still names this key finds the index slot gone; the record is what
+    // lets the coverage validation say "purged — synthesize the tombstone
+    // into the delta" instead of "divergence — latch D4 and refuse" (the
+    // v19 soak failure). Record-before-unlink means any tree scan that
+    // misses the key necessarily sees the record (both under mutexes, and
+    // gc passes and checkpoints are additionally serialized end-to-end by
+    // gc_active_mu_). dead_ts == dirty_since_ckpt_[key]: the delete was the
+    // key's last commit — a later commit either resurrected the head or
+    // fails the hc <= m re-validation above — so the checkpoint tail clear
+    // (same cts filter, same lock) retires both maps in lockstep.
+    {
+        std::lock_guard<std::mutex> dlk(dirty_mu_);
+        purged_since_ckpt_[key] = dead_ts;
+    }
+    {
+        std::unique_lock<std::shared_mutex> lk(nm_);
+        (void)tree_->erase(key);   // unlink-before-retire; false = already gone (defensive)
+    }
+    retire_entry(ent);
+    return true;
 }
 
 #ifdef CHRONOKV_TEST_HOOKS

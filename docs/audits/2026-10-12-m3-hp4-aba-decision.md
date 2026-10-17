@@ -255,6 +255,19 @@ choosing it would delete the milestone, not satisfy it.
    `slot_generation(PageId)` public accessor (acquire); free-list counters
    for `stats()`. `free()` itself is unchanged (immediate push) — and
    finally gets its engine callers.
+   **DONE (slice 1, 2026-10-17) except the last clause, MOVED TO M4
+   (slice 3, 2026-10-18, measured):** `free()`'s first engine caller has
+   to be empty-leaf unlinking, and unlinking a leaf requires the
+   interior-separator surgery that IS M4's merge machinery (a freed leaf
+   the interior still routes to is a dangling child id — worse than no
+   free at all). Slice 3's purge frees SLOTS inside leaves (reused by
+   later inserts — delete-then-reinsert high-water flat, in-suite
+   control C3) but leaves emptied frontier leaves linked: measured
+   ~2 pages/round creep under monotonic new-key churn (11→50 pages over
+   25 rounds, recorded in ROADMAP §M3 + README limitations, not faked).
+   The generation machinery stays exactly as decisioned — its consumers
+   (G2 sites) landed in slice 2 and are load-bearing the moment M4
+   starts freeing.
 2. `BTree::slot_generation(id)` forwarder (BTree owns the pool reference
    discipline; Cursor and descents go through the tree face).
 3. `LeafFence` gains `uint32_t gen`; captured in
@@ -278,14 +291,42 @@ choosing it would delete the milestone, not satisfy it.
    header's memory-ordering audit section as E-series siblings, per that
    section's own rule: "Do not change an order without re-running TSan and
    updating this audit").
+   **DONE (slice 3, 2026-10-18):** `RetiredEntry` queue riding the same
+   `min_active_pin_epoch` gate; unlink-before-retire (§7.3) enforced by
+   `purge_dead_key`'s sequence and made measurable (MUT-NO-UNLINK →
+   ASan heap-UAF in `ensure_index`; clean tree ASan-green). Audit
+   extended per the section's own rule (the `KeyEntry::purged` entry +
+   the GC SAFETY entry-retirement paragraph). One addition beyond the
+   checklist text, forced by the race audit: `commit_txn` takes a
+   `SnapshotGuard` pin — blind writers hold raw `KeyEntry*` across the
+   ensure→lock window and were NOT covered by any existing pin; with
+   entry retirement live, that window became a UAF. TSan legs re-run on
+   the slice-3 commit (the audit section's rule).
 7. `stats()` gains pool utilization + high-water; `health()` degrades at
    80%, fails at 95% (roadmap-fixed thresholds); `LatchTable::erase` stays
    uncalled and is documented as such (entries recycle with slots; the
    table is bounded by peak live pages — pool capacity — not by cumulative
    frees) or deleted; the choice is free, both are bounded.
+   **DONE (slice 3, 2026-10-18):** `PoolStats pool_stats()`
+   (capacity/live/peak-high-water/free/utilization; `peak_live_` tracked
+   under the pool mutex in `alloc()`), `GcStats.entries_retired/
+   entries_reclaimed`, `health()` ≥80% degraded / ≥95% failing (both
+   bands in-suite on a fill sized against BT-1's
+   `require_split_headroom` — a 20-page first cut tripped headroom at
+   94%, measured, so the control pool is 1024 pages). `LatchTable::erase`
+   STAYS UNCALLED, documented at the site (the bounded horn; erasing
+   under the immediate-return free list would race raw-mutex-pointer
+   holders — doing nothing is also the race-free choice).
 8. Memory-ordering audit section extension: the bump/before-memset/release
    and verify-after-latch/acquire pairing; the generation-wrap argument
    (§3) recorded beside CKV-008's epoch-wrap argument.
+   **DONE:** bump/before-memset/release + verify-after-latch/acquire
+   pairing and the wrap argument recorded in slice 1–2; slice 3 added
+   the `KeyEntry::purged` entry (mutex-supplied ordering + the pin
+   requirement for memory VALIDITY — an ordering-adjacent lifetime
+   argument, recorded beside it) and the GC SAFETY entry-retirement
+   paragraph (eligibility-threshold proof, commit pin, PITR-caveat
+   resolution).
 
 ## 7. Safety arguments M3 must carry (not assume)
 
@@ -390,6 +431,25 @@ legacy behavior exists):
   into the fence (chosen here) needs a second read at the exclusive
   acquire, or can reuse the fence's other fields' read (implementation
   detail; the invariant is G2's ordering).
+
+**Postscript (slice 3 landing, 2026-10-18) — one deferred interaction was
+NOT on this list and bit in practice: purge × checkpoint dirty coverage.**
+The v19 soak (first full-suite run with purge live) failed with
+`noncommitted=5653351 threw=0`, `checkpoints=1`/~60: a delta checkpoint
+whose dirty set still named a physically purged key tripped the v28
+CKV-003c coverage validation and latched invariant D4. The validation was
+right — the alternative (silent skip, pre-v28 behavior) loses the delete
+once the checkpoint's WAL rotation truncates its record, resurrecting the
+key from the base. Resolution: `purge_dead_key` records `(key → tombstone
+cts)` in `purged_since_ckpt_` under `dirty_mu_` before the unlink; the
+coverage validation synthesizes the delta entry `(key, cts, "", deleted)`
+from the record; the checkpoint tail clears both maps under one cts
+filter. Genuinely divergent absences (no record) still latch D4
+unchanged. Controls: `run_m3_purge_test` C5 (8 checks incl. a recovery
+leg that proves no resurrection across rotation) + the SYNTH-OFF mutant
+(rc 9, exactly C5 red). Lesson recorded per the item-3 methodology: the
+"deferred to implementation" list itself needs a fail-first net — the
+soak's upgraded oracle was that net here.
 
 ## 11. Provenance
 

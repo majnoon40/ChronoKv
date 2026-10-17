@@ -261,7 +261,7 @@ What 0.28.1 did *not* do, and v29 inherits:
 | v29 M1 — benchmark arena | **COMPLETE 2026-10-17** — steps 1–3 (workloads + YCSB A–F adapters + version pins with sha256/fetch recipe); step-4 vehicle: split (#68–#75 green) then RE-MERGED to one same-hardware job after #75's headers caught the two-runner CPU split (rule 9 over sunk nights); GREEN WEEK **7/7** (#82/#88/#91/#96/#97/#98/#99, 2026-10-11..17, all green on the re-merged vehicle; rows promoted in-tree — mid-week commits verified engine-binary-neutral, so the nights pool honestly); noise bands **CALIBRATED** from the seven nights (`bench/arena_bands.json` — ratio-normalized primary tier because calibration MEASURED four runner CPUs across the week: EPYC 9V45 ×3 / Xeon 8573C / EPYC 7763 ×2 / EPYC 9V74; raw bands hardware-conditional secondary; RSS tier carries the deletechurn ratchet-watch = P1's before-column, flat at ~201 MB) + **GATE ENABLED** per the recipe the ci.yml comment carried: `arena` in `ci-passed` needs (skip-tolerated on push/PR), completeness step (data ROWS, not file-exists) + `check` verdict (exit 1 REGRESSION / exit 2 geometry-mismatch), explicit re-run policy (once via dispatch; two consecutive REGRESSIONs = bisect) and band-update policy (dedicated commit citing the engine change; never widened in-flight); ledger-promotion rule **DECIDED** (cite ⇒ commit that night's TSVs under `bench/results/promoted/` — no bot, no nightly churn); arena-side build cache **REJECTED as measured low-value** (runs dominate the ~57–77 min; provenance-drift risk; revisit at the 120-min cap); actions v4→v5 bumps landed with the enablement (deferred past the week by 52fd43c); README §Performance shipped (acceptance's third leg); **GATE HARDENED same day** — FIVE defects (completeness step passed green on empty/comment-only/stderr TSVs; `check` ignored missing series; the in-sample self-consistency claim vacuous by construction; no synthetic-regression control; half-dead BASELINE legs shifted ratios silently (−15.9% measured) or faked REGRESSIONs — fixed by calibrated-workload-set comparison + strict-geomean BASELINE-GAP refusal), each fixed behind fail-first controls wired into `scripts/test_arena_gate.py` (19+2 = 21 checks) + the push/PR `arena-gate-selftest` job; LOO cross-validation recorded 6 held-out regressions on N2/N6 (ycsb_c/e series, cross-CPU spread) — bands and tolerance UNCHANGED, band-policy question recorded; bench/arena_bands.json untouched | `bench/`, `bench/arena_bands.json`, `bench/results/promoted/green-week-2026-10-11_17/`, `scripts/arena_bands.py`, `scripts/test_arena_gate.py`, ci.yml `arena` + `arena-gate-selftest` |
 | v29 CI hardening (adjacent, unplanned-in-9/27) | **SHIPPED + PROMOTED** — lint/ratchet/hygiene gates, build-shared; the 4 experimental sanitizer legs went green ×3 (#64/#65/#66) → flags deleted, all 12 legs gating | `5cd74b5`; promotion `0027fe0` |
 | v29 M2 — catcher hardening | **COMPLETE** — item 1 (write-skew checker, 2026-10-08, live pre-fix-flag/post-fix-pass proof) + item 5 (test-suite TU split, 2026-10-10: 1 GiB release/stress `-O1` bare, ASan `-O0` possible, 503/0 full suite; found+fixed the `dst::my_tid` non-inline thread_local, now stress-gated) + item 2 (DST grammar growth, 2026-10-11: S5 `tree_merge_cascade` (M4 grammar) + S6 `reclaim_retire_pin` (M3 grammar), green vs the merge-free tree, 600/600 children at PR scale, four-mutant fail-first matrix; nightly seeds/shard rebalanced 3,125→2,083 to hold N=100k and the wall-time band at six scenarios) + item 3 (de-vacuation, 2026-10-11: v17 GC-boundedness / v18 LSN-contiguity / m2_phase1 size-rotation / 30 s soak all upgraded to real oracles — accounting, differential readbacks, size-rotation admission exercised via a lowered segment cap, shadow-model differential over live AND recovered state; each proven old-GREEN/new-RED against its scratch-build reversion; the soak run additionally exposed and fixed its own empty-WAL-delta hole; release suite 513→514/0) + item 4 (crash-fuzz composition, 2026-10-11: window-sequence plan grammar + seven named templates incl. the Audit-2 surfaces and the Structural merge-window slot, kAll 26→28 with the `seg_*` WAL-2 window, fault matrix widened to all 12 kinds, composition ledger published+asserted; both reversion proofs red — orphan-tolerance revert 16 violations, DirFsyncFail-site removal 7 rc-22 witness violations — clean stream 0 violations) — all five items shipped | `check_write_skew`; `dstscn::s5/s6`; `crashfuzz` grammar; `tests/`, Makefile template |
-| v29 M3–M7 — the overhaul | **M3 STARTED 2026-10-17 — slices 1–2/3 landed** (slice 1: pool-side slot-generation mechanism, invariant G1 live in `alloc()`, six unit controls, no-bump mutant reddens 4/6, suite 526→532/0. Slice 2: the G2 verification sites — `LeafFence.gen` checked first in `fence_unchanged` (W2/W3), `Cursor::leaf_gen_` verified in `enter_leaf` with restart-from-last-emitted-key on mismatch (W1/W6), `cursor_restarts` diagnostic — and the HP machinery DELETED not wired (registry, Cursor HP, H1 review test — recorded at the deletion sites); content-invariant bump seam gives exact mutant isolation: MUT-FENCE reddens control A alone, MUT-CURSOR control B alone; release 532→533/0, DST 150/150. Slice 3 next: first `free()` callers + KeyEntry retirement + stats/health + acceptance battery). M4–M7 not started. M0 CLOSED 2026-10-08; constraint 3 SATISFIED 2026-10-11 (M2 COMPLETE); constraint 2 SATISFIED 2026-10-17 (M1 COMPLETE: green week 7/7, bands calibrated + committed, gate enabled + hardened ×2). HP4/ABA decision doc 2026-10-12: generation-tagged slots + immediate free-list return; heap nodes on the epoch reclaimer; HP machinery to be deleted, not wired | `docs/audits/2026-10-12-m3-hp4-aba-decision.md`; `PagePool::slot_generation` |
+| v29 M3–M7 — the overhaul | **M3 slices 1–3/3 LANDED 2026-10-18 — engine-side reclamation complete; page `free()` callers ride M4's leaf unlink (measured scope note in §M3)** (slice 1: pool-side slot-generation mechanism, invariant G1 live in `alloc()`, six unit controls, no-bump mutant reddens 4/6, suite 526→532/0. Slice 2: the G2 verification sites — `LeafFence.gen` checked first in `fence_unchanged` (W2/W3), `Cursor::leaf_gen_` verified in `enter_leaf` with restart-from-last-emitted-key on mismatch (W1/W6), `cursor_restarts` diagnostic — and the HP machinery DELETED not wired (registry, Cursor HP, H1 review test — recorded at the deletion sites); content-invariant bump seam gives exact mutant isolation: MUT-FENCE reddens control A alone, MUT-CURSOR control B alone; release 532→533/0, DST 150/150. Slice 3 (2026-10-18): the PURGE — dead keys (tombstone head ≤ pass threshold) are flagged under `commit_mu`, unlinked under `nm_` (unlink-before-retire), and retired through the epoch reclaimer (`RetiredEntry` queue, same pin algebra; `commit_txn` gained a blind-writer `SnapshotGuard` pin + flag retry loop); `pool_stats()` utilization/high-water, `health()` 80/95 thresholds, audit extended; checkpoint integration — purge records its tombstone in `purged_since_ckpt_` so the delta's dirty-coverage validation SYNTHESIZES the deleted entry instead of latching D4 (no resurrection after WAL rotation), found by the v19 soak's first slice-3 run; 29 controls (pin-protection, resurrection, delete-then-reinsert flatness with exact 9600/9600 + `created-reclaimed==400` oracles, both health bands, purge×checkpoint recovery), BEFORE/AFTER churn driver 6200-ratchet→flat-200, mutants PURGE-OFF rc9/6-FAIL, NO-RETIRE rc9/7-FAIL, NO-UNLINK ASan heap-UAF in `ensure_index`, SYNTH-OFF rc9/5-FAIL (clean ASan 29/29); release 533→562/0, DST 150/150. `PagePool::free()` engine callers + monotonic-shape page high-water move to M4 (empty leaves stay linked until merge machinery exists — measured 11→50 pages/25 rounds, recorded not faked).) M4–M7 not started. M0 CLOSED 2026-10-08; constraint 3 SATISFIED 2026-10-11 (M2 COMPLETE); constraint 2 SATISFIED 2026-10-17 (M1 COMPLETE: green week 7/7, bands calibrated + committed, gate enabled + hardened ×2). HP4/ABA decision doc 2026-10-12: generation-tagged slots + immediate free-list return; heap nodes on the epoch reclaimer; HP machinery to be deleted, not wired | `docs/audits/2026-10-12-m3-hp4-aba-decision.md`; `PagePool::slot_generation` |
 | v30 M0–M5 — the challenge, 1.0.0 | not started | — |
 
 ---
@@ -914,7 +914,7 @@ grammar proven by two reversion runs (16 and 7 violations) with the
 full clean stream at 0 violations, 28/28 points and 12/12 kinds; item 5
 as recorded above.
 
-## M3 — Page reclamation  **[L]**  *(M0 gate lifted 2026-10-08; HP4/ABA decision MADE 2026-10-12; implementation STARTED 2026-10-17 — slices 1–2/3 landed)*
+## M3 — Page reclamation  **[L]**  *(M0 gate lifted 2026-10-08; HP4/ABA decision MADE 2026-10-12; implementation STARTED 2026-10-17 — slices 1–3/3 landed 2026-10-18; page-level `free()` callers + monotonic-shape page acceptance move to M4 per the slice-3 scope note)*
 
 Carried unchanged from the 2026-09-27 plan (appendix §M3): wire
 `PagePool::free()`, give the hazard-pointer machinery its consumers,
@@ -1054,18 +1054,123 @@ before the next begins):**
   150/150 green** (S3/S4/S5 hammer the cursor paths under the baton);
   `make lint` green (ratchet 33=33 — the new header code adds zero
   conversion warnings), STRESS 4-TU syntax gate green.
-* **Slice 3/3 — NEXT (checklist items 6–8): the first `free()` callers.**
-  KeyEntry retirement through the existing epoch reclaimer (with the
-  §7.3 unlink-before-retire obligation), the purge-trigger shape (the
-  deferred design point, with the PITR-horizon eligibility caveat),
-  `stats()` pool utilization + high-water, `health()` 80/95 thresholds,
-  the memory-ordering audit extension — then the acceptance battery
-  (delete-then-reinsert high-water, ASan/TSan with reuse on, arena
-  delete-churn against the RSS ratchet-watch).
+* **Slice 3/3 — LANDED 2026-10-18 (checklist items 6–8): the purge —
+  the index stops growing with lifetime distinct keys.** Purge trigger
+  shape (the deferred design point): inside the existing `gc_once`
+  sweep, per-key, after the chain walk — a key whose HEAD is a tombstone
+  with `0 != commit_ts <= m` (the pass threshold) is dead for EVERY live
+  snapshot, because `m` is the minimum over live reader slots: every
+  live `ts >= tombstone cts` reads "absent" identically via the tombstone
+  or via the entry's absence, and no `ts < tombstone cts` is live. New
+  slots acquired mid-pass pin `ts >= published >= m` (monotone), so the
+  pass-start `m` is a valid bound for the whole pass. PITR-horizon
+  caveat RESOLVED (recorded at the site): purge is in-memory only —
+  on-disk coverage and the v26.1 refusal rules are untouched, and as-of
+  reconstruction below the tombstone replays from base+deltas regardless
+  of live-index state. `purge_dead_key` sequence (each step a mutant
+  target): (1) re-validate + set `KeyEntry::purged` UNDER `commit_mu` —
+  once flagged, no commit can link onto the entry (commit_txn checks the
+  flag under the same mutex); (2) UNLINK the tree slot under `nm_`
+  (`BTree::erase`, leaf-exclusive; empty leaves stay linked — see the
+  scope note below); (3) retire the entry through the epoch reclaimer
+  (new `RetiredEntry` queue riding the SAME `min_active_pin_epoch` gate;
+  unlink-before-retire per §7.3 — the tree's encoded pointer is not
+  epoch-pinned). `commit_txn` gained a `SnapshotGuard` pin for the whole
+  commit (blind writers hold raw `KeyEntry*` across the ensure→lock
+  window and never took a slot; the pin makes them first-class citizens
+  of the E-series algebra — the flag read itself would otherwise be
+  UAF-able) + an ensure→lock RETRY LOOP on the flag (resurrection =
+  fresh entry = new lifecycle; bounded — the purger never waits on
+  anything the committer holds; `nm_` serializes unlink vs slow-path
+  create, and the flag+re-validation under `commit_mu` serializes vs
+  link). Budget: `GC_PURGES_PER_PASS = 64` (bounded-pass culture).
+  Accounting parity: a purged entry's tombstone anchor is destroyed with
+  it and tallied into `reclaimed`, keeping `live == created - reclaimed`
+  EXACT (the oracles below depend on it). CHECKPOINT INTEGRATION (found
+  by the v19 soak, not predicted — FAIL-FIRST below): a purged key can
+  still be in `dirty_since_ckpt_`, and a delta capture of a dirty key
+  ABSENT from the index trips the v28 CKV-003c coverage validation —
+  correctly, because a delta that skipped the delete would RESURRECT the
+  key once this checkpoint's WAL rotation truncates the delete record
+  (the base holds the pre-delete value). `purge_dead_key` therefore
+  records `(key → tombstone cts)` in `purged_since_ckpt_` (under
+  `dirty_mu_`, BEFORE the unlink), the coverage validation SYNTHESIZES
+  the delta entry `(key, cts, "", deleted)` from it (genuine divergence
+  still latches D4 — CKV-003c's fail-first test still trips), and the
+  checkpoint tail clears records under the same cts filter as the dirty
+  map; `gc_active_mu_` serializes passes vs checkpoints end-to-end, so
+  record/consume/clear never interleave. Counter:
+  `synthesized_tombstones()`. Stats/health (item 7):
+  `PoolStats pool_stats()` (capacity/live/peak-high-water/free/
+  utilization; `PagePool::peak_live_` tracked under `mu_` in `alloc()`),
+  `GcStats.entries_retired/entries_reclaimed`, `health()` degrades at
+  ≥80% utilization and fails at ≥95% (roadmap-fixed thresholds; early
+  warning ahead of BT-1/CKV-003b exhaustion territory). Item 7's
+  `LatchTable::erase` choice: STAYS UNCALLED, documented at the site
+  (bounded by pool capacity, and erasing under the immediate-return free
+  list would race raw-mutex-pointer holders). Item 8: memory-ordering
+  audit extended (`KeyEntry::purged` entry + the GC SAFETY entry-
+  retirement paragraph with the full eligibility/pin/PITR argument).
+  CONTROLS (`run_m3_purge_test`, 29 checks, release-gated — no stress
+  points needed): C1 lifecycle (retire→reclaim→absent→exact accounting
+  →resurrection-not-re-purged), C2 pin protection (purge BLOCKED while
+  an older txn snapshot is live — pinned txn still reads its pre-
+  tombstone value; proceeds after release), C3 delete-then-reinsert
+  churn ×24 rounds on a fixed 400-key set: live pages FLAT (≤1.5×+8),
+  high-water FLAT, `created-reclaimed == 400` exact, 9600/9600 entries
+  retired+reclaimed, post-churn scan byte-exact, C4 pool_stats surface +
+  both health thresholds on a 1024-page pool filled with ~490B keys
+  (sized against `require_split_headroom` — measured lesson: the first
+  20-page cut tripped BT-1 at 94%, height ≥5 from fat interior nodes),
+  C5 purge×checkpoint (base captures a key LIVE → delete → purge →
+  delta checkpoint succeeds with EXACTLY ONE synthesized tombstone, no
+  D4 latch, commits still acknowledged, and the recovery leg proves the
+  deleted key stays deleted across WAL rotation — the on-disk delta is
+  byte-exactly the 37B synthesized tombstone).
+  FAIL-FIRST: BEFORE/AFTER churn driver (30 rounds, steady 400-key live
+  set, 8 passes/round): BEFORE (c3bdf29) live_versions ratchets
+  200→6200 (+200/round = churn rate); AFTER flat at 200 EXACTLY, wall
+  19.1s→0.9s. Mutants: PURGE-OFF → rc 9, 6 FAIL (C1×4, C2-after,
+  C3-entries; C4 green — isolation); NO-RETIRE → rc 9, 7 FAIL (adds the
+  accounting identity — the leak detector); NO-UNLINK under ASan →
+  heap-use-after-free in `ensure_index` (the §7.3 obligation, measured);
+  SYNTH-OFF (checkpoint integration only) → rc 9, 5 FAIL reddening
+  exactly C5 (C1–C4 green — isolation); clean tree ASan-green 29/29
+  rc 0. The commit-pin/flag window is
+  concurrency-only by construction — its teeth are the TSan legs + the
+  recorded argument, stated honestly, not faked with a vacuous control.
+  C5's fail-first was FOUND, not predicted: the first full-suite run of
+  the slice failed the v19 soak with `noncommitted=5653351 threw=0`,
+  `checkpoints=1` of ~60 (one delta checkpoint latched D4 on a purged
+  key; later commits fast-failed DatabaseFailed, the ckpt thread
+  swallowed the throws) — the upgraded soak's oracle earning its keep. A
+  deterministic 2s driver pins the same sequence pre-fix (`checkpoint
+  aborted: 1 dirty key(s) absent from the index ... first missing key:
+  dk`, next put status 6, health level 2, rc 9) and goes 8/8 rc 0
+  post-fix.
+  **SCOPE NOTE, measured not assumed**: under a MONOTONIC new-key
+  frontier, slice 3 flattens the HEAP side exactly but live PAGES still
+  creep (measured 11→50 pages/25 rounds): erase frees slots, but emptied
+  frontier leaves stay linked until leaf unlink+merge gives
+  `PagePool::free()` its engine callers — that interior-separator surgery
+  IS M4's merge machinery, so checklist item 1's "finally gets its
+  engine callers" moves to M4 with this rationale; the page-level
+  high-water acceptance for the monotonic shape joins M4's battery
+  (arena delete-churn RSS ratchet-watch too — first gated nightly).
+  Suite: release 533 → 562 PASS / 0 FAIL (+29; the soak green again —
+  checkpoints=54, zero noncommitted), DST 6×25 = 150/150,
+  lint green, ratchet 33=33.
 
-**Acceptance** (unchanged): delete-then-reinsert workload's high-water mark
-stabilizes instead of ratcheting; TSan-clean; no use-after-free under ASan
-with reuse enabled; arena delete-churn table shows bounded memory.
+**Acceptance** (updated with slice 3's measured scope note): the
+delete-then-reinsert workload's high-water stabilizes instead of
+ratcheting — PROVEN in-suite for the fixed-working-set shape (C3: pages,
+peak, entries, and version accounting all flat/exact) and on the heap
+side for the monotonic shape (BEFORE/AFTER driver: 6200-ratchet → flat
+200); the monotonic shape's PAGE-level high-water + the arena
+delete-churn RSS ratchet-watch ride M4's leaf unlink (slice-3 scope
+note). TSan-clean + no use-after-free under ASan with reuse on: the
+sanitizer legs now run with entry retirement + the commit pin live
+(clean ASan 29/29 measured locally; CI legs on the commit).
 
 ## M4 — Leaf merge and rebalance  **[XL]**  *(M0 gate lifted 2026-10-08)*
 

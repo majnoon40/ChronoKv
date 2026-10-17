@@ -7,6 +7,80 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **feat (v29 M3 slice 3/3, 2026-10-18): the PURGE — dead keys are
+  physically evicted, and the index stops growing with lifetime distinct
+  keys (README limitation #1, heap side closed).** A key whose head
+  version is a tombstone at or below the GC pass threshold is dead for
+  every live snapshot (threshold = min over live slots; every live
+  `ts >= tombstone cts` reads "absent" identically via tombstone or via
+  absence, no live `ts` sits below). `purge_dead_key`: re-validate +
+  flag `KeyEntry::purged` under `commit_mu` → unlink the tree slot under
+  `nm_` (`BTree::erase`; empty leaves stay linked until M4) → retire the
+  entry through the epoch reclaimer (new `RetiredEntry` queue, same
+  `min_active_pin_epoch` gate as versions; UNLINK-BEFORE-RETIRE per
+  decision doc §7.3). `commit_txn` gained (a) a `SnapshotGuard` pin for
+  the whole commit — blind writers hold raw `KeyEntry*` across the
+  ensure→lock window and the pin folds them into the E-series algebra —
+  and (b) an ensure→lock retry loop on the purged flag (resurrection =
+  fresh entry; bounded, mutex-linearized against the flag-set).
+  Budget `GC_PURGES_PER_PASS = 64`. Version-accounting parity: the
+  purged entry's tombstone anchor is tallied into `reclaimed`, keeping
+  `live == created - reclaimed` exact. CHECKPOINT INTEGRATION (found by
+  the v19 soak on this slice's first full-suite run — see EVIDENCE): a
+  purged key can still sit in `dirty_since_ckpt_`, and a delta capture
+  of a dirty key that is ABSENT from the index trips the v28 CKV-003c
+  coverage validation — correctly: a delta that does not cover the
+  delete would RESURRECT the key on recovery once the checkpoint's WAL
+  rotation truncates the delete record (base still holds the pre-delete
+  value; pre-v28 that was the silent-loss path). So `purge_dead_key`
+  records `(key → tombstone cts)` in `purged_since_ckpt_` (under
+  `dirty_mu_`, BEFORE the unlink), the coverage validation SYNTHESIZES
+  the delta entry `(key, cts, "", deleted)` from the record (genuine
+  divergence still latches D4 — the CKV-003c fail-first test still
+  trips), and the checkpoint tail clears records under the same cts
+  filter as the dirty map (any throw before the tail leaves both maps
+  intact; the next checkpoint re-synthesizes — idempotent). GC passes
+  and checkpoints both hold `gc_active_mu_` end-to-end, so
+  record/consume/clear never interleave; purge takes `commit_mu`,
+  `dirty_mu_`, `nm_` strictly sequentially (no new lock nesting). New
+  counter `synthesized_tombstones()` (+ `_for_test` forwarder). NEW API: `Database::pool_stats()`
+  (`PoolStats`: capacity/live/peak-high-water/free/utilization),
+  `GcStats.entries_retired/entries_reclaimed`, `health()` degrades at
+  ≥80% pool utilization / fails at ≥95% (roadmap-fixed; early warning
+  ahead of BT-1/D4 exhaustion). Memory-ordering audit extended
+  (`KeyEntry::purged` + the GC SAFETY entry-retirement paragraph incl.
+  the PITR-caveat resolution: purge is in-memory only; v26.1 coverage
+  rules untouched). `LatchTable::erase` stays uncalled, documented
+  (item 7's bounded horn; erasing under the immediate-return free list
+  would race raw-mutex-pointer holders). EVIDENCE: BEFORE/AFTER churn
+  driver (30 rounds, steady 400-key live set): live_versions
+  200→6200 ratchet becomes FLAT 200 (exact live set), wall 19.1s→0.9s;
+  `run_m3_purge_test` 29 controls in 5 blocks (lifecycle, pin-protection
+  with the pinned txn still reading its pre-tombstone value, 24-round
+  delete-then-reinsert flatness with exact 9600/9600-entry and
+  `created-reclaimed==400` oracles, both health bands on a
+  headroom-sized 1024-page fill, and the purge×checkpoint block: delta
+  checkpoint over a purged key succeeds with exactly one synthesized
+  tombstone, no D4 latch, and the recovery leg proves no resurrection
+  across WAL rotation); mutants: PURGE-OFF rc9 6-FAIL (C4 green —
+  isolation), NO-RETIRE rc9 7-FAIL (accounting identity = leak
+  detector), NO-UNLINK ASan heap-UAF in `ensure_index`, SYNTH-OFF rc9
+  5-FAIL reddening exactly the purge×checkpoint block (C1–C4 green);
+  clean ASan 29/29 rc0. The checkpoint-integration fail-first was
+  FOUND, not predicted: the first full-suite run failed the v19 soak
+  with `noncommitted=5653351 threw=0`, `checkpoints=1` of ~60 (one
+  delta checkpoint latched D4 on a purged key; every later commit
+  fast-failed DatabaseFailed and the ckpt thread swallowed the throws);
+  a deterministic 2s driver reproduces it pre-fix (`checkpoint aborted:
+  1 dirty key(s) absent from the index ... first missing key: dk`, next
+  put status 6, health level 2) and goes 8/8 post-fix — the on-disk
+  delta is exactly the 37-byte synthesized `dk` tombstone. SCOPE,
+  measured: monotonic-frontier churn flattens the
+  heap but live pages still creep (11→50/25 rounds — emptied leaves
+  stay linked); page-level `free()` callers + that acceptance shape ride
+  M4's leaf unlink/merge. Release suite 533→562/0 (soak green again:
+  checkpoints=54, zero noncommitted); DST 150/150; lint ratchet 33=33.
+
 - **feat (v29 M3 slice 2/3, 2026-10-17): the G2 verification sites are
   live — `fence_unchanged` checks the slot generation FIRST (identity
   before content, W2/W3 closed), `Cursor::enter_leaf` verifies
