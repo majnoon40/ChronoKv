@@ -5,7 +5,7 @@ measures (load-bearing constraint 2 — *measure before predict*). Everything
 here is a hooks-OFF consumer build: the public API only, exactly what an
 embedder compiles.
 
-## Status: M1 steps 1–3 COMPLETE — engine-side + YCSB A–F + baseline adapters (all six mixes) + version pins
+## Status: M1 COMPLETE (2026-10-17) — workloads + adapters + pins + the green week (7/7) + calibrated noise bands + the regression gate
 
 `arena.cpp` ships the engine-side micro suite: `fillseq` / `fillrandom`
 (the new-key `nm_`-path isolation workloads), `readrandom`, `overwrite`,
@@ -66,6 +66,78 @@ hollow engine); a SQLite SELECT left sitting on its result row keeps the
 connection's WAL read snapshot open, so the next `BEGIN IMMEDIATE` on the
 SAME connection returns SQLITE_BUSY immediately WITHOUT invoking the busy
 handler — reset-after-read is mandatory in mixed read/update workloads.
+
+## Noise bands and the regression gate (v29 M1 items 4–5, landed 2026-10-17)
+
+The green week completed **7/7** on the re-merged single-job vehicle
+(nightly runs #82/#88/#91/#96/#97/#98/#99, 2026-10-11..17, all green;
+every TSV row carries its own rule-9 methodology header). The seven
+nights' rows are promoted in-tree at
+`bench/results/promoted/green-week-2026-10-11_17/` — the permanent,
+citable evidence for the acceptance line "the nightly ledger shows one
+full green week".
+
+**The design fact calibration measured:** the nightly runner CPU differs
+night to night even on the single-job vehicle — four CPUs across the
+seven nights (EPYC 9V45 ×3, Xeon Platinum 8573C, EPYC 7763 ×2, EPYC
+9V74). Same-night cross-engine numbers are fair by construction (one
+job, one machine — the fairness protocol's whole product); cross-night
+RAW numbers are a hardware lottery (ratio spreads up to ~63% on
+readrandom). So:
+
+* **PRIMARY bands are ratio-normalized** — ChronoKV ops/s ÷ the geometric
+  mean of the same night's five baseline configs, per workload. The
+  ratio's cross-night spread IS the noise band; a drop below
+  `min × (1 − tolerance)` (tolerance 0.15) is an engine regression, not
+  a runner-lottery outcome.
+* **Raw bands are secondary**, grouped by (cpu, engine, workload) — with
+  ≤3 nights per CPU they are honestly stamped PROVISIONAL and are
+  reference material, not gate material.
+* **RSS bands cross nights directly** (hardware-independent enough); the
+  `deletechurn` RSS delta is P1's before-column and carries a
+  ratchet-watch (WARN above band max × 1.25) that M3's acceptance
+  ("stabilizes instead of ratcheting") tightens into a hard gate.
+
+`bench/arena_bands.json` is the committed calibration — 7 nights ⇒
+CALIBRATED (≥ `--min-nights 7`; anything less stamps PROVISIONAL:
+reportable, not gateable). Regenerate with:
+
+```sh
+python3 scripts/arena_bands.py band --nights <dir-per-night> [...] --out bench/arena_bands.json
+```
+
+**The gate** (ci.yml `arena` job, nightly/dispatch only): a ledger
+completeness step (all seven engines must produce data rows — a crashed
+leg writes stderr into its TSV, so "file exists" is not "rows exist"),
+then `scripts/arena_bands.py check` against the committed bands
+(exit 1 = REGRESSION, exit 2 = geometry mismatch — mixed geometries
+refuse to band). `arena` sits in `ci-passed`'s needs, skip-tolerated on
+push/PR where it does not run: a flaky shared runner never blocks a PR,
+and the gate has teeth on the nightly.
+
+**Policies (explicit, per M1 item 4):**
+* **Re-run:** a red gate re-runs ONCE via `workflow_dispatch` on the same
+  commit (ratio bands normalize the CPU lottery, not transient
+  contention); TWO consecutive REGRESSION verdicts are a real
+  regression — bisect, do not re-run.
+* **Band updates:** recomputed only in a dedicated commit citing the
+  engine change that moved them (M5's writer thread is the planned one;
+  recompute from ≥7 post-change nights), never widened in-flight to
+  silence a red night — the ratchet rule applies to bands.
+* **Ledger promotion (item 5's decision):** raw nightly rows live as run
+  artifacts (90-day retention); whenever a milestone CITES ledger rows,
+  that night's TSVs are committed under `bench/results/promoted/` in the
+  citing commit — citations stay verifiable forever, no bot and no
+  nightly commit churn.
+* **Arena-side build caching: REJECTED as measured low-value** — the
+  nightly's ~57–77 min is dominated by the measured runs themselves;
+  apt install + baseline build is a few minutes of that, and caching
+  built baseline binaries across nights risks binary↔recorded-version
+  provenance drift (the fairness protocol's core asset). Revisit only if
+  nightly wall-time approaches the 120-min cap. The test-suite-side
+  caching question was already answered by `build-shared` (one build,
+  artifact reuse across the consuming jobs; ccache rejection recorded in
+  ci.yml).
 
 ## Usage
 

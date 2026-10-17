@@ -93,7 +93,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Warnings as errors (g++; header + test suite; hooks on/off)
         run: make lint-werror
@@ -217,7 +217,7 @@ jobs:
             cxx: clang++-18
             install: clang-18
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install compiler
         # `matrix.install` is null for entries that don't define it; a truthy
@@ -242,7 +242,7 @@ jobs:
 
       - name: Upload test log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: test-log-engine-${{ strategy.job-index }}-${{ matrix.target }}
           path: test.log
@@ -272,7 +272,7 @@ jobs:
             cxx: clang++-18
             install: clang-18
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install compiler
         if: ${{ matrix.install }}
@@ -290,7 +290,7 @@ jobs:
 
       - name: Upload test log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: test-log-tsan-${{ strategy.job-index }}
           path: test.log
@@ -318,7 +318,7 @@ jobs:
             target: smoke_off_stress
             bin: build/smoke_off/stress/test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build
         run: make -j4 ${{ matrix.target }}
@@ -330,7 +330,7 @@ jobs:
 
       - name: Upload test log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: test-log-smoke-${{ matrix.name }}
           path: test.log
@@ -356,13 +356,13 @@ jobs:
       matrix:
         target: [stress, release]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build
         run: make -j4 ${{ matrix.target }}
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: bin-${{ matrix.target }}
           path: build/${{ matrix.target }}/test
@@ -387,10 +387,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'pull_request') && '30' || '150') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download shared release binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: bin-release
           path: build/release
@@ -414,7 +414,7 @@ jobs:
 
       - name: Upload crash-fuzz artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: crashfuzz-run-${{ github.run_id }}
           path: |
@@ -469,10 +469,10 @@ jobs:
       matrix:
         shard: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'pull_request') && '[0]' || '[0,1,2,3,4,5,6,7]') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download shared stress binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: bin-stress
           path: build/stress
@@ -480,7 +480,7 @@ jobs:
       # shard 0 also runs the lincheck leg, which uses the release binary.
       - name: Download shared release binary (shard 0)
         if: matrix.shard == 0
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: bin-release
           path: build/release
@@ -532,7 +532,7 @@ jobs:
 
       - name: Upload dst logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: dst-run-${{ github.run_id }}-shard-${{ matrix.shard }}
           path: |
@@ -579,7 +579,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'pull_request') && '60' || '240') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build (gcov-instrumented)
         run: make -j4 coverage
@@ -650,7 +650,7 @@ jobs:
 
       - name: Upload coverage artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: coverage-${{ github.run_id }}
           path: |
@@ -659,7 +659,7 @@ jobs:
             cov/*/run.log
           if-no-files-found: ignore
 
-  # ---- v29 M1 step 4: nightly arena ledger vehicle (informational) ---------
+  # ---- v29 M1 step 4: nightly arena ledger vehicle + regression gate ------
   # Runs the arena (ChronoKV, both durability classes) and the five baseline
   # configs over a FIXED geometry on a fixed-spec runner, and uploads the
   # TSVs (each carries its rule-9 methodology header: hardware, engine
@@ -692,18 +692,35 @@ jobs:
   #            same-hardware ledger material, so they do not count toward
   #            the "one green week" acceptance. Rule 9 over sunk nights.
   #
-  # INFORMATIONAL BY DESIGN until the noise protocol is calibrated: the M1
-  # acceptance is "the nightly ledger shows one full green week" BEFORE
-  # deltas-beyond-noise start failing the job, so this job is NOT in
-  # ci-passed's needs — a flaky shared runner must never block a PR, and
-  # the gate must never learn to be ignored (the lesson the DST resharding
-  # history already paid for). Enabling the regression gate = adding
-  # `arena` to ci-passed needs + committing the calibrated noise bands,
-  # after the green week. Gate enablement and ledger promotion (committed
-  # bench/results/ needs contents:write or a bot commit) remain deferred
-  # with calibration.
+  # GATE ENABLED 2026-10-17, exactly per the recipe this comment used to
+  # carry ("adding `arena` to ci-passed needs + committing the calibrated
+  # noise bands, after the green week"): the green week completed 7/7
+  # (#82/#88/#91/#96/#97/#98/#99, 2026-10-11..17, all success on the
+  # re-merged single-job vehicle; rows promoted in-tree under
+  # bench/results/promoted/green-week-2026-10-11_17/), the bands were
+  # calibrated from those seven nights (bench/arena_bands.json —
+  # CALIBRATED, not PROVISIONAL; ratio-normalized primary tier because
+  # calibration MEASURED four different runner CPUs across the seven
+  # nights: EPYC 9V45 x3 / Xeon 8573C / EPYC 7763 x2 / EPYC 9V74), and
+  # `arena` is now in ci-passed's needs (skip-tolerated on push/PR, where
+  # this job does not run by design — a flaky shared runner still never
+  # blocks a PR; the gate has teeth on the nightly, where "the gate must
+  # never learn to be ignored" is the whole point).
+  # RE-RUN POLICY (explicit, M1 item 4): a red gate re-runs ONCE via
+  # workflow_dispatch on the same commit — ratio bands normalize the CPU
+  # lottery but not transient contention; TWO consecutive REGRESSION
+  # verdicts are a real regression: bisect, do not re-run.
+  # BAND-UPDATE POLICY: bands are recomputed only in a dedicated commit
+  # citing the engine change that moved them (M5's writer thread is the
+  # planned one; recompute from >= 7 post-change nights), never widened
+  # in-flight to silence a red night — the ratchet rule applies to bands.
+  # LEDGER PROMOTION RULE (M1 item 5 decision): raw nightly rows live as
+  # run artifacts (90-day retention); whenever a milestone CITES ledger
+  # rows, that night's TSVs are committed under bench/results/promoted/
+  # in the citing commit — citations stay verifiable forever without a
+  # bot or nightly commit churn.
   arena:
-    name: arena (nightly ledger, informational)
+    name: arena (nightly ledger + regression gate)
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -717,7 +734,7 @@ jobs:
       ARENA_SEED: "42"
       ARENA_VALSIZE: "100"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install baseline libraries (pinned per bench/third_party/versions.txt; distro installs during calibration, recipes recorded for vendoring)
         run: |
@@ -736,7 +753,7 @@ jobs:
               --seed "$ARENA_SEED" --valsize "$ARENA_VALSIZE" --durability "$dur" \
               --dir /tmp/ckv_ledger_"$dur" \
               > "bench/results/chronokv-$dur.tsv" 2>&1 || \
-              echo "::warning::arena run chronokv-$dur exited nonzero (informational job)"
+              echo "::warning::arena run chronokv-$dur exited nonzero (the completeness gate below catches missing rows)"
           done
 
       - name: Run baselines (five configs, identical geometry, SAME machine)
@@ -748,7 +765,7 @@ jobs:
               --seed "$ARENA_SEED" --valsize "$ARENA_VALSIZE" \
               --dir /tmp/ckv_ledger_base \
               > "bench/results/$eng.tsv" 2>&1 || \
-              echo "::warning::baseline run $eng exited nonzero (informational job)"
+              echo "::warning::baseline run $eng exited nonzero (the completeness gate below catches missing rows)"
           done
 
       - name: Ledger digest (throughput-only summary in the job log)
@@ -761,16 +778,43 @@ jobs:
 
       - name: Upload ledger artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: arena-ledger-${{ github.run_id }}
           path: bench/results/
           if-no-files-found: warn
 
+      # ---- v29 M1 gate enablement (2026-10-17): the two enforcement steps.
+      # Completeness first: the run steps above swallow engine failures into
+      # ::warning:: so the digest and artifact still ship for triage — this
+      # step is what turns a dead leg into a red job (a crashed arena writes
+      # its stderr INTO the tsv, so "file exists" is not "rows exist").
+      - name: Ledger completeness (all seven engines produced data rows)
+        if: always()
+        run: |
+          for f in chronokv-group chronokv-async sqlite-full sqlite-normal lmdb rocksdb-sync rocksdb-tuned; do
+            n=$(grep -cvE '^#|^[[:space:]]*$' "bench/results/$f.tsv" 2>/dev/null || echo 0)
+            if [ "$n" -lt 1 ]; then
+              echo "::error::bench/results/$f.tsv has no data rows (engine leg died - see warnings above)"
+              exit 1
+            fi
+          done
+
+      # The regression verdict: ratio bands (hardware-normalized) + the RSS
+      # ratchet-watch (deletechurn = P1's before-column; M3's acceptance
+      # tightens WARN to FAIL). Exit 1 = REGRESSION (see the re-run policy
+      # in this job's header comment); exit 2 = geometry mismatch — the
+      # vehicle drifted from the committed bands and MUST NOT be mixed.
+      - name: Regression gate vs calibrated bands (bench/arena_bands.json, 7 green-week nights)
+        if: always()
+        run: |
+          python3 scripts/arena_bands.py check \
+            --bands bench/arena_bands.json --night bench/results
+
   # ---- gate: single aggregate check for branch protection ----------------
   ci-passed:
     name: ci-passed
-    needs: [lint, build-shared, engine-tests, tsan, public-api-smoke, dst, crashfuzz, coverage]
+    needs: [lint, build-shared, engine-tests, tsan, public-api-smoke, dst, crashfuzz, coverage, arena]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     if: always()
@@ -781,7 +825,13 @@ jobs:
           echo "$results" | python3 -c '
           import json, sys
           needs = json.load(sys.stdin)
-          failed = [name for name, j in needs.items() if j["result"] != "success"]
+          # arena runs on schedule/dispatch only; on push/PR it is skipped
+          # BY DESIGN and a skip must not fail the aggregate (a flaky
+          # shared runner never blocks a PR). Every other job stays strict:
+          # only arena gets the skip tolerance.
+          failed = [name for name, j in needs.items()
+                    if j["result"] != "success"
+                    and not (name == "arena" and j["result"] == "skipped")]
           if failed:
               print("FAILED jobs: " + ", ".join(failed))
               sys.exit(1)

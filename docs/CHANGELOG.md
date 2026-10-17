@@ -7,6 +7,83 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **bench+ci+docs (v29 M1 COMPLETE, 2026-10-17): the green week closed
+  7/7, the noise bands are calibrated and committed, the arena
+  regression gate is ENABLED, and the README performance section
+  shipped — constraint 2 is satisfied and the rewrite sequence (M3
+  first) is unblocked.** The week on the re-merged single-job vehicle:
+  #82/#88/#91/#96/#97/#98/#99 (2026-10-11..17), all green; the mid-week
+  commits (52fd43c…6bcb212) were verified engine-binary-neutral before
+  pooling (52fd43c's engine diff is pure deletion under the
+  never-defined `CHRONOKV_VERIFY_FULL` — the seven nights measure one
+  engine). All 49 rows promoted in-tree at
+  `bench/results/promoted/green-week-2026-10-11_17/` (232 KB, every TSV
+  carrying its rule-9 methodology header) — the acceptance's permanent
+  evidence and the first application of the promotion rule.
+  **Calibration** (the pre-built `scripts/arena_bands.py` over the seven
+  nights → `bench/arena_bands.json`, CALIBRATED stamp at 7 ≥
+  min-nights): the week re-measured the design fact — FOUR distinct
+  runner CPUs across seven nights (EPYC 9V45 ×3, Xeon Platinum 8573C,
+  EPYC 7763 ×2, EPYC 9V74) — so the primary tier is ratio-normalized
+  (ChronoKV ops/s ÷ same-night five-baseline geomean). Calibrated
+  medians: the durable write side at 0.20–0.44× (fillseq 0.20–0.22,
+  fillrandom 0.27, ycsb_a 0.38–0.41, overwrite 0.41–0.44) — M5's
+  measured before-column, exactly as claim 3 predicted; readrandom
+  0.57–0.63× (lmdb's mmap owns it); ycsb_b reads 0.68–0.70×; and
+  read-only ycsb_c 1.05–1.09× with scan-heavy ycsb_e 1.05–1.09× —
+  above the power-loss-class field. Raw bands stay hardware-conditional
+  secondary (≤3 nights per CPU, honestly stamped PROVISIONAL); the RSS
+  tier bands cross-night directly and carries the deletechurn
+  ratchet-watch — flat at 201.2–201.5 MB across all seven nights (P1's
+  before-column; M3's acceptance tightens WARN to gate). Night-7
+  self-consistency: 30 series, 0 REGRESSION, 1 WARN inside floor (async
+  readrandom 0.470 vs median 0.565 — the widest band, honestly earned).
+  **Gate enablement** followed the recipe the ci.yml comment itself
+  carried: `arena` added to `ci-passed`'s needs — skip-tolerated on
+  push/PR where the schedule-only job does not run (a flaky shared
+  runner still never blocks a PR; the teeth are on the nightly, where
+  "the gate must never learn to be ignored" is the point) — plus two
+  enforcement steps: ledger completeness (all seven engines must
+  produce DATA ROWS; a crashed leg writes its stderr INTO the TSV, so
+  file-exists ≠ rows-exist) and the `check` verdict (exit 1 REGRESSION,
+  exit 2 geometry mismatch — mixed geometries refuse to band). Policies
+  landed explicitly: a red gate re-runs ONCE via dispatch (bands
+  normalize the CPU lottery, not contention; two consecutive
+  REGRESSIONs = bisect, don't re-run); bands are recomputed only in a
+  dedicated commit citing the engine change that moved them (M5's
+  writer thread is the planned one), never widened in-flight — the
+  ratchet rule applies to bands. **Promotion decision (item 5):** raw
+  nightly rows live as run artifacts (90-day retention); a milestone
+  that CITES rows commits that night's TSVs under
+  `bench/results/promoted/` in the citing commit — verifiable forever,
+  no bot, no nightly commit churn. **Arena-side build cache: REJECTED
+  as measured low-value** — the ~57–77 min nightly is dominated by the
+  measured runs; apt + baseline build is minutes of that, and caching
+  built baselines across nights risks binary↔recorded-version
+  provenance drift, the fairness protocol's core asset; revisit only at
+  the 120-min cap (the test-suite-side cache question was already
+  answered by `build-shared` + the recorded ccache rejection). The
+  actions v4→v5 bumps — explicitly deferred past the green week by
+  52fd43c — ride along (checkout ×9, upload ×8, download ×3; clears the
+  Node-20 deprecation warning flood). **README §Performance** (the
+  acceptance's third leg) publishes the honest current picture with
+  every number tied to its methodology: vehicle, pinned baselines
+  (`bench/third_party/versions.txt`), the ratio-band rationale, the
+  write-side gap named as M5's before-column, the deletechurn RSS as
+  P1's, and the policy links. bench/README: status → M1 COMPLETE + the
+  full bands/gate/policy section. ROADMAP: M1 header → COMPLETE,
+  acceptance → MET (all three legs cited), items 1/4/5 → DONE/DECIDED
+  with the numbers, progress row → one-line COMPLETE, constraint 2 →
+  **SATISFIED 2026-10-17** (the rewrites now run against a GATED
+  ledger), M3–M7 row + next-commits → UNBLOCKED, M3 first (its gates
+  already wait: the S6 DST grammar, the deletechurn ratchet-watch, the
+  HP4/ABA decision checklist). Engine/test/build files UNTOUCHED — the
+  519-check suite at 6bcb212 stands unchanged by construction; this
+  commit is bench artifacts + tool config + CI + docs. Tonight's
+  nightly is the first GATED arena night; this commit's push run
+  exercises the skip-tolerance path (arena skipped on push, `ci-passed`
+  must stay green).
+
 - **test+docs (v30 M0 gap closures G-3 + G-1, 2026-10-13): the `[k,k]`
   point-range equivalence row gets its release-mode checker, and the
   WAL-3 row's CONFIRM resolves by indexing — the INVARIANTS.md gap list

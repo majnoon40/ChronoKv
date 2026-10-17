@@ -1,0 +1,32 @@
+# chronokv-arena (v29 M1 skeleton) — methodology (rule 9)
+# chronokv_version=0.28.1
+# build=g++_-std=c++20_-O2_-g
+# kernel=Linux 6.17.0-1022-azure (x86_64)
+# cpus=4
+# MemTotal:       16373452 kB
+# model name	: AMD EPYC 7763 64-Core Processor
+# wal_dir=/tmp/ckv_ledger_group (backing fs not classified in the skeleton)
+# durability=group threads=4 keys=200000 valsize=100 seed=42 ops=200000 (per YCSB mix)
+# caveat: io_uring backend not observable from a hooks-off build (attribution lands with M1 step 4)
+# columns: workload	ops	seconds	ops_per_sec	p50_us	p99_us	rss_mb	note
+fillseq	200000	58.307	3430	-	-	114.6	single-writer; new-key path (nm_) isolation workload
+fillrandom	200000	56.674	3529	-	-	142.4	single-writer; new-key path (nm_) isolation workload
+readrandom	50000	0.084	595874	5	14	180.4	uniform random; threads=4 misses=0 (zipfian + true YCSB mixes land with M1 step 2)
+overwrite	50000	6.402	7810	514	820	199.3	existing-key update path (no nm_); threads=4
+rangescan100	500	0.017	29558	29	42	199.3	scan_len=100 rows/scans=101
+rangescan10k	100	0.239	418	2065	2176	199.3	scan_len=10000 rows/scans=9875
+deletechurn	120000	31.879	3764	-	-	201.3	3x delete+reinsert of a 10% slice; rss_delta_mb=0 (monotonic pre-M3; P1's before-column)
+ckptload	1	0.035	28	-	-	201.3	checkpoint wall-time under load; writer_ops_during=8
+coldrecovery	200000	6.360	31448	-	-	201.3	WAL-only recovery (no checkpoint); records/s is the v30-M1 bulk-load-prerequisite anchor
+memory	200000	0.000	0	-	-	201.3	rss_mb=215 hwm_mb=277 bytes_per_key=1128 (RSS-level: tree pool + version heap + slack)
+ycsb_a.read	100237	12.988	7718	3	8	235.0	zipfian(0.99)-cdf threads=4
+ycsb_a.update	99763	12.988	7681	525	1026	235.0	zipfian(0.99)-cdf threads=4
+ycsb_b.read	189919	1.537	123600	2	8	235.4	zipfian(0.99)-cdf threads=4
+ycsb_b.update	10081	1.537	6561	540	1063	235.4	zipfian(0.99)-cdf threads=4
+ycsb_c.read	200000	0.183	1095402	3	13	168.7	zipfian(0.99)-cdf threads=4
+ycsb_d.read	190059	1.561	121771	6	22	197.6	zipfian(0.99)-cdf threads=4 misses=496
+ycsb_d.insert	9941	1.561	6369	462	980	197.6	zipfian(0.99)-cdf threads=4 misses=496
+ycsb_e.insert	9995	2.815	3550	488	1780	199.6	zipfian(0.99)-cdf threads=4
+ycsb_e.scan	190005	2.815	67490	23	63	199.6	zipfian(0.99)-cdf threads=4 rows/scans=51
+ycsb_f.read	99775	12.628	7901	3	8	199.9	zipfian(0.99)-cdf threads=4
+ycsb_f.rmw	100225	12.628	7937	499	977	199.9	zipfian(0.99)-cdf threads=4

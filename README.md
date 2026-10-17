@@ -541,8 +541,64 @@ long-run config; a push can no longer cancel a nightly run mid-flight):
   each kind's UNIQUE contributions, forced-fire counts (0 = vacuous kind
   for that vehicle, flagged), and the ledger of error-path lines no run
   reached, as the job summary + an artifact
+- **`arena` (v29 M1, GATED 2026-10-17)**: the nightly benchmark ledger —
+  ChronoKV (group + async) against five baseline configs (sqlite-full,
+  sqlite-normal, lmdb, rocksdb-sync, rocksdb-tuned) in ONE job on ONE
+  machine at a fixed pinned geometry, every row carrying its rule-9
+  methodology header. After the 7/7 green week the job gained teeth: a
+  ledger-completeness step and a regression gate against the committed
+  ratio-normalized noise bands (`bench/arena_bands.json`, calibrated from
+  the seven green-week nights); `arena` is in `ci-passed`'s needs,
+  skip-tolerated on push/PR where it does not run by design
 - **`ci-passed` gate**: aggregates every job into one required check for
   branch protection
+
+## Performance — the honest current picture (v29 M1, calibrated 2026-10-17)
+
+ChronoKV publishes its numbers the way it publishes its safety claims:
+measured on a fixed vehicle, with the methodology committed beside them,
+behind a regression gate — **budgets, not trophies**.
+
+* **Vehicle & methodology** — [`bench/README.md`](bench/README.md): a
+  hooks-OFF consumer build (the public API only, exactly what an embedder
+  compiles) versus five baseline configs at identical geometry (200k
+  keys, 100 B values, 4 threads, seed 42, 200k ops per mix), all seven
+  engines in ONE nightly job on ONE machine (the fairness protocol —
+  same harness, same hardware). Baseline versions pinned with sha256
+  recipes in [`bench/third_party/versions.txt`](bench/third_party/versions.txt).
+* **Noise bands** — [`bench/arena_bands.json`](bench/arena_bands.json),
+  CALIBRATED from the 7/7 green week (nightly runs #82–#99,
+  2026-10-11..17; rows committed under
+  [`bench/results/promoted/green-week-2026-10-11_17/`](bench/results/promoted/green-week-2026-10-11_17/)).
+  Calibration measured the runner CPU varying night to night (four CPUs
+  across seven nights), so the PRIMARY bands are ratio-normalized:
+  ChronoKV ops/s ÷ the same night's baseline geomean. The nightly
+  `arena` job fails on a ratio below the band floor.
+* **Where the engine stands (calibrated medians, ratio vs same-night
+  baseline geomean):** read-only `ycsb_c` **~1.05–1.09×** and scan-heavy
+  `ycsb_e` **~1.05–1.09×** — above the power-loss-class field;
+  `ycsb_b` reads ~0.68–0.70×; `readrandom` ~0.57–0.63× (lmdb's mmap
+  owns that workload outright). The durable write side is the honest
+  weakness: `fillseq` ~0.20–0.22×, `fillrandom` ~0.27×, `ycsb_a`
+  ~0.38–0.41×, `overwrite` ~0.41–0.44× (night-7 raws: group-durability
+  fillseq 3,985 ops/s vs sqlite-full 9,628 and sqlite-normal 38,694 on
+  the same machine). That write-side gap is exactly what the M5
+  WAL-writer-thread milestone exists to attack — the ledger is its
+  measured before-column, per the plan's claim 3, and M5's acceptance
+  is these ratios moving with no unexplained regression elsewhere.
+  `deletechurn` RSS sits flat at ~201 MB — P1's before-column, which M3
+  (page reclamation) must stabilize-then-shrink under the ratchet-watch
+  the bands already carry.
+* **Re-run / band-update / promotion policies** are written down in
+  [`bench/README.md`](bench/README.md) — including the rule that bands
+  are recomputed only in a dedicated commit citing the engine change
+  that moved them, never widened in-flight to silence a red night.
+
+Raw per-night tables live in the nightly run artifacts (`arena-ledger-*`,
+every row self-describing: hardware, kernel, engine versions, geometry,
+seed, durability class); cited rows get promoted in-tree per the
+promotion rule. A result without its methodology header does not get
+quoted anywhere in this repo.
 
 ## Architecture
 

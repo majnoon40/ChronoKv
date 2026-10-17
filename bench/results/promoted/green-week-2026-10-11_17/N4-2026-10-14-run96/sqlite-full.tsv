@@ -1,0 +1,27 @@
+# chronokv-arena BASELINES (v29 M1 step 3) — methodology (rule 9)
+# engine=sqlite3 WAL synchronous=FULL table=WITHOUT-ROWID blob-pk; one txn per write; version=3.45.1
+# durability_class=power-loss (compare: ChronoKV Sync/Group)
+# build=g++_-std=c++20_-O2_-g
+# kernel=Linux 6.17.0-1022-azure (x86_64)
+# cpus=4
+# MemTotal:       16373452 kB
+# model name	: AMD EPYC 7763 64-Core Processor
+# data_dir=/tmp/ckv_ledger_base (backing fs not classified in the skeleton)
+# threads=4 keys=200000 valsize=100 seed=42 ops=200000
+# fairness: same key/value/seed/distribution code as bench/arena.cpp; one txn/commit per write op; rule 10 — baselines live under bench/ only
+# columns: workload	ops	seconds	ops_per_sec	p50_us	p99_us	rss_mb	note
+fillseq	200000	22.294	8971	-	-	13.0	single-writer
+fillrandom	200000	28.082	7122	-	-	14.5	single-writer
+readrandom	50000	0.104	481646	4	67	20.9	uniform random; threads=4
+overwrite	50000	6.814	7338	105	215	22.8	threads=4
+ycsb_a.read	100229	12.025	8335	7	13	25.6	zipfian(0.99)-cdf threads=4
+ycsb_a.update	99771	12.025	8297	104	216	25.6	zipfian(0.99)-cdf threads=4
+ycsb_b.read	189911	2.058	92289	3	13	27.0	zipfian(0.99)-cdf threads=4
+ycsb_b.update	10089	2.058	4903	107	8424	27.0	zipfian(0.99)-cdf threads=4
+ycsb_c.read	200000	0.457	438038	3	77	28.1	zipfian(0.99)-cdf threads=4
+ycsb_d.read	190059	1.896	100252	3	11	27.0	zipfian(0.99)-cdf threads=4 misses=439
+ycsb_d.insert	9941	1.896	5244	106	8441	27.0	zipfian(0.99)-cdf threads=4 misses=439
+ycsb_e.insert	9995	3.321	3010	125	8434	29.2	zipfian(0.99)-cdf threads=4
+ycsb_e.scan	190005	3.321	57217	21	71	29.2	zipfian(0.99)-cdf threads=4 rows/scans=51
+ycsb_f.read	99775	12.495	7985	7	14	27.3	zipfian(0.99)-cdf threads=4
+ycsb_f.rmw	100225	12.495	8021	107	242	27.3	zipfian(0.99)-cdf threads=4

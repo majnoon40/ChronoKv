@@ -1,0 +1,4909 @@
+{
+ "geometry": {
+  "keys": "200000",
+  "ops": "200000",
+  "seed": "42",
+  "threads": "4",
+  "valsize": "100"
+ },
+ "min_nights": 7,
+ "nights": [
+  {
+   "cpu": "AMD EPYC 9V45 96-Core Processor",
+   "dir": "/tmp/nights/N1-2026-10-11-run82",
+   "version": "0.28.1"
+  },
+  {
+   "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+   "dir": "/tmp/nights/N2-2026-10-12-run88",
+   "version": "0.28.1"
+  },
+  {
+   "cpu": "AMD EPYC 7763 64-Core Processor",
+   "dir": "/tmp/nights/N3-2026-10-13-run91",
+   "version": "0.28.1"
+  },
+  {
+   "cpu": "AMD EPYC 7763 64-Core Processor",
+   "dir": "/tmp/nights/N4-2026-10-14-run96",
+   "version": "0.28.1"
+  },
+  {
+   "cpu": "AMD EPYC 9V45 96-Core Processor",
+   "dir": "/tmp/nights/N5-2026-10-15-run97",
+   "version": "0.28.1"
+  },
+  {
+   "cpu": "AMD EPYC 9V74 80-Core Processor",
+   "dir": "/tmp/nights/N6-2026-10-16-run98",
+   "version": "0.28.1"
+  },
+  {
+   "cpu": "AMD EPYC 9V45 96-Core Processor",
+   "dir": "/tmp/nights/N7-2026-10-17-run99",
+   "version": "0.28.1"
+  }
+ ],
+ "ratio": {
+  "chronokv-async/fillrandom": {
+   "max": 0.30902927191068064,
+   "median": 0.27458419435503717,
+   "min": 0.27149128693264274,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 13.670846956872293
+  },
+  "chronokv-async/fillseq": {
+   "max": 0.25503386345234563,
+   "median": 0.21617857486857886,
+   "min": 0.18557858938486468,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 32.12865757381591
+  },
+  "chronokv-async/overwrite": {
+   "max": 0.4428711417952036,
+   "median": 0.4242391289413818,
+   "min": 0.3413380278935885,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 23.932991319064335
+  },
+  "chronokv-async/readrandom": {
+   "max": 0.7674303750169278,
+   "median": 0.56495211461874,
+   "min": 0.4102908829775106,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 63.21588729346276
+  },
+  "chronokv-async/ycsb_a.read": {
+   "max": 0.4630195773318614,
+   "median": 0.4109138014450427,
+   "min": 0.340144512136919,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 29.902881033159023
+  },
+  "chronokv-async/ycsb_a.update": {
+   "max": 0.4629280435432351,
+   "median": 0.4108823848785138,
+   "min": 0.34007808923825444,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 29.899055989295785
+  },
+  "chronokv-async/ycsb_b.read": {
+   "max": 0.788092813249706,
+   "median": 0.7018990663908697,
+   "min": 0.6034894684288289,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 26.300554262039185
+  },
+  "chronokv-async/ycsb_b.update": {
+   "max": 0.7874585387661535,
+   "median": 0.701300743513157,
+   "min": 0.6029904278647172,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 26.303709586467228
+  },
+  "chronokv-async/ycsb_c.read": {
+   "max": 1.186467862319413,
+   "median": 1.0924125338184192,
+   "min": 0.7300304669102468,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 41.78251175988752
+  },
+  "chronokv-async/ycsb_d.insert": {
+   "max": 0.8709689333500454,
+   "median": 0.7205305567149664,
+   "min": 0.579684110469563,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 40.42643579316114
+  },
+  "chronokv-async/ycsb_d.read": {
+   "max": 0.8710204977640866,
+   "median": 0.7205209343130823,
+   "min": 0.5796652520113446,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 40.43674956238562
+  },
+  "chronokv-async/ycsb_e.insert": {
+   "max": 1.1193300048175914,
+   "median": 1.0854799340208405,
+   "min": 0.8609150759648257,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 23.806513667695697
+  },
+  "chronokv-async/ycsb_e.scan": {
+   "max": 1.1191955872589978,
+   "median": 1.0853481801414626,
+   "min": 0.8608621427981155,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 23.801895943402382
+  },
+  "chronokv-async/ycsb_f.read": {
+   "max": 0.45026750591420134,
+   "median": 0.39203236912580075,
+   "min": 0.33171596365902983,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 30.240243304279055
+  },
+  "chronokv-async/ycsb_f.rmw": {
+   "max": 0.45027360426017476,
+   "median": 0.392067112586346,
+   "min": 0.33177271751063037,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 30.22464342082419
+  },
+  "chronokv-group/fillrandom": {
+   "max": 0.38738865934421857,
+   "median": 0.2698476417709235,
+   "min": 0.2564357715645042,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 48.52845365640869
+  },
+  "chronokv-group/fillseq": {
+   "max": 0.2903725697358533,
+   "median": 0.2021533456863994,
+   "min": 0.17771697296203975,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 55.72779238023408
+  },
+  "chronokv-group/overwrite": {
+   "max": 0.4367039317847386,
+   "median": 0.41377095003729314,
+   "min": 0.3096677649080021,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 30.702050703483838
+  },
+  "chronokv-group/readrandom": {
+   "max": 0.7999921661201833,
+   "median": 0.6250330297925122,
+   "min": 0.4839609986412856,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 50.56231469620227
+  },
+  "chronokv-group/ycsb_a.read": {
+   "max": 0.41341399807445456,
+   "median": 0.38294241532497264,
+   "min": 0.3422903291700901,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 18.5729410109892
+  },
+  "chronokv-group/ycsb_a.update": {
+   "max": 0.41336269068684445,
+   "median": 0.38290831833685257,
+   "min": 0.3422337897655042,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 18.575961271952995
+  },
+  "chronokv-group/ycsb_b.read": {
+   "max": 0.8691416617630582,
+   "median": 0.6756939283847626,
+   "min": 0.5720677510982264,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 43.96575108717982
+  },
+  "chronokv-group/ycsb_b.update": {
+   "max": 0.8684712695831537,
+   "median": 0.6751170873011597,
+   "min": 0.5716180586838797,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 43.97062620440714
+  },
+  "chronokv-group/ycsb_c.read": {
+   "max": 1.1577884979371793,
+   "median": 1.0466809087725926,
+   "min": 0.5009458028891622,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 62.75481758984927
+  },
+  "chronokv-group/ycsb_d.insert": {
+   "max": 0.7385598838742844,
+   "median": 0.6809703391775666,
+   "min": 0.5694926854414459,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 24.82739536600482
+  },
+  "chronokv-group/ycsb_d.read": {
+   "max": 0.7385743549429726,
+   "median": 0.6809937572647905,
+   "min": 0.5694904337143523,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 24.82899724481256
+  },
+  "chronokv-group/ycsb_e.insert": {
+   "max": 1.1302593481724446,
+   "median": 1.0524082760117348,
+   "min": 0.522486390930377,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 57.75068203998907
+  },
+  "chronokv-group/ycsb_e.scan": {
+   "max": 1.1304057155572569,
+   "median": 1.0523840207105306,
+   "min": 0.5225347707483293,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 57.761324083818344
+  },
+  "chronokv-group/ycsb_f.read": {
+   "max": 0.44634725426478983,
+   "median": 0.39531453923611637,
+   "min": 0.33358605754435483,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 28.52442435796275
+  },
+  "chronokv-group/ycsb_f.rmw": {
+   "max": 0.44635410886540566,
+   "median": 0.3953346832050106,
+   "min": 0.33363444522111957,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 28.51246511701391
+  }
+ },
+ "raw_by_cpu": {
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/ckptload": {
+   "max": 29.0,
+   "median": 27.0,
+   "min": 25.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 14.814814814814815
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/coldrecovery": {
+   "max": 31396.0,
+   "median": 31182.5,
+   "min": 30969.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 1.3693578128758117
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/deletechurn": {
+   "max": 3979.0,
+   "median": 3840.5,
+   "min": 3702.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 7.212602525712798
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/fillrandom": {
+   "max": 3595.0,
+   "median": 3538.5,
+   "min": 3482.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 3.1934435495266356
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/fillseq": {
+   "max": 3384.0,
+   "median": 3365.5,
+   "min": 3347.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 1.0993908780270392
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/overwrite": {
+   "max": 7309.0,
+   "median": 7296.5,
+   "min": 7284.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 0.3426300280956623
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/rangescan100": {
+   "max": 29185.0,
+   "median": 28835.0,
+   "min": 28485.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.4276053407317497
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/rangescan10k": {
+   "max": 419.0,
+   "median": 417.0,
+   "min": 415.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 0.9592326139088729
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/readrandom": {
+   "max": 517940.0,
+   "median": 454545.0,
+   "min": 391150.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 27.893827893827893
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/ycsb_a.read": {
+   "max": 7360.0,
+   "median": 7265.0,
+   "min": 7170.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.615278733654508
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/ycsb_a.update": {
+   "max": 7325.0,
+   "median": 7230.5,
+   "min": 7136.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.6139271143074474
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/ycsb_b.read": {
+   "max": 121671.0,
+   "median": 119834.5,
+   "min": 117998.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 3.0650605626927137
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/ycsb_b.update": {
+   "max": 6458.0,
+   "median": 6360.5,
+   "min": 6263.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 3.065796714094804
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/ycsb_c.read": {
+   "max": 1122536.0,
+   "median": 1095272.5,
+   "min": 1068009.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 4.978395787349723
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/ycsb_d.insert": {
+   "max": 6739.0,
+   "median": 6643.0,
+   "min": 6547.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.890260424507
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/ycsb_d.read": {
+   "max": 128839.0,
+   "median": 127008.5,
+   "min": 125178.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.8824842431805746
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/ycsb_e.insert": {
+   "max": 3801.0,
+   "median": 3662.0,
+   "min": 3523.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 7.591480065537957
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/ycsb_e.scan": {
+   "max": 72252.0,
+   "median": 69608.5,
+   "min": 66965.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 7.595336776399434
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/ycsb_f.read": {
+   "max": 7135.0,
+   "median": 6916.5,
+   "min": 6698.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 6.318224535530977
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-async/ycsb_f.rmw": {
+   "max": 7167.0,
+   "median": 6947.5,
+   "min": 6728.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 6.318819719323498
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/ckptload": {
+   "max": 28.0,
+   "median": 26.0,
+   "min": 24.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 15.384615384615385
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/coldrecovery": {
+   "max": 31448.0,
+   "median": 31228.0,
+   "min": 31008.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 1.4089919303189444
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/deletechurn": {
+   "max": 4237.0,
+   "median": 4000.5,
+   "min": 3764.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 11.823522059742531
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/fillrandom": {
+   "max": 3529.0,
+   "median": 3469.5,
+   "min": 3410.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 3.4298890330018734
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/fillseq": {
+   "max": 3671.0,
+   "median": 3550.5,
+   "min": 3430.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 6.787776369525419
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/overwrite": {
+   "max": 7810.0,
+   "median": 7585.5,
+   "min": 7361.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 5.919187924329313
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/rangescan100": {
+   "max": 29558.0,
+   "median": 29485.0,
+   "min": 29412.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 0.495167034085128
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/rangescan10k": {
+   "max": 418.0,
+   "median": 412.0,
+   "min": 406.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.912621359223301
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/readrandom": {
+   "max": 730688.0,
+   "median": 663281.0,
+   "min": 595874.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 20.325322148531317
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/ycsb_a.read": {
+   "max": 7718.0,
+   "median": 7571.0,
+   "min": 7424.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 3.883238673887201
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/ycsb_a.update": {
+   "max": 7681.0,
+   "median": 7535.0,
+   "min": 7389.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 3.8752488387524884
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/ycsb_b.read": {
+   "max": 137987.0,
+   "median": 130793.5,
+   "min": 123600.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 10.999782099263342
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/ycsb_b.update": {
+   "max": 7324.0,
+   "median": 6942.5,
+   "min": 6561.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 10.99027727763774
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/ycsb_c.read": {
+   "max": 1095402.0,
+   "median": 1049900.5,
+   "min": 1004399.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 8.667773755703516
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/ycsb_d.insert": {
+   "max": 6369.0,
+   "median": 6295.5,
+   "min": 6222.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.3350011913271382
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/ycsb_d.read": {
+   "max": 121771.0,
+   "median": 120361.0,
+   "min": 118951.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.3429516205415375
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/ycsb_e.insert": {
+   "max": 3582.0,
+   "median": 3566.0,
+   "min": 3550.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 0.89736399326977
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/ycsb_e.scan": {
+   "max": 68084.0,
+   "median": 67787.0,
+   "min": 67490.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 0.8762742118695325
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/ycsb_f.read": {
+   "max": 7901.0,
+   "median": 7715.5,
+   "min": 7530.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 4.8085023653684145
+  },
+  "AMD EPYC 7763 64-Core Processor|chronokv-group/ycsb_f.rmw": {
+   "max": 7937.0,
+   "median": 7750.5,
+   "min": 7564.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 4.812592735952519
+  },
+  "AMD EPYC 7763 64-Core Processor|lmdb/fillrandom": {
+   "max": 3920.0,
+   "median": 3863.0,
+   "min": 3806.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.9510742945896973
+  },
+  "AMD EPYC 7763 64-Core Processor|lmdb/fillseq": {
+   "max": 3854.0,
+   "median": 3827.0,
+   "min": 3800.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 1.4110269140318787
+  },
+  "AMD EPYC 7763 64-Core Processor|lmdb/overwrite": {
+   "max": 3913.0,
+   "median": 3902.0,
+   "min": 3891.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 0.5638134290107637
+  },
+  "AMD EPYC 7763 64-Core Processor|lmdb/readrandom": {
+   "max": 4069079.0,
+   "median": 3947953.5,
+   "min": 3826828.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 6.136115838243789
+  },
+  "AMD EPYC 7763 64-Core Processor|lmdb/ycsb_a.read": {
+   "max": 3936.0,
+   "median": 3910.5,
+   "min": 3885.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 1.304181051016494
+  },
+  "AMD EPYC 7763 64-Core Processor|lmdb/ycsb_a.update": {
+   "max": 3918.0,
+   "median": 3892.5,
+   "min": 3867.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 1.3102119460500963
+  },
+  "AMD EPYC 7763 64-Core Processor|lmdb/ycsb_b.read": {
+   "max": 73891.0,
+   "median": 73305.5,
+   "min": 72720.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 1.5974244770174135
+  },
+  "AMD EPYC 7763 64-Core Processor|lmdb/ycsb_b.update": {
+   "max": 3925.0,
+   "median": 3894.0,
+   "min": 3863.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 1.5921931176168465
+  },
+  "AMD EPYC 7763 64-Core Processor|lmdb/ycsb_c.read": {
+   "max": 4402543.0,
+   "median": 4399390.5,
+   "min": 4396238.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 0.14331530697263634
+  },
+  "AMD EPYC 7763 64-Core Processor|lmdb/ycsb_d.insert": {
+   "max": 3900.0,
+   "median": 3895.0,
+   "min": 3890.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 0.25673940949935814
+  },
+  "AMD EPYC 7763 64-Core Processor|lmdb/ycsb_d.read": {
+   "max": 74565.0,
+   "median": 74472.5,
+   "min": 74380.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 0.24841384403638928
+  },
+  "AMD EPYC 7763 64-Core Processor|lmdb/ycsb_e.insert": {
+   "max": 3872.0,
+   "median": 3693.0,
+   "min": 3514.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 9.694015705388573
+  },
+  "AMD EPYC 7763 64-Core Processor|lmdb/ycsb_e.scan": {
+   "max": 73616.0,
+   "median": 70204.0,
+   "min": 66792.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 9.720243860748676
+  },
+  "AMD EPYC 7763 64-Core Processor|lmdb/ycsb_f.read": {
+   "max": 3935.0,
+   "median": 3926.0,
+   "min": 3917.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 0.45848191543555783
+  },
+  "AMD EPYC 7763 64-Core Processor|lmdb/ycsb_f.rmw": {
+   "max": 3952.0,
+   "median": 3943.5,
+   "min": 3935.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 0.4310891340180043
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-sync/fillrandom": {
+   "max": 4237.0,
+   "median": 4158.0,
+   "min": 4079.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 3.7999037999038
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-sync/fillseq": {
+   "max": 4323.0,
+   "median": 4264.0,
+   "min": 4205.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.7673545966228894
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-sync/overwrite": {
+   "max": 11724.0,
+   "median": 11403.5,
+   "min": 11083.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 5.621081246985574
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-sync/readrandom": {
+   "max": 924435.0,
+   "median": 903541.5,
+   "min": 882648.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 4.624801406465558
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-sync/ycsb_a.read": {
+   "max": 10106.0,
+   "median": 9962.0,
+   "min": 9818.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.8909857458341697
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-sync/ycsb_a.update": {
+   "max": 10060.0,
+   "median": 9916.5,
+   "min": 9773.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.8941662885090507
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-sync/ycsb_b.read": {
+   "max": 141598.0,
+   "median": 140411.0,
+   "min": 139224.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 1.6907507246583244
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-sync/ycsb_b.update": {
+   "max": 7522.0,
+   "median": 7459.0,
+   "min": 7396.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 1.689234481834026
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-sync/ycsb_c.read": {
+   "max": 918615.0,
+   "median": 915076.5,
+   "min": 911538.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 0.7733779634817417
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-sync/ycsb_d.insert": {
+   "max": 7506.0,
+   "median": 7098.0,
+   "min": 6690.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 11.496196111580726
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-sync/ycsb_d.read": {
+   "max": 143501.0,
+   "median": 135699.0,
+   "min": 127897.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 11.498979358727773
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-sync/ycsb_e.insert": {
+   "max": 2849.0,
+   "median": 2809.0,
+   "min": 2769.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.8479886080455676
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-sync/ycsb_e.scan": {
+   "max": 54164.0,
+   "median": 53401.5,
+   "min": 52639.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.855725026450568
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-sync/ycsb_f.read": {
+   "max": 9340.0,
+   "median": 9273.5,
+   "min": 9207.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 1.4341942093060873
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-sync/ycsb_f.rmw": {
+   "max": 9382.0,
+   "median": 9315.5,
+   "min": 9249.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 1.4277279802479739
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-tuned/fillrandom": {
+   "max": 153280.0,
+   "median": 151042.0,
+   "min": 148804.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.963414149706704
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-tuned/fillseq": {
+   "max": 242889.0,
+   "median": 242143.0,
+   "min": 241397.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 0.6161648282213403
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-tuned/overwrite": {
+   "max": 172627.0,
+   "median": 169492.5,
+   "min": 166358.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 3.6986887325397877
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-tuned/readrandom": {
+   "max": 923321.0,
+   "median": 902432.0,
+   "min": 881543.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 4.629490089003936
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-tuned/ycsb_a.read": {
+   "max": 167442.0,
+   "median": 164922.0,
+   "min": 162402.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 3.055990104412995
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-tuned/ycsb_a.update": {
+   "max": 166676.0,
+   "median": 164168.0,
+   "min": 161660.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 3.0554066565956823
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-tuned/ycsb_b.read": {
+   "max": 846687.0,
+   "median": 828572.0,
+   "min": 810457.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 4.372583191321937
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-tuned/ycsb_b.update": {
+   "max": 44980.0,
+   "median": 44017.5,
+   "min": 43055.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 4.373260634974726
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-tuned/ycsb_c.read": {
+   "max": 1005874.0,
+   "median": 993007.5,
+   "min": 980141.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.591420507901501
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-tuned/ycsb_d.insert": {
+   "max": 48092.0,
+   "median": 43984.5,
+   "min": 39877.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 18.67703395514329
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-tuned/ycsb_d.read": {
+   "max": 919455.0,
+   "median": 840927.5,
+   "min": 762400.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 18.676401949038414
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-tuned/ycsb_e.insert": {
+   "max": 2714.0,
+   "median": 2698.0,
+   "min": 2682.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 1.1860637509266123
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-tuned/ycsb_e.scan": {
+   "max": 51592.0,
+   "median": 51290.0,
+   "min": 50988.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 1.1776174692922596
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-tuned/ycsb_f.read": {
+   "max": 168867.0,
+   "median": 166000.0,
+   "min": 163133.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 3.4542168674698797
+  },
+  "AMD EPYC 7763 64-Core Processor|rocksdb-tuned/ycsb_f.rmw": {
+   "max": 169628.0,
+   "median": 166748.5,
+   "min": 163869.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 3.4537042312224697
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-full/fillrandom": {
+   "max": 7122.0,
+   "median": 7039.5,
+   "min": 6957.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.343916471340294
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-full/fillseq": {
+   "max": 8971.0,
+   "median": 8589.5,
+   "min": 8208.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 8.882938471389487
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-full/overwrite": {
+   "max": 7338.0,
+   "median": 7038.0,
+   "min": 6738.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 8.525149190110827
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-full/readrandom": {
+   "max": 481646.0,
+   "median": 467054.0,
+   "min": 452462.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 6.248528007468087
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-full/ycsb_a.read": {
+   "max": 8335.0,
+   "median": 8064.0,
+   "min": 7793.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 6.721230158730159
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-full/ycsb_a.update": {
+   "max": 8297.0,
+   "median": 8027.0,
+   "min": 7757.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 6.727295378098916
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-full/ycsb_b.read": {
+   "max": 92289.0,
+   "median": 90128.5,
+   "min": 87968.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 4.794265964705947
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-full/ycsb_b.update": {
+   "max": 4903.0,
+   "median": 4788.0,
+   "min": 4673.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 4.803675856307435
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-full/ycsb_c.read": {
+   "max": 438038.0,
+   "median": 427907.0,
+   "min": 417776.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 4.735141047003204
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-full/ycsb_d.insert": {
+   "max": 5244.0,
+   "median": 5081.5,
+   "min": 4919.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 6.395749286627964
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-full/ycsb_d.read": {
+   "max": 100252.0,
+   "median": 97150.5,
+   "min": 94049.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 6.3849388320183635
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-full/ycsb_e.insert": {
+   "max": 3010.0,
+   "median": 2925.0,
+   "min": 2840.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 5.811965811965812
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-full/ycsb_e.scan": {
+   "max": 57217.0,
+   "median": 55600.5,
+   "min": 53984.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 5.814695911007995
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-full/ycsb_f.read": {
+   "max": 7985.0,
+   "median": 7792.5,
+   "min": 7600.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 4.94064805903112
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-full/ycsb_f.rmw": {
+   "max": 8021.0,
+   "median": 7827.5,
+   "min": 7634.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 4.944107313957202
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-normal/fillrandom": {
+   "max": 22407.0,
+   "median": 21720.5,
+   "min": 21034.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 6.321217283211713
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-normal/fillseq": {
+   "max": 55535.0,
+   "median": 55151.5,
+   "min": 54768.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 1.390714667778755
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-normal/overwrite": {
+   "max": 45396.0,
+   "median": 40697.0,
+   "min": 35998.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 23.09261124898641
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-normal/readrandom": {
+   "max": 471823.0,
+   "median": 471294.0,
+   "min": 470765.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 0.22448832363662596
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-normal/ycsb_a.read": {
+   "max": 41550.0,
+   "median": 40118.0,
+   "min": 38686.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 7.138940126626452
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-normal/ycsb_a.update": {
+   "max": 41361.0,
+   "median": 39935.5,
+   "min": 38510.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 7.139011656295777
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-normal/ycsb_b.read": {
+   "max": 177074.0,
+   "median": 173996.5,
+   "min": 170919.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 3.5374274769894796
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-normal/ycsb_b.update": {
+   "max": 9407.0,
+   "median": 9243.5,
+   "min": 9080.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 3.537621030994753
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-normal/ycsb_c.read": {
+   "max": 426041.0,
+   "median": 425689.0,
+   "min": 425337.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 0.16537895036047442
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-normal/ycsb_d.insert": {
+   "max": 9719.0,
+   "median": 9594.0,
+   "min": 9469.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.605795288722118
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-normal/ycsb_d.read": {
+   "max": 185810.0,
+   "median": 183420.0,
+   "min": 181030.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 2.6060407807218406
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-normal/ycsb_e.insert": {
+   "max": 5204.0,
+   "median": 5192.0,
+   "min": 5180.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 0.4622496147919877
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-normal/ycsb_e.scan": {
+   "max": 98920.0,
+   "median": 98692.0,
+   "min": 98464.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 0.4620435293640822
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-normal/ycsb_f.read": {
+   "max": 35740.0,
+   "median": 35100.0,
+   "min": 34460.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 3.646723646723647
+  },
+  "AMD EPYC 7763 64-Core Processor|sqlite-normal/ycsb_f.rmw": {
+   "max": 35902.0,
+   "median": 35258.5,
+   "min": 34615.0,
+   "n": 2,
+   "provisional": true,
+   "spread_pct": 3.650183643660394
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/ckptload": {
+   "max": 34.0,
+   "median": 31.0,
+   "min": 27.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 22.580645161290324
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/coldrecovery": {
+   "max": 54209.0,
+   "median": 53749.0,
+   "min": 52663.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 2.8763325829317754
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/deletechurn": {
+   "max": 4996.0,
+   "median": 4484.0,
+   "min": 4108.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 19.803746654772524
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/fillrandom": {
+   "max": 4497.0,
+   "median": 4262.0,
+   "min": 4028.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 11.004223369310184
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/fillseq": {
+   "max": 4412.0,
+   "median": 4163.0,
+   "min": 3983.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 10.305068460245016
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/overwrite": {
+   "max": 10151.0,
+   "median": 9734.0,
+   "min": 9586.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 5.804396959112389
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/rangescan100": {
+   "max": 33052.0,
+   "median": 31959.0,
+   "min": 31523.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 4.784254826496449
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/rangescan10k": {
+   "max": 615.0,
+   "median": 589.0,
+   "min": 581.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 5.772495755517827
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/readrandom": {
+   "max": 1137314.0,
+   "median": 751742.0,
+   "min": 742051.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 52.57960842948778
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/ycsb_a.read": {
+   "max": 10876.0,
+   "median": 10313.0,
+   "min": 10147.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 7.068748181906332
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/ycsb_a.update": {
+   "max": 10824.0,
+   "median": 10264.0,
+   "min": 10099.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 7.063522992985191
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/ycsb_b.read": {
+   "max": 189974.0,
+   "median": 152960.0,
+   "min": 148345.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 27.215611924686193
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/ycsb_b.update": {
+   "max": 10084.0,
+   "median": 8119.0,
+   "min": 7874.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 27.22010099765981
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/ycsb_c.read": {
+   "max": 1963572.0,
+   "median": 1772866.0,
+   "min": 1693426.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 15.237812671685283
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/ycsb_d.insert": {
+   "max": 9014.0,
+   "median": 8062.0,
+   "min": 7621.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 17.278590920367154
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/ycsb_d.read": {
+   "max": 172338.0,
+   "median": 154135.0,
+   "min": 145695.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 17.285496480358127
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/ycsb_e.insert": {
+   "max": 5742.0,
+   "median": 5392.0,
+   "min": 5302.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 8.160237388724036
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/ycsb_e.scan": {
+   "max": 109148.0,
+   "median": 102495.0,
+   "min": 100800.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 8.144787550612225
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/ycsb_f.read": {
+   "max": 10173.0,
+   "median": 9540.0,
+   "min": 9436.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 7.7253668763102725
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-async/ycsb_f.rmw": {
+   "max": 10219.0,
+   "median": 9583.0,
+   "min": 9479.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 7.722007722007722
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/ckptload": {
+   "max": 31.0,
+   "median": 30.0,
+   "min": 26.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 16.666666666666668
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/coldrecovery": {
+   "max": 54577.0,
+   "median": 53793.0,
+   "min": 52075.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 4.651162790697675
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/deletechurn": {
+   "max": 5144.0,
+   "median": 4437.0,
+   "min": 4209.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 21.0727969348659
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/fillrandom": {
+   "max": 4302.0,
+   "median": 4224.0,
+   "min": 4175.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 3.006628787878788
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/fillseq": {
+   "max": 4035.0,
+   "median": 3985.0,
+   "min": 3268.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 19.247176913425346
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/overwrite": {
+   "max": 10020.0,
+   "median": 9549.0,
+   "min": 8969.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 11.006388103466332
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/rangescan100": {
+   "max": 36492.0,
+   "median": 35598.0,
+   "min": 34476.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 5.663239507837519
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/rangescan10k": {
+   "max": 641.0,
+   "median": 638.0,
+   "min": 582.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 9.247648902821316
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/readrandom": {
+   "max": 1188973.0,
+   "median": 799188.0,
+   "min": 746052.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 55.42137769836384
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/ycsb_a.read": {
+   "max": 9954.0,
+   "median": 8984.0,
+   "min": 8603.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 15.037845057880677
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/ycsb_a.update": {
+   "max": 9907.0,
+   "median": 8941.0,
+   "min": 8563.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 15.03187562912426
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/ycsb_b.read": {
+   "max": 150286.0,
+   "median": 140390.0,
+   "min": 137900.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 8.82256570980839
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/ycsb_b.update": {
+   "max": 7977.0,
+   "median": 7452.0,
+   "min": 7320.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 8.816425120772946
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/ycsb_c.read": {
+   "max": 1880734.0,
+   "median": 1835237.0,
+   "min": 1605190.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 15.0140826498158
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/ycsb_d.insert": {
+   "max": 8931.0,
+   "median": 8317.0,
+   "min": 7612.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 15.859083804256342
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/ycsb_d.read": {
+   "max": 170753.0,
+   "median": 159017.0,
+   "min": 145535.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 15.858681776162298
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/ycsb_e.insert": {
+   "max": 5638.0,
+   "median": 5552.0,
+   "min": 4742.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 16.138328530259365
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/ycsb_e.scan": {
+   "max": 107169.0,
+   "median": 105540.0,
+   "min": 90145.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 16.13037710820542
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/ycsb_f.read": {
+   "max": 9644.0,
+   "median": 9515.0,
+   "min": 8578.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 11.20336311087756
+  },
+  "AMD EPYC 9V45 96-Core Processor|chronokv-group/ycsb_f.rmw": {
+   "max": 9688.0,
+   "median": 9558.0,
+   "min": 8617.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 11.20527306967985
+  },
+  "AMD EPYC 9V45 96-Core Processor|lmdb/fillrandom": {
+   "max": 3923.0,
+   "median": 3922.0,
+   "min": 3921.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 0.05099439061703213
+  },
+  "AMD EPYC 9V45 96-Core Processor|lmdb/fillseq": {
+   "max": 3909.0,
+   "median": 3909.0,
+   "min": 3894.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 0.3837298541826554
+  },
+  "AMD EPYC 9V45 96-Core Processor|lmdb/overwrite": {
+   "max": 3921.0,
+   "median": 3919.0,
+   "min": 3918.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 0.07655014034192396
+  },
+  "AMD EPYC 9V45 96-Core Processor|lmdb/readrandom": {
+   "max": 6514338.0,
+   "median": 6033791.0,
+   "min": 5610965.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 14.971897435625463
+  },
+  "AMD EPYC 9V45 96-Core Processor|lmdb/ycsb_a.read": {
+   "max": 3941.0,
+   "median": 3940.0,
+   "min": 3934.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 0.17766497461928935
+  },
+  "AMD EPYC 9V45 96-Core Processor|lmdb/ycsb_a.update": {
+   "max": 3923.0,
+   "median": 3922.0,
+   "min": 3916.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 0.17848036715961244
+  },
+  "AMD EPYC 9V45 96-Core Processor|lmdb/ycsb_b.read": {
+   "max": 74018.0,
+   "median": 73946.0,
+   "min": 73915.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 0.13929083385172963
+  },
+  "AMD EPYC 9V45 96-Core Processor|lmdb/ycsb_b.update": {
+   "max": 3932.0,
+   "median": 3928.0,
+   "min": 3927.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 0.12729124236252545
+  },
+  "AMD EPYC 9V45 96-Core Processor|lmdb/ycsb_c.read": {
+   "max": 7885563.0,
+   "median": 7650574.0,
+   "min": 7503865.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 4.989141991176087
+  },
+  "AMD EPYC 9V45 96-Core Processor|lmdb/ycsb_d.insert": {
+   "max": 3994.0,
+   "median": 3972.0,
+   "min": 3911.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 2.0896273917421953
+  },
+  "AMD EPYC 9V45 96-Core Processor|lmdb/ycsb_d.read": {
+   "max": 76358.0,
+   "median": 75934.0,
+   "min": 74779.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 2.079437406168515
+  },
+  "AMD EPYC 9V45 96-Core Processor|lmdb/ycsb_e.insert": {
+   "max": 3962.0,
+   "median": 3932.0,
+   "min": 3910.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 1.3224821973550356
+  },
+  "AMD EPYC 9V45 96-Core Processor|lmdb/ycsb_e.scan": {
+   "max": 75321.0,
+   "median": 74742.0,
+   "min": 74325.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 1.3325840892670788
+  },
+  "AMD EPYC 9V45 96-Core Processor|lmdb/ycsb_f.read": {
+   "max": 3962.0,
+   "median": 3923.0,
+   "min": 3917.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 1.1470813153199082
+  },
+  "AMD EPYC 9V45 96-Core Processor|lmdb/ycsb_f.rmw": {
+   "max": 3980.0,
+   "median": 3941.0,
+   "min": 3934.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 1.1672164425272773
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-sync/fillrandom": {
+   "max": 5104.0,
+   "median": 4678.0,
+   "min": 4351.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 16.09662248824284
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-sync/fillseq": {
+   "max": 5197.0,
+   "median": 4956.0,
+   "min": 3957.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 25.020177562550444
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-sync/overwrite": {
+   "max": 14804.0,
+   "median": 14167.0,
+   "min": 12827.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 13.9549657655114
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-sync/readrandom": {
+   "max": 1629113.0,
+   "median": 1556863.0,
+   "min": 1528426.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 6.46729994867885
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-sync/ycsb_a.read": {
+   "max": 13047.0,
+   "median": 12397.0,
+   "min": 10396.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 21.384205856255544
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-sync/ycsb_a.update": {
+   "max": 12988.0,
+   "median": 12340.0,
+   "min": 10349.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 21.38573743922204
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-sync/ycsb_b.read": {
+   "max": 193726.0,
+   "median": 185310.0,
+   "min": 175079.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 10.062597809076681
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-sync/ycsb_b.update": {
+   "max": 10292.0,
+   "median": 9845.0,
+   "min": 9301.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 10.066023362112748
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-sync/ycsb_c.read": {
+   "max": 1883225.0,
+   "median": 1826650.0,
+   "min": 1761976.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 6.63777954178414
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-sync/ycsb_d.insert": {
+   "max": 10178.0,
+   "median": 9380.0,
+   "min": 9332.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 9.019189765458423
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-sync/ycsb_d.read": {
+   "max": 194582.0,
+   "median": 179341.0,
+   "min": 178411.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 9.01690076446546
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-sync/ycsb_e.insert": {
+   "max": 5378.0,
+   "median": 5318.0,
+   "min": 4684.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 13.050018804061677
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-sync/ycsb_e.scan": {
+   "max": 102234.0,
+   "median": 101093.0,
+   "min": 89046.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 13.045413629034652
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-sync/ycsb_f.read": {
+   "max": 12641.0,
+   "median": 11708.0,
+   "min": 10990.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 14.101469080970277
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-sync/ycsb_f.rmw": {
+   "max": 12698.0,
+   "median": 11760.0,
+   "min": 11040.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 14.098639455782314
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-tuned/fillrandom": {
+   "max": 239188.0,
+   "median": 232481.0,
+   "min": 187234.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 22.34763270976983
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-tuned/fillseq": {
+   "max": 368351.0,
+   "median": 366691.0,
+   "min": 363651.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 1.2817331213474015
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-tuned/overwrite": {
+   "max": 288651.0,
+   "median": 279888.0,
+   "min": 245558.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 15.396515749156805
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-tuned/readrandom": {
+   "max": 1433466.0,
+   "median": 1363986.0,
+   "min": 1080293.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 25.89271444135057
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-tuned/ycsb_a.read": {
+   "max": 328246.0,
+   "median": 321098.0,
+   "min": 282653.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 14.199091866034669
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-tuned/ycsb_a.update": {
+   "max": 326746.0,
+   "median": 319631.0,
+   "min": 281361.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 14.199185936282776
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-tuned/ycsb_b.read": {
+   "max": 1590707.0,
+   "median": 1469661.0,
+   "min": 1246295.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 23.43479210511812
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-tuned/ycsb_b.update": {
+   "max": 84506.0,
+   "median": 78076.0,
+   "min": 66209.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 23.434858343152825
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-tuned/ycsb_c.read": {
+   "max": 1839759.0,
+   "median": 1750923.0,
+   "min": 1429643.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 23.422846121731226
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-tuned/ycsb_d.insert": {
+   "max": 87802.0,
+   "median": 73001.0,
+   "min": 72332.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 21.19149052752702
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-tuned/ycsb_d.read": {
+   "max": 1678664.0,
+   "median": 1395681.0,
+   "min": 1382891.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 21.192020239581968
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-tuned/ycsb_e.insert": {
+   "max": 5411.0,
+   "median": 5345.0,
+   "min": 4856.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 10.383536014967259
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-tuned/ycsb_e.scan": {
+   "max": 102871.0,
+   "median": 101617.0,
+   "min": 92314.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 10.389009712941732
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-tuned/ycsb_f.read": {
+   "max": 313291.0,
+   "median": 302793.0,
+   "min": 288531.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 8.17720356811419
+  },
+  "AMD EPYC 9V45 96-Core Processor|rocksdb-tuned/ycsb_f.rmw": {
+   "max": 314704.0,
+   "median": 304159.0,
+   "min": 289832.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 8.177302003228574
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-full/fillrandom": {
+   "max": 9411.0,
+   "median": 8816.0,
+   "min": 8605.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 9.142468239564428
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-full/fillseq": {
+   "max": 9988.0,
+   "median": 9628.0,
+   "min": 9189.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 8.298712089738263
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-full/overwrite": {
+   "max": 9570.0,
+   "median": 9015.0,
+   "min": 8643.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 10.282861896838602
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-full/readrandom": {
+   "max": 910474.0,
+   "median": 876376.0,
+   "min": 841994.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 7.813997644846504
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-full/ycsb_a.read": {
+   "max": 9980.0,
+   "median": 9098.0,
+   "min": 8962.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 11.189272367553308
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-full/ycsb_a.update": {
+   "max": 9935.0,
+   "median": 9056.0,
+   "min": 8921.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 11.196996466431095
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-full/ycsb_b.read": {
+   "max": 121114.0,
+   "median": 116236.0,
+   "min": 104940.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 13.914794039712309
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-full/ycsb_b.update": {
+   "max": 6434.0,
+   "median": 6175.0,
+   "min": 5575.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 13.910931174089068
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-full/ycsb_c.read": {
+   "max": 821813.0,
+   "median": 815385.0,
+   "min": 748218.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 9.02579762934074
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-full/ycsb_d.insert": {
+   "max": 6619.0,
+   "median": 6559.0,
+   "min": 6056.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 8.583625552675713
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-full/ycsb_d.read": {
+   "max": 126542.0,
+   "median": 125406.0,
+   "min": 115776.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 8.584916192207709
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-full/ycsb_e.insert": {
+   "max": 3875.0,
+   "median": 3733.0,
+   "min": 3580.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 7.902491293865523
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-full/ycsb_e.scan": {
+   "max": 73663.0,
+   "median": 70971.0,
+   "min": 68055.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 7.901819052852574
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-full/ycsb_f.read": {
+   "max": 9398.0,
+   "median": 8923.0,
+   "min": 8804.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 6.656953939258097
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-full/ycsb_f.rmw": {
+   "max": 9440.0,
+   "median": 8963.0,
+   "min": 8843.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 6.660716278031909
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-normal/fillrandom": {
+   "max": 22991.0,
+   "median": 22975.0,
+   "min": 22860.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 0.5701849836779108
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-normal/fillseq": {
+   "max": 42581.0,
+   "median": 40680.0,
+   "min": 38694.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 9.555063913470994
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-normal/overwrite": {
+   "max": 45371.0,
+   "median": 44854.0,
+   "min": 40468.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 10.93102064475855
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-normal/readrandom": {
+   "max": 922129.0,
+   "median": 921072.0,
+   "min": 836596.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 9.286244723539529
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-normal/ycsb_a.read": {
+   "max": 55138.0,
+   "median": 51213.0,
+   "min": 49022.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 11.942280280397556
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-normal/ycsb_a.update": {
+   "max": 54886.0,
+   "median": 50979.0,
+   "min": 48798.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 11.942172267011907
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-normal/ycsb_b.read": {
+   "max": 294915.0,
+   "median": 289941.0,
+   "min": 282709.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 4.209821998268613
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-normal/ycsb_b.update": {
+   "max": 15667.0,
+   "median": 15403.0,
+   "min": 15019.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 4.206972667662144
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-normal/ycsb_c.read": {
+   "max": 809550.0,
+   "median": 805882.0,
+   "min": 795986.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 1.6831248247262005
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-normal/ycsb_d.insert": {
+   "max": 16624.0,
+   "median": 15654.0,
+   "min": 15599.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 6.547847195604957
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-normal/ycsb_d.read": {
+   "max": 317820.0,
+   "median": 299281.0,
+   "min": 298229.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 6.546021965978461
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-normal/ycsb_e.insert": {
+   "max": 9216.0,
+   "median": 8694.0,
+   "min": 8450.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 8.810674028065332
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-normal/ycsb_e.scan": {
+   "max": 175191.0,
+   "median": 165266.0,
+   "min": 160644.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 8.80217346580664
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-normal/ycsb_f.read": {
+   "max": 55413.0,
+   "median": 53284.0,
+   "min": 53224.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 4.108175061932287
+  },
+  "AMD EPYC 9V45 96-Core Processor|sqlite-normal/ycsb_f.rmw": {
+   "max": 55663.0,
+   "median": 53525.0,
+   "min": 53464.0,
+   "n": 3,
+   "provisional": true,
+   "spread_pct": 4.108360579168613
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/ckptload": {
+   "max": 22.0,
+   "median": 22.0,
+   "min": 22.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/coldrecovery": {
+   "max": 37182.0,
+   "median": 37182.0,
+   "min": 37182.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/deletechurn": {
+   "max": 4451.0,
+   "median": 4451.0,
+   "min": 4451.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/fillrandom": {
+   "max": 3435.0,
+   "median": 3435.0,
+   "min": 3435.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/fillseq": {
+   "max": 3428.0,
+   "median": 3428.0,
+   "min": 3428.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/overwrite": {
+   "max": 6992.0,
+   "median": 6992.0,
+   "min": 6992.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/rangescan100": {
+   "max": 33042.0,
+   "median": 33042.0,
+   "min": 33042.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/rangescan10k": {
+   "max": 511.0,
+   "median": 511.0,
+   "min": 511.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/readrandom": {
+   "max": 667353.0,
+   "median": 667353.0,
+   "min": 667353.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/ycsb_a.read": {
+   "max": 7098.0,
+   "median": 7098.0,
+   "min": 7098.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/ycsb_a.update": {
+   "max": 7065.0,
+   "median": 7065.0,
+   "min": 7065.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/ycsb_b.read": {
+   "max": 119901.0,
+   "median": 119901.0,
+   "min": 119901.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/ycsb_b.update": {
+   "max": 6364.0,
+   "median": 6364.0,
+   "min": 6364.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/ycsb_c.read": {
+   "max": 1273293.0,
+   "median": 1273293.0,
+   "min": 1273293.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/ycsb_d.insert": {
+   "max": 8321.0,
+   "median": 8321.0,
+   "min": 8321.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/ycsb_d.read": {
+   "max": 159090.0,
+   "median": 159090.0,
+   "min": 159090.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/ycsb_e.insert": {
+   "max": 3480.0,
+   "median": 3480.0,
+   "min": 3480.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/ycsb_e.scan": {
+   "max": 66151.0,
+   "median": 66151.0,
+   "min": 66151.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/ycsb_f.read": {
+   "max": 5814.0,
+   "median": 5814.0,
+   "min": 5814.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-async/ycsb_f.rmw": {
+   "max": 5841.0,
+   "median": 5841.0,
+   "min": 5841.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/ckptload": {
+   "max": 10.0,
+   "median": 10.0,
+   "min": 10.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/coldrecovery": {
+   "max": 38238.0,
+   "median": 38238.0,
+   "min": 38238.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/deletechurn": {
+   "max": 3492.0,
+   "median": 3492.0,
+   "min": 3492.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/fillrandom": {
+   "max": 4306.0,
+   "median": 4306.0,
+   "min": 4306.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/fillseq": {
+   "max": 3903.0,
+   "median": 3903.0,
+   "min": 3903.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/overwrite": {
+   "max": 4889.0,
+   "median": 4889.0,
+   "min": 4889.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/rangescan100": {
+   "max": 36601.0,
+   "median": 36601.0,
+   "min": 36601.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/rangescan10k": {
+   "max": 502.0,
+   "median": 502.0,
+   "min": 502.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/readrandom": {
+   "max": 917274.0,
+   "median": 917274.0,
+   "min": 917274.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/ycsb_a.read": {
+   "max": 6181.0,
+   "median": 6181.0,
+   "min": 6181.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/ycsb_a.update": {
+   "max": 6151.0,
+   "median": 6151.0,
+   "min": 6151.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/ycsb_b.read": {
+   "max": 148470.0,
+   "median": 148470.0,
+   "min": 148470.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/ycsb_b.update": {
+   "max": 7881.0,
+   "median": 7881.0,
+   "min": 7881.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/ycsb_c.read": {
+   "max": 1179868.0,
+   "median": 1179868.0,
+   "min": 1179868.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/ycsb_d.insert": {
+   "max": 7056.0,
+   "median": 7056.0,
+   "min": 7056.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/ycsb_d.read": {
+   "max": 134899.0,
+   "median": 134899.0,
+   "min": 134899.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/ycsb_e.insert": {
+   "max": 2112.0,
+   "median": 2112.0,
+   "min": 2112.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/ycsb_e.scan": {
+   "max": 40153.0,
+   "median": 40153.0,
+   "min": 40153.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/ycsb_f.read": {
+   "max": 5487.0,
+   "median": 5487.0,
+   "min": 5487.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|chronokv-group/ycsb_f.rmw": {
+   "max": 5512.0,
+   "median": 5512.0,
+   "min": 5512.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|lmdb/fillrandom": {
+   "max": 3482.0,
+   "median": 3482.0,
+   "min": 3482.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|lmdb/fillseq": {
+   "max": 2850.0,
+   "median": 2850.0,
+   "min": 2850.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|lmdb/overwrite": {
+   "max": 3929.0,
+   "median": 3929.0,
+   "min": 3929.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|lmdb/readrandom": {
+   "max": 4854402.0,
+   "median": 4854402.0,
+   "min": 4854402.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|lmdb/ycsb_a.read": {
+   "max": 3902.0,
+   "median": 3902.0,
+   "min": 3902.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|lmdb/ycsb_a.update": {
+   "max": 3884.0,
+   "median": 3884.0,
+   "min": 3884.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|lmdb/ycsb_b.read": {
+   "max": 73760.0,
+   "median": 73760.0,
+   "min": 73760.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|lmdb/ycsb_b.update": {
+   "max": 3918.0,
+   "median": 3918.0,
+   "min": 3918.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|lmdb/ycsb_c.read": {
+   "max": 5682400.0,
+   "median": 5682400.0,
+   "min": 5682400.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|lmdb/ycsb_d.insert": {
+   "max": 3981.0,
+   "median": 3981.0,
+   "min": 3981.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|lmdb/ycsb_d.read": {
+   "max": 76110.0,
+   "median": 76110.0,
+   "min": 76110.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|lmdb/ycsb_e.insert": {
+   "max": 4348.0,
+   "median": 4348.0,
+   "min": 4348.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|lmdb/ycsb_e.scan": {
+   "max": 82651.0,
+   "median": 82651.0,
+   "min": 82651.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|lmdb/ycsb_f.read": {
+   "max": 2409.0,
+   "median": 2409.0,
+   "min": 2409.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|lmdb/ycsb_f.rmw": {
+   "max": 2420.0,
+   "median": 2420.0,
+   "min": 2420.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-sync/fillrandom": {
+   "max": 3916.0,
+   "median": 3916.0,
+   "min": 3916.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-sync/fillseq": {
+   "max": 3001.0,
+   "median": 3001.0,
+   "min": 3001.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-sync/overwrite": {
+   "max": 6435.0,
+   "median": 6435.0,
+   "min": 6435.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-sync/readrandom": {
+   "max": 1174341.0,
+   "median": 1174341.0,
+   "min": 1174341.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-sync/ycsb_a.read": {
+   "max": 5243.0,
+   "median": 5243.0,
+   "min": 5243.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-sync/ycsb_a.update": {
+   "max": 5219.0,
+   "median": 5219.0,
+   "min": 5219.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-sync/ycsb_b.read": {
+   "max": 149184.0,
+   "median": 149184.0,
+   "min": 149184.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-sync/ycsb_b.update": {
+   "max": 7925.0,
+   "median": 7925.0,
+   "min": 7925.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-sync/ycsb_c.read": {
+   "max": 1266006.0,
+   "median": 1266006.0,
+   "min": 1266006.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-sync/ycsb_d.insert": {
+   "max": 8683.0,
+   "median": 8683.0,
+   "min": 8683.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-sync/ycsb_d.read": {
+   "max": 165999.0,
+   "median": 165999.0,
+   "min": 165999.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-sync/ycsb_e.insert": {
+   "max": 3736.0,
+   "median": 3736.0,
+   "min": 3736.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-sync/ycsb_e.scan": {
+   "max": 71024.0,
+   "median": 71024.0,
+   "min": 71024.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-sync/ycsb_f.read": {
+   "max": 7176.0,
+   "median": 7176.0,
+   "min": 7176.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-sync/ycsb_f.rmw": {
+   "max": 7209.0,
+   "median": 7209.0,
+   "min": 7209.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-tuned/fillrandom": {
+   "max": 164605.0,
+   "median": 164605.0,
+   "min": 164605.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-tuned/fillseq": {
+   "max": 283130.0,
+   "median": 283130.0,
+   "min": 283130.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-tuned/overwrite": {
+   "max": 193264.0,
+   "median": 193264.0,
+   "min": 193264.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-tuned/readrandom": {
+   "max": 1016558.0,
+   "median": 1016558.0,
+   "min": 1016558.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-tuned/ycsb_a.read": {
+   "max": 220327.0,
+   "median": 220327.0,
+   "min": 220327.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-tuned/ycsb_a.update": {
+   "max": 219320.0,
+   "median": 219320.0,
+   "min": 219320.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-tuned/ycsb_b.read": {
+   "max": 1188143.0,
+   "median": 1188143.0,
+   "min": 1188143.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-tuned/ycsb_b.update": {
+   "max": 63120.0,
+   "median": 63120.0,
+   "min": 63120.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-tuned/ycsb_c.read": {
+   "max": 1370680.0,
+   "median": 1370680.0,
+   "min": 1370680.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-tuned/ycsb_d.insert": {
+   "max": 66714.0,
+   "median": 66714.0,
+   "min": 66714.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-tuned/ycsb_d.read": {
+   "max": 1275490.0,
+   "median": 1275490.0,
+   "min": 1275490.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-tuned/ycsb_e.insert": {
+   "max": 3752.0,
+   "median": 3752.0,
+   "min": 3752.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-tuned/ycsb_e.scan": {
+   "max": 71322.0,
+   "median": 71322.0,
+   "min": 71322.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-tuned/ycsb_f.read": {
+   "max": 223947.0,
+   "median": 223947.0,
+   "min": 223947.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|rocksdb-tuned/ycsb_f.rmw": {
+   "max": 224957.0,
+   "median": 224957.0,
+   "min": 224957.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-full/fillrandom": {
+   "max": 4897.0,
+   "median": 4897.0,
+   "min": 4897.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-full/fillseq": {
+   "max": 6971.0,
+   "median": 6971.0,
+   "min": 6971.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-full/overwrite": {
+   "max": 4856.0,
+   "median": 4856.0,
+   "min": 4856.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-full/readrandom": {
+   "max": 634334.0,
+   "median": 634334.0,
+   "min": 634334.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-full/ycsb_a.read": {
+   "max": 7737.0,
+   "median": 7737.0,
+   "min": 7737.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-full/ycsb_a.update": {
+   "max": 7702.0,
+   "median": 7702.0,
+   "min": 7702.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-full/ycsb_b.read": {
+   "max": 53537.0,
+   "median": 53537.0,
+   "min": 53537.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-full/ycsb_b.update": {
+   "max": 2844.0,
+   "median": 2844.0,
+   "min": 2844.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-full/ycsb_c.read": {
+   "max": 651947.0,
+   "median": 651947.0,
+   "min": 651947.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-full/ycsb_d.insert": {
+   "max": 2858.0,
+   "median": 2858.0,
+   "min": 2858.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-full/ycsb_d.read": {
+   "max": 54636.0,
+   "median": 54636.0,
+   "min": 54636.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-full/ycsb_e.insert": {
+   "max": 2602.0,
+   "median": 2602.0,
+   "min": 2602.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-full/ycsb_e.scan": {
+   "max": 49471.0,
+   "median": 49471.0,
+   "min": 49471.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-full/ycsb_f.read": {
+   "max": 6329.0,
+   "median": 6329.0,
+   "min": 6329.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-full/ycsb_f.rmw": {
+   "max": 6358.0,
+   "median": 6358.0,
+   "min": 6358.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-normal/fillrandom": {
+   "max": 15438.0,
+   "median": 15438.0,
+   "min": 15438.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-normal/fillseq": {
+   "max": 25991.0,
+   "median": 25991.0,
+   "min": 25991.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-normal/overwrite": {
+   "max": 41339.0,
+   "median": 41339.0,
+   "min": 41339.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-normal/readrandom": {
+   "max": 625662.0,
+   "median": 625662.0,
+   "min": 625662.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-normal/ycsb_a.read": {
+   "max": 44098.0,
+   "median": 44098.0,
+   "min": 44098.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-normal/ycsb_a.update": {
+   "max": 43896.0,
+   "median": 43896.0,
+   "min": 43896.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-normal/ycsb_b.read": {
+   "max": 207814.0,
+   "median": 207814.0,
+   "min": 207814.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-normal/ycsb_b.update": {
+   "max": 11040.0,
+   "median": 11040.0,
+   "min": 11040.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-normal/ycsb_c.read": {
+   "max": 681025.0,
+   "median": 681025.0,
+   "min": 681025.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-normal/ycsb_d.insert": {
+   "max": 12076.0,
+   "median": 12076.0,
+   "min": 12076.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-normal/ycsb_d.read": {
+   "max": 230871.0,
+   "median": 230871.0,
+   "min": 230871.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-normal/ycsb_e.insert": {
+   "max": 6805.0,
+   "median": 6805.0,
+   "min": 6805.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-normal/ycsb_e.scan": {
+   "max": 129356.0,
+   "median": 129356.0,
+   "min": 129356.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-normal/ycsb_f.read": {
+   "max": 41307.0,
+   "median": 41307.0,
+   "min": 41307.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "AMD EPYC 9V74 80-Core Processor|sqlite-normal/ycsb_f.rmw": {
+   "max": 41493.0,
+   "median": 41493.0,
+   "min": 41493.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/ckptload": {
+   "max": 19.0,
+   "median": 19.0,
+   "min": 19.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/coldrecovery": {
+   "max": 30458.0,
+   "median": 30458.0,
+   "min": 30458.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/deletechurn": {
+   "max": 2762.0,
+   "median": 2762.0,
+   "min": 2762.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/fillrandom": {
+   "max": 2759.0,
+   "median": 2759.0,
+   "min": 2759.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/fillseq": {
+   "max": 2774.0,
+   "median": 2774.0,
+   "min": 2774.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/overwrite": {
+   "max": 5222.0,
+   "median": 5222.0,
+   "min": 5222.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/rangescan100": {
+   "max": 24832.0,
+   "median": 24832.0,
+   "min": 24832.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/rangescan10k": {
+   "max": 354.0,
+   "median": 354.0,
+   "min": 354.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/readrandom": {
+   "max": 665587.0,
+   "median": 665587.0,
+   "min": 665587.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/ycsb_a.read": {
+   "max": 5231.0,
+   "median": 5231.0,
+   "min": 5231.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/ycsb_a.update": {
+   "max": 5206.0,
+   "median": 5206.0,
+   "min": 5206.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/ycsb_b.read": {
+   "max": 92368.0,
+   "median": 92368.0,
+   "min": 92368.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/ycsb_b.update": {
+   "max": 4903.0,
+   "median": 4903.0,
+   "min": 4903.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/ycsb_c.read": {
+   "max": 815302.0,
+   "median": 815302.0,
+   "min": 815302.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/ycsb_d.insert": {
+   "max": 5354.0,
+   "median": 5354.0,
+   "min": 5354.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/ycsb_d.read": {
+   "max": 102360.0,
+   "median": 102360.0,
+   "min": 102360.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/ycsb_e.insert": {
+   "max": 3224.0,
+   "median": 3224.0,
+   "min": 3224.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/ycsb_e.scan": {
+   "max": 61280.0,
+   "median": 61280.0,
+   "min": 61280.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/ycsb_f.read": {
+   "max": 5144.0,
+   "median": 5144.0,
+   "min": 5144.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-async/ycsb_f.rmw": {
+   "max": 5168.0,
+   "median": 5168.0,
+   "min": 5168.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/ckptload": {
+   "max": 20.0,
+   "median": 20.0,
+   "min": 20.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/coldrecovery": {
+   "max": 30653.0,
+   "median": 30653.0,
+   "min": 30653.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/deletechurn": {
+   "max": 2810.0,
+   "median": 2810.0,
+   "min": 2810.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/fillrandom": {
+   "max": 2606.0,
+   "median": 2606.0,
+   "min": 2606.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/fillseq": {
+   "max": 2763.0,
+   "median": 2763.0,
+   "min": 2763.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/overwrite": {
+   "max": 5138.0,
+   "median": 5138.0,
+   "min": 5138.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/rangescan100": {
+   "max": 24918.0,
+   "median": 24918.0,
+   "min": 24918.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/rangescan10k": {
+   "max": 349.0,
+   "median": 349.0,
+   "min": 349.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/readrandom": {
+   "max": 614353.0,
+   "median": 614353.0,
+   "min": 614353.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/ycsb_a.read": {
+   "max": 5264.0,
+   "median": 5264.0,
+   "min": 5264.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/ycsb_a.update": {
+   "max": 5239.0,
+   "median": 5239.0,
+   "min": 5239.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/ycsb_b.read": {
+   "max": 93850.0,
+   "median": 93850.0,
+   "min": 93850.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/ycsb_b.update": {
+   "max": 4982.0,
+   "median": 4982.0,
+   "min": 4982.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/ycsb_c.read": {
+   "max": 559459.0,
+   "median": 559459.0,
+   "min": 559459.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/ycsb_d.insert": {
+   "max": 5096.0,
+   "median": 5096.0,
+   "min": 5096.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/ycsb_d.read": {
+   "max": 97429.0,
+   "median": 97429.0,
+   "min": 97429.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/ycsb_e.insert": {
+   "max": 3357.0,
+   "median": 3357.0,
+   "min": 3357.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/ycsb_e.scan": {
+   "max": 63824.0,
+   "median": 63824.0,
+   "min": 63824.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/ycsb_f.read": {
+   "max": 5173.0,
+   "median": 5173.0,
+   "min": 5173.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|chronokv-group/ycsb_f.rmw": {
+   "max": 5197.0,
+   "median": 5197.0,
+   "min": 5197.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|lmdb/fillrandom": {
+   "max": 2611.0,
+   "median": 2611.0,
+   "min": 2611.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|lmdb/fillseq": {
+   "max": 2549.0,
+   "median": 2549.0,
+   "min": 2549.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|lmdb/overwrite": {
+   "max": 2546.0,
+   "median": 2546.0,
+   "min": 2546.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|lmdb/readrandom": {
+   "max": 3310608.0,
+   "median": 3310608.0,
+   "min": 3310608.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|lmdb/ycsb_a.read": {
+   "max": 2521.0,
+   "median": 2521.0,
+   "min": 2521.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|lmdb/ycsb_a.update": {
+   "max": 2509.0,
+   "median": 2509.0,
+   "min": 2509.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|lmdb/ycsb_b.read": {
+   "max": 44748.0,
+   "median": 44748.0,
+   "min": 44748.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|lmdb/ycsb_b.update": {
+   "max": 2377.0,
+   "median": 2377.0,
+   "min": 2377.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|lmdb/ycsb_c.read": {
+   "max": 3937187.0,
+   "median": 3937187.0,
+   "min": 3937187.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|lmdb/ycsb_d.insert": {
+   "max": 2315.0,
+   "median": 2315.0,
+   "min": 2315.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|lmdb/ycsb_d.read": {
+   "max": 44264.0,
+   "median": 44264.0,
+   "min": 44264.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|lmdb/ycsb_e.insert": {
+   "max": 2057.0,
+   "median": 2057.0,
+   "min": 2057.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|lmdb/ycsb_e.scan": {
+   "max": 39105.0,
+   "median": 39105.0,
+   "min": 39105.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|lmdb/ycsb_f.read": {
+   "max": 2482.0,
+   "median": 2482.0,
+   "min": 2482.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|lmdb/ycsb_f.rmw": {
+   "max": 2493.0,
+   "median": 2493.0,
+   "min": 2493.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-sync/fillrandom": {
+   "max": 3112.0,
+   "median": 3112.0,
+   "min": 3112.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-sync/fillseq": {
+   "max": 3154.0,
+   "median": 3154.0,
+   "min": 3154.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-sync/overwrite": {
+   "max": 10294.0,
+   "median": 10294.0,
+   "min": 10294.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-sync/readrandom": {
+   "max": 963908.0,
+   "median": 963908.0,
+   "min": 963908.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-sync/ycsb_a.read": {
+   "max": 7257.0,
+   "median": 7257.0,
+   "min": 7257.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-sync/ycsb_a.update": {
+   "max": 7224.0,
+   "median": 7224.0,
+   "min": 7224.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-sync/ycsb_b.read": {
+   "max": 104427.0,
+   "median": 104427.0,
+   "min": 104427.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-sync/ycsb_b.update": {
+   "max": 5548.0,
+   "median": 5548.0,
+   "min": 5548.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-sync/ycsb_c.read": {
+   "max": 990252.0,
+   "median": 990252.0,
+   "min": 990252.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-sync/ycsb_d.insert": {
+   "max": 5576.0,
+   "median": 5576.0,
+   "min": 5576.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-sync/ycsb_d.read": {
+   "max": 106601.0,
+   "median": 106601.0,
+   "min": 106601.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-sync/ycsb_e.insert": {
+   "max": 2883.0,
+   "median": 2883.0,
+   "min": 2883.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-sync/ycsb_e.scan": {
+   "max": 54797.0,
+   "median": 54797.0,
+   "min": 54797.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-sync/ycsb_f.read": {
+   "max": 6450.0,
+   "median": 6450.0,
+   "min": 6450.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-sync/ycsb_f.rmw": {
+   "max": 6479.0,
+   "median": 6479.0,
+   "min": 6479.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-tuned/fillrandom": {
+   "max": 168822.0,
+   "median": 168822.0,
+   "min": 168822.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-tuned/fillseq": {
+   "max": 352899.0,
+   "median": 352899.0,
+   "min": 352899.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-tuned/overwrite": {
+   "max": 181601.0,
+   "median": 181601.0,
+   "min": 181601.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-tuned/readrandom": {
+   "max": 907580.0,
+   "median": 907580.0,
+   "min": 907580.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-tuned/ycsb_a.read": {
+   "max": 175379.0,
+   "median": 175379.0,
+   "min": 175379.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-tuned/ycsb_a.update": {
+   "max": 174578.0,
+   "median": 174578.0,
+   "min": 174578.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-tuned/ycsb_b.read": {
+   "max": 873793.0,
+   "median": 873793.0,
+   "min": 873793.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-tuned/ycsb_b.update": {
+   "max": 46420.0,
+   "median": 46420.0,
+   "min": 46420.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-tuned/ycsb_c.read": {
+   "max": 996078.0,
+   "median": 996078.0,
+   "min": 996078.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-tuned/ycsb_d.insert": {
+   "max": 54355.0,
+   "median": 54355.0,
+   "min": 54355.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-tuned/ycsb_d.read": {
+   "max": 1039190.0,
+   "median": 1039190.0,
+   "min": 1039190.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-tuned/ycsb_e.insert": {
+   "max": 2830.0,
+   "median": 2830.0,
+   "min": 2830.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-tuned/ycsb_e.scan": {
+   "max": 53808.0,
+   "median": 53808.0,
+   "min": 53808.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-tuned/ycsb_f.read": {
+   "max": 186267.0,
+   "median": 186267.0,
+   "min": 186267.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|rocksdb-tuned/ycsb_f.rmw": {
+   "max": 187107.0,
+   "median": 187107.0,
+   "min": 187107.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-full/fillrandom": {
+   "max": 5293.0,
+   "median": 5293.0,
+   "min": 5293.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-full/fillseq": {
+   "max": 6687.0,
+   "median": 6687.0,
+   "min": 6687.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-full/overwrite": {
+   "max": 5025.0,
+   "median": 5025.0,
+   "min": 5025.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-full/readrandom": {
+   "max": 646851.0,
+   "median": 646851.0,
+   "min": 646851.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-full/ycsb_a.read": {
+   "max": 6268.0,
+   "median": 6268.0,
+   "min": 6268.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-full/ycsb_a.update": {
+   "max": 6240.0,
+   "median": 6240.0,
+   "min": 6240.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-full/ycsb_b.read": {
+   "max": 82440.0,
+   "median": 82440.0,
+   "min": 82440.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-full/ycsb_b.update": {
+   "max": 4380.0,
+   "median": 4380.0,
+   "min": 4380.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-full/ycsb_c.read": {
+   "max": 660360.0,
+   "median": 660360.0,
+   "min": 660360.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-full/ycsb_d.insert": {
+   "max": 5243.0,
+   "median": 5243.0,
+   "min": 5243.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-full/ycsb_d.read": {
+   "max": 100238.0,
+   "median": 100238.0,
+   "min": 100238.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-full/ycsb_e.insert": {
+   "max": 2477.0,
+   "median": 2477.0,
+   "min": 2477.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-full/ycsb_e.scan": {
+   "max": 47081.0,
+   "median": 47081.0,
+   "min": 47081.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-full/ycsb_f.read": {
+   "max": 6207.0,
+   "median": 6207.0,
+   "min": 6207.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-full/ycsb_f.rmw": {
+   "max": 6235.0,
+   "median": 6235.0,
+   "min": 6235.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-normal/fillrandom": {
+   "max": 14928.0,
+   "median": 14928.0,
+   "min": 14928.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-normal/fillseq": {
+   "max": 36750.0,
+   "median": 36750.0,
+   "min": 36750.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-normal/overwrite": {
+   "max": 35040.0,
+   "median": 35040.0,
+   "min": 35040.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-normal/readrandom": {
+   "max": 643354.0,
+   "median": 643354.0,
+   "min": 643354.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-normal/ycsb_a.read": {
+   "max": 42773.0,
+   "median": 42773.0,
+   "min": 42773.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-normal/ycsb_a.update": {
+   "max": 42577.0,
+   "median": 42577.0,
+   "min": 42577.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-normal/ycsb_b.read": {
+   "max": 249532.0,
+   "median": 249532.0,
+   "min": 249532.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-normal/ycsb_b.update": {
+   "max": 13256.0,
+   "median": 13256.0,
+   "min": 13256.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-normal/ycsb_c.read": {
+   "max": 677457.0,
+   "median": 677457.0,
+   "min": 677457.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-normal/ycsb_d.insert": {
+   "max": 15596.0,
+   "median": 15596.0,
+   "min": 15596.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-normal/ycsb_d.read": {
+   "max": 298174.0,
+   "median": 298174.0,
+   "min": 298174.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-normal/ycsb_e.insert": {
+   "max": 5560.0,
+   "median": 5560.0,
+   "min": 5560.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-normal/ycsb_e.scan": {
+   "max": 105698.0,
+   "median": 105698.0,
+   "min": 105698.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-normal/ycsb_f.read": {
+   "max": 48450.0,
+   "median": 48450.0,
+   "min": 48450.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  },
+  "INTEL(R) XEON(R) PLATINUM 8573C|sqlite-normal/ycsb_f.rmw": {
+   "max": 48669.0,
+   "median": 48669.0,
+   "min": 48669.0,
+   "n": 1,
+   "provisional": true,
+   "spread_pct": 0.0
+  }
+ },
+ "rss": {
+  "chronokv-async/ckptload": {
+   "max": 201.4,
+   "median": 201.4,
+   "min": 201.2,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.09930486593843944
+  },
+  "chronokv-async/coldrecovery": {
+   "max": 201.5,
+   "median": 201.4,
+   "min": 155.1,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 23.03872889771599
+  },
+  "chronokv-async/deletechurn": {
+   "max": 201.4,
+   "median": 201.4,
+   "min": 201.2,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.09930486593843944
+  },
+  "chronokv-async/fillrandom": {
+   "max": 144.8,
+   "median": 141.8,
+   "min": 141.2,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 2.538787023977449
+  },
+  "chronokv-async/fillseq": {
+   "max": 114.7,
+   "median": 114.6,
+   "min": 114.5,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.17452006980803042
+  },
+  "chronokv-async/memory": {
+   "max": 201.5,
+   "median": 201.4,
+   "min": 160.7,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 20.258192651439924
+  },
+  "chronokv-async/overwrite": {
+   "max": 199.9,
+   "median": 199.0,
+   "min": 198.2,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.8542713567839282
+  },
+  "chronokv-async/rangescan100": {
+   "max": 199.9,
+   "median": 199.0,
+   "min": 198.2,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.8542713567839282
+  },
+  "chronokv-async/rangescan10k": {
+   "max": 199.9,
+   "median": 199.0,
+   "min": 198.2,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.8542713567839282
+  },
+  "chronokv-async/readrandom": {
+   "max": 181.5,
+   "median": 180.6,
+   "min": 179.8,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.9413067552602373
+  },
+  "chronokv-async/ycsb_a.read": {
+   "max": 235.2,
+   "median": 235.1,
+   "min": 194.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 17.354317311782214
+  },
+  "chronokv-async/ycsb_a.update": {
+   "max": 235.2,
+   "median": 235.1,
+   "min": 194.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 17.354317311782214
+  },
+  "chronokv-async/ycsb_b.read": {
+   "max": 235.3,
+   "median": 235.1,
+   "min": 196.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 16.546150574223738
+  },
+  "chronokv-async/ycsb_b.update": {
+   "max": 235.3,
+   "median": 235.1,
+   "min": 196.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 16.546150574223738
+  },
+  "chronokv-async/ycsb_c.read": {
+   "max": 235.3,
+   "median": 235.1,
+   "min": 197.7,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 15.99319438536794
+  },
+  "chronokv-async/ycsb_d.insert": {
+   "max": 235.3,
+   "median": 235.1,
+   "min": 198.1,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 15.82305401956615
+  },
+  "chronokv-async/ycsb_d.read": {
+   "max": 235.3,
+   "median": 235.1,
+   "min": 198.1,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 15.82305401956615
+  },
+  "chronokv-async/ycsb_e.insert": {
+   "max": 235.3,
+   "median": 235.1,
+   "min": 198.8,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 15.525308379413016
+  },
+  "chronokv-async/ycsb_e.scan": {
+   "max": 235.3,
+   "median": 235.1,
+   "min": 198.8,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 15.525308379413016
+  },
+  "chronokv-async/ycsb_f.read": {
+   "max": 235.9,
+   "median": 235.8,
+   "min": 201.0,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 14.800678541136557
+  },
+  "chronokv-async/ycsb_f.rmw": {
+   "max": 235.9,
+   "median": 235.8,
+   "min": 201.0,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 14.800678541136557
+  },
+  "chronokv-group/ckptload": {
+   "max": 201.4,
+   "median": 201.3,
+   "min": 196.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 2.483854942871336
+  },
+  "chronokv-group/coldrecovery": {
+   "max": 201.4,
+   "median": 201.3,
+   "min": 153.6,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 23.74565325384998
+  },
+  "chronokv-group/deletechurn": {
+   "max": 201.4,
+   "median": 201.3,
+   "min": 196.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 2.483854942871336
+  },
+  "chronokv-group/fillrandom": {
+   "max": 142.4,
+   "median": 141.4,
+   "min": 140.9,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 1.0608203677510608
+  },
+  "chronokv-group/fillseq": {
+   "max": 114.7,
+   "median": 114.6,
+   "min": 114.5,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.17452006980803042
+  },
+  "chronokv-group/memory": {
+   "max": 201.4,
+   "median": 201.3,
+   "min": 160.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 20.36761053154496
+  },
+  "chronokv-group/overwrite": {
+   "max": 201.4,
+   "median": 199.6,
+   "min": 199.3,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 1.0521042084168308
+  },
+  "chronokv-group/rangescan100": {
+   "max": 201.4,
+   "median": 199.9,
+   "min": 199.3,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 1.0505252626313129
+  },
+  "chronokv-group/rangescan10k": {
+   "max": 201.4,
+   "median": 199.4,
+   "min": 163.2,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 19.157472417251764
+  },
+  "chronokv-group/readrandom": {
+   "max": 181.5,
+   "median": 181.1,
+   "min": 180.3,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.6626173384870175
+  },
+  "chronokv-group/ycsb_a.read": {
+   "max": 235.1,
+   "median": 235.0,
+   "min": 194.2,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 17.404255319148938
+  },
+  "chronokv-group/ycsb_a.update": {
+   "max": 235.1,
+   "median": 235.0,
+   "min": 194.2,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 17.404255319148938
+  },
+  "chronokv-group/ycsb_b.read": {
+   "max": 235.4,
+   "median": 235.1,
+   "min": 174.2,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 26.031475967673337
+  },
+  "chronokv-group/ycsb_b.update": {
+   "max": 235.4,
+   "median": 235.1,
+   "min": 174.2,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 26.031475967673337
+  },
+  "chronokv-group/ycsb_c.read": {
+   "max": 235.3,
+   "median": 235.1,
+   "min": 168.7,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 28.328370905997456
+  },
+  "chronokv-group/ycsb_d.insert": {
+   "max": 235.6,
+   "median": 235.1,
+   "min": 197.6,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 16.163334751169714
+  },
+  "chronokv-group/ycsb_d.read": {
+   "max": 235.6,
+   "median": 235.1,
+   "min": 197.6,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 16.163334751169714
+  },
+  "chronokv-group/ycsb_e.insert": {
+   "max": 235.6,
+   "median": 235.1,
+   "min": 199.5,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 15.355168013611229
+  },
+  "chronokv-group/ycsb_e.scan": {
+   "max": 235.6,
+   "median": 235.1,
+   "min": 199.5,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 15.355168013611229
+  },
+  "chronokv-group/ycsb_f.read": {
+   "max": 235.8,
+   "median": 235.8,
+   "min": 199.9,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 15.22476675148431
+  },
+  "chronokv-group/ycsb_f.rmw": {
+   "max": 235.8,
+   "median": 235.8,
+   "min": 199.9,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 15.22476675148431
+  },
+  "lmdb/fillrandom": {
+   "max": 43.4,
+   "median": 43.4,
+   "min": 43.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.0
+  },
+  "lmdb/fillseq": {
+   "max": 41.9,
+   "median": 41.9,
+   "min": 41.9,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.0
+  },
+  "lmdb/overwrite": {
+   "max": 43.9,
+   "median": 43.9,
+   "min": 43.9,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.0
+  },
+  "lmdb/readrandom": {
+   "max": 43.9,
+   "median": 43.9,
+   "min": 43.9,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.0
+  },
+  "lmdb/ycsb_a.read": {
+   "max": 47.9,
+   "median": 47.9,
+   "min": 47.8,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.208768267223385
+  },
+  "lmdb/ycsb_a.update": {
+   "max": 47.9,
+   "median": 47.9,
+   "min": 47.8,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.208768267223385
+  },
+  "lmdb/ycsb_b.read": {
+   "max": 49.0,
+   "median": 49.0,
+   "min": 48.9,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.20408163265306412
+  },
+  "lmdb/ycsb_b.update": {
+   "max": 49.0,
+   "median": 49.0,
+   "min": 48.9,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.20408163265306412
+  },
+  "lmdb/ycsb_c.read": {
+   "max": 49.2,
+   "median": 49.2,
+   "min": 49.1,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.20325203252032809
+  },
+  "lmdb/ycsb_d.insert": {
+   "max": 51.3,
+   "median": 51.3,
+   "min": 51.0,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.5847953216374214
+  },
+  "lmdb/ycsb_d.read": {
+   "max": 51.3,
+   "median": 51.3,
+   "min": 51.0,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.5847953216374214
+  },
+  "lmdb/ycsb_e.insert": {
+   "max": 55.9,
+   "median": 55.8,
+   "min": 55.5,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.7168458781361982
+  },
+  "lmdb/ycsb_e.scan": {
+   "max": 55.9,
+   "median": 55.8,
+   "min": 55.5,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.7168458781361982
+  },
+  "lmdb/ycsb_f.read": {
+   "max": 53.7,
+   "median": 53.7,
+   "min": 53.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.5586592178771029
+  },
+  "lmdb/ycsb_f.rmw": {
+   "max": 53.7,
+   "median": 53.7,
+   "min": 53.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.5586592178771029
+  },
+  "rocksdb-sync/fillrandom": {
+   "max": 69.8,
+   "median": 69.7,
+   "min": 69.5,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.4304160688665669
+  },
+  "rocksdb-sync/fillseq": {
+   "max": 40.6,
+   "median": 40.5,
+   "min": 40.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.4938271604938342
+  },
+  "rocksdb-sync/overwrite": {
+   "max": 78.0,
+   "median": 77.8,
+   "min": 77.6,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.5141388174807271
+  },
+  "rocksdb-sync/readrandom": {
+   "max": 61.1,
+   "median": 60.9,
+   "min": 60.8,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.49261083743843065
+  },
+  "rocksdb-sync/ycsb_a.read": {
+   "max": 107.0,
+   "median": 105.7,
+   "min": 105.2,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 1.7029328287606407
+  },
+  "rocksdb-sync/ycsb_a.update": {
+   "max": 107.0,
+   "median": 105.7,
+   "min": 105.2,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 1.7029328287606407
+  },
+  "rocksdb-sync/ycsb_b.read": {
+   "max": 108.5,
+   "median": 107.6,
+   "min": 106.5,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 1.858736059479554
+  },
+  "rocksdb-sync/ycsb_b.update": {
+   "max": 108.5,
+   "median": 107.6,
+   "min": 106.5,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 1.858736059479554
+  },
+  "rocksdb-sync/ycsb_c.read": {
+   "max": 97.7,
+   "median": 94.5,
+   "min": 93.7,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 4.232804232804233
+  },
+  "rocksdb-sync/ycsb_d.insert": {
+   "max": 107.4,
+   "median": 100.4,
+   "min": 98.7,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 8.665338645418329
+  },
+  "rocksdb-sync/ycsb_d.read": {
+   "max": 107.4,
+   "median": 100.4,
+   "min": 98.7,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 8.665338645418329
+  },
+  "rocksdb-sync/ycsb_e.insert": {
+   "max": 123.9,
+   "median": 122.0,
+   "min": 120.5,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 2.786885245901644
+  },
+  "rocksdb-sync/ycsb_e.scan": {
+   "max": 123.9,
+   "median": 122.0,
+   "min": 120.5,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 2.786885245901644
+  },
+  "rocksdb-sync/ycsb_f.read": {
+   "max": 135.5,
+   "median": 134.0,
+   "min": 132.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 2.3134328358208913
+  },
+  "rocksdb-sync/ycsb_f.rmw": {
+   "max": 135.5,
+   "median": 134.0,
+   "min": 132.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 2.3134328358208913
+  },
+  "rocksdb-tuned/fillrandom": {
+   "max": 69.7,
+   "median": 69.7,
+   "min": 69.6,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.1434720229555359
+  },
+  "rocksdb-tuned/fillseq": {
+   "max": 40.5,
+   "median": 40.5,
+   "min": 40.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.2469135802469171
+  },
+  "rocksdb-tuned/overwrite": {
+   "max": 132.3,
+   "median": 132.3,
+   "min": 132.2,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.07558578987152134
+  },
+  "rocksdb-tuned/readrandom": {
+   "max": 97.9,
+   "median": 97.9,
+   "min": 97.8,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.10214504596527939
+  },
+  "rocksdb-tuned/ycsb_a.read": {
+   "max": 151.0,
+   "median": 143.3,
+   "min": 139.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 8.094905792044658
+  },
+  "rocksdb-tuned/ycsb_a.update": {
+   "max": 151.0,
+   "median": 143.3,
+   "min": 139.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 8.094905792044658
+  },
+  "rocksdb-tuned/ycsb_b.read": {
+   "max": 152.2,
+   "median": 145.6,
+   "min": 140.7,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 7.898351648351649
+  },
+  "rocksdb-tuned/ycsb_b.update": {
+   "max": 152.2,
+   "median": 145.6,
+   "min": 140.7,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 7.898351648351649
+  },
+  "rocksdb-tuned/ycsb_c.read": {
+   "max": 152.2,
+   "median": 146.2,
+   "min": 141.2,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 7.523939808481533
+  },
+  "rocksdb-tuned/ycsb_d.insert": {
+   "max": 153.5,
+   "median": 147.2,
+   "min": 146.5,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 4.755434782608696
+  },
+  "rocksdb-tuned/ycsb_d.read": {
+   "max": 153.5,
+   "median": 147.2,
+   "min": 146.5,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 4.755434782608696
+  },
+  "rocksdb-tuned/ycsb_e.insert": {
+   "max": 181.7,
+   "median": 180.4,
+   "min": 173.9,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 4.323725055432363
+  },
+  "rocksdb-tuned/ycsb_e.scan": {
+   "max": 181.7,
+   "median": 180.4,
+   "min": 173.9,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 4.323725055432363
+  },
+  "rocksdb-tuned/ycsb_f.read": {
+   "max": 193.6,
+   "median": 193.0,
+   "min": 186.1,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 3.8860103626943006
+  },
+  "rocksdb-tuned/ycsb_f.rmw": {
+   "max": 193.6,
+   "median": 193.0,
+   "min": 186.1,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 3.8860103626943006
+  },
+  "sqlite-full/fillrandom": {
+   "max": 14.7,
+   "median": 14.6,
+   "min": 14.5,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 1.3698630136986254
+  },
+  "sqlite-full/fillseq": {
+   "max": 13.2,
+   "median": 13.1,
+   "min": 13.0,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 1.526717557251903
+  },
+  "sqlite-full/overwrite": {
+   "max": 23.0,
+   "median": 22.9,
+   "min": 22.8,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.8733624454148441
+  },
+  "sqlite-full/readrandom": {
+   "max": 21.0,
+   "median": 21.0,
+   "min": 20.8,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.952380952380949
+  },
+  "sqlite-full/ycsb_a.read": {
+   "max": 26.2,
+   "median": 25.9,
+   "min": 25.6,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 2.3166023166023084
+  },
+  "sqlite-full/ycsb_a.update": {
+   "max": 26.2,
+   "median": 25.9,
+   "min": 25.6,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 2.3166023166023084
+  },
+  "sqlite-full/ycsb_b.read": {
+   "max": 27.3,
+   "median": 27.1,
+   "min": 26.9,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 1.4760147601476092
+  },
+  "sqlite-full/ycsb_b.update": {
+   "max": 27.3,
+   "median": 27.1,
+   "min": 26.9,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 1.4760147601476092
+  },
+  "sqlite-full/ycsb_c.read": {
+   "max": 28.4,
+   "median": 28.2,
+   "min": 27.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 3.546099290780142
+  },
+  "sqlite-full/ycsb_d.insert": {
+   "max": 27.3,
+   "median": 27.2,
+   "min": 27.0,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 1.102941176470591
+  },
+  "sqlite-full/ycsb_d.read": {
+   "max": 27.3,
+   "median": 27.2,
+   "min": 27.0,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 1.102941176470591
+  },
+  "sqlite-full/ycsb_e.insert": {
+   "max": 30.1,
+   "median": 29.9,
+   "min": 29.2,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 3.010033444816061
+  },
+  "sqlite-full/ycsb_e.scan": {
+   "max": 30.1,
+   "median": 29.9,
+   "min": 29.2,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 3.010033444816061
+  },
+  "sqlite-full/ycsb_f.read": {
+   "max": 28.0,
+   "median": 27.9,
+   "min": 27.3,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 2.5089605734767
+  },
+  "sqlite-full/ycsb_f.rmw": {
+   "max": 28.0,
+   "median": 27.9,
+   "min": 27.3,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 2.5089605734767
+  },
+  "sqlite-normal/fillrandom": {
+   "max": 14.7,
+   "median": 14.6,
+   "min": 14.5,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 1.3698630136986254
+  },
+  "sqlite-normal/fillseq": {
+   "max": 13.2,
+   "median": 13.1,
+   "min": 12.9,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 2.2900763358778544
+  },
+  "sqlite-normal/overwrite": {
+   "max": 23.6,
+   "median": 23.4,
+   "min": 23.4,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.8547008547008669
+  },
+  "sqlite-normal/readrandom": {
+   "max": 21.0,
+   "median": 21.0,
+   "min": 20.8,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 0.952380952380949
+  },
+  "sqlite-normal/ycsb_a.read": {
+   "max": 27.0,
+   "median": 26.6,
+   "min": 25.6,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 5.263157894736836
+  },
+  "sqlite-normal/ycsb_a.update": {
+   "max": 27.0,
+   "median": 26.6,
+   "min": 25.6,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 5.263157894736836
+  },
+  "sqlite-normal/ycsb_b.read": {
+   "max": 28.4,
+   "median": 27.9,
+   "min": 26.8,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 5.734767025089598
+  },
+  "sqlite-normal/ycsb_b.update": {
+   "max": 28.4,
+   "median": 27.9,
+   "min": 26.8,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 5.734767025089598
+  },
+  "sqlite-normal/ycsb_c.read": {
+   "max": 29.5,
+   "median": 29.0,
+   "min": 28.1,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 4.827586206896547
+  },
+  "sqlite-normal/ycsb_d.insert": {
+   "max": 28.4,
+   "median": 28.0,
+   "min": 27.0,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 4.999999999999995
+  },
+  "sqlite-normal/ycsb_d.read": {
+   "max": 28.4,
+   "median": 28.0,
+   "min": 27.0,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 4.999999999999995
+  },
+  "sqlite-normal/ycsb_e.insert": {
+   "max": 30.4,
+   "median": 30.1,
+   "min": 28.8,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 5.3156146179401915
+  },
+  "sqlite-normal/ycsb_e.scan": {
+   "max": 30.4,
+   "median": 30.1,
+   "min": 28.8,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 5.3156146179401915
+  },
+  "sqlite-normal/ycsb_f.read": {
+   "max": 28.7,
+   "median": 28.4,
+   "min": 27.0,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 5.985915492957745
+  },
+  "sqlite-normal/ycsb_f.rmw": {
+   "max": 28.7,
+   "median": 28.4,
+   "min": 27.0,
+   "n": 7,
+   "provisional": false,
+   "spread_pct": 5.985915492957745
+  }
+ }
+}
