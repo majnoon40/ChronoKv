@@ -38,11 +38,32 @@ own comment). Bands from fewer than --min-nights (default 7 = the green
 week) are stamped PROVISIONAL: reportable, not gateable.
 
 Subcommands:
-  band    --nights DIR [DIR ...] [--out bands.json]   compute + print bands
-  check   --bands bands.json --night DIR [--tolerance F] [--rss-factor F]
-                                                      verdicts + exit code
-                                                      (1 = REGRESSION: CI-ready)
-  report  --nights DIR [DIR ...]                      cross-night digest
+  band           --nights DIR [DIR ...] [--out bands.json]  compute + print bands
+  check          --bands bands.json --night DIR [--tolerance F] [--rss-factor F]
+                     verdicts + exit code (1 = REGRESSION or MISSING series,
+                     2 = geometry mismatch: CI-ready). MISSING (gate hardening,
+                     defect 2): every band series absent from the night's
+                     ledger is a failing verdict — a leg that dies mid-run
+                     used to just yield fewer verdicts and exit 0.
+  verify-ledger  --night DIR
+                     completeness gate (hardening, defect 1): every one of the
+                     seven engine TSVs must exist and carry >= 1 VALID data row
+                     (>= 7 tab-separated fields, numeric ops_per_sec > 0).
+                     Replaces the ci.yml shell count, which passed green on
+                     empty/comment-only files (grep -c prints 0 AND exits 1, so
+                     `|| echo 0` produced "0\n0" and `[ -lt ]` errored to rc=2
+                     = false) and counted crash-stderr lines as data rows.
+                     Exit 1 on any engine without valid rows.
+  loo            --nights DIR [DIR ...] [--min-nights N] [--tolerance F]
+                     leave-one-out cross-validation (hardening, defect 3):
+                     bands from the other nights, check the held-out one.
+                     In-sample self-consistency is vacuous BY CONSTRUCTION —
+                     each night is a sample of its own bands, so its ratio is
+                     >= the band min > floor(min x (1-tol)) and REGRESSION
+                     cannot fire. LOO is the honest cross-validation.
+                     INFORMATIONAL: always exit 0; the numbers are a maintainer
+                     decision input (band policy forbids silent widening).
+  report         --nights DIR [DIR ...]               cross-night digest
 
 Ledger row format (bench/arena.cpp, "# columns:" header line):
   workload \t ops \t seconds \t ops_per_sec \t p50_us \t p99_us \t rss_mb \t note
@@ -58,6 +79,9 @@ import sys
 
 ENGINES_CKV = ("chronokv-group", "chronokv-async")
 GEOMETRY_KEYS = ("threads", "keys", "valsize", "seed", "ops")
+# the seven ledger TSVs one complete night must carry (gate hardening, defect 1)
+ENGINE_FILES = ("chronokv-group", "chronokv-async", "sqlite-full", "sqlite-normal",
+                "lmdb", "rocksdb-sync", "rocksdb-tuned")
 
 
 def _num(s):
@@ -253,6 +277,64 @@ def cmd_band(args):
         print(f"# written: {args.out}")
 
 
+def run_check(bands, night, tolerance, rss_factor):
+    """Core of `check`, shared with `loo`. Returns (verdicts, worst).
+
+    verdicts: (verdict, series, value, band-stats|None, why); worst: 0 clean,
+    1 warn-tier (WARN / RSS-RATCHET), 2 fail-tier (REGRESSION / MISSING).
+    """
+    verdicts, worst = [], 0
+    seen_ratio = set()
+    for eng, wl in ratios_of(night).items():
+        for w, r in wl.items():
+            key = f"{eng}/{w}"
+            seen_ratio.add(key)
+            st = bands["ratio"].get(key)
+            if st is None:
+                verdicts.append(("NEW", key, r, None, "no band for this series"))
+                continue
+            floor = st["min"] * (1.0 - tolerance)
+            if r < floor:
+                verdicts.append(("REGRESSION", key, r, st,
+                                 f"below floor {floor:.3f} (band min {st['min']:.3f} -{tolerance:.0%})"))
+                worst = max(worst, 2)
+            elif r < st["median"] * (1.0 - tolerance):
+                verdicts.append(("WARN", key, r, st, "below median - tolerance (inside floor)"))
+                worst = max(worst, 1)
+            else:
+                verdicts.append(("OK", key, r, st, ""))
+    # Gate hardening (defect 2): a band series ABSENT from the night is a
+    # failing verdict, not silence. Before this, a leg that died mid-run just
+    # produced fewer verdicts and the check exited 0 (measured: dropping one
+    # workload row -> "29 series checked", deleting chronokv-async.tsv ->
+    # "15 series checked", truncating chronokv-group.tsv to 3 rows ->
+    # "18 series checked" — all exit 0).
+    for key, st in bands["ratio"].items():
+        if key not in seen_ratio:
+            verdicts.append(("MISSING", key, None, st,
+                             "band series absent from this night's ledger (dead or truncated leg?)"))
+            worst = max(worst, 2)
+    seen_rss = set()
+    for eng, wl in night["rows"].items():
+        for w, r in wl.items():
+            if r["rss_mb"] is None:
+                continue
+            key = f"{eng}/{w}"
+            if eng in ENGINES_CKV:
+                seen_rss.add(key)
+            st = bands["rss"].get(key)
+            if st and r["rss_mb"] > st["max"] * rss_factor:
+                verdicts.append(("RSS-RATCHET", key, r["rss_mb"], st,
+                                 f"rss {r['rss_mb']:.1f} > band max {st['max']:.1f} x {rss_factor}"))
+                worst = max(worst, 1)
+    for key, st in bands["rss"].items():
+        if key.split("/", 1)[0] in ENGINES_CKV and key not in seen_rss:
+            verdicts.append(("MISSING-RSS", key, None, st,
+                             "rss band series absent from this night's ledger"))
+            worst = max(worst, 2)
+    return verdicts, worst
+
+
 def cmd_check(args):
     with open(args.bands) as f:
         bands = json.load(f)
@@ -262,44 +344,103 @@ def cmd_check(args):
         print(f"GEOMETRY-MISMATCH: night {geo} vs bands {bands['geometry']} — refuse to judge")
         return 2
     cpu = cpu_of(night)
-    verdicts, worst = [], 0
-    for eng, wl in ratios_of(night).items():
-        for w, r in wl.items():
-            st = bands["ratio"].get(f"{eng}/{w}")
-            if st is None:
-                verdicts.append(("NEW", f"{eng}/{w}", r, None, "no band for this series"))
-                continue
-            floor = st["min"] * (1.0 - args.tolerance)
-            if r < floor:
-                verdicts.append(("REGRESSION", f"{eng}/{w}", r, st, f"below floor {floor:.3f} (band min {st['min']:.3f} -{args.tolerance:.0%})"))
-                worst = max(worst, 2)
-            elif r < st["median"] * (1.0 - args.tolerance):
-                verdicts.append(("WARN", f"{eng}/{w}", r, st, "below median - tolerance (inside floor)"))
-                worst = max(worst, 1)
-            else:
-                verdicts.append(("OK", f"{eng}/{w}", r, st, ""))
-    for eng, wl in night["rows"].items():
-        for w, r in wl.items():
-            if r["rss_mb"] is None:
-                continue
-            st = bands["rss"].get(f"{eng}/{w}")
-            if st and r["rss_mb"] > st["max"] * args.rss_factor:
-                verdicts.append(("RSS-RATCHET", f"{eng}/{w}", r["rss_mb"], st,
-                                 f"rss {r['rss_mb']:.1f} > band max {st['max']:.1f} x {args.rss_factor}"))
-                worst = max(worst, 1)
+    verdicts, worst = run_check(bands, night, args.tolerance, args.rss_factor)
     prov = any(st.get("provisional") for st in bands["ratio"].values())
     print(f"# check night={args.night} cpu={cpu} bands={'PROVISIONAL' if prov else 'calibrated'}")
     for v, k, val, st, why in sorted(verdicts):
-        vs = f"{val:.3f}" if isinstance(val, float) else str(val)
+        vs = f"{val:.3f}" if isinstance(val, float) else ("-" if val is None else str(val))
         med = f" band-median={st['median']:.3f}" if st and "median" in st else ""
         print(f"  {v:<11} {k:<34} {vs:>10}{med}  {why}")
     nreg = sum(1 for v in verdicts if v[0] == "REGRESSION")
+    nmiss = sum(1 for v in verdicts if v[0].startswith("MISSING"))
     print(f"# {len(verdicts)} series checked: {nreg} REGRESSION, "
           f"{sum(1 for v in verdicts if v[0]=='WARN')} WARN, "
-          f"{sum(1 for v in verdicts if v[0]=='RSS-RATCHET')} RSS-RATCHET")
+          f"{sum(1 for v in verdicts if v[0]=='RSS-RATCHET')} RSS-RATCHET, "
+          f"{nmiss} MISSING")
     if prov and worst < 2:
         print("# NOTE: bands PROVISIONAL — verdicts are advisory until the green week calibrates them")
     return 1 if worst >= 2 else 0
+
+
+def valid_data_rows(path):
+    """Count lines that could be genuine ledger rows (gate hardening, defect 1):
+    non-comment, non-blank, >= 7 tab-separated fields, field 4 (ops_per_sec)
+    numeric and > 0. Crash-stderr text written into a TSV by a dead engine leg
+    has no tabs and no numeric ops field — it does NOT count. Rows with
+    ops_per_sec == 0 (the `memory` workload's shape) are not throughput rows
+    and do not count either; every engine carries many valid ones."""
+    n = 0
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 7:
+                continue
+            v = _num(parts[3])
+            if v is not None and v > 0:
+                n += 1
+    return n
+
+
+def cmd_verify_ledger(args):
+    print(f"# verify-ledger night={args.night}")
+    bad = []
+    for eng in ENGINE_FILES:
+        path = os.path.join(args.night, eng + ".tsv")
+        if not os.path.isfile(path):
+            print(f"  MISSING-FILE     {eng}.tsv")
+            bad.append(eng)
+            continue
+        n = valid_data_rows(path)
+        if n < 1:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                head = [ln.rstrip()[:80] for ln in f if ln.strip()][:2]
+            print(f"  ZERO-VALID-ROWS  {eng}.tsv  first lines: {head}")
+            bad.append(eng)
+        else:
+            print(f"  ok               {eng}.tsv  {n} valid data rows")
+    if bad:
+        print(f"# VERIFY-LEDGER FAILED: {len(bad)} engine(s) without valid data rows: {', '.join(bad)}")
+        return 1
+    print(f"# verify-ledger: all {len(ENGINE_FILES)} engines carry >= 1 valid data row")
+    return 0
+
+
+def cmd_loo(args):
+    nights = [parse_night(d) for d in args.nights]
+    if len(nights) < 2:
+        sys.exit("error: loo needs >= 2 nights")
+    min_nights = args.min_nights or (len(nights) - 1)
+    print(f"# leave-one-out cross-validation — {len(nights)} nights, bands from the other "
+          f"{len(nights) - 1} (min-nights={min_nights}), tolerance={args.tolerance}, "
+          f"rss-factor={args.rss_factor}")
+    print("# WHY LOO: in-sample, every night is one of its own bands' samples, so its ratio")
+    print("# is >= the band min > floor(min x (1-tol)) — the in-sample '0 REGRESSION on all")
+    print("# calibration nights' self-consistency claim was VACUOUS by construction (recorded")
+    print("# in the gate-hardening changelog entry). LOO is the honest cross-validation.")
+    print(f"    {'night':<34} {'REG':>4} {'WARN':>5} {'MISS':>5}   regressed series (ratio < floor)")
+    total_reg = 0
+    for i, held in enumerate(nights):
+        others = nights[:i] + nights[i + 1:]
+        bands = compute_bands(others, min_nights)
+        verdicts, _ = run_check(bands, held, args.tolerance, args.rss_factor)
+        regs = [(k, val, st) for v, k, val, st, _why in verdicts if v == "REGRESSION"]
+        nwarn = sum(1 for v, *_ in verdicts if v == "WARN")
+        nmiss = sum(1 for v, *_ in verdicts if v.startswith("MISSING"))
+        total_reg += len(regs)
+        name = os.path.basename(held["dir"].rstrip("/"))
+        detail = "; ".join(f"{k} {val:.3f}<{st['min'] * (1 - args.tolerance):.3f}"
+                           for k, val, st in regs[:6])
+        if len(regs) > 6:
+            detail += f"; +{len(regs) - 6} more"
+        print(f"    {name:<34} {len(regs):>4} {nwarn:>5} {nmiss:>5}   {detail}")
+    print(f"# total held-out REGRESSIONs: {total_reg} across {len(nights)} nights")
+    print("# INFORMATIONAL by design: band policy forbids widening tolerance in-flight;")
+    print("# a held-out REGRESSION is a maintainer decision (hardware-conditional bands,")
+    print("# fleet convergence, or an engine-side investigation), never an automatic widen.")
+    return 0
 
 
 def cmd_report(args):
@@ -334,12 +475,24 @@ def main():
     c.add_argument("--rss-factor", type=float, default=1.25)
     r = sub.add_parser("report")
     r.add_argument("--nights", nargs="+", required=True)
+    vl = sub.add_parser("verify-ledger")
+    vl.add_argument("--night", required=True)
+    lo = sub.add_parser("loo")
+    lo.add_argument("--nights", nargs="+", required=True)
+    lo.add_argument("--min-nights", type=int, default=None,
+                    help="default: nights-1 (six for the seven-night green week)")
+    lo.add_argument("--tolerance", type=float, default=0.15)
+    lo.add_argument("--rss-factor", type=float, default=1.25)
     args = ap.parse_args()
     if args.cmd == "band":
         cmd_band(args)
         return 0
     if args.cmd == "check":
         return cmd_check(args)
+    if args.cmd == "verify-ledger":
+        return cmd_verify_ledger(args)
+    if args.cmd == "loo":
+        return cmd_loo(args)
     cmd_report(args)
     return 0
 

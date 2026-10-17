@@ -659,6 +659,28 @@ jobs:
             cov/*/run.log
           if-no-files-found: ignore
 
+  # ---- v29 M1 gate hardening (2026-10-17): self-tests for the arena gate ----
+  # The gate that judges the ledger must itself be judged. Runs
+  # scripts/test_arena_gate.py: the positive/negative controls for the four
+  # hardened gate defects — verify-ledger fixtures (empty / comment-only /
+  # stderr-only / missing-file must go red; pristine night green), MISSING-
+  # series verdicts (dropped row / deleted TSV / truncated TSV must exit 1),
+  # leave-one-out cross-validation structure (the in-sample self-consistency
+  # claim it replaces was vacuous by construction), and the synthetic
+  # regressions (chronokv ops x0.5 must exit 1, x0.95 must stay green) — plus
+  # meta-controls that the suite never mutates the bands or the promoted TSVs
+  # it judges. Uses only committed fixtures: no runner hardware, no arena run,
+  # so it gates EVERY push/PR (unlike the nightly-only arena job). Red here
+  # means the arena gate's verdicts are untrustworthy until green again.
+  arena-gate-selftest:
+    name: arena-gate selftest (controls for the ledger gate)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Gate self-tests (four hardened defects, controls both directions)
+        run: python3 scripts/test_arena_gate.py
+
   # ---- v29 M1 step 4: nightly arena ledger vehicle + regression gate ------
   # Runs the arena (ChronoKV, both durability classes) and the five baseline
   # configs over a FIXED geometry on a fixed-spec runner, and uploads the
@@ -789,16 +811,21 @@ jobs:
       # ::warning:: so the digest and artifact still ship for triage — this
       # step is what turns a dead leg into a red job (a crashed arena writes
       # its stderr INTO the tsv, so "file exists" is not "rows exist").
-      - name: Ledger completeness (all seven engines produced data rows)
+      # HARDENED the same day (gate defect 1): the first cut was a shell
+      # grep -c count and was broken two ways, both reproduced with fixtures
+      # before the fix — (a) grep -c prints 0 AND exits 1 on zero matches, so
+      # `|| echo 0` produced "0\n0" and `[ "$n" -lt 1 ]` died with "integer
+      # expression expected" (rc=2), the if-branch never ran, and an EMPTY or
+      # comment-only TSV PASSED GREEN; (b) any non-comment line counted, so a
+      # TSV containing only crash stderr counted as data rows. The logic now
+      # lives in scripts/arena_bands.py `verify-ledger` (>=7 tab-separated
+      # fields, numeric ops_per_sec > 0, per engine, missing file = fail),
+      # unit-tested with those exact fixtures on every push/PR by the
+      # arena-gate-selftest job below.
+      - name: Ledger completeness (verify-ledger — valid data rows per engine)
         if: always()
         run: |
-          for f in chronokv-group chronokv-async sqlite-full sqlite-normal lmdb rocksdb-sync rocksdb-tuned; do
-            n=$(grep -cvE '^#|^[[:space:]]*$' "bench/results/$f.tsv" 2>/dev/null || echo 0)
-            if [ "$n" -lt 1 ]; then
-              echo "::error::bench/results/$f.tsv has no data rows (engine leg died - see warnings above)"
-              exit 1
-            fi
-          done
+          python3 scripts/arena_bands.py verify-ledger --night bench/results
 
       # The regression verdict: ratio bands (hardware-normalized) + the RSS
       # ratchet-watch (deletechurn = P1's before-column; M3's acceptance
@@ -814,7 +841,7 @@ jobs:
   # ---- gate: single aggregate check for branch protection ----------------
   ci-passed:
     name: ci-passed
-    needs: [lint, build-shared, engine-tests, tsan, public-api-smoke, dst, crashfuzz, coverage, arena]
+    needs: [lint, build-shared, engine-tests, tsan, public-api-smoke, dst, crashfuzz, coverage, arena, arena-gate-selftest]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     if: always()

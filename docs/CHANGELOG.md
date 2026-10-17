@@ -7,6 +7,111 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **fix+test (v29 M1 gate HARDENING, 2026-10-17): four verified defects
+  in the arena regression gate enabled earlier the same day — each
+  reproduced with fixtures BEFORE the fix, each fixed behind fail-first
+  controls, all controls wired into a new push/PR job. Bands and
+  tolerance UNTOUCHED (`bench/arena_bands.json` sha256 identical, git
+  diff empty); no engine file touched.**
+  * **DEFECT 1 — the ledger-completeness step passed GREEN on dead
+    legs.** The ci.yml shell count `n=$(grep -cvE '^#|^[[:space:]]*$'
+    "$f.tsv" 2>/dev/null || echo 0)` is broken two ways: `grep -c`
+    prints `0` AND exits 1 when nothing matches, so `|| echo 0` appended
+    a second `0` — `n="0\n0"`, `[ "$n" -lt 1 ]` died with `integer
+    expression expected` (rc=2), the if-branch never ran, and EMPTY or
+    COMMENT-ONLY TSVs passed; and any non-comment line counted, so a TSV
+    containing only crash stderr passed. BEFORE (fixtures, step body
+    verbatim): empty → `raw n bytes: [0|0]`, if-test rc=2, GREEN;
+    comments-only → same, GREEN; stderr-only → `n=[3]`, GREEN; full step
+    over a results dir with THREE dead legs → `STEP PASSED GREEN`, exit
+    0 (only the missing-file case was caught: bare `n=[0]`). FIX: the
+    logic moved into `scripts/arena_bands.py verify-ledger --night DIR`
+    (per engine of the seven: file exists; ≥1 row with ≥7 tab-separated
+    fields and numeric `ops_per_sec > 0` — stderr text has neither tabs
+    nor a numeric fourth field; `memory`-style 0-ops rows don't count as
+    throughput rows but no engine depends on them for validity), called
+    from ci.yml. AFTER (same fixtures): empty exit 1
+    `ZERO-VALID-ROWS`, comments-only exit 1, stderr-only exit 1 (first
+    lines echoed for triage), missing-file exit 1 `MISSING-FILE`;
+    pristine promoted night exit 0.
+  * **DEFECT 2 — `check` ignored missing series.** `cmd_check` iterated
+    the night's rows, not the bands' keys: a leg that died mid-run just
+    produced fewer verdicts. BEFORE (promoted N7 mutated): dropped
+    `ycsb_c.read` row → "29 series checked … exit 0"; deleted
+    `chronokv-async.tsv` → "15 series checked … exit 0";
+    `chronokv-group.tsv` truncated to 3 data rows → "18 series checked …
+    exit 0". FIX: after the verdict loop, every `bands["ratio"]` key
+    absent from the night — and every chronokv-engine `bands["rss"]` key
+    absent — is a MISSING / MISSING-RSS verdict at fail tier (exit 1);
+    the summary line gains the MISSING count. AFTER (same fixtures):
+    (a) exit 1, 2 MISSING (ratio + rss rows of the dropped workload);
+    (b) exit 1, 36 MISSING; (c) exit 1, 30 MISSING. Negative controls:
+    the pristine night and ALL SEVEN promoted nights re-check exit 0
+    with 0 MISSING and byte-identical WARN counts to the pre-fix runs —
+    no false positives, no verdict drift on valid ledgers.
+  * **DEFECT 3 — the "0 REGRESSION on all 7 calibration nights"
+    self-consistency claim (this file's previous entry, the ROADMAP item
+    4 record, and the enablement commit message) was VACUOUS BY
+    CONSTRUCTION.** The floor is `band_min × (1 − tolerance)` and each
+    calibration night is one of its own band's samples, so every night's
+    ratio ≥ band min > floor: in-sample REGRESSION cannot fire for ANY
+    series of ANY calibration night. Worked example (measured):
+    `chronokv-group/ycsb_c.read` band min 0.501 — that IS night N2's own
+    ratio — floor 0.426; N2 passing "consistently" carried zero
+    information. The claim is corrected in place in the ROADMAP (kept,
+    annotated — not deleted) and superseded by `arena_bands.py loo`:
+    leave-one-out cross-validation, bands from the other six nights
+    (`--min-nights 6`), held-out night checked at the same tolerance.
+    **LOO numbers on the green week (recorded; NOT acted on — the task
+    rule and the band-update policy both forbid widening): 6 held-out
+    REGRESSIONs across 2 of 7 nights, concentrated entirely in the
+    read/scan-heavy series.** N2 (Xeon Platinum 8573C): group/ycsb_c.read
+    0.501 < floor 0.746; async/ycsb_c.read 0.730 < 0.806. N6 (EPYC
+    9V74): group/ycsb_e.insert 0.522 < 0.826; group/ycsb_e.scan 0.523 <
+    0.826; async/ycsb_e.insert 0.861 < 0.869; async/ycsb_e.scan 0.861 <
+    0.869 (the async pair under the floor by 0.9%). N1/N3/N4/N5/N7: 0
+    each. Reading: for ycsb_c/ycsb_e the cross-CPU-MODEL spread exceeds
+    the 15%-below-min tolerance, i.e. the committed floors for those
+    series are only as general as the observed hardware pool — they hold
+    for the live gate (all seven nights are IN the bands, so any night
+    resembling an observed one passes) but a genuinely new CPU shape
+    could false-red them. `loo` is informational by design (always exit
+    0; an automatic reaction would be exactly the in-flight widening the
+    policy forbids); the numbers are a standing band-policy question for
+    the M1 owner (hardware-conditional bands vs. fleet convergence vs.
+    an engine-side look at the ycsb_c/e variance).
+  * **DEFECT 4 — no synthetic-regression positive control existed for
+    the gate itself** (no test script, no CI job — verified BEFORE:
+    `ls scripts/test_arena_gate.py` → No such file; `grep
+    arena-gate-selftest ci.yml` → nothing). Characterization on the
+    current check (what the controls must pin): a promoted night with
+    chronokv `ops_per_sec` × 0.5 → exit 1 with 27 REGRESSION verdicts;
+    × 0.95 → exit 0, 0 REGRESSION, 2 WARN. FIX: `scripts/
+    test_arena_gate.py` — 14 controls (defect 1's four fixtures +
+    negative; defect 2's three mutations + negative; defect 3's LOO
+    structure — completion, all seven held-out lines, totals line, with
+    the REGRESSION numbers echoed to the CI log but deliberately NOT
+    asserted, band policy being a maintainer decision; defect 4's ×0.5
+    red / ×0.95 green) plus 2 meta-controls (sha256 of
+    `bench/arena_bands.json` and a tree-hash of the promoted week
+    identical before/after — the suite never mutates what it judges).
+    All fixtures are built from the committed promoted TSVs in tempdirs:
+    stdlib-only, no network, no runner hardware, ~0.6 s. Wired as the
+    `arena-gate-selftest` job on EVERY push/PR and nightly, in
+    `ci-passed`'s needs with NO skip tolerance (locally verified: push
+    with arena skipped → 0; nightly green → 0; arena red → 1; selftest
+    red → 1). AFTER: `python3 scripts/test_arena_gate.py` → all 14+2
+    PASS, exit 0.
+  Files: `scripts/arena_bands.py` (verify-ledger + loo subcommands,
+  MISSING verdicts via a `run_check` core shared with loo, docstring),
+  `scripts/test_arena_gate.py` (new), `.github/workflows/ci.yml`
+  (completeness step → verify-ledger with the defect recorded in its
+  comment; new selftest job; ci-passed needs), `bench/README.md` (gate
+  section hardened record + usage), `docs/ROADMAP.md` (M1 header, item 4
+  correction-in-place + hardening addendum, progress row). Suite/engine
+  untouched: the 519-check C++ suite is unaffected by construction (no
+  compiled file changed).
+
 - **bench+ci+docs (v29 M1 COMPLETE, 2026-10-17): the green week closed
   7/7, the noise bands are calibrated and committed, the arena
   regression gate is ENABLED, and the README performance section

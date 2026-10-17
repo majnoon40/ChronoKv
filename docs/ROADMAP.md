@@ -258,7 +258,7 @@ What 0.28.1 did *not* do, and v29 inherits:
 | v29 M0 deliverable zero (audit docs in-tree) | **DONE** | `docs/audits/` (2026-09-23, 2026-09-24) |
 | v29 M0 re-audit commission (Audit-2 over 0.28.0) | **EXECUTED** — 13 findings, all remediated fail-first | PR #2 (`5cd74b5`, merged `b6fb181`) = 0.28.1 |
 | v29 M0 closure | **DONE 2026-10-08** — reconstructed report + tag `v0.28.1` + delta confirmation round, verdict **B+ (clean)**: 20/20 probes, one Low doc-truth finding fixed in the closure commit; **M3+ gate lifted** | `docs/audits/2026-10-delta-confirmation-0.28.1.md` (+ probes) |
-| v29 M1 — benchmark arena | **COMPLETE 2026-10-17** — steps 1–3 (workloads + YCSB A–F adapters + version pins with sha256/fetch recipe); step-4 vehicle: split (#68–#75 green) then RE-MERGED to one same-hardware job after #75's headers caught the two-runner CPU split (rule 9 over sunk nights); GREEN WEEK **7/7** (#82/#88/#91/#96/#97/#98/#99, 2026-10-11..17, all green on the re-merged vehicle; rows promoted in-tree — mid-week commits verified engine-binary-neutral, so the nights pool honestly); noise bands **CALIBRATED** from the seven nights (`bench/arena_bands.json` — ratio-normalized primary tier because calibration MEASURED four runner CPUs across the week: EPYC 9V45 ×3 / Xeon 8573C / EPYC 7763 ×2 / EPYC 9V74; raw bands hardware-conditional secondary; RSS tier carries the deletechurn ratchet-watch = P1's before-column, flat at ~201 MB) + **GATE ENABLED** per the recipe the ci.yml comment carried: `arena` in `ci-passed` needs (skip-tolerated on push/PR), completeness step (data ROWS, not file-exists) + `check` verdict (exit 1 REGRESSION / exit 2 geometry-mismatch), explicit re-run policy (once via dispatch; two consecutive REGRESSIONs = bisect) and band-update policy (dedicated commit citing the engine change; never widened in-flight); ledger-promotion rule **DECIDED** (cite ⇒ commit that night's TSVs under `bench/results/promoted/` — no bot, no nightly churn); arena-side build cache **REJECTED as measured low-value** (runs dominate the ~57–77 min; provenance-drift risk; revisit at the 120-min cap); actions v4→v5 bumps landed with the enablement (deferred past the week by 52fd43c); README §Performance shipped (acceptance's third leg) | `bench/`, `bench/arena_bands.json`, `bench/results/promoted/green-week-2026-10-11_17/`, `scripts/arena_bands.py`, ci.yml `arena` |
+| v29 M1 — benchmark arena | **COMPLETE 2026-10-17** — steps 1–3 (workloads + YCSB A–F adapters + version pins with sha256/fetch recipe); step-4 vehicle: split (#68–#75 green) then RE-MERGED to one same-hardware job after #75's headers caught the two-runner CPU split (rule 9 over sunk nights); GREEN WEEK **7/7** (#82/#88/#91/#96/#97/#98/#99, 2026-10-11..17, all green on the re-merged vehicle; rows promoted in-tree — mid-week commits verified engine-binary-neutral, so the nights pool honestly); noise bands **CALIBRATED** from the seven nights (`bench/arena_bands.json` — ratio-normalized primary tier because calibration MEASURED four runner CPUs across the week: EPYC 9V45 ×3 / Xeon 8573C / EPYC 7763 ×2 / EPYC 9V74; raw bands hardware-conditional secondary; RSS tier carries the deletechurn ratchet-watch = P1's before-column, flat at ~201 MB) + **GATE ENABLED** per the recipe the ci.yml comment carried: `arena` in `ci-passed` needs (skip-tolerated on push/PR), completeness step (data ROWS, not file-exists) + `check` verdict (exit 1 REGRESSION / exit 2 geometry-mismatch), explicit re-run policy (once via dispatch; two consecutive REGRESSIONs = bisect) and band-update policy (dedicated commit citing the engine change; never widened in-flight); ledger-promotion rule **DECIDED** (cite ⇒ commit that night's TSVs under `bench/results/promoted/` — no bot, no nightly churn); arena-side build cache **REJECTED as measured low-value** (runs dominate the ~57–77 min; provenance-drift risk; revisit at the 120-min cap); actions v4→v5 bumps landed with the enablement (deferred past the week by 52fd43c); README §Performance shipped (acceptance's third leg); **GATE HARDENED same day** — four defects (completeness step passed green on empty/comment-only/stderr TSVs; `check` ignored missing series; the in-sample self-consistency claim vacuous by construction; no synthetic-regression control), each fixed behind fail-first controls wired into `scripts/test_arena_gate.py` + the push/PR `arena-gate-selftest` job; LOO cross-validation recorded 6 held-out regressions on N2/N6 (ycsb_c/e series, cross-CPU spread) — bands and tolerance UNCHANGED, band-policy question recorded; bench/arena_bands.json untouched | `bench/`, `bench/arena_bands.json`, `bench/results/promoted/green-week-2026-10-11_17/`, `scripts/arena_bands.py`, `scripts/test_arena_gate.py`, ci.yml `arena` + `arena-gate-selftest` |
 | v29 CI hardening (adjacent, unplanned-in-9/27) | **SHIPPED + PROMOTED** — lint/ratchet/hygiene gates, build-shared; the 4 experimental sanitizer legs went green ×3 (#64/#65/#66) → flags deleted, all 12 legs gating | `5cd74b5`; promotion `0027fe0` |
 | v29 M2 — catcher hardening | **COMPLETE** — item 1 (write-skew checker, 2026-10-08, live pre-fix-flag/post-fix-pass proof) + item 5 (test-suite TU split, 2026-10-10: 1 GiB release/stress `-O1` bare, ASan `-O0` possible, 503/0 full suite; found+fixed the `dst::my_tid` non-inline thread_local, now stress-gated) + item 2 (DST grammar growth, 2026-10-11: S5 `tree_merge_cascade` (M4 grammar) + S6 `reclaim_retire_pin` (M3 grammar), green vs the merge-free tree, 600/600 children at PR scale, four-mutant fail-first matrix; nightly seeds/shard rebalanced 3,125→2,083 to hold N=100k and the wall-time band at six scenarios) + item 3 (de-vacuation, 2026-10-11: v17 GC-boundedness / v18 LSN-contiguity / m2_phase1 size-rotation / 30 s soak all upgraded to real oracles — accounting, differential readbacks, size-rotation admission exercised via a lowered segment cap, shadow-model differential over live AND recovered state; each proven old-GREEN/new-RED against its scratch-build reversion; the soak run additionally exposed and fixed its own empty-WAL-delta hole; release suite 513→514/0) + item 4 (crash-fuzz composition, 2026-10-11: window-sequence plan grammar + seven named templates incl. the Audit-2 surfaces and the Structural merge-window slot, kAll 26→28 with the `seg_*` WAL-2 window, fault matrix widened to all 12 kinds, composition ledger published+asserted; both reversion proofs red — orphan-tolerance revert 16 violations, DirFsyncFail-site removal 7 rc-22 witness violations — clean stream 0 violations) — all five items shipped | `check_write_skew`; `dstscn::s5/s6`; `crashfuzz` grammar; `tests/`, Makefile template |
 | v29 M3–M7 — the overhaul | not started — M0 CLOSED 2026-10-08; constraint 3 SATISFIED 2026-10-11 (M2 COMPLETE, all five items); **constraint 2 SATISFIED 2026-10-17 (M1 COMPLETE: green week 7/7, bands calibrated + committed, regression gate enabled) — the rewrite sequence is UNBLOCKED, M3 first**. M3's decide-before-build HP4/ABA decision doc landed 2026-10-12: generation-tagged page slots + immediate free-list return; heap nodes stay on the epoch reclaimer; HP machinery to be deleted, not wired | `docs/audits/2026-10-12-m3-hp4-aba-decision.md` |
@@ -394,7 +394,7 @@ catchers (constraints 2–3) still governs the order of work.
 
 Until then, M3+ stays gated. M1/M2 proceed.
 
-## M1 — The benchmark arena  **[M] [MEASURE FIRST] — COMPLETE 2026-10-17**
+## M1 — The benchmark arena  **[M] [MEASURE FIRST] — COMPLETE 2026-10-17 (gate enabled + HARDENED same day)**
 
 **Status.** Steps 1–3 shipped (engine-side workloads incl. the `nm_`
 isolation fills; YCSB A–F over zipfian(0.99)-CDF with documented
@@ -505,6 +505,41 @@ with the tighten-after-measuring follow-up in the job comment).
    the ratchet rule applies to bands. Night-7 self-consistency: 30
    series checked, 0 REGRESSION, 1 WARN inside floor (async readrandom
    0.470 vs median 0.565 — the widest band, honestly earned).
+   **CORRECTION (gate hardening, same day): that self-consistency run
+   was VACUOUS BY CONSTRUCTION** — each calibration night is a sample of
+   its own bands, so its ratio is ≥ the band min > floor(min × 0.85) and
+   in-sample REGRESSION cannot fire (worked example: the group/ycsb_c
+   band min 0.501 IS N2's own value). The honest replacement is
+   leave-one-out cross-validation (`arena_bands.py loo`, bands from the
+   other six nights): **6 held-out REGRESSIONs across 2 of 7 nights**,
+   all in the read/scan-heavy series — N2 (Xeon 8573C): group/ycsb_c
+   0.501<0.746, async/ycsb_c 0.730<0.806; N6 (EPYC 9V74): group/ycsb_e
+   0.522|0.523<0.826, async/ycsb_e 0.861<0.869 (0.9% under floor); the
+   other five nights 0. Recorded, NOT acted on: bands and tolerance stay
+   unchanged (widening in-flight is exactly what the band-update policy
+   forbids; the committed bands include all seven nights and already
+   encode the observed hardware spread, so the live gate is unaffected —
+   the LOO numbers bound how the bands GENERALIZE to unseen hardware).
+   Standing band-policy question for the M1 owner: hardware-conditional
+   gating vs. fleet convergence vs. an engine-side look at the ycsb_c/e
+   variance. **GATE HARDENED 2026-10-17 (four defects, each fixed behind
+   fail-first controls, all recorded in the CHANGELOG):** (1) the
+   completeness step's shell count passed green on empty/comment-only
+   TSVs (`grep -c` prints 0 AND exits 1 → `|| echo 0` → `"0\n0"` →
+   `[ -lt ]` rc=2 → if-branch skipped) and counted crash stderr as data
+   rows — replaced by `arena_bands.py verify-ledger` (≥7 tab fields,
+   numeric ops_per_sec > 0, per engine; missing file = fail); (2)
+   `check` iterated the NIGHT's rows, so dead legs just yielded fewer
+   verdicts (measured: dropped row → 29 series exit 0; deleted async
+   TSV → 15 series exit 0; truncated TSV → 18 series exit 0) — band
+   series absent from a night are now MISSING verdicts, exit 1; (3) the
+   vacuous self-consistency claim above → `loo`; (4) no synthetic-
+   regression control existed → chronokv ops ×0.5 must exit 1 (27
+   REGRESSION verdicts measured), ×0.95 must stay exit 0. All controls
+   (14 + 2 meta: the suite never mutates the bands or promoted TSVs it
+   judges) live in `scripts/test_arena_gate.py`, wired as the
+   `arena-gate-selftest` job on EVERY push/PR (committed fixtures, no
+   runner hardware) and in `ci-passed`'s needs with no skip tolerance.
 5. The ledger-promotion decision (committed `bench/results/` needs
    contents:write or a bot commit) — and the **soak vehicle is NAMED
    (2026-10-10): the rolling nightly chain with persisted state +
