@@ -1657,6 +1657,22 @@ namespace stress {
     // while dst is armed.
     inline std::function<void()> gap_callback_leaf_latch{nullptr};    // "tree_leaf_latch_gap"
     inline std::function<void()> gap_callback_cursor_switch{nullptr}; // "tree_cursor_leaf_switch"
+    // BT-3 (2026-10-18, docs/audits/2026-10-18-bt3-split-visibility-window.md):
+    // exact-name hooks for the split rebuild->splice visibility windows.
+    // tree_split_splice_gap fires in put_recursive between the split leaf's
+    // exclusive-latch release and the parent splice; tree_root_install_gap
+    // fires in put()/put_with_old() between put_recursive's split return and
+    // install_new_root's root_id_ store. Both are split-only (rare), so they
+    // are TRUE stress_points — dst may schedule them like any other. The
+    // root-descend hook fires between the CALLER's root_id_ load and the
+    // root latch inside find_leaf_crabbing — the stale-root descent window.
+    // It is invoked DIRECTLY (the gap_callback_scan precedent: find_leaf_
+    // crabbing is every reader's hot path, so dst scheduling and the
+    // probabilistic yield must not see it), only while gap_hook is armed
+    // and dst is NOT. Same arming discipline as all callbacks above.
+    inline std::function<void()> gap_callback_split_splice{nullptr};  // "tree_split_splice_gap"
+    inline std::function<void()> gap_callback_root_install{nullptr};  // "tree_root_install_gap"
+    inline std::function<void()> gap_callback_root_descend{nullptr};  // direct, find_leaf_crabbing
 }
 
 // ===================== v27 M0: deterministic scheduler =====================
@@ -1850,6 +1866,14 @@ inline void stress_point(const char* name) {
         else if (stress::gap_callback_cursor_switch &&
                  std::strcmp(name, "tree_cursor_leaf_switch") == 0)
             stress::gap_callback_cursor_switch();
+        // BT-3 (2026-10-18): exact-name dispatch for the two split-
+        // visibility seams (both 't' names; split-only, dst-safe).
+        else if (stress::gap_callback_split_splice &&
+                 std::strcmp(name, "tree_split_splice_gap") == 0)
+            stress::gap_callback_split_splice();
+        else if (stress::gap_callback_root_install &&
+                 std::strcmp(name, "tree_root_install_gap") == 0)
+            stress::gap_callback_root_install();
     }
 }
 #else
@@ -11828,7 +11852,14 @@ public:
             // writer here computed uint16 key_off = PAGE_SIZE -
             // split_key.size(), which wrapped for oversized separators —
             // audit CKV-001 — and could only express a two-child root).
+            // BT-3 seam (2026-10-18): the root-install gap — the new pages
+            // are filled, the old root leaf is still an untrimmed superset,
+            // and the new root is not published yet (bt3 B/D pin reads here).
+            stress_point("tree_root_install_gap");
             install_new_root(r.promotions, r.last_new_page);
+            // BT-3: the new root is published — now (and only now) the
+            // copy-out split pages below shrink to their group 0.
+            execute_pending_trims(r.pending_trims);
         }
         return r.inserted;
     }
@@ -11863,7 +11894,9 @@ public:
         if (r.split) {
             // Root split: v28 (CKV-002) — k-way-capable install (same as
             // put(); see install_new_root).
+            stress_point("tree_root_install_gap");   // BT-3 seam (2026-10-18)
             install_new_root(r.promotions, r.last_new_page);
+            execute_pending_trims(r.pending_trims);  // BT-3: trim after publication
         }
         return existed;
     }
@@ -11930,6 +11963,8 @@ public:
     // beside fence_recheck_retries; the delete-churn table reads both).
     uint64_t cursor_restarts() const { return cursor_restarts_.load(std::memory_order_relaxed); }
     void note_cursor_restart() const { cursor_restarts_.fetch_add(1, std::memory_order_relaxed); }
+    // BT-3 (2026-10-18): stale-root revalidation retries (find_leaf_crabbing).
+    uint64_t root_revalidations() const { return root_revalidations_.load(std::memory_order_relaxed); }
 
     // v29 M3 slice 1: forward the pool's per-slot reuse generation
     // (invariants G1/G2 — see PagePool::alloc / PagePool::slot_generation
@@ -12671,6 +12706,12 @@ private:
     // per-page latch is the actual consistency mechanism.
     std::atomic<uint64_t> generation_{0};
     mutable std::atomic<uint64_t> cursor_restarts_{0};   // v29 M3 slice 2 (W1/W6 restarts)
+    // BT-3 (2026-10-18): stale-root revalidation retries in
+    // find_leaf_crabbing (the reader/cursor descent). A nonzero delta means
+    // a descent caught a root that changed between the caller's load and
+    // the latch — normal control flow, never an error (same contract as
+    // cursor_restarts_ / fence_recheck_retries_).
+    mutable std::atomic<uint64_t> root_revalidations_{0};
     // v25.1 M1.6: debug counter for fence re-check retries (concurrent-split detection).
     // Public so ChronoKV/Database can read it for test verification.
     mutable std::atomic<uint64_t> fence_recheck_retries_{0};
@@ -12860,6 +12901,36 @@ private:
 
     // Result of a put operation: whether the child split, and if so,
     // the split key and new child page to insert into the parent.
+    // BT-3 (2026-10-18, docs/audits/2026-10-18-bt3-split-visibility-window.md):
+    // a deferred-trim record for the COPY-OUT split. The splitting page
+    // keeps its full pre-split contents (a SUPERSET of its planned group 0)
+    // until the TOPMOST splice of the cascade publishes; only then is it
+    // rebuilt to exactly group 0. Every acked key stays reachable by
+    // descent at every instant of the window: unspliced levels route
+    // through the untrimmed superset, spliced levels route through the new
+    // pages. The old destructive rebuild (group 0 written under the leaf
+    // exclusive, parent spliced only after its release) exposed the
+    // high-group acked keys to false-negative point reads — controls bt3
+    // A/B/D reproduced it deterministically at the seams.
+    struct TrimRecord {
+        PageId page = 0;
+        bool is_leaf = false;
+        // Leaf: group-0 entries (sorted, the triggering new key / in-place
+        // update already applied — the materialized plan itself, replayed
+        // not recomputed), the chain successor to publish, and the mutation
+        // epoch to resume ABOVE (old_epoch + 1: a pre-split captured fence
+        // must not validate — CKV-008 semantics preserved verbatim).
+        std::vector<std::pair<std::string, std::string>> leaf_entries;
+        PageId leaf_next = 0;
+        uint32_t leaf_resume_epoch = 0;
+        // Interior: group-0 slots (from the candidate list, spliced
+        // promotions included) and group 0's rightmost child (the promoted
+        // boundary entry's child — the same value the destructive rebuild
+        // used).
+        std::vector<std::pair<std::string, PageId>> interior_entries;
+        PageId interior_rightmost = 0;
+    };
+
     struct InsertResult {
         bool inserted;       // true = new key inserted, false = existing key updated
         bool split;          // true = child split; parent/root must install `promotions`
@@ -12875,6 +12946,11 @@ private:
         // last_new_page == new_child.
         std::vector<std::pair<std::string, PageId>> promotions;
         PageId last_new_page = 0;
+        // BT-3 (2026-10-18): deferred trims of the copy-out split — carried
+        // up the cascade and executed ONLY after the topmost splice publishes
+        // (insert_into_parent_multi's clean exit, or put()/put_with_old()
+        // after install_new_root). See TrimRecord.
+        std::vector<TrimRecord> pending_trims;
     };
 
     // v28 (CKV-002): byte budget available for entries (slots + slab) on
@@ -13047,6 +13123,54 @@ private:
         new_root_latch.unlock();
     }
 
+    // BT-3 (2026-10-18): execute the deferred trims of a copy-out split
+    // cascade AFTER the topmost splice has published (the callers are
+    // insert_into_parent_multi's clean exit and put()/put_with_old() after
+    // install_new_root). Each trim rebuilds ONE page under its OWN
+    // exclusive latch — no latch coupling, no upward acquisition, no
+    // allocation (the planner proved group 0 fits, so the additive
+    // backstops in insert_into_*_no_split cannot fire). The execution
+    // order across pages is irrelevant: every page's parent routing is
+    // already published, and until its own trim each page's superset
+    // contents still serve every stale route — acked keys are reachable
+    // by descent at every instant (the property the destructive rebuild
+    // broke; see the TrimRecord comment and the finding doc §7).
+    //
+    // Cursor interaction: a cursor parked inside a superset page holds its
+    // shared latch, so its trim waits; the cursor emits the superset and
+    // continues via the OLD next_leaf_id (the new pages are bypassed —
+    // their contents were just emitted from the superset, so the scan
+    // stays complete and duplicate-free). A cursor entering after the trim
+    // follows the published chain. Both are the per-page-snapshot contract
+    // the range_scan API already guarantees.
+    void execute_pending_trims(std::vector<TrimRecord>& trims) {
+        for (const auto& tr : trims) {
+            auto lk = latches_.lock_exclusive(tr.page);
+            Page* p = pool_.get(tr.page);
+            std::memset(p->bytes, 0, PAGE_SIZE);
+            PageHeader* h = header(p);
+            h->key_count = 0;
+            if (tr.is_leaf) {
+                h->is_leaf = 1;
+                h->min_key_off = h->max_key_off = 0;
+                h->min_key_len = h->max_key_len = 0;
+                // CKV-008 semantics preserved: resume ABOVE the pre-split
+                // epoch (the inserts below bump it further), so any fence
+                // captured before the split fails re-validation.
+                page_set_mut_epoch(h, tr.leaf_resume_epoch);
+                set_next_leaf(p, tr.leaf_next);
+                for (const auto& e : tr.leaf_entries)
+                    insert_into_leaf_no_split(tr.page, e.first, e.second);
+            } else {
+                h->is_leaf = 0;
+                set_rightmost_child(p, tr.interior_rightmost);
+                for (const auto& e : tr.interior_entries)
+                    insert_into_interior_no_split(tr.page, e.first, e.second);
+            }
+        }
+        trims.clear();
+    }
+
     // v25.1 M1.6: Optimistic latch crabbing for the write path.
     //
     // Descend with SHARED latches only (crabbing: hold parent shared until
@@ -13118,11 +13242,27 @@ private:
             InsertResult r = put_leaf_nolatch(leaf, key, value);
             if (r.split) {
                 leaf_excl.unlock();
+                // BT-3 seam (2026-10-18): THE splice gap — the leaf's
+                // copy-out split has filled the new pages and its latch is
+                // down, but the parent does not route to them yet. The
+                // splitting page is still an untrimmed SUPERSET, so every
+                // acked key remains reachable by descent through this
+                // window (bt3 A/B pin it at this exact seam).
+                stress_point("tree_split_splice_gap");
                 // v28 (CKV-002): install the (possibly k-way) split's
-                // promotions into the parent chain.
+                // promotions into the parent chain. BT-3: the cascade's
+                // deferred trims ride along in `pending` and execute at
+                // the clean exit (or return attached to pr for the
+                // root-split path — put()/put_with_old() run them after
+                // install_new_root publishes).
+                std::vector<TrimRecord> pending;
+                pending.swap(r.pending_trims);
                 InsertResult pr = insert_into_parent_multi(
-                    cur_root, leaf, r.promotions, r.last_new_page);
-                if (pr.split) return pr;  // root split — handled by put()/put_with_old
+                    cur_root, leaf, r.promotions, r.last_new_page, pending);
+                if (pr.split) {
+                    pr.pending_trims = std::move(pending);
+                    return pr;  // root split — handled by put()/put_with_old
+                }
                 return {r.inserted, false, "", 0};
             }
             return r;
@@ -13159,7 +13299,8 @@ private:
     InsertResult insert_into_parent_multi(
             PageId root, PageId child,
             const std::vector<std::pair<std::string, PageId>>& promotions,
-            PageId last_page) {
+            PageId last_page,
+            std::vector<TrimRecord>& pending) {
         while (true) {
             // v25.7 (review note 3): reload root_id_ per iteration — the
             // `root` parameter is only the initial hint.
@@ -13172,7 +13313,9 @@ private:
             PageId parent = find_parent_crabbing(cur_root, promotions.front().first,
                                                  child, parent_shared);
             if (parent == 0) {
-                // `child` is the root — root split needed.
+                // `child` is the root — root split needed. The pending
+                // trims ride back to put()/put_with_old() by reference:
+                // they execute only AFTER install_new_root publishes.
                 InsertResult r{false, true, promotions.front().first, last_page};
                 r.promotions = promotions;
                 r.last_new_page = last_page;
@@ -13190,11 +13333,20 @@ private:
             }
             InsertResult r = interior_install(parent, promotions, child, last_page);
             if (r.split) {
-                // Parent itself split — propagate up.
+                // Parent itself split (copy-out: it stays a superset until
+                // ITS parent splices) — its deferred trim joins the
+                // cascade's pending set and the recursion climbs.
                 parent_excl.unlock();
+                for (auto& tr : r.pending_trims) pending.push_back(std::move(tr));
                 return insert_into_parent_multi(root, parent, r.promotions,
-                                                r.last_new_page);
+                                                r.last_new_page, pending);
             }
+            // BT-3: CLEAN EXIT — the topmost splice of this cascade is
+            // published. NOW (and only now) the split pages may shrink to
+            // their group 0: until this point every untrimmed page served
+            // as a superset, so no acked key was ever unreachable by
+            // descent during the window.
+            execute_pending_trims(pending);
             return {false, false, "", 0};
         }
     }
@@ -13414,13 +13566,24 @@ private:
 
         // ---- MUTATE (allocation-free from here: bounded memcpys only,
         // every group proven to fit by the planner) ----
-        // Save the old leaf's next_leaf_id BEFORE clearing any page. The
-        // LAST new leaf inherits this pointer to maintain the chain. (This
-        // was the split relink-order bug fixed in earlier versions — the
-        // ordering is preserved here.)
+        // BT-3 (2026-10-18): COPY-OUT split. The original page (pages[0])
+        // is left BYTE-IDENTICAL here — its full pre-split contents keep
+        // serving every descent route (the parent is unspliced; a stale
+        // root still lands on it) until the topmost splice publishes, at
+        // which point execute_pending_trims rebuilds it to exactly group 0.
+        // Only the NEW pages are written here, and they are unreachable
+        // until publication by BOTH routes: descent (the parent lacks their
+        // separators) and chain (pages[0]'s next_leaf_id still bypasses
+        // them — the trim publishes the chain link). The old destructive
+        // rebuild made pages[0] lose the high groups at latch release,
+        // opening the false-negative point-read window (finding doc S-W1;
+        // controls bt3 A/B/D reproduced it at the seams).
+        // Save the old leaf's next_leaf_id BEFORE building any new page.
+        // The LAST new leaf inherits it; pages[0] inherits pages[1] at
+        // trim time (chain published atomically with the group-0 shrink).
         const PageId old_next = get_next_leaf(p);
-        const uint32_t old_epoch = page_mut_epoch(h);   // v28 CKV-008: the rebuild must not look "unchanged"
-        for (size_t j = 0; j < k; ++j) {
+        const uint32_t old_epoch = page_mut_epoch(h);   // v28 CKV-008: the trim must not look "unchanged"
+        for (size_t j = 1; j < k; ++j) {
             Page* q = pool_.get(pages[j]);
             std::memset(q->bytes, 0, PAGE_SIZE);
             PageHeader* qh = header(q);
@@ -13428,16 +13591,10 @@ private:
             qh->key_count = 0;
             qh->min_key_off = qh->max_key_off = 0;
             qh->min_key_len = qh->max_key_len = 0;
-            // v28 CKV-008: page 0 (the page any pre-split fence was
-            // captured on) resumes ABOVE its old epoch so that fence fails
-            // validation; fresh pages start at 1 — they were unreachable
-            // before the parent splice, so no captured fence can reference
-            // them. The rebuild inserts below bump every page further.
-            page_set_mut_epoch(qh, (j == 0) ? (old_epoch + 1u) : 1u);
-            // Chain: group j -> group j+1; the last group inherits old_next.
-            // Pages 1..k-1 are unreachable until the parent splice, and
-            // page 0 is under the caller's exclusive latch until the split
-            // returns — the chain is only observable once fully built.
+            // Fresh pages start at epoch 1 — they were unreachable before
+            // the parent splice, so no captured fence can reference them.
+            page_set_mut_epoch(qh, 1u);
+            // Chain among the new pages; the last inherits old_next.
             set_next_leaf(q, (j + 1 < k) ? pages[j + 1] : old_next);
             const size_t end = (j + 1 < k) ? groups[j + 1] : n;
             for (size_t i = groups[j]; i < end; ++i)
@@ -13447,7 +13604,8 @@ private:
         // Promotions for the parent: for each group j >= 1, its first key
         // becomes a separator whose LEFT child is the page of group j-1;
         // the parent's existing slot for this page is repointed to the last
-        // group's page (last_new_page).
+        // group's page (last_new_page). Group 0's page is pages[0] — the
+        // ORIGINAL page, which becomes exactly group 0 at trim time.
         InsertResult r;
         r.inserted = !update;
         r.split = true;
@@ -13456,6 +13614,17 @@ private:
         r.split_key = r.promotions.front().first;
         r.new_child = pages.back();
         r.last_new_page = pages.back();
+        // BT-3: the deferred trim of pages[0]. group 0 replays the
+        // MATERIALIZED plan (new key included, `update` applied, sorted);
+        // the epoch resumes above the captured old epoch so every pre-split
+        // fence fails re-validation exactly as the destructive rebuild did.
+        TrimRecord tr;
+        tr.page = page_id;
+        tr.is_leaf = true;
+        tr.leaf_entries.assign(entries.begin(), entries.begin() + groups[1]);
+        tr.leaf_next = pages[1];
+        tr.leaf_resume_epoch = old_epoch + 1u;
+        r.pending_trims.push_back(std::move(tr));
         return r;
     }
 
@@ -13605,9 +13774,19 @@ private:
         const size_t k = plan.group_starts.size();   // >= 2
         std::vector<PageId> pages;
         pages.reserve(k);
-        pages.push_back(page_id);   // group 0 reuses the original page
+        pages.push_back(page_id);   // group 0 reuses the original page (via its DEFERRED TRIM)
         for (size_t j = 1; j < k; ++j) pages.push_back(pool_.alloc());
-        for (size_t j = 0; j < k; ++j) {
+        // BT-3 (2026-10-18): COPY-OUT — the original page is left
+        // BYTE-IDENTICAL here. Its OLD slots are a superset router for
+        // every stale route (it lacks only the freshly spliced promotions,
+        // whose keys are unreachable-unacked until this cascade publishes)
+        // and it is rebuilt to exactly candidate-group-0 by
+        // execute_pending_trims once the GRANDPARENT splice lands. The
+        // destructive rebuild here had the same false-negative window as
+        // the leaf's (finding doc S-W1, interior level). New pages are
+        // unreachable until the caller's recursion splices the returned
+        // promotions.
+        for (size_t j = 1; j < k; ++j) {
             Page* q = pool_.get(pages[j]);
             std::memset(q->bytes, 0, PAGE_SIZE);
             PageHeader* qh = header(q);
@@ -13629,6 +13808,17 @@ private:
         r.split_key = r.promotions.front().first;
         r.new_child = pages.back();
         r.last_new_page = pages.back();
+        // BT-3: deferred trim of the original page to candidate group 0:
+        // slots [0, promoted[0]) plus the promoted boundary entry's child
+        // as rightmost — byte-identical to what the destructive rebuild
+        // used to write at this point (promoted[0] is always a valid entry
+        // index: both planner branches promote existing entries only).
+        TrimRecord tr;
+        tr.page = page_id;
+        tr.is_leaf = false;
+        tr.interior_entries.assign(entries.begin(), entries.begin() + plan.promoted[0]);
+        tr.interior_rightmost = entries[plan.promoted[0]].second;
+        r.pending_trims.push_back(std::move(tr));
         return r;
     }
 
@@ -13821,8 +14011,42 @@ private:
     // for callers that don't need the fence (Cursor's initial descent).
     PageId find_leaf_crabbing(PageId root, const std::string& key,
                               std::shared_lock<std::shared_mutex>& held_latch) const {
+#ifdef CHRONOKV_STRESS
+        // BT-3 seam (2026-10-18, direct invocation per the gap_callback_scan
+        // precedent — this is every reader's hot path, so dst scheduling and
+        // the probabilistic yield must not see it): fires between the
+        // CALLER's root_id_ load and the root latch below — the stale-root
+        // descent window. Only while gap_hook is armed and dst is NOT.
+        if (stress::gap_hook.load(std::memory_order_acquire) && !dst::is_armed() &&
+            stress::gap_callback_root_descend)
+            stress::gap_callback_root_descend();
+#endif
+        // BT-3 (2026-10-18): ROOT REVALIDATION. The caller's root_id_ load
+        // and this latch acquisition can be separated by arbitrary time
+        // (preemption); a root split completed in between leaves `root`
+        // pointing at a former root whose contents no longer cover the
+        // whole key space (post-trim it is exactly group 0 — the stale-root
+        // variant of the finding's S-W2, an unbounded window; and once M4
+        // lands root collapse it becomes a FREED slot). Latch the slot,
+        // then verify it is still the current root BEFORE reading any byte
+        // of it; on mismatch release and restart from a fresh load. A stale
+        // root's bytes are therefore never read: a rebuilt/reused slot
+        // cannot alias into a descent, and the benign ABA (the slot IS the
+        // current root again after a free+realloc cycle) passes the check
+        // holding valid current content. Writers do not consume this path
+        // (they descend via the fence variant under write_mu_, where the
+        // root cannot change mid-descent); this covers readers and the
+        // Cursor's initial descent. The check is one atomic load on the
+        // uncontended path.
         PageId id = root;
-        auto cur_latch = latches_.lock_shared(id);
+        std::shared_lock<std::shared_mutex> cur_latch;
+        while (true) {
+            cur_latch = latches_.lock_shared(id);
+            if (id == root_id_.load(std::memory_order_acquire)) break;
+            cur_latch.unlock();
+            root_revalidations_.fetch_add(1, std::memory_order_relaxed);
+            id = root_id_.load(std::memory_order_acquire);
+        }
         while (true) {
             const Page* p = pool_.get(id);
             const PageHeader* h = header(p);

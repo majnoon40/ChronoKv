@@ -351,11 +351,18 @@ update is a dedicated after-the-fact commit).
 
 ## 8. Slice plan (each slice: green suite + controls + mutants + ASan, house norm)
 
-* **Slice 0 — BT-3 remediation (0.28.2, BEFORE any merge code; separate
-  document owns the detail).** Repro controls RED on current code →
-  copy-out split + root revalidation → mutants MUT-REBUILD /
-  MUT-NOREVALIDATE / MUT-NOTRIM with exact co-flip isolation. M4 slice 3
-  cannot start without §7.2 of that fix (decision 7's hard dependency).
+* **Slice 0 — BT-3 remediation (LANDED 2026-10-18, same day as this
+  decision doc; BEFORE any merge code, per rule 11).** Reproduced
+  fail-first (verbatim RED: controls A–D, `missing_in_gap=32 first=k00368`
+  / `92 first=k00092` / `found_in_stale_descent=0` / engine-level
+  `reader_val=<absent>`), fixed by the copy-out split + deferred trim +
+  root revalidation package, controls bt3 A–E green, mutants MUT-REBUILD
+  {A,B,D} / MUT-NOREVALIDATE {C} / MUT-NOTRIM {E} with exact co-flip
+  isolation, full stress + release suites ALL TESTS PASSED. Versioning
+  follows the arc's Unreleased pattern (the 0.28.2 proposal was
+  superseded — recorded in the finding doc §9). Repro log: finding doc
+  §11. **§7.2's root revalidation is LIVE — slice 3's collapse
+  dependency is discharged.**
 * **Slice 1 — free-time generation bump (pool-side only).** `free()` bump
   + contract comment + G1 amendment (INVARIANTS.md + decision-doc
   cross-reference) + unit controls driven through test hooks (free a

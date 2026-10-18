@@ -1,11 +1,16 @@
 # BT-3 (candidate): the split rebuild→splice visibility window
 
 **Date:** 2026-10-18
-**Status:** CANDIDATE — reachability established by code reading at
-`1ab7c8c`; **NOT yet reproduced by execution** (rule 9: this document claims
-only what the reading proves; the fail-first repro in §6 is the measurement
-that confirms or refutes it, and per rule 12 it must be verified before the
-fix ships).
+**Status:** **REPRODUCED (deterministic, verbatim in §11) and FIXED
+(2026-10-18, same arc)** — the fail-first repro ran BEFORE the fix per
+rule 1; the fix is the two-mechanism package of §7 (copy-out split +
+root revalidation), controls bt3 A–E in the stress suite
+(`CKV_ONLY_BT3=1`), mutant matrix with exact co-flip isolation in §11.
+The originally-proposed 0.28.2 version stamp is SUPERSEDED by the v29
+arc's observed pattern (M1–M3 shipped under the static 0.28.1 constant
+with `## Unreleased` changelog entries; BT-3 rides the same pattern —
+the version stamp belongs to the arc's release boundary, not to this
+remediation).
 **Found by:** M4 pre-work design reading (the merge protocol is the split
 protocol's mirror; enumerating the split's reader-visible windows found this
 one). This is an independent-of-the-fixer finding channel per rule 12 — the
@@ -253,11 +258,23 @@ read) — one mechanism discharges both.
 * **S-W2** stale-root descent (unbounded under preemption) → closed by
   root revalidation.
 * **S-W3** NEW, introduced by copy-out alone: between splice and trim,
-  page 0 holds stale COPIES of the high group; a stale-root reader could
-  read a since-updated value from page 0 → closed by root revalidation
-  (the reader never descends through a non-current root). Copy-out without
-  revalidation trades false-absent for false-stale — unacceptable; the two
-  mechanisms ship together or not at all.
+  page 0 holds COPIES of the high group; a stale-root reader could read
+  them after the trim made them non-current → closed by root revalidation
+  (the reader never descends through a non-current root). **Prose
+  correction (2026-10-18, post-repro):** the value-STALENESS horn as
+  originally worded ("a since-updated value") is UNREACHABLE under
+  `write_mu_` — the splitting writer owns structural exclusivity from
+  phase 1 through the trim, so no writer can update the new pages' copies
+  while the superset still exists (and engine-level value updates never
+  touch tree slots at all — version chains only). The real S-W3 content
+  is: (i) post-trim, the stale-root descent MISSES the high group again
+  (the superset is gone — S-W2's shape, which revalidation closes), and
+  (ii) M4's root collapse turns the same stale-root descent into a
+  freed-slot use-after-free candidate — revalidation's check-before-byte-
+  read ordering is what makes collapse safe. The package conclusion is
+  unchanged (copy-out and revalidation ship together or not at all); the
+  argument for the second mechanism is miss-based and collapse-based, not
+  staleness-based.
 * **S-W4** cursor emission across phases → argued above; bound by S4/S5
   oracles plus a dedicated parked-cursor control at the
   `tree_leaf_trim` seam.
@@ -283,8 +300,13 @@ read) — one mechanism discharges both.
   revalidation is a hard dependency of M4's root collapse; copy-out is a
   hard dependency of honest M4 acceptance (soak/DST/lincheck flakes would
   otherwise be misattributed to merge code).
-* **Version:** propose 0.28.2 patch (remediation arc, CHANGELOG + README
-  safety-properties note in the same commit per rule 3), tags per rule 2.
+* **Version:** ~~propose 0.28.2 patch~~ **SUPERSEDED (2026-10-18, at
+  landing):** the v29 arc's observed pattern ships main-branch work under
+  the static 0.28.1 constant with `## Unreleased` CHANGELOG entries (M1–M3
+  all rode it); BT-3 follows — CHANGELOG entry + README safety-properties
+  bullet + INVARIANTS row landed in the same commit as the fix (rule 3
+  satisfied at the arc's granularity), and the version stamp + tag belong
+  to the arc's release boundary (rule 2), not to this remediation.
 * **Known-limitation entry:** none needed if fixed before merge; if the
   maintainer defers the fix, README §Known limitations MUST carry the
   window before M4 ships (rule 7: known-limitation entries before the fix
@@ -301,3 +323,75 @@ read) — one mechanism discharges both.
   the battery if the leaf repro confirms.
 * Whether any historical lincheck/soak flake was ever a BT-3 hit is
   unknowable from the record; none is claimed.
+
+---
+
+## 11. REPRO LOG (2026-10-18) — executed, verbatim
+
+The maintainer lifted the no-build constraint for the repro. Vehicle: the
+project's own recorded 1 GiB-container shape (`-O0 --param
+ggc-min-expand=5`, g++ 12.2.0, 2 cores). Baseline BEFORE any edit: full
+release suite at `1ab7c8c` — **ALL TESTS PASSED** (so every red below is
+attributable). Then the two seams + the direct root-descend hook landed
+(neutral instrumentation), and the bt3 controls A–D ran against the
+**pre-fix** header:
+
+```
+stress seed: 24301 (0x5eed)
+   bt3 A: splice-gap seam fired (anti-vacuity):  PASS
+   bt3 A: point reads inside the splice gap see every acked key:  FAIL
+      (pre_missing=0 missing_in_gap=32 first=k00368 post_missing=0)
+   bt3 B: root-install seam fired on a height-1 tree (anti-vacuity):  PASS
+   bt3 B: point reads inside the root-install gap see every acked key:  FAIL
+      (depth1=1 missing_in_gap=92 first=k00092 post_missing=0)
+   bt3 C: stale-root descent still finds the acked key (root revalidated under the latch):  FAIL
+      (fired=1 found_in_stale_descent=0 found_after=1)
+   bt3 D: a concurrent reader inside the commit's root-install window sees the acked key:  FAIL
+      (timed_out=0 reader_found=0 reader_val=<absent>)
+   bt3 D: post-window convergence:  PASS
+exit=1
+```
+
+**The claim is CONFIRMED, deterministically.** Reading the numbers: A's
+32 missing keys are exactly the high group of the split leaf (`k00368`
+onward — the byte-balanced split point of a 432-key frontier leaf); B's
+92 of 150+ are exactly the balanced upper half of the root-leaf split
+(`k00092` onward); C shows the stale-root descent missing a key that is
+found one call later (`found_after=1`); D is the engine-level
+strict-serializability violation through the public API — a reader inside
+a commit's root-install window gets `<absent>` for a key acked 140
+commits earlier. Every `post_missing=0`: transient, convergent, silent —
+exactly the §5 severity shape.
+
+A fifth control, **E** (trim-shape anti-vacuity: exact `size()` and exact
+chain scan after a root split — green pre-fix by construction, the
+destructive rebuild never duplicates), was added with the fix to give
+MUT-NOTRIM an oracle; §6's A/B/C plan became A–E.
+
+**Post-fix** (copy-out split + deferred trim + root revalidation, §7):
+bt3 **8/8 PASS, exit=0**. Mutant matrix on scratch reverts of the fixed
+header, each rebuild + `CKV_ONLY_BT3=1` run — exact co-flip isolation:
+
+| scratch mutant | red | green |
+| --- | --- | --- |
+| (pre-fix, seams only) | A, B, C, D | E (anti-vacuity, green by design) |
+| MUT-REBUILD (restore destructive page-0 rebuild in phase 1) | A, B, D — at the IDENTICAL pre-fix counts (`32/k00368`, `92/k00092`) | C, E |
+| MUT-NOREVALIDATE (delete the root check) | C alone | A, B, D, E |
+| MUT-NOTRIM (`execute_pending_trims` no-op) | E alone (`size=277 model=185` — the superset double-counted; `scan_rows=184` — the chain bypasses the new page) | A, B, C, D |
+
+Full suites on the fixed header (same vehicle): **stress suite ALL TESTS
+PASSED** (bt3 battery included in-flow, rc=0, zero FAIL lines) and
+**release suite ALL TESTS PASSED** (rc=0). Quiescent post-split states
+are byte-identical to the pre-fix protocol's (same groups, same final
+mut_epoch, same chain), which is why the 562-check battery — btree fuzz,
+concurrent cursors, checkpoint/recovery, crash-fuzz, DST — needed no
+expectation changes: no test flipped (rule 14 not triggered; the fix
+changes window behavior only, and the windows had no pre-existing
+oracles — that WAS the defect).
+
+**Rule-12 note:** repro and fix were executed in the same work session
+(the maintainer's standing instruction for this arc); the controls are
+the permanent independent harness — they live in the suite, run on every
+stress build, and any regression of either mechanism reddens its exact
+co-flip set per the matrix above.
+

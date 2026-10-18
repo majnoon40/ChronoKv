@@ -580,6 +580,7 @@ static int run_backup_test();         // v26 M3 online backup
 static int run_pitr_test();           // v26 M4 point-in-time restore
 static int run_m16_phase1_test();
 static int run_m3_gen_verification_test();   // v29 M3 slice 2: G2 verification-site controls
+static int run_bt3_visibility_test();        // BT-3 (2026-10-18): split rebuild->splice visibility controls
 static int run_m3_purge_test();              // v29 M3 slice 3: physical purge controls
 static int run_m2_phase1_test();
 static int run_m2_phase2_test();
@@ -2432,6 +2433,17 @@ return 0;
     if (getenv("CKV_ONLY_REMEDIATION")) {
         crc_init();
         int f = run_remediation_tests();
+        std::cout.flush();
+        return f == 0 ? 0 : 1;
+    }
+
+    // BT-3 (2026-10-18): CKV_ONLY_BT3=1 runs just the split-visibility
+    // battery — every control here FAILED on the pre-fix header (seams
+    // only) by construction (fail-first discipline; the verbatim RED run
+    // is quoted in the fix commit and the finding document).
+    if (getenv("CKV_ONLY_BT3")) {
+        crc_init();
+        int f = run_bt3_visibility_test();
         std::cout.flush();
         return f == 0 ? 0 : 1;
     }
@@ -7983,6 +7995,7 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     fails += run_m16_phase1_test();
     fails += run_m3_gen_verification_test();
     fails += run_m3_purge_test();
+    fails += run_bt3_visibility_test();
     fails += run_m2_phase1_test();
     fails += run_m2_phase2_test();
     fails += run_m2_phase3_test();
@@ -8747,6 +8760,278 @@ static int run_m3_gen_verification_test() {
 #else
     check("m3-gen A: fence re-check vs generation bump (skipped — needs CHRONOKV_STRESS)", true);
     check("m3-gen B: cursor leaf-switch restart (skipped — needs CHRONOKV_STRESS)", true);
+#endif
+    return fails;
+}
+
+// =====================================================================
+// BT-3 (2026-10-18): the split rebuild->splice VISIBILITY battery.
+// Finding: docs/audits/2026-10-18-bt3-split-visibility-window.md. Every
+// control is fail-first against the pre-fix header (seams only): the
+// verbatim RED run is quoted in the finding doc's repro log and the fix
+// commit. The four windows:
+//   A — splice gap (leaf under an interior parent): a point read executed
+//       INSIDE the window (one-shot seam callback; single-threaded — the
+//       read path takes neither write_mu_ nor nm_, so the inline probe is
+//       deadlock-free) must see every prevalidated acked key. Pre-fix the
+//       high group of the split leaf is descent-unreachable: page 0 was
+//       rebuilt to group 0 and the new pages are spliced only after.
+//   B — root-install gap: same shape for the window between
+//       put_recursive's split return and install_new_root's root_id_
+//       store (a height-1 tree's root-leaf split).
+//   C — stale-root descent: a reader whose root_id_ load precedes a
+//       completed root split must still find upper-group keys — the
+//       descent revalidates the latched slot against the current root
+//       before reading a byte of it. Pre-fix this window is unbounded
+//       (the old root leaf permanently lacks the high group).
+//   D — engine level: a second thread's kv.read() while a writer parks in
+//       the root-install seam inside kv.commit() must see the acked key —
+//       the user-visible strict-serializable-ack claim.
+// A/B/C are single-threaded through one-shot seam callbacks (fully
+// deterministic, no timing loops); D is a two-thread rendezvous with a
+// bounded deadline (timeout = FAIL, never a hang).
+// =====================================================================
+static int run_bt3_visibility_test() {
+    using namespace chronokv;
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) {
+            ++fails;
+            if (!detail.empty()) std::cout << "      (" << detail << ")\n";
+        }
+    };
+#ifdef CHRONOKV_STRESS
+    auto pad = [](int i, size_t w) {
+        std::string s = std::to_string(i);
+        return s.size() < w ? std::string(w - s.size(), '0') + s : s;
+    };
+    auto tkey = [&](int i) { return "k" + pad(i, 5); };   // 6-byte keys
+    auto tval = [&](int i) { return "v" + pad(i, 7); };   // 8-byte values
+
+    // ---- Control A — the splice gap under an interior parent. ----
+    {
+        try {
+            chronokv_page::PagePool pool(32ULL * 1024 * 1024);
+            chronokv_btree::BTree t(pool);
+            constexpr int N = 400;              // 400 x 22 B => >= 3 leaves, height 2
+            for (int i = 0; i < N; ++i) t.put(tkey(i), tval(i));
+            std::string buf;
+            int pre_missing = 0;
+            for (int i = 0; i < N; ++i) if (!t.get(tkey(i), &buf)) ++pre_missing;
+            bool fired = false;
+            std::vector<std::string> missing_in_gap;
+            stress::gap_callback_split_splice = [&]() {
+                if (fired) return;              // one-shot
+                fired = true;
+                std::string b;
+                for (int i = 0; i < N; ++i)
+                    if (!t.get(tkey(i), &b)) missing_in_gap.push_back(tkey(i));
+            };
+            stress::gap_hook.store(true, std::memory_order_release);
+            int inserted = N;
+            for (int i = N; i < N + 250 && !fired; ++i) {
+                t.put(tkey(i), tval(i));
+                inserted = i + 1;
+            }
+            stress::gap_hook.store(false, std::memory_order_release);
+            stress::gap_callback_split_splice = nullptr;
+            int post_missing = 0;
+            for (int i = 0; i < inserted; ++i) if (!t.get(tkey(i), &buf)) ++post_missing;
+            check("bt3 A: splice-gap seam fired (anti-vacuity)", fired);
+            check("bt3 A: point reads inside the splice gap see every acked key",
+                  pre_missing == 0 && fired && missing_in_gap.empty() && post_missing == 0,
+                  "pre_missing=" + std::to_string(pre_missing) +
+                  " missing_in_gap=" + std::to_string(missing_in_gap.size()) +
+                  (missing_in_gap.empty() ? std::string() : " first=" + missing_in_gap.front()) +
+                  " post_missing=" + std::to_string(post_missing));
+        } catch (const std::exception& e) {
+            check("bt3 A: point reads inside the splice gap see every acked key",
+                  false, std::string("exception: ") + e.what());
+        }
+    }
+    // ---- Control B — the root-install gap (height-1 root-leaf split). ----
+    {
+        try {
+            chronokv_page::PagePool pool(32ULL * 1024 * 1024);
+            chronokv_btree::BTree t(pool);
+            std::vector<std::string> model;     // acked keys (the trigger put's own key joins only AFTER its put returns)
+            for (int i = 0; i < 150; ++i) { t.put(tkey(i), tval(i)); model.push_back(tkey(i)); }
+            const bool depth1 = (t.depth() == 1);
+            bool fired = false;
+            std::vector<std::string> missing_in_gap;
+            stress::gap_callback_root_install = [&]() {
+                if (fired) return;              // one-shot
+                fired = true;
+                std::string b;
+                for (const auto& k : model) if (!t.get(k, &b)) missing_in_gap.push_back(k);
+            };
+            stress::gap_hook.store(true, std::memory_order_release);
+            for (int i = 150; i < 400 && !fired; ++i) {
+                t.put(tkey(i), tval(i));
+                model.push_back(tkey(i));       // acked: put() returned
+            }
+            stress::gap_hook.store(false, std::memory_order_release);
+            stress::gap_callback_root_install = nullptr;
+            std::string b;
+            int post_missing = 0;
+            for (const auto& k : model) if (!t.get(k, &b)) ++post_missing;
+            check("bt3 B: root-install seam fired on a height-1 tree (anti-vacuity)", depth1 && fired);
+            check("bt3 B: point reads inside the root-install gap see every acked key",
+                  depth1 && fired && missing_in_gap.empty() && post_missing == 0,
+                  "depth1=" + std::to_string(depth1) +
+                  " missing_in_gap=" + std::to_string(missing_in_gap.size()) +
+                  (missing_in_gap.empty() ? std::string() : " first=" + missing_in_gap.front()) +
+                  " post_missing=" + std::to_string(post_missing));
+        } catch (const std::exception& e) {
+            check("bt3 B: point reads inside the root-install gap see every acked key",
+                  false, std::string("exception: ") + e.what());
+        }
+    }
+    // ---- Control C — the stale-root descent (unbounded window). ----
+    {
+        try {
+            chronokv_page::PagePool pool(32ULL * 1024 * 1024);
+            chronokv_btree::BTree t(pool);
+            for (int i = 0; i < 150; ++i) t.put(tkey(i), tval(i));
+            const std::string canary = tkey(140);   // high group of the coming root split (~mid of 185)
+            bool fired = false;
+            stress::gap_callback_root_descend = [&]() {
+                if (fired) return;              // one-shot
+                fired = true;
+                // Complete a FULL root split + install INSIDE the reader's
+                // descent — after its root_id_ load, before its root latch.
+                // When this returns, the descent holds a stale root id.
+                // (The callback's own puts re-enter this seam; the one-shot
+                // flag makes them no-ops. Their descents use the fence
+                // variant, which has no seam.)
+                for (int i = 150; i < 400 && t.depth() == 1; ++i) t.put(tkey(i), tval(i));
+            };
+            stress::gap_hook.store(true, std::memory_order_release);
+            std::string buf;
+            const bool found = t.get(canary, &buf);
+            stress::gap_hook.store(false, std::memory_order_release);
+            stress::gap_callback_root_descend = nullptr;
+            std::string buf2;
+            const bool found_after = t.get(canary, &buf2);
+            check("bt3 C: stale-root descent still finds the acked key (root revalidated under the latch)",
+                  fired && found && buf == tval(140) && found_after && buf2 == tval(140),
+                  "fired=" + std::to_string(fired) +
+                  " found_in_stale_descent=" + std::to_string(found) +
+                  (found ? " value_ok=" + std::to_string(buf == tval(140)) : std::string()) +
+                  " found_after=" + std::to_string(found_after));
+        } catch (const std::exception& e) {
+            check("bt3 C: stale-root descent still finds the acked key (root revalidated under the latch)",
+                  false, std::string("exception: ") + e.what());
+        }
+    }
+    // ---- Control D — engine level, two-thread rendezvous. ----
+    {
+        const std::string wd = "/tmp/bt3_engine_window";
+        std::filesystem::remove_all(wd);
+        try {
+            ChronoKV kv(wd);
+            kv.set_durability(DurabilityMode::Async);   // durability incidental to this oracle (S5 precedent)
+            for (int i = 0; i < 150; ++i) {
+                if (kv.commit(tkey(i), tval(i)) != TxnResult::Committed)
+                    throw std::runtime_error("bt3 D: build commit failed at " + std::to_string(i));
+            }
+            std::atomic<int> phase{0};          // 0=idle 1=writer-in-seam 2=reader-done
+            std::atomic<bool> reader_found{false};
+            std::atomic<bool> timed_out{false};
+            std::string reader_val;
+            stress::gap_callback_root_install = [&]() {
+                int expected = 0;
+                if (!phase.compare_exchange_strong(expected, 1)) return;   // one-shot
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                while (phase.load(std::memory_order_acquire) != 2) {
+                    if (std::chrono::steady_clock::now() > deadline) {
+                        timed_out.store(true);
+                        break;
+                    }
+                    std::this_thread::yield();
+                }
+            };
+            stress::gap_hook.store(true, std::memory_order_release);
+            std::thread reader([&]() {
+                while (phase.load(std::memory_order_acquire) != 1) std::this_thread::yield();
+                if (!timed_out.load()) {
+                    auto v = kv.read(tkey(140));
+                    reader_found.store(v.has_value());
+                    if (v) reader_val = *v;
+                }
+                phase.store(2, std::memory_order_release);
+            });
+            TxnResult r = TxnResult::Committed;
+            for (int i = 150; i < 400 && phase.load(std::memory_order_acquire) == 0; ++i)
+                r = kv.commit(tkey(i), tval(i));
+            reader.join();
+            stress::gap_hook.store(false, std::memory_order_release);
+            stress::gap_callback_root_install = nullptr;
+            auto v2 = kv.read(tkey(140));
+            check("bt3 D: a concurrent reader inside the commit's root-install window sees the acked key",
+                  !timed_out.load() && phase.load() == 2 && r == TxnResult::Committed &&
+                  reader_found.load() && reader_val == tval(140),
+                  "timed_out=" + std::to_string(timed_out.load()) +
+                  " reader_found=" + std::to_string(reader_found.load()) +
+                  " reader_val=" + (reader_val.empty() ? std::string("<absent>") : reader_val));
+            check("bt3 D: post-window convergence",
+                  v2.has_value() && *v2 == tval(140),
+                  v2 ? *v2 : std::string("<absent>"));
+        } catch (const std::exception& e) {
+            check("bt3 D: a concurrent reader inside the commit's root-install window sees the acked key",
+                  false, std::string("exception: ") + e.what());
+        }
+        std::filesystem::remove_all(wd);
+    }
+    // ---- Control E — the trim actually happens (MUT-NOTRIM isolation). ----
+    // A/B/C/D pin VISIBILITY, which a skipped trim does not break (the
+    // superset keeps serving every route — that is the copy-out safety
+    // argument). What a skipped trim breaks is SHAPE: the split page keeps
+    // the high group forever, so size() double-counts it against the new
+    // page (descent reaches BOTH: the parent routes the high group right,
+    // the untrimmed superset still holds it), the page stays over budget,
+    // and a later in-place update of a high-group key diverges the two
+    // copies (descent updates the new page; a chain scan through the
+    // superset emits the stale copy). E pins the shape leg: after a root
+    // split, size() must equal the model exactly. Green pre-fix (the
+    // destructive rebuild never duplicates) — E is the trim's anti-vacuity
+    // control, RED under MUT-NOTRIM alone.
+    {
+        try {
+            chronokv_page::PagePool pool(32ULL * 1024 * 1024);
+            chronokv_btree::BTree t(pool);
+            int model = 0;
+            for (int i = 0; i < 150; ++i) { t.put(tkey(i), tval(i)); ++model; }
+            for (int i = 150; i < 400 && t.depth() == 1; ++i) { t.put(tkey(i), tval(i)); ++model; }
+            const size_t sz = t.size();
+            const size_t depth = t.depth();
+            // Update a high-group key in place, then chain-scan: the scan
+            // must see the UPDATED value exactly once (a surviving superset
+            // copy would emit the stale one or duplicate the key).
+            const std::string hi_key = tkey(model - 5);
+            t.put(hi_key, "updated!");
+            auto scan = t.scan_all("");
+            bool scan_ok = (scan.size() == (size_t)model);
+            int seen = 0;
+            for (const auto& kv : scan)
+                if (kv.first == hi_key) { ++seen; scan_ok = scan_ok && kv.second == "updated!"; }
+            check("bt3 E: the deferred trim lands — exact size, exact chain scan after a root split",
+                  depth >= 2 && sz == (size_t)model && scan_ok && seen == 1,
+                  "depth=" + std::to_string(depth) + " size=" + std::to_string(sz) +
+                  " model=" + std::to_string(model) + " scan_rows=" + std::to_string(scan.size()) +
+                  " hi_key_seen=" + std::to_string(seen));
+        } catch (const std::exception& e) {
+            check("bt3 E: the deferred trim lands — exact size, exact chain scan after a root split",
+                  false, std::string("exception: ") + e.what());
+        }
+    }
+#else
+    check("bt3 A: splice-gap point-read visibility (skipped — needs CHRONOKV_STRESS)", true);
+    check("bt3 B: root-install-gap point-read visibility (skipped — needs CHRONOKV_STRESS)", true);
+    check("bt3 C: stale-root descent revalidation (skipped — needs CHRONOKV_STRESS)", true);
+    check("bt3 D: engine-level window visibility (skipped — needs CHRONOKV_STRESS)", true);
+    check("bt3 E: deferred-trim shape (skipped — needs CHRONOKV_STRESS)", true);
 #endif
     return fails;
 }

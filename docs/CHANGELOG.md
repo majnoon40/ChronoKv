@@ -7,6 +7,70 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **fix (BT-3, 2026-10-18): the split rebuild→splice VISIBILITY window —
+  point reads could transiently false-negative ACKED keys (a
+  strict-serializable-ack break of the TXN-1 class), found by the M4
+  pre-work design reading, reproduced deterministically at new seams
+  BEFORE the fix, and closed by a two-mechanism package.**
+  `split_leaf`/`split_interior_planned` destructively REBUILT the
+  splitting page (group 0 only) under its exclusive latch, and
+  `put_recursive` released that latch BEFORE `insert_into_parent_multi`
+  spliced the parent — in the window the parent still routed the high
+  group's keys to a page that no longer held them and the new pages were
+  (per their own comment) "unreachable until the parent splice", so
+  `find_index`/`Database::get`/`Transaction::get` returned ABSENT for
+  keys acked arbitrarily long ago; an SSI txn could commit on that stale
+  read (the moved key is not concurrently written, so neither the phantom
+  tracker nor write-set validation conflicts). Root splits added a
+  preemption-UNBOUNDED stale-root variant (v25.7's per-iteration root
+  reload covers writers only). Scans were immune (the chain is built
+  under the leaf exclusive — why the S4/lincheck scan oracles never saw
+  it), `ensure_index` self-heals via `nm_`, and no stress point sat in
+  the gap, so DST could not schedule it. FIX (both halves are load-
+  bearing; either alone converts false-absent into a different wrong
+  answer): (1) COPY-OUT splits — the new pages are filled while the
+  splitting page KEEPS its full pre-split contents (a superset serving
+  every stale route), and is rebuilt to exactly group 0 by a DEFERRED
+  TRIM (`execute_pending_trims`) only after the TOPMOST splice publishes
+  (the parent cascade's clean exit, or `install_new_root` for the root
+  case); the trim replays the MATERIALIZED plan (quiescent states are
+  byte-identical to the old protocol — same layout, same final mut_epoch
+  semantics), is allocation-free (cannot fail), and publishes the chain
+  link; a parked cursor blocks the trim and its captured `next_leaf_id`
+  bypasses the new pages, so scans crossing the window emit the superset
+  exactly once — completeness and no-duplication hold for cursors AND for
+  `checkpoint_locked`'s `tree_scan_all` (a missed key there would be
+  checkpoint data loss). The hold-the-latch-across-the-splice alternative
+  was rejected with a deadlock proof (upward acquisition against crabbing
+  readers). (2) ROOT REVALIDATION — `find_leaf_crabbing` (every reader
+  and cursor descent) verifies the latched root slot against `root_id_`
+  BEFORE reading any byte of it, restarting from a fresh load on mismatch
+  (`root_revalidations_` diagnostic; the benign ABA — the slot IS the
+  current root again — passes holding valid current content). This is
+  also exactly the mechanism M4's root collapse needs (a freed root slot
+  must never alias into a descent) — the M4 decision doc's hard
+  dependency is discharged. SEAMS: `tree_split_splice_gap` and
+  `tree_root_install_gap` (split-only ⇒ dst-safe stress_points) plus a
+  direct-invoked root-descend hook (the `gap_callback_scan` precedent —
+  reader hot path, dst scheduling must not see it). CONTROLS (fail-first,
+  `CKV_ONLY_BT3=1` and in the full stress suite): bt3 A (splice gap,
+  400-key height-2 tree, inline one-shot probe), B (root-install gap),
+  C (stale-root descent), D (engine-level two-thread rendezvous with a
+  bounded deadline — the public-API claim), E (trim-shape anti-vacuity:
+  exact `size()` + exact chain scan after a root split). VERBATIM RED
+  pre-fix: A `missing_in_gap=32 first=k00368`, B `missing_in_gap=92
+  first=k00092`, C `found_in_stale_descent=0`, D `reader_found=0
+  reader_val=<absent>` — all with `post_missing=0` (transient,
+  convergent, SILENT). Mutant matrix with exact co-flip sets:
+  MUT-REBUILD → {A,B,D} red at identical counts; MUT-NOREVALIDATE → {C}
+  red alone; MUT-NOTRIM → {E} red alone (`size=277 model=185`).
+  Post-fix: bt3 8/8, full stress suite ALL TESTS PASSED, full release
+  suite ALL TESTS PASSED (this arc's `-O0 --param ggc-min-expand=5` 1 GiB
+  sandbox shape; CI re-runs the four-config matrix on push). Finding +
+  repro log: `docs/audits/2026-10-18-bt3-split-visibility-window.md`.
+  The M4 merge protocol (decision doc, same date) is copy-then-unlink BY
+  CONSTRUCTION — the delete side never opens an equivalent window.
+
 - **feat (v29 M3 slice 3/3, 2026-10-18): the PURGE — dead keys are
   physically evicted, and the index stops growing with lifetime distinct
   keys (README limitation #1, heap side closed).** A key whose head

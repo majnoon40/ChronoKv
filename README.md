@@ -446,6 +446,19 @@ inactive transaction), `Error` (engine failures), `NotYetImplementedError`.
   alongside the commit clock, so the first commit's barrier never waits on
   holes the instance will never track (regression-tested with a hard
   timeout).
+- **Split visibility (BT-3, 2026-10-18)**: splits are COPY-OUT — the
+  splitting page keeps its full pre-split contents (a superset serving
+  every stale route) until the topmost parent splice publishes, and only
+  then is trimmed to its group 0 under its own exclusive latch
+  (allocation-free; quiescent states are byte-identical to the old
+  protocol), so a point read can never transiently miss an acked key
+  mid-split. Every reader descent revalidates its latched root slot
+  against the current `root_id_` before reading any byte of it — a
+  stale-root load (or, once M4 lands root collapse, a freed root slot)
+  can never alias into a descent. Scans were already immune (the chain is
+  published under the leaf exclusive); the bt3 A–E battery
+  (`CKV_ONLY_BT3=1`) pins each window fail-first. See
+  `docs/audits/2026-10-18-bt3-split-visibility-window.md`.
 - **Backup semantics (v26 M3)**: a backup is *at least* as new as the
   checkpoint taken inside `backup()` and *at most* as new as copy
   completion — not a point-in-time snapshot. `verify_backup()` succeeds
