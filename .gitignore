@@ -9,6 +9,10 @@ build/
 core
 core.*
 tsan.*
+# ...EXCEPT the committed TSan suppressions file (v29 M4 follow-up round 3:
+# the tsan.* artifact pattern silently swallowed docs/tsan.supp out of two
+# commits — both CI cuts died on 'failed to read suppressions file').
+!docs/tsan.supp
 asan.*
 
 # Test scratch files

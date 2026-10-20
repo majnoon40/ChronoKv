@@ -1,0 +1,78 @@
+# ThreadSanitizer suppressions — ChronoKV
+#
+# Wired via TSAN_OPTIONS="suppressions=${{ github.workspace }}/docs/
+# tsan.supp" in the ci.yml tsan legs (full-suite and public-api-smoke)
+# and required for local `./build/tsan/test` runs. The path MUST be
+# ABSOLUTE: libtsan resolves a relative suppressions path against the
+# BINARY's directory, not the process CWD (measured: the first CI cut
+# died on "failed to read suppressions file '.../build/tsan/docs/
+# tsan.supp'"). Suppression TYPES are per-report-class by construction:
+# a `deadlock:` entry can never suppress a data-race report — the race
+# detector stays at full strength.
+#
+# =====================================================================
+# deadlock:chronokv_btree::LatchTable — the page-latch ROLE-FLIP artifact
+# =====================================================================
+# Discovered by: the M4 landing CI run (2026-10-20, run 39468873357 —
+# all three tsan legs red with 18-21 distinct "lock-order-inversion
+# (potential deadlock)" cycles and 16 suite checks failing as
+# `child exit 66`: forked battery children PASSED their checks but TSan
+# overwrote their exit(0) with its exitcode 66 on report emission).
+#
+# Root cause (identity conflation, not a deadlock):
+#   * LatchTable entries are keyed by PageId and NEVER erased — a
+#     deliberate, argued design (M3 slice-3 decision-doc checklist item
+#     7: erasing on free is WRONG under the immediate-return free list
+#     because get_or_create hands out raw mutex pointers).
+#   * v29 M4 gave PagePool::free() its first production callers, so a
+#     slot's rwlock OBJECT now legitimately plays different tree roles
+#     over time: ancestor of Y at t1 (descent records edge X=>Y), freed,
+#     re-allocated as a DESCENDANT of Y at t2 (descent records Y=>X).
+#     The lock-order graph accumulates both directions across time and
+#     reports a cycle. Pre-M4 this was unobservable: production code
+#     never freed a page, so a latch identity never flipped roles.
+#   * Cross-instance heap-address reuse (the suite opens/closes hundreds
+#     of Databases; freed LatchTable nodes' addresses are recycled) adds
+#     the same class of stitched edges between unrelated mutex objects.
+#
+# Why it cannot deadlock (the argument this suppression rests on):
+#   * The reported edge pairs are SHARED acquisitions (rdlock) — two
+#     shared latches are mutually compatible; a shared/shared "cycle"
+#     cannot block.
+#   * Every descent (find_leaf_crabbing*, find_parent_crabbing, Cursor)
+#     acquires page latches strictly TOP-DOWN against the CURRENT shape.
+#   * Shape changes (split trims, merges, collapse) run under write_mu_
+#     (single structural writer) and hold path EXCLUSIVES; a stale-shape
+#     reader holds shared latches that the shape change must wait for,
+#     completes against a consistent old shape, and releases — the two
+#     directions can never be simultaneously held-and-waited.
+#   * The decision doc's §1.2/§3.4 latch rules (never acquire upward,
+#     siblings try-lock) are enforced in maybe_rebalance by construction.
+#
+# Residual blind spot (recorded, not hidden): a REAL inversion between a
+# page latch and an ENGINE mutex (nm_/write_mu_/commit_mu/checkpoint_mu_/
+# batch path) would also carry a LatchTable frame and be suppressed. Its
+# backstop is behavioral: a real latch-order deadlock hangs the suite —
+# the forked harnesses' parent deadlines and the CI job timeouts fail
+# loudly (the C1 precedent). Engine-mutex-only cycles (no LatchTable
+# frame) remain fully detected.
+#
+# Fail-first provenance (house norm): the artifact reproduces
+# deterministically in ~20 s with a scratch driver — build 400 keys,
+# drain-to-empty (merges + collapse free the root/leaf slots), regrow
+# (LIFO slot reuse flips roles), descend: 2 lock-order reports, exit 66,
+# oracles green (found=400 scan=400). With this suppression: 0 reports,
+# exit 0, oracles unchanged. The 20-line driver is quoted in the fix
+# commit message; the suite's own m4 D/G controls are the in-tree
+# permanent shape (drain-to-empty + collapse-x-reuse).
+#
+# Alternative dispositions considered and rejected:
+#   * erase latch entries on free — the exact WRONG the M3 decision doc
+#     recorded (raw-pointer UAF window between get_or_create and the
+#     latch acquisition in Cursor::enter_leaf's predecessor-released
+#     gap);
+#   * generation-keyed latch entries — unbounded entry growth under
+#     churn, against P1's bounded-steady-state spirit;
+#   * detect_deadlocks=0 — strictly broader (kills engine-mutex cycle
+#     detection too); this file is the narrower cut.
+deadlock:chronokv_btree::LatchTable
