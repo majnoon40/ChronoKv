@@ -263,7 +263,7 @@ jobs:
       # cycles (and forked children exit 66 on the report, failing checks
       # they passed). Narrow deadlock:-type suppression — data races stay
       # at full strength; full argument + residual blind spot in the file.
-      TSAN_OPTIONS: suppressions=docs/tsan.supp
+      TSAN_OPTIONS: suppressions=${{ github.workspace }}/docs/tsan.supp
     strategy:
       fail-fast: false
       matrix:
@@ -314,7 +314,7 @@ jobs:
       # Ignored by the non-TSan legs; the tsan leg carries the same
       # page-latch role-flip suppression as the full-suite tsan job
       # (docs/tsan.supp — argument and blind spot recorded there).
-      TSAN_OPTIONS: suppressions=docs/tsan.supp
+      TSAN_OPTIONS: suppressions=${{ github.workspace }}/docs/tsan.supp
     strategy:
       fail-fast: false
       matrix:

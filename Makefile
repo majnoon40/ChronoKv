@@ -22,8 +22,12 @@
 # complete it comfortably inside one job.
 
 # v29 M4 follow-up (2026-10-20): local TSan runs need the suppressions
-# the CI legs set — TSAN_OPTIONS="suppressions=docs/tsan.supp"
-# ./build/tsan/test — otherwise the page-latch role-flip artifact (M4's
+# the CI legs set — TSAN_OPTIONS="suppressions=$(pwd)/docs/tsan.supp"
+# ./build/tsan/test (ABSOLUTE path: libtsan resolves a relative
+# suppressions path against the BINARY's directory, not the CWD — the
+# first CI cut died on "failed to read suppressions file" from
+# build/tsan/docs/tsan.supp) — otherwise the page-latch role-flip
+# artifact (M4's
 # slot reuse × never-erased LatchTable identities) prints false
 # lock-order-inversion cycles and forked battery children exit 66 on
 # checks they PASSED. The file header carries the full argument, the
