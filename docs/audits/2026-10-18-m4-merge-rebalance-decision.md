@@ -578,3 +578,27 @@ teeth are structural, but the house norm is the measured RED and this
 postscript says plainly that it is owed). The permanent independent
 harness is the suite itself plus the stress-build S5 legs in CI, per the
 rule-12 note slice 0 established.
+
+**§13 addendum (2026-10-20) — risk R-4 resolved, one investigation cycle
+spent exactly as budgeted.** The M4 landing CI run (39468873357) reddened
+all three TSan legs: 18–21 distinct `lock-order-inversion (potential
+deadlock)` cycles per leg, and 16 suite checks failing as `child exit 66`
+(forked battery children PASSED their checks; TSan overwrote their exit(0)
+with its report exitcode). Diagnosis: the page-latch ROLE-FLIP artifact —
+LatchTable entries are never erased (the M3 item-7 decision), so M4's slot
+reuse makes one rwlock identity play ancestor at t1 and descendant at t2;
+the lock-order graph accumulates both directions across time and reports a
+cycle that cannot occur (shared/shared edges; top-down descents; shape
+changes under path exclusives + `write_mu_`). Pre-M4 the artifact was
+unobservable — production code never freed a page. Reproduced
+deterministically in ~20 s by a scratch build→drain→regrow→descend driver
+(exit 66 with oracles green; exit 0 under the suppression). Disposition:
+`docs/tsan.supp` — a narrow `deadlock:`-type suppression anchored at
+`LatchTable` (type-scoped: data races can never be suppressed;
+engine-mutex-only cycles stay detected), wired via `TSAN_OPTIONS` into
+both TSan CI jobs; the residual blind spot (mixed latch×engine-mutex
+inversions) and its behavioral backstop (real deadlocks hang the
+fork-harness parent deadlines / job timeouts loudly — the C1 precedent)
+are recorded in the file header, with the two rejected alternatives
+(erase-on-free — the M3-documented raw-pointer UAF; gen-keyed entries —
+unbounded growth against P1's spirit).

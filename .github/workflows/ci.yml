@@ -255,6 +255,15 @@ jobs:
     name: tsan (${{ matrix.name }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    env:
+      # v29 M4 follow-up (2026-10-20, run 39468873357): the page-latch
+      # role-flip artifact — M4's slot reuse makes a never-erased
+      # LatchTable rwlock identity play both tree roles over time, which
+      # TSan's lock-order graph stitches into false "potential deadlock"
+      # cycles (and forked children exit 66 on the report, failing checks
+      # they passed). Narrow deadlock:-type suppression — data races stay
+      # at full strength; full argument + residual blind spot in the file.
+      TSAN_OPTIONS: suppressions=docs/tsan.supp
     strategy:
       fail-fast: false
       matrix:
@@ -301,6 +310,11 @@ jobs:
     name: smoke (${{ matrix.name }})
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      # Ignored by the non-TSan legs; the tsan leg carries the same
+      # page-latch role-flip suppression as the full-suite tsan job
+      # (docs/tsan.supp — argument and blind spot recorded there).
+      TSAN_OPTIONS: suppressions=docs/tsan.supp
     strategy:
       fail-fast: false
       matrix:

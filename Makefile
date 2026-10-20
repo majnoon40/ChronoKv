@@ -21,6 +21,14 @@
 # removed — `make tsan` runs the FULL suite as one step. CI runners
 # complete it comfortably inside one job.
 
+# v29 M4 follow-up (2026-10-20): local TSan runs need the suppressions
+# the CI legs set — TSAN_OPTIONS="suppressions=docs/tsan.supp"
+# ./build/tsan/test — otherwise the page-latch role-flip artifact (M4's
+# slot reuse × never-erased LatchTable identities) prints false
+# lock-order-inversion cycles and forked battery children exit 66 on
+# checks they PASSED. The file header carries the full argument, the
+# residual blind spot, and the two rejected alternatives.
+
 # NOTE (v29 M2 item 5, 2026-10-10): the test suite is now FOUR translation
 # units - main.cpp (~10.6k lines) plus tests/tests_{dst,remediation,lincheck}
 # - each including the ~13.5k-line header; the largest cc1plus unit is

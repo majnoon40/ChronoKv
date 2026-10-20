@@ -7,6 +7,44 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **fix (v29 M4 follow-up, 2026-10-20): the TSan legs' page-latch
+  role-flip artifact — narrow `deadlock:` suppression wired into both
+  TSan CI jobs (`docs/tsan.supp`).** The M4 landing run (39468873357)
+  reddened all three tsan legs with 18–21 distinct `lock-order-inversion
+  (potential deadlock)` cycles each and 16 suite checks failing as
+  `child exit 66` — forked battery children that PASSED their checks,
+  whose exit(0) TSan overwrote with its report exitcode. Root cause is
+  identity conflation, not a deadlock: `LatchTable` entries are keyed by
+  PageId and never erased (the M3 item-7 decision — erase-on-free is a
+  raw-pointer UAF under the immediate-return free list), and M4 gave
+  `PagePool::free()` its first production callers, so one rwlock identity
+  now legitimately plays ancestor at t1 and (freed, re-allocated)
+  descendant at t2; the lock-order graph accumulates both directions
+  across time. The reported edges are SHARED acquisitions (mutually
+  compatible — a shared/shared cycle cannot block); every descent is
+  top-down against the current shape, and shape changes run under
+  `write_mu_` holding path exclusives that stale-shape readers' shared
+  latches gate. Pre-M4 the artifact was unobservable (no production
+  frees). Reproduced deterministically (~20 s scratch driver: build 400
+  keys → drain-to-empty → regrow → descend; exit 66 with oracles green,
+  exit 0 under the suppression). The suppression is type-scoped
+  (`deadlock:` can never suppress a data race) and anchored at
+  `LatchTable`, so engine-mutex-only inversion cycles stay detected; the
+  residual blind spot (mixed latch×engine-mutex inversions) has a
+  behavioral backstop — a real one hangs the fork-harness parent
+  deadlines / job timeouts loudly (the C1 precedent). Rejected
+  alternatives recorded in the file header (erase-on-free: the M3-documented
+  UAF; generation-keyed entries: unbounded growth against P1's spirit;
+  `detect_deadlocks=0`: strictly broader). Evidence + dispositions also
+  appended to the M4 decision doc (§13 addendum: risk R-4 resolved, one
+  investigation cycle, exactly as budgeted). Separately: the 2026-10-20
+  nightly's red `release (g++-13)` leg was the v18 checkpoint ratio gate
+  (2.59× vs ≥4× on a slow runner — a timing flake, same SHA green the two
+  prior days and on every other compiler leg of the same run); its
+  failed-jobs re-run came back 32/32 green. Gate left untouched per the
+  standing rule (recalibrate only on repeated measured evidence, never
+  in-flight to silence one red night).
+
 - **feat (v29 M4, 2026-10-18): leaf merge & rebalance LANDED —
   `PagePool::free()` has its engine callers, the M3 creeping ceiling is
   closed, and the DST S5 grammar is binding.** The delete path now
