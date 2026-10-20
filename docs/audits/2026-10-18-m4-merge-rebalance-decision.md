@@ -463,7 +463,13 @@ use-after-free candidate. Classified walk-throughs of `pool_.get(...)`:
 2. **P1 soak vehicle** (ROADMAP: GitHub kills jobs at 6 h): self-hosted
    runner, rolling nightly chain with persisted state + aggregate verdict,
    or offline rig with committed logs? Slice 4 is blocked on this; slices
-   1–3 are not.
+   1–3 are not. **UPDATE 2026-10-20:** the recommendation is drafted in
+   `2026-10-20-m5-wal-writer-thread-decision.md` §13 (rolling nightly
+   chain on the existing `backup()`/B1 state-transfer primitive, configs
+   rotating per night, committed per-segment ledger, broken chain restarts
+   loudly) — one vehicle decision serving this leg, M5 slice 3's arena
+   legs, and v30 M1's 24 h/7 d soaks; it awaits maintainer adoption
+   because it edits the nightly's contract and budget (rule 13).
 3. **Version identity:** M1–M3 slices shipped under a static 0.28.1 with
    the arc's MINOR (0.29.0?) at completion. M4 follows the same pattern?
    (Rule 3's "version identity in the same commit" is satisfied at the
