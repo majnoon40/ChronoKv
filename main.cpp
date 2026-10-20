@@ -4409,14 +4409,31 @@ return 0;
     // regresses to full serialization, the ratio collapses to ~1x and the
     // test still fails.
     {
-        // N is sized so the full checkpoint's serialization work dominates
-        // the ~2ms of fixed fsync/rename/dirent-fsync I/O every checkpoint
-        // pays: with small N on fast CI storage the fixed cost dominates
-        // BOTH measurements and the true ratio collapses toward the 4x bar
-        // (observed 3.78x at N=5000 on GitHub runners). At N=20000 the
-        // full checkpoint is ~10x serialization vs ~1x fixed cost, so the
-        // O(N) vs O(delta) gap is unambiguous.
-        constexpr int N = 20000;
+        // N is sized so the full checkpoint's serialization work (S)
+        // dominates the fixed fsync/rename/dirent-fsync I/O (F) every
+        // checkpoint pays: ratio = (S+F)/F, so a slow-fsync runner
+        // compresses the measured ratio toward the bar NO MATTER how
+        // correct the delta path is. Calibration history (rule 9 — every
+        // number measured on the vehicle that produced it):
+        //   * N=5000:  3.78x observed on GitHub runners -> raised.
+        //   * N=20000: GREEN for years, then TWO flakes in two days on
+        //     non-stress release legs — 2026-10-20 nightly release(g++-13)
+        //     best full=15.25ms best delta=5.90ms ratio=2.59x, and the
+        //     same day's push run release(io_uring-disabled) best
+        //     full=18.74ms best delta=5.11ms ratio=3.66x — with the SAME
+        //     SHA green the two prior days and on every other compiler
+        //     leg of both runs (runner variance, engine property intact).
+        //     Floor model from those numbers: F reached ~5-6ms while S at
+        //     N=20000 was only ~9-13ms.
+        //   * N=75000 (this cut): S ~= 35ms, so the 4x bar tolerates F up
+        //     to ~11.7ms — 2x the worst observed floor — and the detector
+        //     gets SHARPER, not weaker: an O(N)-regressed delta at this N
+        //     fails at ratio ~1 by a mile. The bar itself is UNTOUCHED
+        //     (4x; stress builds keep their calibrated 2x) per the standing
+        //     rule: adapt the method, never weaken what it proves.
+        // Runtime cost of the raise: ~+2.5s release, ~+35s sanitizer legs
+        // (3 reps x 75k commits) — inside every leg's budget.
+        constexpr int N = 75000;
         constexpr int REPS = 3;
         double best_full_ms = std::numeric_limits<double>::max();
         double best_delta_ms = std::numeric_limits<double>::max();
@@ -4428,10 +4445,11 @@ return 0;
             unlink(cp.c_str());
 
             // 16 MiB page pool (see Options::page_pool_bytes guidance):
-            // 5000 keys use a few hundred KiB of index pages, so a small
-            // pool avoids the 256 MiB default's virtual-memory pressure on
-            // memory-constrained VMs (4 GB / no swap) without changing the
-            // timing semantics — both measurements use the same pool size.
+            // 75000 keys use ~2 MiB of index pages (~25 B/entry), so the
+            // small pool avoids the 256 MiB default's virtual-memory
+            // pressure on memory-constrained VMs (4 GB / no swap) without
+            // changing the timing semantics — both measurements use the
+            // same pool size.
             ChronoKV kv(wd, 16ULL * 1024 * 1024);  // no GC: timing test measures checkpoint only
 
             // Populate with N keys.
