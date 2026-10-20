@@ -2320,6 +2320,22 @@ inline constexpr size_t WAL_MAX_RECORD  = 1u << 20;     // hard cap on a seriali
 // structs in namespace chronokv_btree.
 inline constexpr size_t TREE_MAX_KEY_BYTES = 4048;
 
+// v29 M4 (leaf merge & rebalance; decision doc
+// docs/audits/2026-10-18-m4-merge-rebalance-decision.md §1.12): diagnostic
+// snapshot of the tree's rebalance counters, beside cursor_restarts() /
+// fence_recheck_retries() on the engine face. Global scope (not nested in
+// BTree) so ChronoKV — declared before namespace chronokv_btree exists —
+// can name it; same reason PoolStats/GcStats live here.
+struct TreeMergeStats {
+    uint64_t leaf_merges = 0;      // leaf-into-left-survivor merges executed
+    uint64_t interior_merges = 0;  // interior merges (cascade level) executed
+    uint64_t borrows = 0;          // single-entry rotations (leaf + interior)
+    uint64_t root_collapses = 0;   // height reductions (old root freed)
+    uint64_t abandons_lock = 0;    // attempts dropped on a sibling try_lock
+    uint64_t abandons_fit = 0;     // attempts dropped on a byte-aware fits refusal
+    uint64_t pages_freed = 0;      // pool_.free() calls by the merge machinery
+};
+
 // v28 (audit CKV-001): typed refusal for entries that can never fit a
 // page. Thrown BEFORE any page mutation, so a throw leaves the tree
 // structurally unchanged. The engine's commit_txn key gate makes this
@@ -6530,6 +6546,9 @@ public:
     uint64_t fence_recheck_retries() const;
     // v29 M3 slice 2: cursor generation-mismatch restarts (defined out-of-line after BTree).
     uint64_t cursor_restarts() const;
+    // v29 M4: rebalance counters (defined out-of-line after BTree — the
+    // delete-churn battery reads these beside cursor_restarts()).
+    TreeMergeStats tree_merge_stats() const;
     // v25.1 M1.6: debug counter for ensure_index loser-delete branch.
     uint64_t ensure_index_loser_deletes() const;
 
@@ -10401,6 +10420,10 @@ public:
     // v25.1 M1.6: debug counter for fence re-check retries (test use).
     // Defined out-of-line (after BTree) — see below.
     uint64_t fence_recheck_retries() const;
+    // v29 M4: rebalance counters (test/diagnostic use — the delete-churn
+    // battery and the parked-cursor abandonment control read these).
+    // Defined out-of-line (after BTree) — see below.
+    TreeMergeStats merge_stats_for_test() const;
     // v25.1 M1.6: debug counter for ensure_index loser-delete branch (test use).
     uint64_t ensure_index_loser_deletes() const;
     // v25.1 M2 Phase 2: test-only io_uring mock injection.
@@ -11407,10 +11430,51 @@ public:
     // disjunction, generalized to all slots; the hazard-pointer machinery
     // is scheduled for deletion in M3 (it never covered the cursor's
     // leaf-switch gap — the window that actually matters).
+    //
+    // v29 M4 (decision doc docs/audits/2026-10-18-m4-merge-rebalance-decision.md
+    // §1.1 — invariant G1 AMENDED): free() ALSO bumps the slot generation.
+    // An alloc-only bump leaves the LIMBO window (freed, not yet
+    // reallocated) undetectable: free() does not memset, so a limbo slot
+    // keeps its old contents AND its old generation — Cursor::enter_leaf's
+    // G2 check would pass and emit from a corpse (duplicating keys its
+    // merge survivor now holds), and a writer's fence_unchanged would pass
+    // on a leaf about to be memset by its next alloc (an acked-write loss).
+    // Bumping at free makes limbo detectable at every EXISTING verification
+    // site — enter_leaf restarts, fence_unchanged re-descends — with no new
+    // sites. CONTRACT: callers hold the page's EXCLUSIVE latch when calling
+    // (the merge protocol does by construction; the bump is then ordered
+    // before any subsequent latcher can observe the slot). Wrap argument
+    // re-derived: aliasing a captured gen now needs 2^31 free+alloc cycles
+    // inside one latch acquisition instead of 2^32 allocs — still
+    // impossible. G1 becomes: every slot LIFETIME transition (alloc AND
+    // free) bumps exactly once under the pool mutex.
     void free(PageId id) {
         if (id == 0) return;
         std::lock_guard<std::mutex> lk(mu_);
+        slot_gen_[id - 1].fetch_add(1, std::memory_order_release);
         free_list_.push_back(id);
+    }
+
+    // v29 M4 (decision doc §1.1 + the borrow-rotation postscript): identity
+    // bump WITHOUT a free — the page stays live and allocated, but every
+    // (id, gen) pair captured before the bump fails its G2 verification.
+    // The borrow rotation needs it: a rotation moves ONE key across a chain
+    // edge (lender -> borrower), and a cursor in the latch-free leaf-switch
+    // gap has already captured (successor, gen) from the predecessor's
+    // latch. A left-borrow would duplicate the migrated key for that cursor
+    // (emitted from the lender, re-emitted at the borrower's slot 0); a
+    // right-borrow would DROP it (the cursor left the lender before the key
+    // arrived and the lender's rebuild removed it from the source). Bumping
+    // BOTH rotated pages routes the switcher into enter_leaf's existing
+    // restart-from-last-emitted path, which re-descends and emits exactly
+    // once — no cursor semantic change (decision 9), no monotonic emission
+    // filter. Merges do NOT need this: the survivor's absorbed keys always
+    // land behind an in-flight cursor (left-survivor rule, §1.4) and the
+    // dying page's own free-bump covers the switcher heading for IT.
+    void bump_generation_for_rewrite(PageId id) {
+        if (id == 0) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        slot_gen_[id - 1].fetch_add(1, std::memory_order_release);
     }
 
     // Get a pointer to a page by ID. The pointer is valid until the
@@ -11800,6 +11864,24 @@ public:
         std::shared_lock<std::shared_mutex> held;
         return find_leaf_crabbing(root_id_.load(std::memory_order_acquire), key, held);
     }
+    // v29 M4 (root-collapse ABA control, decision doc §4 MW5): seed a
+    // descent with a DELIBERATELY STALE root id — the shape a preempted
+    // reader produces when a collapse (or root split) completed between its
+    // root_id_ load and its root latch. Post-M4 the stale slot may be FREED
+    // and reused; find_leaf_crabbing's root revalidation must route to the
+    // current root without reading a byte of the stale slot.
+    bool get_via_stale_root_for_test(PageId stale_root, const std::string& key,
+                                     std::string* out_value) const {
+        return get_recursive(stale_root, key, out_value);
+    }
+    PageId root_id_for_test() const { return root_id_.load(std::memory_order_acquire); }
+    // v29 M4 slice-1 control: exercise the free()-time generation bump
+    // (decision doc §1.1) through the production contract — under the
+    // page's exclusive latch, exactly as a merge calls it.
+    void free_page_for_test(PageId id) {
+        auto lk = latches_.lock_exclusive(id);
+        pool_.free(id);
+    }
 #endif
 
     // Insert or update a key. Returns true on insert, false on update.
@@ -11812,6 +11894,10 @@ public:
     // level (each adjacent pair of groups overflows one page budget and a
     // split page holds <= 2 budgets), plus the root page.
     void require_split_headroom() {
+        // v29 M4 inventory (decision doc §11): this leftmost-spine walk is
+        // unlatched — classified SAFE because it runs under write_mu_,
+        // where the structure is frozen. M4's rebalance runs under the SAME
+        // mutex (BTree::erase), so the classification survives merges.
         size_t height = 1;
         PageId id = root_id_.load(std::memory_order_acquire);
         while (true) {
@@ -11908,7 +11994,19 @@ public:
     bool erase(const std::string& key) {
         std::lock_guard<std::mutex> wlk(write_mu_);   // BT-2 fix
         generation_.fetch_add(1, std::memory_order_relaxed);  // M1.4: atomic (concurrent-safe)
-        return erase_recursive(root_id_.load(std::memory_order_acquire), key);
+        PageId leaf = 0;
+        bool underflow = false;
+        bool removed = erase_recursive(root_id_.load(std::memory_order_acquire),
+                                       key, &leaf, &underflow);
+        // v29 M4 (decision doc §3.1): the delete path is the rebalance
+        // trigger. Underflow was measured UNDER the leaf's exclusive latch
+        // inside erase_recursive (no second pass over the slots); the
+        // rebalance is a FRESH top-down descent — never an upward latch
+        // acquisition from the erased leaf (§1.2's deadlock proof).
+        // Best-effort by contract: an abandoned attempt is retried by the
+        // next erase, and correctness never depends on a merge happening.
+        if (removed && underflow) maybe_rebalance(key);
+        return removed;
     }
 
     // Range scan: returns all (key, value) pairs with lo <= key <= hi.
@@ -11931,6 +12029,15 @@ public:
     }
 
     // For diagnostics: count total keys in the tree.
+    //
+    // v29 M4 UNLATCHED-WALKER INVENTORY (decision doc §11): size(),
+    // size_recursive and depth() below walk pages WITHOUT latches. That is
+    // safe only where the structure is FROZEN — quiescence (recovery's
+    // empty-engine check, tests between operations) or write_mu_ held. Now
+    // that PagePool::free() has engine callers (the merge machinery), an
+    // unlatched walk concurrent with a rebalance could dereference a freed
+    // slot. Live-path callers must use a Cursor (latched, restart-verified)
+    // instead; do NOT add new callers of these two without a class check.
     size_t size() const {
         return size_recursive(root_id_.load(std::memory_order_acquire));
     }
@@ -11976,6 +12083,21 @@ public:
     // NOTE: distinct from generation() above, which is the TREE-wide
     // structural-change counter (a debug tripwire), not per-slot identity.
     uint32_t slot_generation(PageId id) const { return pool_.slot_generation(id); }
+
+    // v29 M4 (decision doc §1.12): rebalance diagnostics — merges, borrows,
+    // collapses, abandons and pages_freed since open. Read-only snapshot;
+    // the delete-churn battery reads these beside cursor_restarts().
+    TreeMergeStats merge_stats() const {
+        TreeMergeStats s;
+        s.leaf_merges     = leaf_merges_.load(std::memory_order_relaxed);
+        s.interior_merges = interior_merges_.load(std::memory_order_relaxed);
+        s.borrows         = borrows_.load(std::memory_order_relaxed);
+        s.root_collapses  = root_collapses_.load(std::memory_order_relaxed);
+        s.abandons_lock   = abandons_lock_.load(std::memory_order_relaxed);
+        s.abandons_fit    = abandons_fit_.load(std::memory_order_relaxed);
+        s.pages_freed     = pages_freed_.load(std::memory_order_relaxed);
+        return s;
+    }
 
     // v25.1 M1.3/M1.4: Cursor — iterator-style range scan.
     //
@@ -12303,6 +12425,8 @@ public:
     // v25.1 M1.3: find the leaf that would contain `key`. Public wrapper
     // around find_leaf for Cursor's use. (Non-crabbing — kept for the
     // standalone-tree tests that don't need concurrent safety.)
+    // v29 M4 inventory (decision doc §11): UNLATCHED — quiescent/test-only,
+    // same class as size()/depth(); never call from a live concurrent path.
     PageId find_leaf_for_scan(const std::string& key) const {
         return find_leaf(root_id_.load(std::memory_order_acquire), key);
     }
@@ -12717,6 +12841,25 @@ private:
     mutable std::atomic<uint64_t> fence_recheck_retries_{0};
     // v25.1 M1.6: counter for ensure_index loser-delete branch (double-allocation race).
     mutable std::atomic<uint64_t> ensure_index_loser_deletes_{0};
+    // v29 M4 (decision doc §1.12): rebalance counters. Single-writer by
+    // construction (every increment runs under write_mu_); atomic for
+    // lock-free diagnostic reads, relaxed like the counters above.
+    mutable std::atomic<uint64_t> leaf_merges_{0};
+    mutable std::atomic<uint64_t> interior_merges_{0};
+    mutable std::atomic<uint64_t> borrows_{0};
+    mutable std::atomic<uint64_t> root_collapses_{0};
+    mutable std::atomic<uint64_t> abandons_lock_{0};
+    mutable std::atomic<uint64_t> abandons_fit_{0};
+    mutable std::atomic<uint64_t> pages_freed_{0};
+
+    // v29 M4 (decision doc §1.8): a page whose LIVE bytes (header + slots +
+    // entry bytes — the split planner's cost model, not the slab high-water,
+    // which erase-holes inflate) fall below this is underflowed and eligible
+    // for borrow/merge. Quarter-fill is the classic trigger; the byte-based
+    // test makes the exact value a tuning knob, not a correctness parameter.
+    // The root is exempt (a root leaf may legally sit empty; a root interior
+    // collapses at 0 slots instead).
+    static constexpr size_t MERGE_UNDERFLOW_BYTES = PAGE_SIZE / 4;
 
     // ---- Helpers for page access ----
 
@@ -14098,7 +14241,12 @@ private:
     // v25.1 M1.6: erase with OPTIMISTIC latch crabbing (same pattern as put).
     // Shared descent, exclusive at leaf with fence re-check, re-descend on
     // fence failure. Erase doesn't cause splits, so no split propagation.
-    bool erase_recursive(PageId page_id, const std::string& key) {
+    // v29 M4: on success, reports the erased leaf's id and whether it is
+    // now underflowed (live bytes < MERGE_UNDERFLOW_BYTES) — measured HERE,
+    // under the leaf exclusive this function already holds, so the
+    // rebalance trigger costs no extra latch pass.
+    bool erase_recursive(PageId page_id, const std::string& key,
+                         PageId* out_leaf, bool* out_underflow) {
         // v25.1 M1.6: Optimistic crabbing with fence re-check (same as put).
         // v25.7 (review note 3): reload root_id_ per iteration — see the
         // long comment in put_recursive for the stale-root argument.
@@ -14133,11 +14281,580 @@ private:
                     h->key_count--;
                     page_bump_mut_epoch(h);   // v28 CKV-008: leaf content changed under our exclusive latch
                     update_fences_leaf(p);
+                    // v29 M4: underflow read for the rebalance trigger —
+                    // live bytes, under the exclusive latch we already hold.
+                    *out_leaf = leaf;
+                    *out_underflow = live_bytes_leaf(p) < MERGE_UNDERFLOW_BYTES;
                     return true;
                 }
             }
             return false;  // key not found
         }
+    }
+
+    // =====================================================================
+    // v29 M4 — leaf merge & rebalance (decision doc
+    // docs/audits/2026-10-18-m4-merge-rebalance-decision.md).
+    //
+    // The delete side of the split protocol's mirror image, with the
+    // visibility window closed BY CONSTRUCTION: a split's rebuild had to
+    // become copy-out+deferred-trim (BT-3) because it DESTROYED content
+    // before the parent routed to it; a merge copies the dying page's
+    // content into the survivor FIRST and unlinks AFTER, so at every
+    // instant every key is reachable by descent through exactly one live
+    // route, and by chain through the survivor's rebuild or the dying
+    // page's intact body. The ordering that makes the freed slot safe for
+    // the two G2 verification sites shipped in M3 slice 2:
+    //   copy -> parent unlink -> chain unlink (inside the survivor rebuild)
+    //        -> free() (generation bump under the dying page's exclusive).
+    // Cursor::advance_to_valid's documented capture contract ("while the
+    // successor is linked from a latched page it cannot be freed") becomes
+    // true here for the first time.
+    // =====================================================================
+
+    // Route inside an interior page (first slot whose key is > `key` wins
+    // its LEFT child; else the rightmost) — the descents' rule, factored
+    // for the rebalance walk. Packed child ids are read BY VALUE (the
+    // interior_install alignment note applies verbatim).
+    static PageId route_child(const Page* p, const std::string& key) {
+        const PageHeader* h = header(p);
+        const InteriorSlot* slots = interior_slots(p);
+        size_t i = 0;
+        while (i < h->key_count) {
+            std::string k(reinterpret_cast<const char*>(p) + slots[i].key_off,
+                           slots[i].key_len);
+            if (key < k) break;
+            ++i;
+        }
+        return (i == h->key_count) ? get_rightmost_child(p)
+                                   : slots[i].child_page_id;
+    }
+
+    // LIVE bytes: header + slot array + the entries' own bytes — the split
+    // planner's cost model (decision §1.5: one capacity oracle for both
+    // directions), NOT the slab high-water, which erase-holes inflate until
+    // the next compaction. Additive form only (Blocker-4/EXTRA-2 lesson).
+    static size_t live_bytes_leaf(const Page* p) {
+        const PageHeader* h = header(p);
+        const LeafSlot* slots = leaf_slots(p);
+        size_t b = sizeof(PageHeader) + (size_t)h->key_count * sizeof(LeafSlot);
+        for (uint16_t i = 0; i < h->key_count; ++i)
+            b += (size_t)slots[i].key_len + (size_t)slots[i].value_len;
+        return b;
+    }
+    static size_t live_bytes_interior(const Page* p) {
+        const PageHeader* h = header(p);
+        const InteriorSlot* slots = interior_slots(p);
+        size_t b = sizeof(PageHeader) + (size_t)h->key_count * sizeof(InteriorSlot);
+        for (uint16_t i = 0; i < h->key_count; ++i)
+            b += (size_t)slots[i].key_len;
+        return b;
+    }
+
+    // Materialize a page's entries (caller holds the page's latch).
+    static std::vector<std::pair<std::string, std::string>>
+    materialize_leaf(const Page* p) {
+        const PageHeader* h = header(p);
+        const LeafSlot* slots = leaf_slots(p);
+        std::vector<std::pair<std::string, std::string>> out;
+        out.reserve(h->key_count);
+        for (uint16_t i = 0; i < h->key_count; ++i)
+            out.emplace_back(
+                std::string(reinterpret_cast<const char*>(p) + slots[i].key_off,
+                            slots[i].key_len),
+                std::string(reinterpret_cast<const char*>(p) + slots[i].value_off,
+                            slots[i].value_len));
+        return out;
+    }
+    static std::vector<std::pair<std::string, PageId>>
+    materialize_interior(const Page* p, PageId* rightmost) {
+        const PageHeader* h = header(p);
+        const InteriorSlot* slots = interior_slots(p);
+        std::vector<std::pair<std::string, PageId>> out;
+        out.reserve(h->key_count);
+        for (uint16_t i = 0; i < h->key_count; ++i) {
+            const PageId cid = slots[i].child_page_id;   // by value (packed)
+            out.emplace_back(
+                std::string(reinterpret_cast<const char*>(p) + slots[i].key_off,
+                            slots[i].key_len),
+                cid);
+        }
+        *rightmost = get_rightmost_child(p);
+        return out;
+    }
+
+    // Additive single-page fit over a materialized list (Blocker-4 form).
+    static bool leaf_entries_fit(const std::vector<std::pair<std::string, std::string>>& es) {
+        size_t b = sizeof(PageHeader) + es.size() * sizeof(LeafSlot);
+        for (const auto& e : es) b += e.first.size() + e.second.size();
+        return b <= PAGE_SIZE;
+    }
+    static bool interior_entries_fit(const std::vector<std::pair<std::string, PageId>>& es) {
+        size_t b = sizeof(PageHeader) + es.size() * sizeof(InteriorSlot);
+        for (const auto& e : es) b += e.first.size();
+        return b <= PAGE_SIZE;
+    }
+
+    // Rebuild a page from a materialized list. Caller holds the page's
+    // EXCLUSIVE latch; allocation-free (every fit is pre-proven by the
+    // planner checks — the insert helpers' additive guards cannot trip).
+    // Leaf: the epoch resumes ABOVE the caller-captured old epoch so every
+    // pre-merge captured fence fails re-validation (CKV-008 semantics, the
+    // copy-out trim's rule); the inserts below bump it further.
+    void rebuild_leaf_page(PageId id,
+                           const std::vector<std::pair<std::string, std::string>>& entries,
+                           PageId next, uint32_t resume_epoch) {
+        Page* p = pool_.get(id);
+        std::memset(p->bytes, 0, PAGE_SIZE);
+        PageHeader* h = header(p);
+        h->is_leaf = 1;
+        h->key_count = 0;
+        h->min_key_off = h->max_key_off = 0;
+        h->min_key_len = h->max_key_len = 0;
+        page_set_mut_epoch(h, resume_epoch);
+        set_next_leaf(p, next);
+        for (const auto& e : entries)
+            insert_into_leaf_no_split(id, e.first, e.second);
+    }
+    void rebuild_interior_page(PageId id,
+                               const std::vector<std::pair<std::string, PageId>>& slots,
+                               PageId rightmost) {
+        Page* p = pool_.get(id);
+        std::memset(p->bytes, 0, PAGE_SIZE);
+        PageHeader* h = header(p);
+        h->is_leaf = 0;
+        h->key_count = 0;
+        h->min_key_off = h->max_key_off = 0;
+        h->min_key_len = h->max_key_len = 0;
+        // Interior pages never carry a mut_epoch (CKV-008); the memset's
+        // zeros are the correct resumed state.
+        set_rightmost_child(p, rightmost);
+        for (const auto& s : slots)
+            insert_into_interior_no_split(id, s.first, s.second);
+    }
+
+    // Remove `dying` from `parent`'s child set, folding its range into
+    // `survivor` (its LEFT neighbor — the survivor-is-left rule §1.4 means
+    // `dying` always HAS a left neighbor slot). Convention: slot (key, LEFT
+    // child of key).
+    //   dying == slots[di].child, di >= 1: drop slots[di-1] (the separator
+    //     between survivor and dying — an interior merge pulled it DOWN into
+    //     the survivor beforehand; a leaf merge simply retires it) and
+    //     repoint slots[di]'s child to survivor.
+    //   dying == rightmost: drop the LAST slot; survivor becomes rightmost.
+    // Removal-only, so the rebuild always fits. Caller holds parent excl.
+    void interior_remove_child(PageId parent, PageId dying, PageId survivor) {
+        Page* pp = pool_.get(parent);
+        PageId rm = 0;
+        auto slots = materialize_interior(pp, &rm);
+        std::vector<std::pair<std::string, PageId>> out;
+        out.reserve(slots.size());
+        if (rm == dying) {
+            if (slots.empty() || slots.back().second != survivor)
+                throw std::runtime_error(
+                    "interior_remove_child: rightmost death without the survivor as last slot");
+            out.assign(slots.begin(), slots.end() - 1);
+            rm = survivor;
+        } else {
+            size_t di = SIZE_MAX;
+            for (size_t i = 0; i < slots.size(); ++i)
+                if (slots[i].second == dying) { di = i; break; }
+            if (di == SIZE_MAX || di == 0)
+                throw std::runtime_error(
+                    "interior_remove_child: dying child absent or lacks its left sibling");
+            for (size_t i = 0; i < slots.size(); ++i) {
+                if (i + 1 == di) continue;                 // drop the separator left of dying
+                if (i == di) { out.emplace_back(slots[i].first, survivor); continue; }
+                out.push_back(slots[i]);
+            }
+        }
+        rebuild_interior_page(parent, out, rm);
+    }
+
+    // Leaf merge: survivor (LEFT of the pair) absorbs dying. Caller holds
+    // survivor + dying + parent exclusives. Returns false (nothing
+    // mutated) when the combined set does not fit one page — the caller
+    // falls back to a borrow. True = executed; the parent lost a slot.
+    bool leaf_merge_exec(PageId surv, PageId dying, PageId parent) {
+        Page* sp = pool_.get(surv);
+        Page* dp = pool_.get(dying);
+        auto es = materialize_leaf(sp);
+        auto ed = materialize_leaf(dp);
+        // PLAN (§1.5): additive combined fit against the one-page budget.
+        size_t b = sizeof(PageHeader) + (es.size() + ed.size()) * sizeof(LeafSlot);
+        for (const auto& e : es) b += e.first.size() + e.second.size();
+        for (const auto& e : ed) b += e.first.size() + e.second.size();
+        if (b > PAGE_SIZE) {
+            abandons_fit_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        const uint32_t surv_epoch = page_mut_epoch(header(sp));
+        const PageId dying_next = get_next_leaf(dp);   // read BEFORE any mutation
+        for (auto& e : ed) es.push_back(std::move(e));   // survivor-is-left: concatenation is sorted
+        // MUTATE, allocation-free. The survivor rebuild publishes the chain
+        // unlink (survivor.next := dying.next) under the survivor exclusive
+        // — the capture contract's "unlinking under this page's exclusive
+        // latch" arm.
+        rebuild_leaf_page(surv, es, dying_next, surv_epoch + 1u);
+        stress_point("tree_merge_copied");
+        interior_remove_child(parent, dying, surv);
+        // The limbo seam: both links are gone, the slot is not yet returned.
+        // A cursor that captured (dying, gen) before our survivor exclusive
+        // enters here with a stale pair; free()'s bump is what reddens it
+        // (MW1) — the NO-FREE-BUMP mutant turns this window into a
+        // duplicate-emitting corpse read.
+        stress_point("tree_merge_unlink_gap");
+        pool_.free(dying);            // caller holds dying's exclusive (§1.1 contract)
+        pages_freed_.fetch_add(1, std::memory_order_relaxed);
+        leaf_merges_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // Leaf borrow: rotate ONE entry from lender to borrower through the
+    // parent separator. Caller holds lender + borrower + parent exclusives.
+    // lender_is_left: lender.max -> borrower front, and the parent slot
+    //   whose LEFT child is the lender carries the new separator (the moved
+    //   key = borrower's new min).
+    // !lender_is_left (borrower is the leftmost): lender.min -> borrower
+    //   back, and the parent slot whose LEFT child is the BORROWER carries
+    //   the lender's new min.
+    // Plan-before-mutate: borrower-plus-moved and the parent's rebuilt slot
+    // list are fit-checked BEFORE the first byte changes; the mutation
+    // ORDER keeps the moved key findable at every instant (insert at the
+    // borrower while the old separator still routes to the lender, which
+    // still holds it; re-separate the parent; shrink the lender last).
+    bool leaf_borrow_exec(PageId lender, PageId borrower, PageId parent,
+                          bool lender_is_left) {
+        Page* lp = pool_.get(lender);
+        Page* bp = pool_.get(borrower);
+        Page* pp = pool_.get(parent);
+        auto el = materialize_leaf(lp);
+        if (el.size() < 2) {   // the lender keeps at least one entry
+            abandons_fit_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        auto eb = materialize_leaf(bp);
+        const std::pair<std::string, std::string> moved =
+            lender_is_left ? el.back() : el.front();
+        // (1) borrower + moved, additive:
+        size_t bb = sizeof(PageHeader) + (eb.size() + 1) * sizeof(LeafSlot);
+        for (const auto& e : eb) bb += e.first.size() + e.second.size();
+        bb += sizeof(LeafSlot) + moved.first.size() + moved.second.size();
+        if (bb > PAGE_SIZE) {
+            abandons_fit_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        // (3) the parent's separator replacement (the new key can be LONGER):
+        PageId prm = 0;
+        auto pslots = materialize_interior(pp, &prm);
+        const std::string new_sep = lender_is_left ? moved.first : el[1].first;
+        const PageId sep_child = lender_is_left ? lender : borrower;
+        size_t si = SIZE_MAX;
+        for (size_t i = 0; i < pslots.size(); ++i)
+            if (pslots[i].second == sep_child) { si = i; break; }
+        if (si == SIZE_MAX)
+            throw std::runtime_error("leaf_borrow_exec: separator slot not found");
+        pslots[si].first = new_sep;
+        if (!interior_entries_fit(pslots)) {
+            abandons_fit_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        // ---- MUTATE (allocation-free; every fit proven above) ----
+        const uint32_t lender_epoch = page_mut_epoch(header(lp));
+        const PageId lender_next = get_next_leaf(lp);   // before the rebuild
+        insert_into_leaf_no_split(borrower, moved.first, moved.second);
+        rebuild_interior_page(parent, pslots, prm);
+        if (lender_is_left) el.pop_back(); else el.erase(el.begin());
+        rebuild_leaf_page(lender, el, lender_next, lender_epoch + 1u);
+        // Identity bump on BOTH rotated leaves (the borrow-rotation window,
+        // PagePool::bump_generation_for_rewrite): a cursor in the latch-free
+        // switch gap holds a pre-rotation (id, gen) capture of the page it
+        // is about to enter; the bump sends it through enter_leaf's
+        // restart-from-last-emitted path, which can neither duplicate
+        // (left-borrow) nor drop (right-borrow) the migrated key.
+        pool_.bump_generation_for_rewrite(borrower);
+        pool_.bump_generation_for_rewrite(lender);
+        borrows_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // Interior merge: survivor (LEFT of the pair) absorbs dying. `sep` is
+    // the separator between them (the parent slot key whose LEFT child is
+    // the survivor) — it is pulled DOWN into the survivor as the boundary
+    // slot key, and dying's rightmost child becomes the survivor's.
+    // Dying's CHILDREN are reattached, never freed: only the interior page
+    // itself dies. Caller holds survivor + dying + parent exclusives.
+    bool interior_merge_exec(PageId surv, PageId dying, PageId parent,
+                             const std::string& sep) {
+        Page* sp = pool_.get(surv);
+        Page* dp = pool_.get(dying);
+        PageId surv_rm = 0;
+        auto ss = materialize_interior(sp, &surv_rm);
+        PageId dying_rm = 0;
+        auto ds = materialize_interior(dp, &dying_rm);
+        size_t b = sizeof(PageHeader) +
+                   (ss.size() + 1 + ds.size()) * sizeof(InteriorSlot);
+        for (const auto& e : ss) b += e.first.size();
+        b += sep.size();
+        for (const auto& e : ds) b += e.first.size();
+        if (b > PAGE_SIZE) {
+            abandons_fit_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        ss.emplace_back(sep, surv_rm);
+        for (auto& e : ds) ss.push_back(std::move(e));
+        rebuild_interior_page(surv, ss, dying_rm);
+        stress_point("tree_merge_copied");
+        interior_remove_child(parent, dying, surv);
+        stress_point("tree_merge_unlink_gap");
+        pool_.free(dying);            // caller holds dying's exclusive
+        pages_freed_.fetch_add(1, std::memory_order_relaxed);
+        interior_merges_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // Interior borrow: rotate one CHILD (with its separator) from lender to
+    // borrower through the parent. Left lender: lender.rightmost moves under
+    // the pair's separator G to the borrower's front, and the lender's last
+    // slot key becomes the new G. Right lender (borrower leftmost): the
+    // lender's first child moves under G to the borrower's tail (G becomes
+    // the borrower's last slot key) and the lender's first slot key becomes
+    // the new G. Interior pages host no parked cursors and descents are
+    // latch-coupled through the parent — which the rebalance path holds
+    // exclusive across the WHOLE operation — so no identity bump is needed
+    // here (MW4).
+    bool interior_borrow_exec(PageId lender, PageId borrower, PageId parent,
+                              bool lender_is_left) {
+        Page* lp = pool_.get(lender);
+        Page* bp = pool_.get(borrower);
+        Page* pp = pool_.get(parent);
+        PageId l_rm = 0;
+        auto ls = materialize_interior(lp, &l_rm);
+        PageId b_rm = 0;
+        auto bs = materialize_interior(bp, &b_rm);
+        if (ls.empty()) {   // rightmost-only lender: nothing rotatable
+            abandons_fit_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        PageId prm = 0;
+        auto pslots = materialize_interior(pp, &prm);
+        const PageId sep_child = lender_is_left ? lender : borrower;
+        size_t si = SIZE_MAX;
+        for (size_t i = 0; i < pslots.size(); ++i)
+            if (pslots[i].second == sep_child) { si = i; break; }
+        if (si == SIZE_MAX)
+            throw std::runtime_error("interior_borrow_exec: separator slot not found");
+        const std::string G = pslots[si].first;
+        std::string new_sep;
+        PageId moved_child = 0;
+        if (lender_is_left) {
+            moved_child = l_rm;
+            new_sep = ls.back().first;
+            l_rm = ls.back().second;
+            ls.pop_back();
+            bs.insert(bs.begin(), {G, moved_child});
+        } else {
+            moved_child = ls.front().second;
+            new_sep = ls.front().first;
+            ls.erase(ls.begin());
+            bs.push_back({G, b_rm});
+            b_rm = moved_child;
+        }
+        size_t bb = sizeof(PageHeader) + bs.size() * sizeof(InteriorSlot);
+        for (const auto& e : bs) bb += e.first.size();
+        if (bb > PAGE_SIZE) {
+            abandons_fit_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        pslots[si].first = new_sep;
+        if (!interior_entries_fit(pslots)) {
+            abandons_fit_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        rebuild_interior_page(lender, ls, l_rm);
+        rebuild_interior_page(borrower, bs, b_rm);
+        rebuild_interior_page(parent, pslots, prm);
+        borrows_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // The rebalance orchestrator. See the block comment and the decision
+    // doc §3 for the protocol; §1.2/§1.3 for the latch rules (top-down
+    // only, ancestors hard, siblings and the leaf try-lock, abandon is a
+    // counted normal event). Runs under write_mu_ (BTree::erase), so the
+    // structure is FROZEN for the whole call: the Phase-1 walk needs no
+    // latches (the require_split_headroom classification), and no fence or
+    // revalidation can fail from a concurrent structural writer.
+    void maybe_rebalance(const std::string& key) {
+        stress_point("tree_rebalance_begin");
+        // ---- Phase 1: discover the root..leaf path (unlatched, frozen). ----
+        std::vector<PageId> path;
+        {
+            PageId id = root_id_.load(std::memory_order_acquire);
+            while (true) {
+                path.push_back(id);
+                const Page* p = pool_.get(id);
+                if (header(p)->is_leaf) break;
+                id = route_child(p, key);
+            }
+        }
+        if (path.size() < 2) return;   // single-leaf root: the root is exempt (§1.8)
+        const size_t leaf_idx = path.size() - 1;
+        // ---- Phase 2: exclusive crabbing root..parent, try-lock the leaf. ----
+        std::vector<std::unique_lock<std::shared_mutex>> held;
+        held.reserve(path.size());
+        for (size_t i = 0; i < leaf_idx; ++i)
+            held.push_back(latches_.lock_exclusive(path[i]));
+        std::unique_lock<std::shared_mutex> leaf_lk(
+            *latches_.get_or_create(path[leaf_idx]), std::try_to_lock);
+        if (!leaf_lk.owns_lock()) {
+            // A parked cursor (or a transient reader) holds the leaf shared:
+            // ABANDON — holding every ancestor exclusive while waiting on
+            // this latch would freeze the tree wide (§1.3).
+            abandons_lock_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        const PageId leaf = path[leaf_idx];
+        const PageId parent = path[leaf_idx - 1];
+        if (live_bytes_leaf(pool_.get(leaf)) >= MERGE_UNDERFLOW_BYTES)
+            return;   // re-checked under the latch: not (or no longer) underflowed
+
+        // Locate the leaf in the parent and its siblings.
+        PageId prm = 0;
+        auto pslots = materialize_interior(pool_.get(parent), &prm);
+        long leaf_i = -1;
+        for (size_t i = 0; i < pslots.size(); ++i)
+            if (pslots[i].second == leaf) { leaf_i = static_cast<long>(i); break; }
+        const bool leaf_is_rm = (prm == leaf);
+        if (leaf_i < 0 && !leaf_is_rm)
+            return;   // defensive: cannot happen while write_mu_ is held
+        PageId left_sib = 0, right_sib = 0;
+        if (leaf_is_rm) {
+            if (!pslots.empty()) left_sib = pslots.back().second;
+        } else {
+            const size_t li = static_cast<size_t>(leaf_i);
+            if (li > 0) left_sib = pslots[li - 1].second;
+            right_sib = (li + 1 < pslots.size()) ? pslots[li + 1].second : prm;
+        }
+
+        // ---- Leaf level: merge (survivor-is-left) preferred, borrow next. ----
+        bool parent_lost_slot = false;
+        auto leaf_attempt = [&](PageId sib, bool sib_is_left) -> bool {
+            if (sib == 0) return false;
+            std::unique_lock<std::shared_mutex> sl(
+                *latches_.get_or_create(sib), std::try_to_lock);
+            if (!sl.owns_lock()) {
+                abandons_lock_.fetch_add(1, std::memory_order_relaxed);
+                return false;   // try the other side
+            }
+            bool did;
+            if (sib_is_left) {
+                did = leaf_merge_exec(sib, leaf, parent);       // survivor = sib
+                if (did) parent_lost_slot = true;
+                else did = leaf_borrow_exec(sib, leaf, parent, true);
+            } else {
+                did = leaf_merge_exec(leaf, sib, parent);       // survivor = leaf (leftmost absorbs)
+                if (did) parent_lost_slot = true;
+                else did = leaf_borrow_exec(sib, leaf, parent, false);
+            }
+            return did;
+        };
+        if (!leaf_attempt(left_sib, true))
+            leaf_attempt(right_sib, false);
+        leaf_lk.unlock();   // leaf level done; the cascade works above it
+
+        // ---- Cascade: while a page lost a slot, rebalance that level. ----
+        if (parent_lost_slot) {
+            size_t lvl = leaf_idx - 1;      // index (in path/held) of the page that lost a slot
+            PageId cur = parent;
+            while (true) {
+                if (lvl == 0) {
+                    // cur is the ROOT (held[0] exclusive): collapse at 0 slots.
+                    Page* rp = pool_.get(cur);
+                    const PageHeader* rh = header(rp);
+                    if (!rh->is_leaf && rh->key_count == 0) {
+                        const PageId new_root = get_rightmost_child(rp);
+                        // No latch on new_root: collapse WRITES no content
+                        // (unlike install_new_root); the release store alone
+                        // publishes, and every descender revalidates the
+                        // latched root id before reading a byte (BT-3 §7.2 —
+                        // the mechanism this collapse is built on, MW5).
+                        stress_point("tree_root_collapse");
+                        root_id_.store(new_root, std::memory_order_release);
+                        pool_.free(cur);    // held[0] IS cur's exclusive (§1.1 contract)
+                        pages_freed_.fetch_add(1, std::memory_order_relaxed);
+                        root_collapses_.fetch_add(1, std::memory_order_relaxed);
+                        held[0].unlock();   // freed slot: drop its latch now
+                    }
+                    break;
+                }
+                if (live_bytes_interior(pool_.get(cur)) >= MERGE_UNDERFLOW_BYTES)
+                    break;
+                const PageId gp = path[lvl - 1];   // exclusive held (path)
+                PageId gprm = 0;
+                auto gs = materialize_interior(pool_.get(gp), &gprm);
+                long ci = -1;
+                for (size_t i = 0; i < gs.size(); ++i)
+                    if (gs[i].second == cur) { ci = static_cast<long>(i); break; }
+                const bool cur_is_rm = (gprm == cur);
+                if (ci < 0 && !cur_is_rm) break;   // defensive
+                PageId sp = 0, sr = 0;
+                if (cur_is_rm) {
+                    if (!gs.empty()) sp = gs.back().second;
+                } else {
+                    const size_t cui = static_cast<size_t>(ci);
+                    if (cui > 0) sp = gs[cui - 1].second;
+                    sr = (cui + 1 < gs.size()) ? gs[cui + 1].second : gprm;
+                }
+                // 0 = nothing executed (try the other side), 1 = borrow (stop),
+                // 2 = merge (gp lost a slot -> climb).
+                auto interior_attempt = [&](PageId sib, bool sib_is_left) -> int {
+                    if (sib == 0) return 0;
+                    std::unique_lock<std::shared_mutex> sl(
+                        *latches_.get_or_create(sib), std::try_to_lock);
+                    if (!sl.owns_lock()) {
+                        abandons_lock_.fetch_add(1, std::memory_order_relaxed);
+                        return 0;
+                    }
+                    // The separator between the pair: the parent slot whose
+                    // LEFT child is the left page of the pair.
+                    PageId prm2 = 0;
+                    auto gs2 = materialize_interior(pool_.get(gp), &prm2);
+                    const PageId sep_child = sib_is_left ? sib : cur;
+                    std::string sep;
+                    bool found = false;
+                    for (const auto& e : gs2)
+                        if (e.second == sep_child) { sep = e.first; found = true; break; }
+                    if (!found)
+                        throw std::runtime_error(
+                            "maybe_rebalance: interior separator not found");
+                    const PageId surv = sib_is_left ? sib : cur;
+                    const PageId dying = sib_is_left ? cur : sib;
+                    if (interior_merge_exec(surv, dying, gp, sep)) {
+                        if (sib_is_left) {
+                            // `cur` died: drop its path latch (the slot is
+                            // freed; the latch entry persists by LatchTable
+                            // design and unlocking a freed slot is harmless).
+                            held[lvl].unlock();
+                        }
+                        return 2;
+                    }
+                    if (interior_borrow_exec(sib, cur, gp, sib_is_left))
+                        return 1;
+                    return 1;   // fits-refused both ways: stop here (counted)
+                };
+                int r = interior_attempt(sp, true);
+                if (r == 0) r = interior_attempt(sr, false);
+                if (r != 2) break;
+                // gp lost a slot: climb.
+                lvl--;
+                cur = gp;
+            }
+        }
+        // Path latches release deepest-first (tidiness; no waiter depends
+        // on the order — nothing acquires upward).
+        for (auto it = held.rbegin(); it != held.rend(); ++it)
+            if (it->owns_lock()) it->unlock();
     }
 
     size_t size_recursive(PageId page_id) const {
@@ -14236,6 +14953,10 @@ inline uint64_t ChronoKV::fence_recheck_retries() const {
 
 inline uint64_t ChronoKV::cursor_restarts() const {
     return tree_ ? tree_->cursor_restarts() : 0;
+}
+// v29 M4: rebalance counters (out-of-line — BTree complete here).
+inline TreeMergeStats ChronoKV::tree_merge_stats() const {
+    return tree_ ? tree_->merge_stats() : TreeMergeStats{};
 }
 
 // v29 M3 slice 3: out-of-line (PagePool complete here). See declarations.
@@ -14356,6 +15077,9 @@ inline uint64_t ChronoKV::ensure_index_loser_deletes() const {
 namespace chronokv {
 inline uint64_t Database::fence_recheck_retries() const {
     return api_engine()->fence_recheck_retries();
+}
+inline TreeMergeStats Database::merge_stats_for_test() const {
+    return api_engine()->tree_merge_stats();
 }
 inline uint64_t Database::ensure_index_loser_deletes() const {
     return api_engine()->ensure_index_loser_deletes();

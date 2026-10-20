@@ -582,6 +582,7 @@ static int run_m16_phase1_test();
 static int run_m3_gen_verification_test();   // v29 M3 slice 2: G2 verification-site controls
 static int run_bt3_visibility_test();        // BT-3 (2026-10-18): split rebuild->splice visibility controls
 static int run_m3_purge_test();              // v29 M3 slice 3: physical purge controls
+static int run_m4_merge_test();              // v29 M4: leaf merge & rebalance controls (decision doc 2026-10-18)
 static int run_m2_phase1_test();
 static int run_m2_phase2_test();
 static int run_m2_phase3_test();
@@ -2444,6 +2445,21 @@ return 0;
     if (getenv("CKV_ONLY_BT3")) {
         crc_init();
         int f = run_bt3_visibility_test();
+        std::cout.flush();
+        return f == 0 ? 0 : 1;
+    }
+
+    // v29 M4 (2026-10-18): CKV_ONLY_M4=1 runs just the merge/rebalance
+    // battery (decision doc docs/audits/2026-10-18-m4-merge-rebalance-decision.md
+    // §8, slices 1-4). Fail-first note, recorded honestly: the maintainer's
+    // single-build directive for this arc means the mutant reversion round
+    // (the exact-isolation set listed in the battery's header comment) is
+    // RECORDED, not executed — the controls themselves are shaped to redden
+    // under each named mutant, and the stress-build S5/DST legs bind the
+    // concurrency windows on every CI run.
+    if (getenv("CKV_ONLY_M4")) {
+        crc_init();
+        int f = run_m4_merge_test();
         std::cout.flush();
         return f == 0 ? 0 : 1;
     }
@@ -7995,6 +8011,7 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     fails += run_m16_phase1_test();
     fails += run_m3_gen_verification_test();
     fails += run_m3_purge_test();
+    fails += run_m4_merge_test();
     fails += run_bt3_visibility_test();
     fails += run_m2_phase1_test();
     fails += run_m2_phase2_test();
@@ -8084,6 +8101,20 @@ static int run_page_pool_selftest() {
     // checks below (measured; raw outputs in the slice-1 commit message).
     // The mechanism is NOT dead code in the HP-registry sense — it lands
     // with its controls, and its consumers land inside the same milestone.
+    //
+    // v29 M4 FLIP (rule 14, contract change — decision doc
+    // 2026-10-18-m4-merge-rebalance-decision.md §1.1): G1 is AMENDED from
+    // "bump exactly once per ALLOC transition" to "bump exactly once per
+    // LIFETIME transition — alloc AND free". The free-time bump is what
+    // makes the LIMBO window (freed, not yet reallocated: old contents,
+    // old generation) detectable at the two existing G2 sites; with an
+    // alloc-only bump, a cursor entering a limbo successor would pass its
+    // generation check and emit from a corpse, and a writer's fence
+    // re-check would pass on a leaf about to be memset by its next alloc.
+    // Every exact-count expectation below advances accordingly (a
+    // free->alloc cycle is now TWO bumps); the ABA-distinguishability
+    // detector keeps its shape (captured gen stale after reuse) and its
+    // mutant teeth (deleting EITHER bump reddens it).
     {
         PagePool pool(16 * 4096);
         check("pp: gen — null id reports 0", pool.slot_generation(0) == 0);
@@ -8092,27 +8123,32 @@ static int run_page_pool_selftest() {
         check("pp: gen — virgin slots start at 1 (independent counters)",
               pool.slot_generation(a) == 1 && pool.slot_generation(b) == 1);
         pool.free(a);
+        check("pp: gen — free bumps the generation at the lifetime transition (M4 G1)",
+              pool.slot_generation(a) == 2 && pool.slot_generation(b) == 1);
         PageId c = pool.alloc();          // free-list LIFO: reuses slot a
         check("pp: gen — free->alloc reuse hands back the same slot id", c == a);
-        check("pp: gen — reuse bumps the generation exactly once (G1), siblings untouched",
-              pool.slot_generation(c) == 2 && pool.slot_generation(b) == 1);
+        check("pp: gen — a free->alloc cycle bumps exactly twice (free + alloc), siblings untouched",
+              pool.slot_generation(c) == 3 && pool.slot_generation(b) == 1);
         pool.free(c); pool.free(b);
         PageId d = pool.alloc();          // LIFO: reuses b (freed last)
         PageId e = pool.alloc();          // then a/c
         check("pp: gen — per-slot monotonic across repeated cycles",
               d == b && e == a &&
-              pool.slot_generation(d) == 2 && pool.slot_generation(e) == 3);
+              pool.slot_generation(d) == 3 && pool.slot_generation(e) == 5);
         // The reuse window the tag exists for: a (id, gen) pair captured
         // BEFORE a free can never validate against the reincarnated slot —
-        // same id, generation strictly advanced by exactly one bump.
-        // (Detector, not illustration: the first cut compared against the
-        // constant 1 and passed vacuously under the no-bump mutant; this
-        // form reddens under it — measured, both directions below.)
+        // same id, generation strictly advanced (two bumps per cycle since
+        // the M4 amendment; the detector's teeth are the inequality, which
+        // EITHER bump alone satisfies — deleting the free bump reddens the
+        // limbo-entry controls in run_m4_merge_test, deleting the alloc
+        // bump reddens the slice-1 reuse checks above).
         const uint32_t g_before = pool.slot_generation(d);
         pool.free(d);
+        check("pp: gen — the limbo slot is detectable BEFORE any realloc (M4 free-bump)",
+              pool.slot_generation(d) == g_before + 1);
         const PageId f = pool.alloc();     // LIFO: reuses d
         check("pp: gen — the ABA pair is distinguishable (captured gen stale after reuse)",
-              f == d && pool.slot_generation(f) == g_before + 1 &&
+              f == d && pool.slot_generation(f) == g_before + 2 &&
               pool.slot_generation(f) != g_before);
     }
     {
@@ -9708,6 +9744,554 @@ static int run_m3_purge_test() {
             std::filesystem::remove(cp + (i == 0 ? "" : ".delta." + std::to_string(i)));
     }
 
+    return fails;
+}
+
+// =====================================================================
+// v29 M4 — leaf merge & rebalance: the control battery.
+//
+// Decision doc: docs/audits/2026-10-18-m4-merge-rebalance-decision.md.
+// Slice 0 (BT-3) landed separately (run_bt3_visibility_test); these are
+// the slices 1-3 controls plus the in-suite leg of the slice-4 P1
+// battery. Blocks:
+//   A — the G1 amendment's unit shape: free() bumps the slot generation
+//       (the LIMBO window becomes detectable at the two existing G2
+//       sites), through the pool directly and through the tree face's
+//       production-contract wrapper (free under the page exclusive).
+//   B — leaf merge shape: a contiguous delete run over a multi-leaf tree
+//       must merge, free pages, shrink the live count, and keep point
+//       reads / scans / size() / the three structural verifiers exact.
+//   C — borrow shape: ~950-byte values make every merge of an underflowed
+//       leaf with a full sibling IMPOSSIBLE (combined > one page) — the
+//       planner must refuse the merge (abandons_fit) and rotate a single
+//       entry instead, differentially exact.
+//   D — drain-to-empty: ascending full drain must cascade to a root
+//       collapse with EXACT page accounting (live == 1: the survivor root
+//       leaf; pages_freed == built - 1) and regrow from the collapsed
+//       root differentially exact. (S5's empty_tree seeds bind the same
+//       shape under the stress scheduler.)
+//   E — the parked-cursor contract (decision §1.3): a cursor parked on
+//       the leftmost leaf makes every rebalance touching it ABANDON at
+//       the try-lock (counted, never a tree-wide freeze), the parked scan
+//       still emits exactly, and the drain COMPLETES after the cursor
+//       releases (the S6 blocked-while-pinned/drains-after-release
+//       shape). Single-threaded by design: the cursor OBJECT holds the
+//       shared latch; glibc's pthread_rwlock_trywrlock returns EBUSY for
+//       any reader-held lock including the calling thread's, which is
+//       exactly the production try-lock path.
+//   F — the MONOTONIC-FRONTIER page acceptance M3 slice 3 deferred to M4
+//       (its scope note measured live pages creeping 11 -> 50 over 25
+//       rounds): with merges live, the engine-level churn driver must
+//       flatten the curve — P1's in-suite leg, engine face (pool_stats +
+//       merge_stats_for_test), anti-vacuity on pages_freed.
+//   G — root collapse x slot reuse (MW5): a stale root id captured before
+//       a collapse, whose slot is FREED and REUSED by the regrow, must
+//       still serve correct reads through find_leaf_crabbing's root
+//       revalidation (BT-3's mechanism — the M4 hard dependency), with
+//       anti-vacuity on the generation advance and the revalidation
+//       counter.
+//   H — checkpoint across active merges (MW6): a missed key in
+//       checkpoint_locked's tree_scan_all would be checkpoint data loss,
+//       so the recovery differential gets its own control.
+//   I — concurrent churn (release-mode S5-lite): sweeper x scanner x gc
+//       threads with S5's in-flight legitimacy rules and a quiescence
+//       differential; the deterministic window binding rides the stress
+//       build's S5 over the new seams (tree_rebalance_begin,
+//       tree_merge_copied, tree_merge_unlink_gap, tree_root_collapse).
+//
+// Mutant expectations (recorded for the scratch-build reversion round —
+// NOT executed in this arc per the maintainer's single-build directive;
+// each names the block it reddens ALONE):
+//   NO-FREE-BUMP (drop free()'s bump)        -> A (limbo detectability) +
+//       the stress-build cursor-restart controls; E/F differentials under
+//       ASan (corpse reads).
+//   FREE-BEFORE-UNLINK (free ahead of the    -> B/D verifiers + ASan UAF
+//       parent/chain unlink)                    on the descent paths.
+//   NO-PARENT-UNLINK (skip interior_remove_  -> B/D separator verifier +
+//       child)                                   point-read ghosts.
+//   NO-CASCADE (leaf merges only)            -> D's exact page accounting
+//                                               (interior pages leak).
+//   NO-COLLAPSE (skip the root fold)         -> D's depth/live oracles.
+//   NO-TRYLOCK (hard-lock the leaf)          -> E DEADLOCKS (the C1
+//                                               parent-deadline shape).
+//   RIGHT-SURVIVOR (merge into the RIGHT     -> E/I duplicate emission
+//       sibling; violates decision §1.4)        (the parked/switched cursor
+//                                               re-emits the absorbed keys).
+//   NO-REWRITE-BUMP (drop the borrow         -> C's differential under the
+//       identity bumps)                         stress scheduler (switch-gap
+//                                               drop/duplicate).
+// =====================================================================
+static int run_m4_merge_test() {
+    using namespace chronokv;
+    using namespace chronokv_btree;
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) {
+            ++fails;
+            if (!detail.empty()) std::cout << "      (" << detail << ")\n";
+        }
+    };
+    auto msstr = [](const TreeMergeStats& m) {
+        return "lm=" + std::to_string(m.leaf_merges) +
+               " im=" + std::to_string(m.interior_merges) +
+               " bw=" + std::to_string(m.borrows) +
+               " rc=" + std::to_string(m.root_collapses) +
+               " aL=" + std::to_string(m.abandons_lock) +
+               " aF=" + std::to_string(m.abandons_fit) +
+               " pf=" + std::to_string(m.pages_freed);
+    };
+    auto skey = [](int i) { char b[16]; snprintf(b, sizeof b, "k%05d", i); return std::string(b); };
+    auto sval = [](int i) { char b[32]; snprintf(b, sizeof b, "value-%05d-pad", i); return std::string(b); };
+
+    // ---- Block A: the G1 amendment — free() bumps (limbo detectable). ----
+    {
+        PagePool pool(16 * 4096);
+        const PageId a = pool.alloc();
+        const uint32_t g1 = pool.slot_generation(a);
+        pool.free(a);
+        const uint32_t g2 = pool.slot_generation(a);
+        check("m4 A: free() bumps the generation BEFORE any realloc (the limbo window is detectable)",
+              g2 == g1 + 1, "g1=" + std::to_string(g1) + " g2=" + std::to_string(g2));
+        const PageId b = pool.alloc();
+        check("m4 A: LIFO reuse hands the slot back with the alloc bump on top",
+              b == a && pool.slot_generation(b) == g1 + 2);
+
+        PagePool pool2(16 * 4096);
+        BTree t(pool2);
+        t.put("k", "v");
+        const PageId root = t.root_id_for_test();
+        const uint32_t gr = t.slot_generation(root);
+        const PageId scratch = pool2.alloc();          // an unlinked slot
+        const uint32_t gs = pool2.slot_generation(scratch);
+        t.free_page_for_test(scratch);                 // the production contract: under the page exclusive
+        check("m4 A: tree-face free bumps under the page exclusive (the merge protocol's contract)",
+              pool2.slot_generation(scratch) == gs + 1 && t.slot_generation(scratch) == gs + 1);
+        check("m4 A: the live root's identity is untouched by a scratch free",
+              t.root_id_for_test() == root && t.slot_generation(root) == gr);
+    }
+
+    // ---- Block B: leaf merge shape + exact differentials. ----
+    {
+        PagePool pool(64ULL * 1024 * 1024);
+        BTree t(pool);
+        std::map<std::string, std::string> model;
+        constexpr int N = 900;
+        for (int i = 0; i < N; ++i) { t.put(skey(i), sval(i)); model[skey(i)] = sval(i); }
+        const size_t pages_full = pool.live_count();
+        const size_t depth_full = t.depth();
+        check("m4 B: build produced a multi-leaf, multi-level tree",
+              pages_full >= 5 && depth_full >= 2,
+              "pages=" + std::to_string(pages_full) + " depth=" + std::to_string(depth_full));
+        for (int i = 100; i < 500; ++i) { t.erase(skey(i)); model.erase(skey(i)); }
+        const TreeMergeStats ms = t.merge_stats();
+        const size_t pages_after = pool.live_count();
+        int misses = 0, ghosts = 0, wrong = 0;
+        std::string buf;
+        for (int i = 0; i < N; ++i) {
+            const bool found = t.get(skey(i), &buf);
+            auto it = model.find(skey(i));
+            if (it == model.end()) { if (found) ++ghosts; }
+            else if (!found) ++misses;
+            else if (buf != it->second) ++wrong;
+        }
+        auto scan = t.scan_all();
+        bool scan_exact = scan.size() == model.size();
+        if (scan_exact) {
+            size_t j = 0;
+            for (const auto& kv : model) {
+                if (scan[j].first != kv.first || scan[j].second != kv.second) { scan_exact = false; break; }
+                ++j;
+            }
+        }
+        check("m4 B: the delete run merged leaves and FREED pages",
+              ms.leaf_merges > 0 && ms.pages_freed > 0, msstr(ms));
+        check("m4 B: live pages shrank (the M3 creeping ceiling, inverted)",
+              pages_after < pages_full,
+              "full=" + std::to_string(pages_full) + " after=" + std::to_string(pages_after));
+        check("m4 B: point-read differential exact after merges",
+              misses == 0 && ghosts == 0 && wrong == 0,
+              "misses=" + std::to_string(misses) + " ghosts=" + std::to_string(ghosts) +
+              " wrong=" + std::to_string(wrong));
+        check("m4 B: full-scan differential exact after merges", scan_exact,
+              "scan=" + std::to_string(scan.size()) + " model=" + std::to_string(model.size()));
+        check("m4 B: size() tracks the model", t.size() == model.size(),
+              "size=" + std::to_string(t.size()) + " model=" + std::to_string(model.size()));
+        auto lc = t.verify_leaf_chain();
+        auto sv = t.verify_separator_invariants();
+        auto cc = t.verify_chain_completeness();
+        check("m4 B: structural verifiers clean (chain, separators, completeness)",
+              !lc.found && !sv.found && !cc.found,
+              lc.found ? lc.reason : (sv.found ? "separator violation" : (cc.found ? "chain incomplete" : "")));
+    }
+
+    // ---- Block C: borrow shape (merges byte-impossible). ----
+    {
+        PagePool pool(16ULL * 1024 * 1024);
+        BTree t(pool);
+        std::map<std::string, std::string> model;
+        // Uniform 29-byte entries (6B key + 15B value + 8B slot): the
+        // in-place insert guard (32 + 8n + 29 <= 4096 - 21n) caps a leaf at
+        // n=140; the 141st arrival splits byte-balanced 70/71. Sequential
+        // inserts then regrow the rightmost leaf toward full: at N=210 the
+        // tree is exactly L0=70 (~50%) + L1=140 (live 4092 of 4096 bytes —
+        // FULL, one entry from its own split) under an interior root.
+        // Erasing L0 through the quarter-page trigger (n<=34: live
+        // 32+29n < 1024) makes every merge with L1 byte-impossible — at
+        // the k-th rebalance the combined size is 32 + 29*(175-k) bytes,
+        // above the page for every k <= 34 (a merge first fits at k=35:
+        // 4092 <= 4096) — so with ERASED=65 (k=1..30, margin 5) the
+        // planner must REFUSE every merge (abandons_fit) and rotate one
+        // entry per erase instead (borrows), L0 being the leftmost leaf
+        // (no left sibling; decision §1.4's merge directions both need a
+        // fit the planner denies).
+        // MEASURED CORRECTION LOG (rule 9 — the shape claims below are the
+        // third arithmetic pass, the first two refuted by suite runs): cut
+        // 1 assumed 950B fat values (balanced splits never leave a sibling
+        // fat enough to refuse a merge — observed lm=1); cut 2 assumed a
+        // 28B cost (the value is 15 chars, not 14 — at 29B the 216-key
+        // build carries THREE leaves 70/70/75 and the first underflow
+        // merged with a half-full neighbor — observed lm=1 pf=1 bw=0).
+        constexpr int N = 210;
+        for (int i = 0; i < N; ++i) { t.put(skey(i), sval(i)); model[skey(i)] = sval(i); }
+        check("m4 C: anti-vacuity — two leaves under an interior root",
+              t.depth() == 2, "depth=" + std::to_string(t.depth()));
+        // 65 erases of L0's keys (k00000..k00064): the first 36 shrink it
+        // to n=34 (live 1018 < 1024 — the trigger fires on the 36th); each
+        // of the remaining 30 fires a rebalance that must refuse the merge
+        // and borrow (each borrow returns L0 to n=35, so every subsequent
+        // erase re-triggers at n=34 — exactly one rotation per erase).
+        constexpr int ERASED = 65;
+        for (int i = 0; i < ERASED; ++i) { t.erase(skey(i)); model.erase(skey(i)); }
+        const TreeMergeStats ms = t.merge_stats();
+        std::string buf;
+        int bad = 0;
+        for (const auto& kv : model) if (!t.get(kv.first, &buf) || buf != kv.second) ++bad;
+        for (int i = 0; i < ERASED; ++i) if (t.get(skey(i), &buf)) ++bad;
+        auto scan = t.scan_all();
+        bool scan_exact = scan.size() == model.size();
+        if (scan_exact) {
+            size_t j = 0;
+            for (const auto& kv : model) {
+                if (scan[j].first != kv.first || scan[j].second != kv.second) { scan_exact = false; break; }
+                ++j;
+            }
+        }
+        check("m4 C: merges REFUSED on bytes (abandons_fit) and borrows executed instead",
+              ms.borrows >= 25 && ms.abandons_fit >= 25 && ms.leaf_merges == 0, msstr(ms));
+        check("m4 C: exactly 30 rotations for 30 underflowed erases (no stray activity)",
+              ms.borrows == 30 && ms.abandons_fit == 30, msstr(ms));
+        check("m4 C: borrow differential exact (point reads + full scan)",
+              bad == 0 && scan_exact, "bad=" + std::to_string(bad) +
+              " scan=" + std::to_string(scan.size()) + " model=" + std::to_string(model.size()));
+        auto lc = t.verify_leaf_chain();
+        auto sv = t.verify_separator_invariants();
+        check("m4 C: structural verifiers clean after 30 rotations", !lc.found && !sv.found,
+              lc.found ? lc.reason : std::string());
+    }
+
+    // ---- Block D: drain-to-empty — cascade, collapse, EXACT accounting. ----
+    {
+        PagePool pool(64ULL * 1024 * 1024);
+        BTree t(pool);
+        std::map<std::string, std::string> model;
+        constexpr int N = 900;
+        for (int i = 0; i < N; ++i) { t.put(skey(i), sval(i)); model[skey(i)] = sval(i); }
+        const size_t pages_full = pool.live_count();
+        for (int i = 0; i < N; ++i) { t.erase(skey(i)); model.erase(skey(i)); }
+        const TreeMergeStats ms = t.merge_stats();
+        const size_t live_end = pool.live_count();
+        check("m4 D: drain-to-empty — size 0, scan empty, depth 1",
+              t.size() == 0 && t.scan_all().empty() && t.depth() == 1,
+              "size=" + std::to_string(t.size()) + " depth=" + std::to_string(t.depth()));
+        check("m4 D: the cascade reached the root and COLLAPSED it",
+              ms.root_collapses >= 1, msstr(ms));
+        check("m4 D: EXACT page accounting — live == 1 (the survivor root leaf)",
+              live_end == 1, "live=" + std::to_string(live_end));
+        check("m4 D: EXACT page accounting — pages_freed == built - 1",
+              ms.pages_freed == pages_full - 1,
+              "freed=" + std::to_string(ms.pages_freed) + " built=" + std::to_string(pages_full));
+        auto lc = t.verify_leaf_chain();
+        auto cc = t.verify_chain_completeness();
+        check("m4 D: the collapsed tree verifies clean", !lc.found && !cc.found,
+              lc.found ? lc.reason : std::string());
+        // Regrow from the collapsed single-leaf root.
+        for (int i = 0; i < N; ++i) { t.put(skey(i), sval(i)); model[skey(i)] = sval(i); }
+        int misses = 0, wrong = 0;
+        std::string buf;
+        for (const auto& kv : model) if (!t.get(kv.first, &buf)) ++misses; else if (buf != kv.second) ++wrong;
+        auto scan = t.scan_all();
+        auto sv = t.verify_separator_invariants();
+        check("m4 D: regrow from the collapsed root — differential exact, verifiers clean",
+              misses == 0 && wrong == 0 && scan.size() == model.size() && !sv.found && t.depth() >= 2,
+              "misses=" + std::to_string(misses) + " wrong=" + std::to_string(wrong) +
+              " scan=" + std::to_string(scan.size()) + " depth=" + std::to_string(t.depth()));
+    }
+
+    // ---- Block E: the parked-cursor contract (abandon, never freeze). ----
+    {
+        PagePool pool(64ULL * 1024 * 1024);
+        BTree t(pool);
+        std::map<std::string, std::string> model;
+        constexpr int N = 400;
+        for (int i = 0; i < N; ++i) { t.put(skey(i), sval(i)); model[skey(i)] = sval(i); }
+        const PageId L0 = t.find_leaf_for_test(skey(0));
+        {
+            auto cur = t.open_cursor(skey(0), skey(N - 1));
+            check("m4 E: anti-vacuity — the cursor parked on the leftmost leaf",
+                  cur.valid() && t.find_leaf_for_test(cur.key()) == L0);
+            // Erase every key NOT under the parked leaf. The cursor OBJECT
+            // holds L0's shared latch for this whole scope; every rebalance
+            // that needs L0 (as merge survivor, borrow lender, or the leaf
+            // itself) must ABANDON at the try-lock.
+            std::map<std::string, std::string> parked_model;
+            int erased = 0;
+            for (int i = 0; i < N; ++i) {
+                if (t.find_leaf_for_test(skey(i)) == L0) { parked_model[skey(i)] = sval(i); continue; }
+                t.erase(skey(i));
+                model.erase(skey(i));
+                ++erased;
+            }
+            const TreeMergeStats ms1 = t.merge_stats();
+            check("m4 E: rebalances touching the parked leaf ABANDONED (counted, no freeze)",
+                  ms1.abandons_lock >= 1 && erased > 0, msstr(ms1));
+            // The parked scan still emits EXACTLY the keys that were under
+            // it at park time (its per-page snapshot), in order.
+            std::vector<std::string> emitted;
+            while (cur.valid()) { emitted.push_back(cur.key()); cur.next(); }
+            bool exact = emitted.size() == parked_model.size();
+            if (exact) {
+                size_t j = 0;
+                for (const auto& kv : parked_model)
+                    if (emitted[j++] != kv.first) { exact = false; break; }
+            }
+            check("m4 E: the parked scan completed with exact emission", exact,
+                  "emitted=" + std::to_string(emitted.size()) +
+                  " parked_model=" + std::to_string(parked_model.size()));
+        }
+        // Cursor released: the blocked-while-pinned work now drains (the S6
+        // liveness shape) — the tree collapses to the single root leaf.
+        for (int i = 0; i < N; ++i) t.erase(skey(i));
+        const TreeMergeStats ms2 = t.merge_stats();
+        check("m4 E: after release the drain COMPLETES (liveness): live == 1, size == 0",
+              pool.live_count() == 1 && t.size() == 0 &&
+              ms2.leaf_merges + ms2.root_collapses > 0,
+              "live=" + std::to_string(pool.live_count()) + " " + msstr(ms2));
+    }
+
+    // ---- Block F: the monotonic-frontier page acceptance (P1 in-suite leg). ----
+    {
+        // M3 slice 3's recorded scope note: this exact driver shape ratcheted
+        // live pages 11 -> 50 over 25 rounds (erase freed slots; emptied
+        // frontier leaves stayed linked). M4 must flatten it.
+        Options o;
+        o.auto_start_gc = false;
+        o.page_pool_bytes = 32ULL * 1024 * 1024;
+        auto db = Database::open(o);
+        const std::string val(400, 'v');
+        const int KS = 400;
+        size_t live_r5 = 0, peak_r5 = 0;
+        for (int r = 0; r < 24; ++r) {
+            char pfx[8]; snprintf(pfx, sizeof pfx, "r%02d_", r);
+            const std::string p(pfx);
+            for (int i = 0; i < KS; ++i) db.put(p + std::to_string(i), val);
+            for (int i = 0; i < KS; ++i) db.erase(p + std::to_string(i));
+            for (int g = 0; g < 10; ++g) db.gc_pass_for_test();   // >= ceil(400/64) purges
+            if (r == 4) {
+                auto ps = db.pool_stats();
+                live_r5 = ps.live_pages;
+                peak_r5 = ps.peak_live_pages;
+            }
+        }
+        for (int g = 0; g < 10; ++g) db.gc_pass_for_test();
+        auto ps = db.pool_stats();
+        const TreeMergeStats ms = db.merge_stats_for_test();
+        check("m4 F: monotonic-frontier LIVE pages flat (M3's 11->50 ratchet closed)",
+              live_r5 > 0 && ps.live_pages <= live_r5 + 4,
+              "live r5=" + std::to_string(live_r5) + " r24=" + std::to_string(ps.live_pages));
+        check("m4 F: monotonic-frontier HIGH-WATER bounded (P1: steady state, no ratchet)",
+              ps.peak_live_pages <= peak_r5 + 8,
+              "peak r5=" + std::to_string(peak_r5) + " r24=" + std::to_string(ps.peak_live_pages));
+        check("m4 F: the merge machinery measurably ran (anti-vacuity)",
+              ms.pages_freed >= 20 && ms.leaf_merges >= 20, msstr(ms));
+        check("m4 F: frontier keys are absent after the purge",
+              !db.get("r23_0").has_value() && !db.get("r00_399").has_value());
+        db.close();
+    }
+
+    // ---- Block G: collapse x slot reuse — the stale-root ABA (MW5). ----
+    {
+        PagePool pool(16ULL * 1024 * 1024);
+        BTree t(pool);
+        constexpr int N1 = 150;    // height-1 build (root leaf)
+        for (int i = 0; i < N1; ++i) t.put(skey(i), sval(i));
+        for (int i = N1; i < 600 && t.depth() == 1; ++i) t.put(skey(i), sval(i));
+        const PageId rid = t.root_id_for_test();          // the height-2 interior root
+        const uint32_t g_rid = t.slot_generation(rid);
+        const uint64_t reval0 = t.root_revalidations();
+        check("m4 G: anti-vacuity — the tree grew an interior root",
+              t.depth() >= 2 && rid != 0);
+        constexpr int N2 = 600;
+        for (int i = 0; i < N2; ++i) t.erase(skey(i));    // drain: cascade -> collapse frees rid
+        check("m4 G: the collapse freed the interior root slot",
+              t.root_id_for_test() != rid && t.slot_generation(rid) >= g_rid + 1,
+              "root=" + std::to_string(t.root_id_for_test()) + " rid=" + std::to_string(rid) +
+              " gen=" + std::to_string(t.slot_generation(rid)) + " g0=" + std::to_string(g_rid));
+        for (int i = 0; i < 400; ++i) t.put(skey(i), sval(i));   // regrow: the slot is REUSED (LIFO)
+        std::string buf;
+        const bool found = t.get_via_stale_root_for_test(rid, skey(200), &buf);
+        const uint64_t reval1 = t.root_revalidations();
+        check("m4 G: stale-root descent after collapse+REUSE finds the key (root revalidation)",
+              found && buf == sval(200) && reval1 > reval0 &&
+              t.root_id_for_test() != rid && t.slot_generation(rid) >= g_rid + 2,
+              "found=" + std::to_string(found) + " reval_delta=" + std::to_string(reval1 - reval0) +
+              " gen=" + std::to_string(t.slot_generation(rid)) + " g0=" + std::to_string(g_rid));
+    }
+
+    // ---- Block H: checkpoint across active merges (MW6 recovery differential). ----
+    {
+        const std::string wd = "/tmp/m4_ckpt_merge";
+        const std::string cp = wd + "/ckpt";
+        std::filesystem::remove_all(wd);
+        try {
+            Options o;
+            o.wal_dir = wd + "/wal";
+            o.checkpoint_path = cp;
+            o.auto_start_gc = false;
+            std::map<std::string, std::string> model;
+            {
+                auto db = Database::open(o);
+                for (int i = 0; i < 800; ++i) { db.put(skey(i), sval(i)); model[skey(i)] = sval(i); }
+                for (int i = 100; i < 300; ++i) { db.erase(skey(i)); model.erase(skey(i)); }
+                for (int i = 500; i < 600; ++i) { db.erase(skey(i)); model.erase(skey(i)); }
+                for (int g = 0; g < 12; ++g) db.gc_pass_for_test();   // purge -> unlink -> merges
+                const TreeMergeStats ms = db.merge_stats_for_test();
+                check("m4 H: anti-vacuity — merges ran before the checkpoint",
+                      ms.leaf_merges > 0 && ms.pages_freed > 0, msstr(ms));
+                db.checkpoint();
+                db.close();
+            }
+            auto db2 = Database::open(o);
+            int bad = 0;
+            for (int i = 0; i < 800; ++i) {
+                auto v = db2.get(skey(i));
+                auto it = model.find(skey(i));
+                if (it == model.end()) { if (v.has_value()) ++bad; }
+                else if (!v.has_value() || *v != it->second) ++bad;
+            }
+            auto scan = db2.range_scan("a", "z~");
+            if (scan.size() != model.size()) ++bad;
+            db2.close();
+            check("m4 H: recovery after a checkpoint taken across merges is exact",
+                  bad == 0, "bad=" + std::to_string(bad) + " scan=" + std::to_string(scan.size()) +
+                  " model=" + std::to_string(model.size()));
+        } catch (const std::exception& e) {
+            check("m4 H: recovery after a checkpoint taken across merges is exact",
+                  false, std::string("exception: ") + e.what());
+        }
+        std::filesystem::remove_all(wd);
+        for (int i = 0; i < 64; ++i)
+            std::filesystem::remove(cp + (i == 0 ? "" : ".delta." + std::to_string(i)));
+    }
+
+    // ---- Block I: concurrent churn (release-mode S5-lite). ----
+    {
+        Options o;
+        o.auto_start_gc = false;
+        auto db = Database::open(o);
+        constexpr int NM = 600;
+        auto mkey = [](int i) { char b[16]; snprintf(b, sizeof b, "m%05d", i); return std::string(b); };
+        for (int i = 0; i < NM; ++i) db.put(mkey(i), "vm" + std::to_string(i));
+        std::map<std::string, std::string> live;      // sweeper-private truth
+        std::map<std::string, std::set<std::string>> ever;
+        for (int i = 0; i < NM; ++i) { live[mkey(i)] = "vm" + std::to_string(i); ever[mkey(i)].insert(live[mkey(i)]); }
+        std::mutex model_mu;                          // guards `ever` for the scanner
+        std::atomic<bool> bad{false};
+        std::atomic<bool> sweeper_done{false};
+        std::atomic<bool> gc_stop{false};
+        struct Rng { uint64_t s; uint64_t n() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return s >> 11; } };
+
+        std::thread sweeper([&] {
+            Rng rng{0x4D345EEDULL};
+            for (int op = 0; op < 1400; ++op) {
+                const int i = (int)(rng.n() % (unsigned)NM);
+                const std::string k = mkey(i);
+                // 65% delete bias: the stationary live set (~35% of NM,
+                // ~25-entry leaves at 20B cost) sits BELOW the quarter-page
+                // underflow trigger, so merges fire DURING the concurrent
+                // phase — the first cut ran 50/50, whose ~60-entry steady
+                // leaves never underflowed (suite run: ms all-zero, the
+                // anti-vacuity leg reddened alone).
+                if (rng.n() % 100 < 65) {
+                    if (db.erase(k) != Status::OK) { bad.store(true); continue; }
+                    live.erase(k);
+                } else {
+                    const std::string v = "xm" + std::to_string(op);
+                    { std::lock_guard<std::mutex> lk(model_mu); ever[k].insert(v); }
+                    if (db.put(k, v) != Status::OK) { bad.store(true); continue; }
+                    live[k] = v;
+                }
+            }
+            sweeper_done.store(true);
+        });
+        std::thread scanner([&] {
+            for (int n = 0; n < 18 && !bad.load(); ++n) {
+                auto rs = db.range_scan("a", "z~");
+                std::string prev;
+                for (size_t j = 0; j < rs.size(); ++j) {
+                    if (j && !(prev < rs[j].first)) { bad.store(true); break; }   // order + uniqueness
+                    prev = rs[j].first;
+                    std::lock_guard<std::mutex> lk(model_mu);
+                    auto it = ever.find(rs[j].first);
+                    if (it == ever.end() || !it->second.count(rs[j].second)) { bad.store(true); break; }
+                }
+                std::this_thread::yield();
+            }
+        });
+        std::thread gcer([&] {
+            while (!sweeper_done.load() && !bad.load()) {
+                db.gc_pass_for_test();     // purge x merges concurrent with scans + writes
+                std::this_thread::yield();
+            }
+            gc_stop.store(true);
+        });
+        sweeper.join();
+        scanner.join();
+        gcer.join();
+        // Deterministic machinery-forcing wave (the anti-vacuity leg must
+        // not ride the rng's steady state): delete everything except a
+        // 50-key survivor band, then drain the purges — the emptied leaves
+        // MUST merge/collapse regardless of the churn phase's shape.
+        for (int i = 0; i < NM; ++i) {
+            if (i >= 250 && i < 300) continue;              // the survivor band
+            const std::string k = mkey(i);
+            if (live.count(k)) {
+                if (db.erase(k) != Status::OK) bad.store(true);
+                live.erase(k);
+            }
+        }
+        for (int g = 0; g < 14; ++g) db.gc_pass_for_test();   // quiesce: drain purges
+        auto rs = db.range_scan("a", "z~");
+        bool exact = rs.size() == live.size() && !bad.load();
+        if (exact) {
+            size_t j = 0;
+            for (const auto& kv : live) {
+                if (rs[j].first != kv.first || rs[j].second != kv.second) { exact = false; break; }
+                ++j;
+            }
+        }
+        const TreeMergeStats ms = db.merge_stats_for_test();
+        check("m4 I: concurrent churn (sweeper x scanner x gc) held every in-flight invariant",
+              !bad.load(), "bad flag set (order/uniqueness/legitimacy violation)");
+        check("m4 I: quiescence differential exact with merges active", exact,
+              "scan=" + std::to_string(rs.size()) + " live=" + std::to_string(live.size()));
+        check("m4 I: the merge machinery ran (anti-vacuity: churn phase + forced wave)",
+              ms.leaf_merges + ms.borrows > 0 && ms.pages_freed > 0, msstr(ms));
+        db.close();
+        (void)gc_stop;
+    }
+
+    if (fails == 0) std::cout << "   M4 MERGE BATTERY PASSED\n";
     return fails;
 }
 

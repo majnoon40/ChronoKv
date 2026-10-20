@@ -1,11 +1,13 @@
 # M4 leaf merge & rebalance: the protocol decision
 
 **Date:** 2026-10-18
-**Status:** DRAFT — DECIDED pending the maintainer's answers to §12 (open
-questions). This is the "made **before** implementation" decision the v29
-M4 milestone requires, in the shape of the M3 precedent
-(`2026-10-12-m3-hp4-aba-decision.md`). No M4 engine code exists at the
-code-basis commit.
+**Status:** DECIDED — slices 0–3 LANDED 2026-10-18 (slice 0 as `f053698`;
+slices 1–3 in the single M4 commit per the maintainer's directive, with
+the §13 postscript recording the two implementation-forced refinements
+and the measured numbers). This is the "made **before** implementation"
+decision the v29 M4 milestone requires, in the shape of the M3 precedent
+(`2026-10-12-m3-hp4-aba-decision.md`). Slice 4's soak/arena legs remain
+pending the §12.2 vehicle decision.
 **Scope:** the leaf/interior merge, borrow, cascade and root-collapse
 protocol; `PagePool::free()`'s first engine callers; the invariant-P1
 checker battery; the G1 amendment free-then-alloc bumping requires. NOT in
@@ -475,3 +477,98 @@ use-after-free candidate. Classified walk-throughs of `pool_.get(...)`:
    the byte-based test makes the exact value a tuning knob, not a
    correctness parameter. Ship with 1/4, record churn-driver sensitivity
    in slice 4?
+
+---
+
+## 13. Landing postscript (2026-10-18, slices 1–3; measured, per rule 9)
+
+**Landed shape.** All twelve decisions shipped as written, with TWO
+refinements the implementation forced — both recorded here rather than
+quietly folded in, per the M3 decision doc's postscript precedent:
+
+1. **§1.1a — borrow rotations need a THIRD bump kind (identity bump
+   without free).** The pre-implementation window analysis (MW1–MW8)
+   covered merges against switch-gap cursors but under-analyzed BORROWS:
+   a rotation migrates ONE key across exactly the chain edge a latch-free
+   switcher straddles. A left-borrow duplicates the migrated key for that
+   cursor (emitted from the lender, re-emitted at the borrower's slot 0);
+   a right-borrow DROPS it (the cursor left the lender before the key
+   arrived; the lender's rebuild removed it from the source). Neither is
+   fixable by the monotonic-emission-filter alternative for the DROP
+   direction (a filter cannot un-drop), so decision 9 (no cursor semantic
+   change) stands — via `PagePool::bump_generation_for_rewrite()`: both
+   rotated pages' identities advance under the held exclusives, and the
+   switcher routes into `enter_leaf`'s EXISTING restart-from-last-emitted
+   path, which re-descends and emits exactly once in both directions.
+   Merges provably need no such bump (the survivor's absorbed keys always
+   land BEHIND an in-flight cursor — §1.4's argument — and the dying
+   page's own free-bump covers the switcher heading for IT); the mutant
+   that reddens the bump's teeth is NO-REWRITE-BUMP under the stress
+   scheduler (recorded, §8's matrix).
+2. **§1.4a — the leftmost leaf MAY absorb its right sibling.** The
+   decision text confined a leftmost underflowed leaf to borrowing, on
+   the survivor-is-left rule, accepting a bounded one-page leftover. The
+   implemented rule is exactly survivor-is-left for EVERY pair — and
+   "leftmost absorbs its right neighbor" keeps the survivor the LEFT
+   page, so the §1.4 emission argument applies verbatim (a parked/in-
+   flight cursor either blocks the attempt at the try-lock, or has the
+   absorbed keys land behind it, or hits the free-bump restart). The
+   leftover case therefore does not exist: §12.4 is MOOT, and the
+   drain-to-empty control's exact accounting (`live == 1`,
+   `pages_freed == built − 1`, MEASURED 12 == 13 − 1 with 24 borrows +
+   11 merges + 1 collapse along the way) is the proof that no residue
+   survives a full drain.
+
+**Measured landing numbers** (release suite, the recorded 1 GiB vehicle:
+`-O0 --param ggc-min-expand=5`, g++ 12.2.0 — the BT-3 repro's vehicle;
+CI re-runs the four-config matrix on push):
+
+* **Suite: 607/0** (base at `f053698`: 567 = 562 + 5 bt3 release
+  skip-lines; +38 m4 checks, +2 net from the rule-14 pool-gen flips).
+  Two first-run control FAILURES were shape miscalculations in the
+  battery, not engine defects — every differential was green in the same
+  run — and both are recorded in their control comments with the
+  refuted arithmetic (block C's leaf geometry: 29-byte entries, capacity
+  140, the N=216 three-leaf surprise; block I's 50/50 churn steady state
+  never underflowing a leaf). Rule 9's discipline applied to the tests
+  themselves.
+* **Monotonic-frontier driver** (25 rounds × 400 keys × 400 B values,
+  the M3 scope-note shape): live pages return to **1 every round**,
+  high-water **FLAT at 5** (one round's working set — tree pages carry
+  23-byte `KeyEntry` pointers; the values live on the version heap),
+  75 leaf merges + 25 root collapses + 100 pages freed. The recorded M3
+  ratchet (11→50) is closed; the in-suite m4 F control asserts the
+  flatness with bounds.
+* **Delete-then-reinsert churn** (M3's fixed-working-set shape): live=5,
+  peak=5, FLAT over 24 rounds, 72 merges / 96 frees — the heap-side and
+  page-side curves are now both flat.
+* **Stress/DST**: the four new seams (`tree_rebalance_begin`,
+  `tree_merge_copied`, `tree_merge_unlink_gap`, `tree_root_collapse`)
+  are registered stress_points; S5's pre-written grammar binds them on
+  every stress/nightly run from this commit forward (the grammar needed
+  no edits — its delete windows, drain-to-empty seeds and revive
+  interleavings hit borrow, merge, cascade and collapse as designed).
+
+**§12 dispositions at landing.** (1) RESOLVED — slice 0 landed first, as
+`f053698`, per rule 11 (its own §9 records the supersession of the
+0.28.2 proposal: the version stamp belongs to the arc's release
+boundary). (2) OPEN — the soak vehicle still blocks P1's 7-day leg and
+the arena-movement leg; nothing else waits on it. (3) RESOLVED by
+precedent — 0.28.1 static through the arc, MINOR at the M7 boundary.
+(4) MOOT per §1.4a above. (5) SHIPPED at `PAGE_SIZE / 4`; the block-C
+control demonstrates the trigger's byte-exactness (34 vs 35 entries at
+29-byte cost flips it), and no sensitivity issue surfaced in the
+drivers.
+
+**Single-build directive, recorded honestly (rules 1/12 boundary).** The
+maintainer directed ONE build at the end of the arc: the mutant reversion
+round (§8's matrix — eight mutants, each named against the block it must
+redden ALONE) is therefore RECORDED, not executed, and the fail-first
+REDs for the new controls were not re-run against a pre-M4 scratch tree
+(the controls' oracles are exact-count identities whose pre-M4 values are
+trivially zero — `pages_freed == built − 1` cannot pass without frees,
+`abandons_lock ≥ 1` cannot pass without the try-lock path — so their
+teeth are structural, but the house norm is the measured RED and this
+postscript says plainly that it is owed). The permanent independent
+harness is the suite itself plus the stress-build S5 legs in CI, per the
+rule-12 note slice 0 established.

@@ -7,6 +7,75 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **feat (v29 M4, 2026-10-18): leaf merge & rebalance LANDED —
+  `PagePool::free()` has its engine callers, the M3 creeping ceiling is
+  closed, and the DST S5 grammar is binding.** The delete path now
+  rebalances: an erase that leaves a leaf underflowed (live bytes <
+  PAGE_SIZE/4, root exempt) triggers a best-effort `maybe_rebalance` —
+  byte-aware plan-before-mutate merges sharing the split planner as the
+  single capacity oracle (merges allocate NOTHING, so BT-1's headroom
+  bound is untouched), survivor-is-left (the leftmost leaf may absorb its
+  right sibling; a leaf is never merged INTO its right sibling, which is
+  what keeps cursor emission exact with NO scan-semantic change), borrow
+  rotations when a merge cannot fit, interior cascade, and root collapse
+  at 0 slots — the old root freed through the ordinary free list on the
+  strength of BT-3's root revalidation (the slice-0 hard dependency,
+  discharged). Protocol (decision doc
+  `docs/audits/2026-10-18-m4-merge-rebalance-decision.md`, amended in its
+  §13 postscript): fresh TOP-DOWN exclusive crabbing after the erase
+  releases the leaf (never an upward acquisition — deadlock proof §1.2);
+  ancestors hard-lock, leaf+siblings TRY-LOCK, abandonment a counted
+  normal event (a parked `RangeScanStream` can never freeze the tree
+  wide); UNLINK-BEFORE-FREE in both links under held exclusives, which
+  makes `Cursor::advance_to_valid`'s documented capture contract true for
+  the first time. **Invariant G1 AMENDED** (rule-14 flips at the pool
+  controls, cited in place): the slot generation now bumps at EVERY
+  lifetime transition — `alloc()` (M3) AND `free()` (M4) — because a
+  freed-not-yet-reallocated LIMBO slot keeps old contents AND old
+  generation: with an alloc-only bump a switch-gap cursor would pass its
+  G2 check and emit from a corpse, and a writer's fence re-check would
+  pass on a leaf about to be memset (an acked-write loss). A third,
+  free-less bump (`bump_generation_for_rewrite`) covers BORROW rotations:
+  a rotated key migrates across the exact chain edge a switch-gap cursor
+  straddles (left-borrow would duplicate it, right-borrow drop it), so
+  both rotated pages' identities advance and the cursor's existing
+  restart-from-last-emitted path absorbs the window — the refinement the
+  implementation forced on the decision doc, recorded in its postscript.
+  Diagnostics: `merge_stats()` (leaf/interior merges, borrows, collapses,
+  lock/fit abandons, pages freed) on the tree face +
+  `Database::merge_stats_for_test()`; four new stress seams
+  (`tree_rebalance_begin`, `tree_merge_copied`, `tree_merge_unlink_gap`,
+  `tree_root_collapse`) auto-bind S5's seeded scheduler; the unlatched
+  walkers (`size`/`depth`/`find_leaf_for_scan`) are classified
+  quiescent-only in-tree (decision doc §11's inventory re-run at landing).
+  MEASURED (release suite on the recorded 1 GiB vehicle, `-O0 --param
+  ggc-min-expand=5`, g++ 12.2.0): **607/0** (base 567 = 562 + 5 bt3
+  skip-lines; +38 m4 checks +2 net pool-gen flips). Drivers: monotonic
+  frontier 25×400 keys — live pages return to 1 EVERY round, peak FLAT
+  at 5 (one round's working set; M3's recorded ratchet: 11→50), 75 leaf
+  merges + 25 root collapses + 100 pages freed; drain-to-empty — EXACT
+  accounting `live==1`, `pages_freed==built−1` (12==13−1), depth 2→1,
+  24 borrows + 11 merges + 1 collapse, regrow differential exact;
+  fixed-working-set churn — live=5 peak=5 flat over 24 rounds. Controls
+  m4 A–I: free-bump unit + tree-face contract, delete-run merge shape
+  with the three structural verifiers, 30/30-exact borrow rotations with
+  30 planner refusals and ZERO merges (the fit arithmetic is in the
+  control comment, twice-refuted by measurement before it was trusted),
+  parked-cursor ABANDON (counted, no freeze) + exact parked emission +
+  drain-completes-after-release liveness, checkpoint-across-merges
+  recovery differential, collapse×slot-reuse stale-root ABA on the
+  revalidation, and a concurrent sweeper×scanner×gc churn with S5's
+  legitimacy rules + quiescence differential. Two first-run control
+  failures were SHAPE miscalculations (recorded in the control comments
+  per rule 9), not engine defects: every differential was green in the
+  same run. Mutant matrix RECORDED-not-executed (the maintainer's
+  single-build directive for this arc; each mutant's exact co-flip block
+  is named in the battery header). P1 status: in-suite legs PROVEN; the
+  7-day soak + arena-movement acceptance legs await the soak-vehicle
+  decision (ROADMAP §M4). No on-disk or format change anywhere (pages
+  are never persisted); no cursor semantic change; version stays 0.28.1
+  per the arc-boundary pattern (BT-3's record).
+
 - **fix (BT-3, 2026-10-18): the split rebuild→splice VISIBILITY window —
   point reads could transiently false-negative ACKED keys (a
   strict-serializable-ack break of the TXN-1 class), found by the M4

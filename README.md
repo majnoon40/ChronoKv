@@ -101,16 +101,22 @@ before the DST harness is green") is met.
   containers, `CKV_IOURING_DISABLED` compile-out).
 - **Paged B+ tree index** — 4 KiB pages with a 256 MiB (configurable)
   page pool, per-page shared latches, and incremental range-scan cursors.
-  Page slots carry reuse generation tags (v29 M3): every verification
-  site checks slot identity before trusting content across a latch
-  handoff. Page *reclamation* is not implemented yet (no merge/unlink) —
-  see Known limitations.
+  Page slots carry reuse generation tags (v29 M3, amended by M4): every
+  lifetime transition — alloc, free, and a borrow rotation's identity
+  bump — advances the tag, and every verification site checks slot
+  identity before trusting content across a latch handoff. Full page
+  reclamation is live (v29 M4): byte-aware sibling borrow, leaf/interior
+  merge with cascade, and root collapse return emptied pages to the pool
+  (see Known limitations for the best-effort contract).
 - **Epoch-pinned deferred reclamation** — of MVCC versions AND (v29 M3)
   of physically purged index entries: a key dead for every live snapshot
   (tombstone at or below the GC horizon) is unlinked and its `KeyEntry`
   epoch-reclaimed, so the index tracks the live key set. No GC-vs-scan
-  lock contention on the read path. (B+ tree *pages* are not reclaimed
-  yet — see Known limitations.)
+  lock contention on the read path. (v29 M4) emptied PAGES are reclaimed
+  too: the delete path merges underflowed leaves/interiors, collapses the
+  root, and frees the pages — value-identity (PageIds) guarded by
+  generation tags at every handoff, address-identity (`KeyEntry*`,
+  `Version*`) by the epoch reclaimer.
 - **Rich public API** — sync + async operations, atomic batches,
   prefix observers, streaming range scans, and read-only health/stats
   diagnostics.
@@ -641,20 +647,26 @@ E1–E16 safety argument and the v24 fix log at the top of the file).
 
 ## Known limitations
 
-- **No B+ tree page reclamation (yet)**: dead keys ARE physically purged
-  since v29 M3 — a tombstoned key at or below the GC horizon loses its
-  index entry, its tree slot, and its versions (epoch-reclaimed), so the
-  index tracks the LIVE key set, not lifetime distinct keys, and erased
-  slot space is reused by later inserts. But `PagePool::free()` still has
-  no engine callers and the tree has no merge/rebalance: emptied leaves
-  stay linked and splits only ever add pages, so under a monotonic
-  new-key frontier the pool remains a **creeping ceiling** (measured:
-  ~2 pages/round of frontier churn; flat under delete-then-reinsert on a
-  fixed working set). On exhaustion (`Options::page_pool_bytes`, 256 MiB
-  by default) `alloc()` throws `std::bad_alloc`; `pool_stats()` exposes
-  live/peak/utilization and `health()` degrades at ≥80% and fails at
-  ≥95%. Leaf unlink/merge (M4) gives `free()` its callers and closes
-  the monotonic shape.
+- **B+ tree page reclamation is best-effort (v29 M4)**: the delete path
+  rebalances — an erase leaving a leaf underflowed (live bytes < ¼ page,
+  root exempt) attempts a byte-aware sibling borrow or merge (survivor is
+  always the LEFT page), cascading through interior levels up to a root
+  collapse, freeing every emptied page through `PagePool::free()`
+  (generation-tagged, unlink-before-free). Measured: the monotonic
+  new-key frontier that ratcheted 11→50 pages over 25 rounds pre-M4 now
+  returns to live=1 every round with the high-water FLAT at one round's
+  working set (peak 5); drain-to-empty frees exactly `built − 1` pages
+  and collapses to the single root leaf. The contract's honest edges:
+  (1) rebalance attempts are **abandoned, not blocked**, whenever a
+  sibling or the leaf is latched by a reader — a `RangeScanStream` parked
+  on a leaf defers that region's merges until it moves (correctness never
+  depends on a merge; `merge_stats` exposes the abandon counters);
+  (2) a page whose combined-bytes merge does not fit borrows instead and
+  may sit underflowed while its neighbors stay full; (3) on exhaustion
+  (`Options::page_pool_bytes`, 256 MiB default) `alloc()` still throws
+  `std::bad_alloc`; `pool_stats()` exposes live/peak/utilization and
+  `health()` degrades at ≥80% and fails at ≥95%. P1's 7-day-soak
+  acceptance leg awaits the soak-vehicle decision (ROADMAP §M4).
 - **`~Transaction()` aborts the process** if the transaction is still active
   and the `Database` is alive. This is deliberate (see Safety properties), but
   it means an exception propagating out of a scope that holds a `Transaction`
