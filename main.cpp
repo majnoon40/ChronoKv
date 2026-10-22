@@ -10526,7 +10526,14 @@ static int run_m5_writer_test() {
             std::vector<std::thread> th;
             for (int t = 0; t < NT; ++t) th.emplace_back([&, t] {
                 (*st)[t] = dbp->put("w2k" + std::to_string(t), "v");
-                returned->fetch_add(1, std::memory_order_relaxed);
+                // RELEASE: the st[t] write above must happen-before the
+                // main thread's acquire-load of this counter — and the
+                // definitive HB edge is the join below (the first cut
+                // read st after a RELAXED count with no join: a true
+                // data race; the CI TSan leg caught it, and its single
+                // in-process report then poisoned every later forked
+                // battery child to exit-66 — 16 red checks, one defect).
+                returned->fetch_add(1, std::memory_order_release);
             });
             // Wait for the writer to park on the first arrival, give the
             // others a bounded pile-up window (the oracle does not depend
@@ -10537,14 +10544,17 @@ static int run_m5_writer_test() {
             pf->release.store(true, std::memory_order_release);
             // Bounded wait for ALL waiters to return (the strand detector).
             const auto dl2 = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-            while (returned->load(std::memory_order_relaxed) < NT && deadline_ok(dl2))
+            while (returned->load(std::memory_order_acquire) < NT && deadline_ok(dl2))
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            const bool all_returned = returned->load(std::memory_order_relaxed) == NT;
-            bool all_failed_clean = all_returned;
-            if (all_returned)
+            const bool all_returned = returned->load(std::memory_order_acquire) == NT;
+            bool all_failed_clean = false;
+            if (all_returned) {
+                for (auto& t : th) t.join();   // the definitive HB edge: st is read AFTER this
+                all_failed_clean = true;
                 for (int t = 0; t < NT; ++t)
                     if ((*st)[t] != Status::WalFailure && (*st)[t] != Status::Failed)
                         all_failed_clean = false;
+            }
             check("m5 W2: writer death, multiple waiters, no strand",
                   all_returned && all_failed_clean && !pf->timed_out.load() &&
                   dbp->wal_failed_for_test() && dbp->wal_stats().writer_deaths >= 1,
@@ -10552,7 +10562,6 @@ static int run_m5_writer_test() {
                   " clean=" + std::to_string(all_failed_clean) +
                   " park_timeout=" + std::to_string(pf->timed_out.load()));
             if (all_returned) {
-                for (auto& t : th) t.join();
                 dbp->set_leader_pre_drain_hook_for_test(nullptr);
                 dbp->set_leader_post_unlock_hook_for_test(nullptr);
                 dbp->close();
