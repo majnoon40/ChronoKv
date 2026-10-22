@@ -166,6 +166,19 @@ jobs:
             bin: build/release/test
             cxx: clang++-18
             install: clang-18
+          # v29 M5 slice 1 (decision doc §1.12): the legacy leader/follower
+          # leg — the lifeboat path behind the compile flag, running the
+          # UNMOVED suite (its C1a/SRC-E batteries keep the leader hooks;
+          # the m5 writer battery skip-PASSes here exactly like bt3
+          # skip-PASSes outside stress builds). Both legs stay green for
+          # the flag's one-release life; the deletion commit (matrix
+          # re-runs cited) removes this entry WITH the code.
+          - name: release (g++-13, legacy WAL leader)
+            os: ubuntu-24.04
+            target: release
+            bin: build/release/test
+            cxx: g++
+            extra_defs: -DCKV_WAL_LEGACY_LEADER
           - name: asan+ubsan
             os: ubuntu-24.04
             target: asan

@@ -59,6 +59,18 @@
 //                           batch_cv_. Clean code: fail-stop, WalFailure,
 //                           every thread RETURNS. C1 mutant: cleanup
 //                           skipped -> followers strand -> parent deadline.
+//
+// v29 M5 RE-ANCHOR (rule 14, decision doc
+// docs/audits/2026-10-20-m5-wal-writer-thread-decision.md §11 — comment-
+// only; both scenarios' CODE and oracles are untouched and bind both
+// compile legs): on the writer-thread path (the default build) S1's
+// mixed-class handoff window is the writer's drain-prefix cut (seam
+// `wal_drain_class_switch`; `wal_mixed_handoff` exists only on the legacy
+// leg), and S2's fault fires inside the WRITER's rotation — its oracle
+// ("every thread RETURNS", fail-stop, WalFailure, zero escapes) is exactly
+// the W-STRAND no-strand contract, with the death-drain replacing the
+// leader-cleanup as the mechanism under test. The dst scheduler binds
+// whichever seams the running leg emits; the oracles are seam-agnostic.
 //   S3 gc_epoch_scan      — GC class: version churn + synchronous gc_once
 //                           passes + range scans with monotonic-value
 //                           validation. Reclaim-vs-scan defects surface as

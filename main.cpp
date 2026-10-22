@@ -583,6 +583,7 @@ static int run_m3_gen_verification_test();   // v29 M3 slice 2: G2 verification-
 static int run_bt3_visibility_test();        // BT-3 (2026-10-18): split rebuild->splice visibility controls
 static int run_m3_purge_test();              // v29 M3 slice 3: physical purge controls
 static int run_m4_merge_test();              // v29 M4: leaf merge & rebalance controls (decision doc 2026-10-18)
+static int run_m5_writer_test();             // v29 M5 slice 1: WAL writer-thread / W-STRAND controls (decision doc 2026-10-20)
 static int run_m2_phase1_test();
 static int run_m2_phase2_test();
 static int run_m2_phase3_test();
@@ -1963,16 +1964,40 @@ static int run_review_regression_tests() {
             if (ok && !db.wal_failed_for_test()) {
                 ok = false; fr = "WAL did not enter fail-stop after the rotation failure";
             }
+#ifdef CKV_WAL_LEGACY_LEADER
             if (ok && db.wal_leader_active_for_test()) {
                 ok = false;
                 fr = "leader_active_ still true after a leader exception -- cleanup was "
                      "skipped, so any follower parked on batch_cv_ is stranded forever";
             }
+#else
+            // v29 M5 rule-14 re-anchor (decision doc §11): the writer-thread
+            // path has NO leader to leak — C1's contract (failure is always
+            // terminal-for-waiters, cleanup can never be skipped) becomes
+            // W-STRAND, whose timing-independent detector HERE is: after the
+            // rotation failure latched the fail-stop, the NEXT put must fail
+            // FAST (the entry gate), never park — a stranded-waiter state is
+            // precisely what would hang this call. The multi-waiter form is
+            // the m5 W2 battery; the mutants are named in its header.
+            if (ok) {
+                chronokv::Status st2 = db.put("c1a_after", "v");
+                if (st2 != chronokv::Status::WalFailure &&
+                    st2 != chronokv::Status::Failed) {
+                    ok = false;
+                    fr = "post-fail-stop put returned " + std::to_string((int)st2) +
+                         " (expected WalFailure/Failed — a park here IS the strand)";
+                }
+            }
+#endif
         } catch (const std::exception& e) {
             fault::disarm();
             ok = false; fr = std::string("exception: ") + e.what();
         }
+#ifdef CKV_WAL_LEGACY_LEADER
         report("review C1a: leader exception resets leader_active_ (cleanup not skipped)", ok, fr);
+#else
+        report("review C1a (M5 W-STRAND re-anchor): rotation failure is terminal — fail-stop latched, next put fails fast, no strand", ok, fr);
+#endif
 #else
         report("review C1a: leader cleanup invariant (needs fault injection)", true);
 #endif
@@ -2460,6 +2485,18 @@ return 0;
     if (getenv("CKV_ONLY_M4")) {
         crc_init();
         int f = run_m4_merge_test();
+        std::cout.flush();
+        return f == 0 ? 0 : 1;
+    }
+
+    // v29 M5 slice 1 (2026-10-20): CKV_ONLY_M5=1 runs just the WAL
+    // writer-thread battery (decision doc
+    // docs/audits/2026-10-20-m5-wal-writer-thread-decision.md §8 slice 1).
+    // Legacy-leg builds skip-PASS it (the leader-era suites are that leg's
+    // regression net, run unmoved).
+    if (getenv("CKV_ONLY_M5")) {
+        crc_init();
+        int f = run_m5_writer_test();
         std::cout.flush();
         return f == 0 ? 0 : 1;
     }
@@ -8030,6 +8067,7 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     fails += run_m3_gen_verification_test();
     fails += run_m3_purge_test();
     fails += run_m4_merge_test();
+    fails += run_m5_writer_test();
     fails += run_bt3_visibility_test();
     fails += run_m2_phase1_test();
     fails += run_m2_phase2_test();
@@ -10310,6 +10348,392 @@ static int run_m4_merge_test() {
     }
 
     if (fails == 0) std::cout << "   M4 MERGE BATTERY PASSED\n";
+    return fails;
+}
+
+// =====================================================================
+// v29 M5 slice 1 — the WAL writer thread: the W-STRAND / queue battery.
+//
+// Decision doc: docs/audits/2026-10-20-m5-wal-writer-thread-decision.md.
+// These controls are NEW-PATH-ONLY; under CKV_WAL_LEGACY_LEADER they
+// skip-PASS exactly like the bt3 battery skips outside stress builds
+// (the legacy leg's job is to run the UNMOVED leader-era suites — its
+// C1a/SRC-E batteries keep probing the leader hooks there).
+// Blocks:
+//   W1 — writer death, single committer: an injected exception in the
+//        writer's unlocked I/O section (C1b's injection class, successor
+//        seam) must surface as WalFailure — never std::terminate, never a
+//        throw to the committer — with the D3 fail-stop latched, the
+//        death counted exactly once, later writes failing FAST at the
+//        gate, reads of durable data still working, and recovery exact
+//        (the injection fires before any byte lands, so the rejected put
+//        is absent and the baseline present).
+//   W2 — writer death with MULTIPLE parked waiters: the C1 strand-class
+//        successor. Every committer parked on the queue when the writer
+//        dies must RETURN (WalFailure/Failed) — bounded, no hang. The
+//        oracle is coalescing-independent: whether the deaths land in one
+//        drained batch or the death-drain, all waiters terminalize.
+//   W3 — mixed durability drains by CLASS PREFIX (the H3 successor
+//        window, seam wal_drain_class_switch): an async item and a group
+//        item queued behind a parked writer drain as two same-class
+//        batches, class_switches >= 1, both commits succeed, both records
+//        read back.
+//   W4 — backpressure admits BEFORE reserving (WW7's anti-hole oracle):
+//        with queue_max_items=1 and the writer parked, a second committer
+//        blocks in admission holding NO cts — pub_allocated_max stays at
+//        the first committer's reservation while it waits (the
+//        RESERVE-BEFORE-SPACE mutant reddens exactly this), then both
+//        complete in cts order after release.
+//   W5 — close racing an in-flight put: the documented v25.7/v25.8
+//        contract is "completes against a keepalive-held engine OR fails
+//        cleanly" — the oracle is the DISJUNCTION plus on-disk/ack
+//        consistency (the key exists after reopen IFF the put returned
+//        OK), so the control is deterministic under either scheduling.
+// Hook-state note: every hook captures shared_ptr state, so a
+// deadline-exceeded control can leak its Database and detach its threads
+// WITHOUT any dangling capture (a stranded writer spinning on a dead
+// stack atomic would trade a hang for a UAF — the leak is the honest
+// lesser evil, and the FAIL is already printed; the suite treats such a
+// run as terminal in CI practice).
+//
+// Mutants (recorded per the single-build directive; each names the block
+// it reddens ALONE):
+//   NO-DEATH-DRAIN (writer loop skips death_drain_locked after a death)
+//       -> W2 strands (deadline FAIL); W1 stays green (single waiter is
+//          terminalized by the flip itself) — the isolation is the point.
+//   NO-WRITER-CATCH (remove the total-catch, let the thread die)
+//       -> W1/W2: std::terminate takes the process down (loud).
+//   RESERVE-BEFORE-SPACE (admit after reserving cts)
+//       -> W4's pub_allocated_max oracle RED alone.
+//   NO-CLASS-PREFIX (drain ignores the class cut)
+//       -> W3's class_switches oracle RED; the mixed batch also breaks
+//          CKV-004's exact-debit assumption (v26 D2 batteries under
+//          mixed-class load in the stress legs).
+//   SKIP-ROTATE-CMD (rotate_after_checkpoint bypasses the queue)
+//       -> the checkpoint batteries' R-REBASE ordering probes (H1
+//          regression, m2_phase1) under adversarial scheduling.
+// =====================================================================
+static int run_m5_writer_test() {
+    using namespace chronokv;
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) {
+            ++fails;
+            if (!detail.empty()) std::cout << "      (" << detail << ")\n";
+        }
+    };
+#ifdef CKV_WAL_LEGACY_LEADER
+    check("m5 W1: writer death, single committer (skipped — legacy leader leg)", true);
+    check("m5 W2: writer death, multiple waiters, no strand (skipped — legacy leader leg)", true);
+    check("m5 W3: mixed durability drains by class prefix (skipped — legacy leader leg)", true);
+    check("m5 W4: backpressure admits before reserving (skipped — legacy leader leg)", true);
+    check("m5 W5: close vs in-flight put (skipped — legacy leader leg)", true);
+#else
+    // Shared hook state (see the hook-state note above).
+    struct ParkFlags {
+        std::atomic<bool> parked{false};
+        std::atomic<bool> release{false};
+        std::atomic<bool> timed_out{false};
+    };
+    auto deadline_ok = [](const std::chrono::steady_clock::time_point& d) {
+        return std::chrono::steady_clock::now() < d;
+    };
+
+    // ---- W1: writer death, single committer. ----
+    {
+        const std::string wd = "/tmp/m5_w1";
+        std::filesystem::remove_all(wd);
+        try {
+            Options o;
+            o.wal_dir = wd;
+            o.auto_start_gc = false;
+            auto db = Database::open(o);
+            check("m5 W1: baseline put durable", db.put("pre", "v") == Status::OK);
+            auto fired = std::make_shared<std::atomic<bool>>(false);
+            db.set_leader_post_unlock_hook_for_test([fired] {
+                if (fired->exchange(true)) return;              // one-shot
+                throw std::runtime_error("injected writer I/O failure (W-STRAND control)");
+            });
+            Status st = Status::OK;
+            bool threw = false;
+            try { st = db.put("w1", "v"); } catch (...) { threw = true; }
+            auto ws = db.wal_stats();
+            check("m5 W1: writer exception -> WalFailure to the committer, not terminate, not a throw",
+                  !threw && st == Status::WalFailure,
+                  "threw=" + std::to_string(threw) + " st=" + std::to_string((int)st));
+            check("m5 W1: D3 fail-stop latched, death counted exactly once",
+                  db.wal_failed_for_test() && ws.writer_deaths == 1,
+                  "failed=" + std::to_string(db.wal_failed_for_test()) +
+                  " deaths=" + std::to_string(ws.writer_deaths));
+            const Status st2 = db.put("after", "x");
+            check("m5 W1: subsequent writes fail fast at the gate (no strand)",
+                  st2 == Status::WalFailure || st2 == Status::Failed,
+                  "st2=" + std::to_string((int)st2));
+            auto pre = db.get("pre");
+            check("m5 W1: reads of already-durable data keep working (D3 semantics)",
+                  pre.has_value() && *pre == "v");
+            auto h = db.health();
+            check("m5 W1: health reports level 2",
+                  h.level == 2, "level=" + std::to_string(h.level));
+            db.set_leader_post_unlock_hook_for_test(nullptr);
+            db.close();
+            auto db2 = Database::open(o);
+            auto w1 = db2.get("w1");
+            auto pr2 = db2.get("pre");
+            auto af = db2.get("after");
+            check("m5 W1: recovery exact — rejected batch absent, acked baseline present",
+                  !w1.has_value() && !af.has_value() && pr2.has_value() && *pr2 == "v");
+            db2.close();
+        } catch (const std::exception& e) {
+            check("m5 W1: writer death, single committer", false,
+                  std::string("exception: ") + e.what());
+        }
+        std::filesystem::remove_all(wd);
+    }
+
+    // ---- W2: writer death with multiple parked waiters (no strand). ----
+    {
+        const std::string wd = "/tmp/m5_w2";
+        std::filesystem::remove_all(wd);
+        bool leaked = false;
+        std::unique_ptr<Database> dbp;
+        try {
+            Options o;
+            o.wal_dir = wd;
+            o.auto_start_gc = false;
+            dbp = std::make_unique<Database>(Database::open(o));
+            auto pf = std::make_shared<ParkFlags>();
+            auto kill = std::make_shared<std::atomic<bool>>(false);
+            dbp->set_leader_pre_drain_hook_for_test([pf] {
+                if (pf->parked.exchange(true)) return;          // park once
+                const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (!pf->release.load(std::memory_order_acquire)) {
+                    if (std::chrono::steady_clock::now() > dl) {
+                        pf->timed_out.store(true);
+                        return;
+                    }
+                    std::this_thread::yield();
+                }
+            });
+            dbp->set_leader_post_unlock_hook_for_test([kill] {
+                if (kill->exchange(true)) return;               // one-shot
+                throw std::runtime_error("injected writer death (W2 no-strand control)");
+            });
+            constexpr int NT = 3;
+            auto st = std::make_shared<std::vector<Status>>(NT, Status::OK);
+            auto returned = std::make_shared<std::atomic<int>>(0);
+            std::vector<std::thread> th;
+            for (int t = 0; t < NT; ++t) th.emplace_back([&, t] {
+                (*st)[t] = dbp->put("w2k" + std::to_string(t), "v");
+                returned->fetch_add(1, std::memory_order_relaxed);
+            });
+            // Wait for the writer to park on the first arrival, give the
+            // others a bounded pile-up window (the oracle does not depend
+            // on coalescing), then release into the kill.
+            const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!pf->parked.load() && deadline_ok(dl)) std::this_thread::yield();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            pf->release.store(true, std::memory_order_release);
+            // Bounded wait for ALL waiters to return (the strand detector).
+            const auto dl2 = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (returned->load(std::memory_order_relaxed) < NT && deadline_ok(dl2))
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            const bool all_returned = returned->load(std::memory_order_relaxed) == NT;
+            bool all_failed_clean = all_returned;
+            if (all_returned)
+                for (int t = 0; t < NT; ++t)
+                    if ((*st)[t] != Status::WalFailure && (*st)[t] != Status::Failed)
+                        all_failed_clean = false;
+            check("m5 W2: writer death, multiple waiters, no strand",
+                  all_returned && all_failed_clean && !pf->timed_out.load() &&
+                  dbp->wal_failed_for_test() && dbp->wal_stats().writer_deaths >= 1,
+                  "returned=" + std::to_string(returned->load()) + "/" + std::to_string(NT) +
+                  " clean=" + std::to_string(all_failed_clean) +
+                  " park_timeout=" + std::to_string(pf->timed_out.load()));
+            if (all_returned) {
+                for (auto& t : th) t.join();
+                dbp->set_leader_pre_drain_hook_for_test(nullptr);
+                dbp->set_leader_post_unlock_hook_for_test(nullptr);
+                dbp->close();
+                dbp.reset();
+            } else {
+                // STRANDED (a real W-STRAND regression): leak the Database
+                // and detach — joining would hang the suite, and destroying
+                // the engine under blocked waiters would be a UAF. The FAIL
+                // above is the report; CI treats it as terminal.
+                leaked = true;
+                for (auto& t : th) t.detach();
+                dbp.release();
+            }
+        } catch (const std::exception& e) {
+            check("m5 W2: writer death, multiple waiters, no strand", false,
+                  std::string("exception: ") + e.what());
+        }
+        if (!leaked) std::filesystem::remove_all(wd);
+    }
+
+    // ---- W3: mixed durability drains by class prefix. ----
+    {
+        const std::string wd = "/tmp/m5_w3";
+        std::filesystem::remove_all(wd);
+        try {
+            ChronoKV kv(wd);
+            auto pf = std::make_shared<ParkFlags>();
+            kv.set_wal_pre_drain_hook_for_test([pf] {
+                if (pf->parked.exchange(true)) return;
+                const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (!pf->release.load(std::memory_order_acquire)) {
+                    if (std::chrono::steady_clock::now() > dl) { pf->timed_out.store(true); return; }
+                    std::this_thread::yield();
+                }
+            });
+            kv.set_durability(DurabilityMode::Async);
+            std::atomic<int> r1{ -1 }, r2{ -1 };
+            std::thread t1([&] { r1.store((int)kv.commit("a1", "v1")); });
+            const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (kv.wal_stats().queue_high_water < 1 && deadline_ok(dl))
+                std::this_thread::yield();
+            kv.set_durability(DurabilityMode::Group);
+            std::thread t2([&] { r2.store((int)kv.commit("g1", "v1")); });
+            while (kv.wal_stats().queue_high_water < 2 && deadline_ok(dl))
+                std::this_thread::yield();
+            pf->release.store(true, std::memory_order_release);
+            t1.join();
+            t2.join();
+            kv.set_wal_pre_drain_hook_for_test(nullptr);
+            auto ws = kv.wal_stats();
+            check("m5 W3: mixed durability drains by class prefix (H3's successor window)",
+                  ws.class_switches >= 1 && ws.drains >= 2 && !pf->timed_out.load() &&
+                  r1.load() == (int)TxnResult::Committed && r2.load() == (int)TxnResult::Committed,
+                  "switches=" + std::to_string(ws.class_switches) +
+                  " drains=" + std::to_string(ws.drains) +
+                  " r1=" + std::to_string(r1.load()) + " r2=" + std::to_string(r2.load()) +
+                  " park_timeout=" + std::to_string(pf->timed_out.load()));
+            auto a1 = kv.read("a1");
+            auto g1 = kv.read("g1");
+            check("m5 W3: both classes' records read back",
+                  a1.has_value() && *a1 == "v1" && g1.has_value() && *g1 == "v1");
+        } catch (const std::exception& e) {
+            check("m5 W3: mixed durability drains by class prefix", false,
+                  std::string("exception: ") + e.what());
+        }
+        std::filesystem::remove_all(wd);
+    }
+
+    // ---- W4: backpressure admits BEFORE reserving (the anti-hole oracle). ----
+    {
+        const std::string wd = "/tmp/m5_w4";
+        std::filesystem::remove_all(wd);
+        try {
+            Options o;
+            o.wal_dir = wd;
+            o.auto_start_gc = false;
+            o.wal_queue_max_items = 1;
+            auto db = Database::open(o);
+            auto pf = std::make_shared<ParkFlags>();
+            db.set_leader_pre_drain_hook_for_test([pf] {
+                if (pf->parked.exchange(true)) return;
+                const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (!pf->release.load(std::memory_order_acquire)) {
+                    if (std::chrono::steady_clock::now() > dl) { pf->timed_out.store(true); return; }
+                    std::this_thread::yield();
+                }
+            });
+            auto st1 = std::make_shared<std::atomic<int>>((int)Status::OK);
+            auto st2 = std::make_shared<std::atomic<int>>((int)Status::OK);
+            auto t2_done = std::make_shared<std::atomic<bool>>(false);
+            std::thread t1([&] { st1->store((int)db.put("bp1", "v")); });
+            const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (db.wal_stats().queue_high_water < 1 && deadline_ok(dl))
+                std::this_thread::yield();
+            std::thread t2([&] { st2->store((int)db.put("bp2", "v")); t2_done->store(true); });
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            auto ws = db.wal_stats();
+            // The anti-hole oracle: T2 is blocked in ADMISSION and must hold
+            // NO reservation — the allocation watermark is exactly T1's cts.
+            check("m5 W4: a blocked producer holds no cts (admission precedes reservation)",
+                  !t2_done->load() && ws.backpressure_waits >= 1 && ws.pub_allocated_max == 1,
+                  "t2_done=" + std::to_string(t2_done->load()) +
+                  " bp_waits=" + std::to_string(ws.backpressure_waits) +
+                  " pub_alloc_max=" + std::to_string(ws.pub_allocated_max));
+            pf->release.store(true, std::memory_order_release);
+            t1.join();
+            t2.join();
+            db.set_leader_pre_drain_hook_for_test(nullptr);
+            auto ws2 = db.wal_stats();
+            auto b1 = db.get("bp1");
+            auto b2 = db.get("bp2");
+            check("m5 W4: after release both commits complete in cts order",
+                  st1->load() == (int)Status::OK && st2->load() == (int)Status::OK &&
+                  ws2.pub_allocated_max == 2 &&
+                  b1.has_value() && *b1 == "v" && b2.has_value() && *b2 == "v",
+                  "st1=" + std::to_string(st1->load()) + " st2=" + std::to_string(st2->load()) +
+                  " pub_alloc_max=" + std::to_string(ws2.pub_allocated_max));
+            db.close();
+        } catch (const std::exception& e) {
+            check("m5 W4: backpressure admits before reserving", false,
+                  std::string("exception: ") + e.what());
+        }
+        std::filesystem::remove_all(wd);
+    }
+
+    // ---- W5: close racing an in-flight put (completes-or-fails-cleanly). ----
+    {
+        const std::string wd = "/tmp/m5_w5";
+        std::filesystem::remove_all(wd);
+        try {
+            Options o;
+            o.wal_dir = wd;
+            o.auto_start_gc = false;
+            auto db = std::make_unique<Database>(Database::open(o));
+            auto pf = std::make_shared<ParkFlags>();
+            db->set_leader_pre_drain_hook_for_test([pf] {
+                if (pf->parked.exchange(true)) return;
+                const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (!pf->release.load(std::memory_order_acquire)) {
+                    if (std::chrono::steady_clock::now() > dl) { pf->timed_out.store(true); return; }
+                    std::this_thread::yield();
+                }
+            });
+            auto st1 = std::make_shared<std::atomic<int>>((int)Status::OK);
+            std::thread t1([&] { st1->store((int)db->put("cl", "v")); });
+            const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (db->wal_stats().queue_high_water < 1 && deadline_ok(dl))
+                std::this_thread::yield();
+            bool close_threw = false;
+            std::thread t2([&] { try { db->close(); } catch (...) { close_threw = true; } });
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            pf->release.store(true, std::memory_order_release);
+            t1.join();
+            t2.join();
+            // NOTE: no hook-clear here — close() may have completed the
+            // deferred teardown already (api_engine() would throw), and the
+            // hook captures are shared_ptr-owned, so a still-parked writer
+            // can never touch a dead stack. The hook dies with the engine.
+            db.reset();   // deferred teardown (if any) completes here: drain-then-join
+            auto db2 = Database::open(o);
+            auto cl = db2.get("cl");
+            db2.close();
+            const bool completed = (st1->load() == (int)Status::OK);
+            const bool failed_clean = (st1->load() != (int)Status::OK);
+            check("m5 W5: close vs in-flight put — completes-or-fails-cleanly, disk matches the ack",
+                  !close_threw && !pf->timed_out.load() &&
+                  ((completed && cl.has_value() && *cl == "v") ||
+                   (failed_clean && !cl.has_value())),
+                  "st1=" + std::to_string(st1->load()) +
+                  " found=" + std::to_string(cl.has_value()) +
+                  " close_threw=" + std::to_string(close_threw) +
+                  " park_timeout=" + std::to_string(pf->timed_out.load()));
+        } catch (const std::exception& e) {
+            check("m5 W5: close vs in-flight put", false,
+                  std::string("exception: ") + e.what());
+        }
+        std::filesystem::remove_all(wd);
+    }
+#endif  // CKV_WAL_LEGACY_LEADER
+
+    if (fails == 0) std::cout << "   M5 WRITER BATTERY PASSED\n";
     return fails;
 }
 

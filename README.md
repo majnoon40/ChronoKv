@@ -86,7 +86,13 @@ before the DST harness is green") is met.
 - **Crash-safe WAL** — CRC-checked, segmented (64 MiB) WAL with torn-tail
   truncation (interior corruption fails loud instead of being silently
   cut), batch group-commit, per-segment LSN continuity validation, and
-  strict commit-timestamp gap/duplicate detection on replay.
+  strict commit-timestamp gap/duplicate detection on replay. Since v29 M5
+  a **dedicated writer thread** owns every WAL file mutation: committers
+  are producers on a bounded MPSC queue (cts reserved at admission, so
+  cts order == WAL order structurally), the leader/follower handshake is
+  deleted on the default path (lifeboat leg behind
+  `CKV_WAL_LEGACY_LEADER` for one release), and writer failure is always
+  terminal-for-waiters, never silent (invariant W-STRAND).
 - **Three durability modes** — `Sync` (fsync per commit), `Group`
   (default; batched fsync, durable against power loss), `Async`
   (durable against process crash only).
@@ -149,7 +155,8 @@ before the DST harness is green") is met.
   untested-lines ledger (v27 M3) — all run under a four-config sanitizer
   matrix (Release / ASan+UBSan / TSan / Stress) plus the gcov build.
 - **Crash-consistent recovery** — 28 instrumented crash points cover the whole
-  durability state machine (WAL leader, segment rotation, segment-creation
+  durability state machine (WAL batch I/O stages — the writer thread since
+  v29 M5, names and stage order unchanged; segment rotation, segment-creation
   dir-fsync window, MANIFEST write/rename, checkpoint, rebase, backup). The
   fuzzer forks a child, kills it at a
   seeded point, then reopens and asserts the database is recoverable with no
@@ -323,12 +330,13 @@ inactive transaction), `Error` (engine failures), `NotYetImplementedError`.
   the rollback truncation is itself fsynced, so it cannot be undone by a
   power loss. **Known indeterminate window — NARROWED, not closed (SRC-B
   decision 2026-10-10):** if the rollback `ftruncate` *itself* fails, the
-  leader now zero-fills the FULL attempted batch extent (every record of a
+  WAL's I/O executor (v29 M5: the writer thread; historically the
+  group-commit leader) zero-fills the FULL attempted batch extent (every record of a
   multi-record group-commit batch) via a chunked `pwrite` loop (short
   writes and `EINTR` retried) and `fdatasync`s it: recovery classifies
   zeros-at-EOF as the ordinary `TORN_TAIL` — never interior-CORRUPT, and
   nothing can append after the extent (`failed_` latches in the same
-  leader pass; every writer path checks it) — so the existing tested
+  executor pass; every writer path checks it) — so the existing tested
   repair truncates it and the rejected frames cannot replay on the next
   open. The `rollback-indeterminate` health reason (option 4) clears ONLY
   if the fill AND its `fdatasync` both succeed; the instance fail-stops

@@ -3574,6 +3574,9 @@ inline bool pwrite_all(int fd, const uint8_t* d, size_t n, off_t offset) {
 struct WalInstanceStats {
     uint64_t batches, records, bytes, fsyncs, write_fails, fsync_fails,
              truncations, truncate_fails, async_lost, pub_allocated_max;
+    // v29 M5 slice 1: writer-thread diagnostics (zero on the legacy leg).
+    uint64_t queue_high_water = 0, backpressure_waits = 0,
+             class_switches = 0, drains = 0, writer_deaths = 0;
 };
 struct EpochInstanceStats { uint64_t entries, oldest, newest; };
 struct GcInstanceStats {
@@ -3620,8 +3623,14 @@ struct FdGuard {
     FdGuard& operator=(const FdGuard&) = delete;
 };
 
+// v29 M5: forward declaration for the friendship below (ChronoKV is
+// defined after this class; the W3 control arms the writer seam at the
+// engine level, where no Database forwarder exists).
+class ChronoKV;
+
 class WalSegments {
     friend class ::chronokv::Database;  // v25.1 M2: test injection access
+    friend class ::ChronoKV;            // v29 M5: engine-level test-hook arming (W3 control)
     std::string dir_;
     int active_fd_ = -1;
     FdGuard lock_fd_;  // v22.1 M4: inter-process guard (flock), v24: RAII
@@ -3638,8 +3647,10 @@ class WalSegments {
     // construction before any concurrency).
     uint64_t last_ckpt_ts_ = 0;
     std::atomic<uint64_t> lsn_{0};  // physical write-order sequence (item 6)
+#ifdef CKV_WAL_LEGACY_LEADER
     std::mutex batch_mu_;
     std::condition_variable batch_cv_;
+#endif
     std::atomic<bool> failed_{false};
     // SRC-B option 4 (maintainer decision 2026-10): a rollback of a
     // rejected batch could not be COMPLETED — its ftruncate failed, or the
@@ -3649,6 +3660,76 @@ class WalSegments {
     // In-memory only: no on-disk marker, no new public Status. Surfaced
     // through health() beside the fail-stop reason.
     std::atomic<bool> rollback_indeterminate_{false};
+#ifndef CKV_WAL_LEGACY_LEADER
+    // =====================================================================
+    // v29 M5 slice 1 — the WAL writer thread (decision doc
+    // docs/audits/2026-10-20-m5-wal-writer-thread-decision.md).
+    //
+    // ONE dedicated thread owns every WAL file mutation; committers are
+    // producers on a bounded MPSC queue. The legacy leader/follower
+    // handshake (leader_active_, cur_batch_, pending_, batch_mu_/batch_cv_
+    // — all #ifdef'd to the CKV_WAL_LEGACY_LEADER leg) does not exist on
+    // this path: the C1/H3 defect CLASS (election, handoff, orphaned
+    // batches, stranded followers) is unreachable by construction, and
+    // W-STRAND replaces its cleanup contract: writer failure is ALWAYS
+    // terminal-for-waiters (failed_ latch + death-drain of the whole
+    // queue), never silent, never a hang.
+    //
+    // Ordering identities (decision §1.3): cts is reserved UNDER queue_mu_
+    // in the same critical section as the enqueue, and space is assured
+    // BEFORE the reservation — so cts order == enqueue order == drain
+    // order == WAL offset order is structural (the legacy leader's
+    // defensive sort is subsumed), and backpressure can never orphan a
+    // reserved cts (the WW7/CKV-012 re-derivation).
+    //
+    // Fork discipline: the writer thread joins the GC thread's documented
+    // contract — forked children construct their OWN engine (only the
+    // forking thread survives fork(); every fork site in the suite does
+    // this, crash-fuzz child_body included). No pthread_atfork machinery:
+    // there is no supported shape in which a child inherits a live
+    // WalSegments and commits through it.
+    // =====================================================================
+    struct QueueCommand {
+        enum Kind : uint8_t { ROTATE, FORCE_SIZE_ROTATE } kind = ROTATE;
+        uint64_t ckpt_ts = 0;
+        bool ok = false;        // command result (rotate bodies return bool)
+        bool terminal = false;  // writer finished it (success OR failed_)
+    };
+    struct QueueItem {
+        std::shared_ptr<Batch> batch;            // BATCH item (exactly one of
+        std::shared_ptr<QueueCommand> command;   // batch/command is non-null)
+    };
+    std::mutex queue_mu_;             // producer reservation+enqueue, writer
+                                      // drain + state flips, rotation bodies,
+                                      // and the test accessors' single truth
+    std::condition_variable queue_cv_;  // writer wake + producer space
+    std::condition_variable done_cv_;   // batch/command completion broadcast
+    std::deque<QueueItem> queue_;
+    size_t queue_bytes_ = 0;            // admitted serialized-record estimate
+    size_t queue_max_items_ = 4096;
+    size_t queue_max_bytes_ = 32ULL * 1024 * 1024;
+    bool stop_requested_ = false;       // close: drain, then exit
+    bool writer_joined_ = false;        // shutdown idempotence
+    std::thread writer_;
+    // M5 diagnostics (wal_stats face; single-writer = the producer/writer
+    // under queue_mu_, atomics for lock-free reads like the v20 M1 set).
+    std::atomic<uint64_t> i_queue_high_water{0};
+    std::atomic<uint64_t> i_backpressure_waits{0};
+    std::atomic<uint64_t> i_class_switches{0};
+    std::atomic<uint64_t> i_drains{0};
+    std::atomic<uint64_t> i_writer_deaths{0};
+#ifdef CHRONOKV_TEST_HOOKS
+    // Successors of the leader-era seams (decision §11), same TEST SURFACE
+    // names at the Database level (rule-14 re-anchor notes live at the
+    // forwarders): writer_pre_drain_hook_ parks the writer AFTER wake and
+    // BEFORE the drain-prefix cut (SRC-E1's deterministic multi-record
+    // collection window; W3/W4/W5 controls); writer_io_throw_hook_ raises
+    // inside the I/O section with no lock held (C1b's post-unlock-throw
+    // shape; the W-STRAND battery).
+    std::function<void()> writer_pre_drain_hook_;
+    std::function<void()> writer_io_throw_hook_;
+#endif
+#else
     std::shared_ptr<Batch> cur_batch_;
     // H3 fix: FIFO of batches that have records but no leader yet.
     // cur_batch_ (when non-null) is always pending_.back() -- the batch
@@ -3662,6 +3743,7 @@ class WalSegments {
     //     happen strictly front-to-back.
     std::deque<std::shared_ptr<Batch>> pending_;
     bool leader_active_ = false;
+#endif  // CKV_WAL_LEGACY_LEADER (member split)
 
     // v25.1 M2 Phase 1: multi-segment WAL. Fixed-size segments (64 MiB).
     static constexpr size_t SEGMENT_MAX_BYTES = 64ULL * 1024 * 1024;
@@ -3702,7 +3784,11 @@ class WalSegments {
     // v25.7: takes batch_mu_ — every other access to active_segment_bytes_
     // is under it (the leader's own updates moved under the lock too).
     void force_rotation_for_test() {
+#ifdef CKV_WAL_LEGACY_LEADER
         std::lock_guard<std::mutex> lk(batch_mu_);
+#else
+        std::lock_guard<std::mutex> lk(queue_mu_);   // v29 M5: the writer reads it under queue_mu_
+#endif
         active_segment_bytes_ = segment_max_bytes_;
     }
 
@@ -3711,14 +3797,22 @@ class WalSegments {
     // the public set_rebase_threshold knob's "tests lower this to exercise
     // the trigger quickly" pattern.
     void set_segment_max_bytes_for_test(size_t bytes) {
+#ifdef CKV_WAL_LEGACY_LEADER
         std::lock_guard<std::mutex> lk(batch_mu_);
+#else
+        std::lock_guard<std::mutex> lk(queue_mu_);   // v29 M5
+#endif
         segment_max_bytes_ = bytes ? bytes : SEGMENT_MAX_BYTES;
     }
 
     // v26 M0 (invariant D2): the active segment's byte accounting, so a test
     // can assert a failed batch was rolled back out of the rotation budget.
     size_t active_segment_bytes_for_test() {
+#ifdef CKV_WAL_LEGACY_LEADER
         std::lock_guard<std::mutex> lk(batch_mu_);
+#else
+        std::lock_guard<std::mutex> lk(queue_mu_);   // v29 M5
+#endif
         return active_segment_bytes_;
     }
 
@@ -3729,14 +3823,24 @@ class WalSegments {
     // bug (before the fix, an exception thrown while lk was still owned
     // made the re-acquiring lk.lock() throw EDEADLK, so leader_active_
     // stayed true and every parked follower was stranded forever).
+#ifdef CKV_WAL_LEGACY_LEADER
+    // v29 M5: LEGACY-LEG ONLY — the writer-thread path has no leader. The
+    // successor contract is W-STRAND (writer failure is terminal-for-
+    // waiters, decision doc §1.6); its detector is the m5 battery's
+    // no-strand controls, and main.cpp's C1a site carries the rule-14
+    // re-anchor citation.
     bool leader_active_for_test() {
         std::lock_guard<std::mutex> lk(batch_mu_);
         return leader_active_;
     }
+#endif
 
+#ifdef CKV_WAL_LEGACY_LEADER
     // Review fix C1: inject a failure AFTER the leader has released
     // batch_mu_, which is the path where the old bare `throw;` (outside the
     // handler) called std::terminate. Set to a lambda that throws.
+    // (v29 M5: legacy leg only; the writer-thread successor is
+    // writer_io_throw_hook_ — same injection class, no lock held, mid-I/O.)
     std::function<void()> leader_post_unlock_hook_;
     // SRC-E1 (zero-fill multi-record test): pause the elected leader BEFORE
     // it drains pending_ — the collection window in which followers enqueue
@@ -3747,6 +3851,7 @@ class WalSegments {
     // Test-gated exactly like leader_post_unlock_hook_ above: zero
     // production cost (the call site is CHRONOKV_TEST_HOOKS-gated too).
     std::function<void()> leader_pre_drain_hook_;
+#endif  // CKV_WAL_LEGACY_LEADER (leader-era hooks)
 #endif
     // v25.1 M2: stress_point hook for the CQE-wait gap test.
     // When set, the leader calls this BEFORE waiting for the CQE, allowing
@@ -3771,9 +3876,14 @@ public:
                  write_fails = 0, fsync_fails = 0,
                  truncations = 0, truncate_fails = 0, async_lost = 0,
                  pub_allocated_max = 0;
+        // v29 M5 slice 1 (decision §10.3): writer-thread diagnostics —
+        // zero on the legacy leg (the members do not exist there).
+        // writer_deaths reads 0 outside the W-STRAND controls BY CONTRACT.
+        uint64_t queue_high_water = 0, backpressure_waits = 0,
+                 class_switches = 0, drains = 0, writer_deaths = 0;
     };
     WalStats wal_stats() const {
-        return WalStats{
+        WalStats s{
             i_wal_batches.load(std::memory_order_relaxed),
             i_wal_records.load(std::memory_order_relaxed),
             i_wal_bytes.load(std::memory_order_relaxed),
@@ -3784,6 +3894,14 @@ public:
             i_wal_truncate_fails.load(std::memory_order_relaxed),
             i_async_lost.load(std::memory_order_relaxed),
             i_pub_allocated_max.load(std::memory_order_relaxed)};
+#ifndef CKV_WAL_LEGACY_LEADER
+        s.queue_high_water   = i_queue_high_water.load(std::memory_order_relaxed);
+        s.backpressure_waits = i_backpressure_waits.load(std::memory_order_relaxed);
+        s.class_switches     = i_class_switches.load(std::memory_order_relaxed);
+        s.drains             = i_drains.load(std::memory_order_relaxed);
+        s.writer_deaths      = i_writer_deaths.load(std::memory_order_relaxed);
+#endif
+        return s;
     }
 
     // v25.1 M2 Phase 3: test-only public static accessors for inspecting the
@@ -4241,7 +4359,18 @@ private:
     }
 
 public:
-    explicit WalSegments(const std::string& dir) : dir_(dir) {
+    // v29 M5 slice 1: the queue caps are the new path's admission bounds
+    // (0 = built-in defaults; the legacy leg's pending_ is unbounded as it
+    // has always been and ignores them).
+    explicit WalSegments(const std::string& dir,
+                         size_t queue_max_items = 0,
+                         size_t queue_max_bytes = 0) : dir_(dir) {
+#ifndef CKV_WAL_LEGACY_LEADER
+        if (queue_max_items) queue_max_items_ = queue_max_items;
+        if (queue_max_bytes) queue_max_bytes_ = queue_max_bytes;
+#else
+        (void)queue_max_items; (void)queue_max_bytes;
+#endif
         // v28 review-F2: create wal_dir RECURSIVELY, and fail with the real
         // cause. The old single-level ::mkdir (return ignored) could not
         // create a nested path — the documented README quick-start
@@ -4331,9 +4460,24 @@ public:
          }();
             lsn_.store(max_lsn, std::memory_order_relaxed);
         }
+#ifndef CKV_WAL_LEGACY_LEADER
+        // v29 M5 slice 1: the writer thread starts LAST — after every
+        // open/repair step has settled the file state — and is joined
+        // FIRST in the destructor (decision §1.8: drain-then-stop-then-
+        // join before any fd closes). A constructor that throws before
+        // this point never started the thread; nothing after it throws.
+        writer_ = std::thread([this] { writer_loop(); });
+#endif
     }
 
     ~WalSegments() {
+#ifndef CKV_WAL_LEGACY_LEADER
+        // v29 M5: join the writer BEFORE any fd closes (decision §1.8) —
+        // thread-outlives-fds is unrepresentable. Idempotent; the drain
+        // finishes durable I/O for everything queued, so a clean close
+        // loses no acked-pending record.
+        shutdown_writer();
+#endif
         // lock_fd_ handled by FdGuard RAII (member destructor)
         if (active_fd_ >= 0) checked_close(active_fd_);
     }
@@ -4362,6 +4506,7 @@ public:
         failed_.store(true, std::memory_order_release);
     }
 
+#ifdef CKV_WAL_LEGACY_LEADER
     // Timestamp is reserved INSIDE batch_mu_ so that cts assignment order
     // matches WAL-batch entry order. This prevents interior gaps in the WAL
     // after a crash: no thread can reserve cts=N+1 and enter the batch before
@@ -5076,7 +5221,579 @@ public:
     if (!ok) return {1, ts};
     return {reserve_conflict ? 2 : 0, ts};
 }
+#else   // !CKV_WAL_LEGACY_LEADER — the v29 M5 writer-thread path
 
+    // =====================================================================
+    // v29 M5 slice 1 — the WAL writer thread (NEW PATH; the legacy leader/
+    // follower handshake above lives behind CKV_WAL_LEGACY_LEADER for one
+    // release, per the decision doc §1.12).
+    //
+    // PRODUCER (group_append): one critical section under queue_mu_ performs
+    // space admission, cts reservation, on_reserve (the v17 validation +
+    // transition publication that MUST stay inside the reservation window),
+    // serialization, and the enqueue; the CKV-012 window ENDS at the
+    // enqueue — from there the item is owned by the writer or by its death
+    // drain (W-STRAND), so a reserved cts is either WAL-framed or burned,
+    // never orphaned. EXTRA-1's latch semantics move VERBATIM: a throw
+    // inside the window latches failed_ UNDER queue_mu_ before any
+    // concurrent committer can reserve past the burned cts, burns via
+    // on_abandon, and rethrows for commit_txn's WalFailure translation +
+    // idempotent CKV-012R latch. Lock order: on_reserve/on_abandon run
+    // under queue_mu_; PhantomTracker/PublicationTracker mutexes are leaves
+    // (the batch_mu_ -> pub edge's substitution, decision §1.13).
+    //
+    // Space admission happens BEFORE the reservation: a producer blocked on
+    // a full queue holds no cts, so backpressure can never create a
+    // reserved-but-unqueued hole (decision §1.3, window WW7). The byte bound
+    // is admitted against a conservative pre-serialization estimate (sum of
+    // key+value+24); a bounded overshoot of one max-size record is possible
+    // and documented — the bound is a knob, not an invariant.
+    //
+    // WAITER: today's predicates exactly — durable on done||failed, async on
+    // written||failed; `written` is published (release) after a successful
+    // WRITE stage and BEFORE the fsync runs, preserving the async
+    // silent-loss contract and CKV-004's stage-gated rollback semantics.
+    // =====================================================================
+    std::pair<int, uint64_t> group_append(std::atomic<uint64_t>& clock, const WriteSet& ws,
+                                   DurabilityMode mode,
+                                   const std::function<bool(uint64_t)>& on_reserve,
+                                   const std::function<void(uint64_t)>& on_abandon) {
+        const bool i_am_async = (mode == DurabilityMode::Async);
+        // Conservative admission estimate for the byte bound (see above).
+        size_t est_bytes = 32;
+        for (const auto& e : ws)
+            est_bytes += std::get<0>(e).size() + std::get<1>(e).size() + 24;
+
+        std::unique_lock<std::mutex> lk(queue_mu_);
+        if (failed_) return {1, 0};
+        while (!failed_ && !stop_requested_ &&
+               (queue_.size() >= queue_max_items_ ||
+                queue_bytes_ + est_bytes > queue_max_bytes_)) {
+            i_backpressure_waits.fetch_add(1, std::memory_order_relaxed);
+            stress_point("wal_enqueue_full");
+            queue_cv_.wait(lk);
+        }
+        if (failed_) return {1, 0};
+        if (stop_requested_) return {1, 0};   // close race: fail cleanly (documented contract)
+
+        uint64_t ts = 0;
+        bool reserve_conflict = false;
+        std::shared_ptr<Batch> my_batch;
+        try {
+            ts = clock.fetch_add(1, std::memory_order_seq_cst);
+            diag::store_max(diag::pub_allocated, ts);
+            diag::store_max(i_pub_allocated_max, ts);
+            stress_point("after_cts_reserve");
+            // v17 race closure (carried verbatim from the legacy window):
+            // validation + write-transition publication run INSIDE the
+            // reservation critical section, so a writer with cts N and a
+            // later reader with cts N+1 are totally ordered against the
+            // phantom tracker. A failed validation still reserves and
+            // writes an empty no-op record (WAL cts contiguity); the caller
+            // burns the ts in the publication tracker.
+            if (on_reserve && !on_reserve(ts)) reserve_conflict = true;
+            WriteSet noop_ws;
+            auto rec = reserve_conflict ? wal_ser(ts, noop_ws) : wal_ser(ts, ws);
+#ifdef CHRONOKV_FAULT_INJECTION
+            // CKV-012: the OOM-class trigger for the reservation window
+            // (moved with the window; the EXTRA-1/T3 crash-fuzz template
+            // fires here on the new path).
+            if (fault::fire(fault::Kind::AllocFail)) throw std::bad_alloc();
+#endif
+            my_batch = std::make_shared<Batch>();
+            my_batch->records.push_back({ts, rec});
+            if (i_am_async)
+                my_batch->has_async.store(true, std::memory_order_relaxed);
+            QueueItem it;
+            it.batch = my_batch;
+            queue_bytes_ += rec.size();
+            queue_.push_back(std::move(it));
+            if (queue_.size() > i_queue_high_water.load(std::memory_order_relaxed))
+                i_queue_high_water.store(queue_.size(), std::memory_order_relaxed);
+            // CKV-012 window END (the legacy has_async store's successor):
+            // the item is queued; the writer (or its death drain) owes it a
+            // terminal state — W-STRAND.
+        } catch (...) {
+            // EXTRA-1, verbatim: latch the fail-stop HERE, while queue_mu_
+            // is still held, so no concurrent committer can reserve and
+            // write past the burned cts (an interior gap at next open).
+            // Burn first (the published prefix must advance past the hole),
+            // then rethrow; commit_txn surfaces WalFailure + its idempotent
+            // CKV-012R latch.
+            if (ts != 0) failed_.store(true, std::memory_order_release);
+            if (ts != 0 && on_abandon) on_abandon(ts);
+            throw;
+        }
+        lk.unlock();
+        queue_cv_.notify_one();   // wake the writer
+
+        const bool need_fsync = !i_am_async;
+        lk.lock();
+        done_cv_.wait(lk, [&] {
+            return my_batch->failed ||
+                   (need_fsync ? my_batch->done
+                               : my_batch->written.load(std::memory_order_acquire));
+        });
+        bool ok = need_fsync ? (my_batch->done && !my_batch->failed)
+                             : my_batch->written.load(std::memory_order_acquire);
+        if (!ok) return {1, ts};
+        return {reserve_conflict ? 2 : 0, ts};
+    }
+
+    // v29 M5: idempotent writer shutdown — drain-to-terminal, then stop,
+    // then JOIN before any fd closes (decision §1.8: a clean close finishes
+    // durable I/O for everything queued, and thread-outlives-fds is
+    // unrepresentable). Called from the destructor; safe to call twice.
+    void shutdown_writer() {
+        if (writer_joined_) return;
+        {
+            std::lock_guard<std::mutex> lk(queue_mu_);
+            stop_requested_ = true;
+        }
+        queue_cv_.notify_all();
+        done_cv_.notify_all();
+        if (writer_.joinable()) writer_.join();
+        writer_joined_ = true;
+    }
+
+    // v29 M5 (W-STRAND, decision §1.6): give EVERY queued item a terminal
+    // failed state — no waiter of a dead/failed writer ever parks again.
+    // Caller holds queue_mu_; failed_ already latched.
+    void death_drain_locked() {
+        while (!queue_.empty()) {
+            QueueItem it = std::move(queue_.front());
+            queue_.pop_front();
+            if (it.batch) it.batch->failed = true;
+            if (it.command) { it.command->ok = false; it.command->terminal = true; }
+        }
+        queue_bytes_ = 0;
+        done_cv_.notify_all();
+        queue_cv_.notify_all();   // space-waiters wake and see failed_/stop
+    }
+
+    // v29 M5: the writer thread — the WAL's single I/O owner. The loop is
+    // total-catch: NOTHING escapes to std::terminate silently; a failure
+    // latches failed_, terminal-fails the current drain AND the rest of the
+    // queue (death drain), and parks. The loop exits only on stop with an
+    // empty queue (clean close drains everything first).
+    void writer_loop() {
+        std::unique_lock<std::mutex> lk(queue_mu_);
+        while (true) {
+            queue_cv_.wait(lk, [this] { return !queue_.empty() || stop_requested_; });
+            if (queue_.empty()) {
+                if (stop_requested_) break;
+                continue;
+            }
+            if (failed_) { death_drain_locked(); continue; }
+            // The wake seam (successor of wal_leader_elected): between this
+            // point and the prefix cut, producers can still enqueue — the
+            // dst-schedulable window where batch composition is decided.
+            stress_point("wal_writer_wake");
+#ifdef CHRONOKV_TEST_HOOKS
+            // The pre-drain hook runs UNLOCKED — exactly like the legacy
+            // leader's election-window hook: its whole purpose (SRC-E1) is
+            // to hold the executor while PRODUCERS enqueue, so holding
+            // queue_mu_ across it would deadlock the collection window it
+            // exists to open. Same unsynchronized-read discipline as the
+            // legacy hooks: tests arm/disarm around quiescent moments.
+            lk.unlock();
+            if (writer_pre_drain_hook_) writer_pre_drain_hook_();
+            lk.lock();
+            if (queue_.empty()) continue;            // hook-side effects
+            if (failed_) { death_drain_locked(); continue; }
+#endif
+            if (queue_.front().command) {
+                std::shared_ptr<QueueCommand> cmd = queue_.front().command;
+                queue_.pop_front();
+                // Command bodies run UNDER queue_mu_ — the rotation bodies
+                // mutate the same accounting the test accessors read, and
+                // the legacy leg ran them under batch_mu_ with the same
+                // profile (I/O included; producers wait exactly as they
+                // waited behind the leader's rotation).
+                if (cmd->kind == QueueCommand::ROTATE)
+                    cmd->ok = rotate_after_checkpoint_impl(cmd->ckpt_ts);
+                cmd->terminal = true;
+                done_cv_.notify_all();
+                if (failed_) death_drain_locked();
+                continue;
+            }
+            // BATCH: drain the maximal same-class prefix (v24-Fix-4's
+            // async-XOR-durable invariant as a drain policy, decision §1.4).
+            // FIFO == cts order (§1.3), so the drain needs NO sort: the
+            // legacy leader's defensive std::sort is subsumed by
+            // construction.
+            const bool cls_async =
+                queue_.front().batch->has_async.load(std::memory_order_relaxed);
+            std::vector<std::shared_ptr<Batch>> drain;
+            while (!queue_.empty() && queue_.front().batch &&
+                   queue_.front().batch->has_async.load(std::memory_order_relaxed) == cls_async) {
+                drain.push_back(std::move(queue_.front().batch));
+                queue_.pop_front();
+            }
+            if (!queue_.empty() && queue_.front().batch &&
+                queue_.front().batch->has_async.load(std::memory_order_relaxed) != cls_async) {
+                i_class_switches.fetch_add(1, std::memory_order_relaxed);
+                // The mixed-durability seam (successor of wal_mixed_handoff;
+                // DST S1's H3-class window re-anchors here per rule 14).
+                stress_point("wal_drain_class_switch");
+            }
+            size_t drained_est = 0, total_records = 0;
+            for (const auto& b : drain)
+                for (const auto& r : b->records) { drained_est += r.second.size(); ++total_records; }
+            queue_bytes_ = (queue_bytes_ > drained_est) ? queue_bytes_ - drained_est : 0;
+            queue_cv_.notify_all();   // space freed: wake blocked producers
+            lk.unlock();
+            run_batch_io(drain, cls_async, total_records);
+            lk.lock();
+            if (failed_) death_drain_locked();   // W-STRAND for the remainder
+        }
+    }
+
+    // v29 M5: one drain's I/O — the stage-for-stage mirror of the legacy
+    // leader's unlocked section (same crash-point names and stage order per
+    // decision WW9: wal_batch_framed / wal_after_write / wal_after_fsync /
+    // wal_before_rollback / wal_before_state_flip; same io_uring chain and
+    // offset-pinned pwrite fallback; same CKV-004 stage-gated rollback with
+    // the SRC-B zero-fill neutralization; same diagnostics dual-write).
+    // Runs with NO lock held except the scoped queue_mu_ windows that
+    // mirror the legacy leader's batch_mu_ windows (rotation check,
+    // `written` publication, state flip).
+    void run_batch_io(std::vector<std::shared_ptr<Batch>>& drain,
+                      bool cls_async, size_t total_records) {
+        bool io_ok = true;
+        bool writer_threw = false;
+        bool write_published = false;     // CKV-004's `written` gate input
+        bool seg_bytes_rollback = false;
+        off_t batch_start = 0;
+        size_t batch_bytes = 0;
+        uint64_t base_lsn = 0;
+
+        try {
+            {
+                std::lock_guard<std::mutex> qlk(queue_mu_);
+                // Rotate if full BEFORE writing (a batch is always fully
+                // contained in one segment) — the legacy leader's position.
+                maybe_rotate_segment();
+                if (failed_) throw std::runtime_error("segment rotation failed");
+            }
+            diag::wal_batches.fetch_add(1, std::memory_order_relaxed);
+            i_wal_batches.fetch_add(1, std::memory_order_relaxed);
+            i_drains.fetch_add(1, std::memory_order_relaxed);   // M5 diag: one drain == one durability I/O unit
+
+            batch_start = lseek(active_fd_, 0, SEEK_END);
+            base_lsn = lsn_.fetch_add(total_records, std::memory_order_relaxed) + 1;
+
+            // Concatenate every drained record's frame into ONE buffer, in
+            // queue order == cts order == LSN order (FIFO-structural; the
+            // legacy defensive sort is subsumed — decision §1.3).
+            std::vector<uint8_t> batch_buf;
+            uint64_t lsn = base_lsn;
+            for (const auto& b : drain) {
+                for (const auto& r : b->records) {
+                    auto frame = wal_frame(wal_prepend_lsn(lsn++, r.second));
+                    batch_buf.insert(batch_buf.end(), frame.begin(), frame.end());
+                    batch_bytes += frame.size();
+                }
+            }
+
+            CKV_CRASH_POINT("wal_batch_framed");
+#ifdef CHRONOKV_TEST_HOOKS
+            // C1b's successor seam: an exception with NO lock held, mid-I/O
+            // (the class the old bare-`throw;`-outside-handler turned into
+            // std::terminate). Set to a lambda that throws.
+            if (writer_io_throw_hook_) writer_io_throw_hook_();
+#endif
+            bool used_iouring = false;
+            if (iouring_ && iouring_->available()) {
+                int wsub = iouring_->submit_write(active_fd_, batch_buf.data(),
+                                                  batch_buf.size(), batch_start, 1);
+                int fsub = (wsub >= 0) ? iouring_->submit_fsync(active_fd_, 2) : -1;
+                if (wsub < 0 || fsub < 0) {
+                    iouring_->discard_pending();
+                    iouring_->drain_cqes();
+                }
+                if (cqe_wait_hook_) cqe_wait_hook_();
+                if (leader_timed_out_.load(std::memory_order_acquire)) {
+                    used_iouring = false;
+                    iouring_->discard_pending();
+                } else {
+                    int ret = iouring_->enter_with_timeout(2, 2, 500);
+                    if (ret > 0) {
+                        int res1 = -1, res2 = -1, ud1 = 0, ud2 = 0;
+                        iouring_->pop_cqe(&res1, &ud1);
+                        iouring_->pop_cqe(&res2, &ud2);
+                        if (res1 >= 0 && res2 >= 0 &&
+                            (size_t)(unsigned)res1 >= batch_buf.size()) {
+                            io_ok = true; used_iouring = true;
+                            last_batch_used_iouring_.store(true, std::memory_order_relaxed);
+                        } else {
+                            used_iouring = false;
+                            last_batch_used_iouring_.store(false, std::memory_order_relaxed);
+                            iouring_->drain_cqes();
+                        }
+                        iouring_->note_write_outcome(used_iouring);
+                    } else {
+                        used_iouring = false;
+                        iouring_->drain_cqes();
+                    }
+                }
+            }
+            if (!used_iouring) {
+                if (!chronokv_iouring::pwrite_all(active_fd_, batch_buf.data(),
+                                                  batch_buf.size(), batch_start)) {
+                    io_ok = false;
+                    diag::wal_write_fails.fetch_add(1, std::memory_order_relaxed);
+                    i_wal_write_fails.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+
+            CKV_CRASH_POINT("wal_after_write");
+            {
+                // Publish `written` for the WHOLE drain before the fsync
+                // runs — the async silent-loss contract's stage semantics,
+                // identical to the legacy leader (CKV-004's gate reads it).
+                std::lock_guard<std::mutex> qlk(queue_mu_);
+                if (io_ok) {
+                    write_published = true;
+                    for (auto& b : drain) b->written.store(true, std::memory_order_release);
+                    done_cv_.notify_all();
+                }
+            }
+
+            if (io_ok && used_iouring) {
+                // v26 M1 carried verbatim: the io_uring chain ran its own
+                // FSYNC op, so honour EVERY fsync fault kind here (a
+                // non-FsyncFail kind must not be silently inert on modern
+                // kernels); one charge max via || short-circuit.
+#ifdef CHRONOKV_FAULT_INJECTION
+                if (fault::fire(fault::Kind::FsyncFail) ||
+                    fault::fire(fault::Kind::FsyncFailAfterPersist)) {
+                    io_ok = false;
+                    diag::wal_fsync_fails.fetch_add(1, std::memory_order_relaxed);
+                    i_wal_fsync_fails.fetch_add(1, std::memory_order_relaxed);
+                }
+#endif
+            } else if (io_ok && !checked_fsync(active_fd_)) {
+                io_ok = false;
+                diag::wal_fsync_fails.fetch_add(1, std::memory_order_relaxed);
+                i_wal_fsync_fails.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            CKV_CRASH_POINT("wal_after_fsync");
+            if (io_ok) {
+                diag::wal_records.fetch_add(total_records, std::memory_order_relaxed);
+                i_wal_records.fetch_add(total_records, std::memory_order_relaxed);
+                diag::wal_bytes.fetch_add(batch_bytes, std::memory_order_relaxed);
+                i_wal_bytes.fetch_add(batch_bytes, std::memory_order_relaxed);
+                diag::wal_fsyncs.fetch_add(1, std::memory_order_relaxed);
+                i_wal_fsyncs.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            CKV_CRASH_POINT("wal_before_rollback");
+            if (!io_ok && batch_start >= 0) {
+                // CKV-004 (invariant D2), carried verbatim: gate the
+                // rollback on the failure STAGE, not the durability class.
+                // `write_published && cls_async` is exactly the set of cases
+                // in which some caller may have ACKED this drain — the only
+                // case where truncation would violate the documented
+                // silent-loss contract. Drains are single-class by the
+                // prefix policy, so the whole-drain debit is exact.
+                if (write_published && cls_async) {
+                    diag::async_committed_then_lost.fetch_add(total_records,
+                                                              std::memory_order_relaxed);
+                    i_async_lost.fetch_add(total_records, std::memory_order_relaxed);
+                } else {
+                    diag::wal_truncations.fetch_add(1, std::memory_order_relaxed);
+                    i_wal_truncations.fetch_add(1, std::memory_order_relaxed);
+                    int trc;
+#ifdef CHRONOKV_FAULT_INJECTION
+                    if (fault::fire(fault::Kind::TruncateFail)) { trc = -1; errno = EIO; }
+                    else
+#endif
+                    trc = ftruncate(active_fd_, batch_start);
+                    if (trc != 0) {
+                        diag::wal_truncate_fails.fetch_add(1, std::memory_order_relaxed);
+                        i_wal_truncate_fails.fetch_add(1, std::memory_order_relaxed);
+                        rollback_indeterminate_.store(true, std::memory_order_release);   // SRC-B opt.4
+                        std::cerr << "WARNING: ftruncate failed after WAL durability "
+                                     "failure (errno=" << errno << ") — non-durable "
+                                     "record may persist in the WAL file\n";
+                        // SRC-B ZERO-FILL NEUTRALIZATION — the legacy
+                        // leader's block carried over stage-for-stage
+                        // (maintainer decision 2026-10-10; zeros-at-EOF
+                        // classify TORN_TAIL and the tested repair
+                        // truncates them; interior zeros before surviving
+                        // CRC-valid frames classify CORRUPT and refuse the
+                        // open loudly — SRC-E4's operator-repair WARNING).
+                        // Best-effort, fail harmless: no throw out of this
+                        // path; failed_ latches below either way (D3).
+                        bool fill_ok = true;
+                        size_t zeroed_bytes = 0;   // SRC-E4: actually-landed count
+                        try {
+                            static constexpr size_t kZeroChunk = 64u * 1024u;
+#ifdef CHRONOKV_TEST_HOOKS
+                            chronokv_iouring::wal_zerofill_pwrite_attempts_for_test().store(0);
+                            chronokv_iouring::wal_zerofill_nth_fired_for_test().store(false);
+                            chronokv_iouring::wal_zerofill_short_fired_for_test().store(false);
+                            chronokv_iouring::wal_zerofill_last_run_for_test() =
+                                chronokv_iouring::WalZeroFillRun{
+                                    seg_path(active_id_), static_cast<int64_t>(batch_start),
+                                    static_cast<int64_t>(batch_bytes), 0, false, false};
+#endif
+                            const size_t zlen = batch_bytes < kZeroChunk ? batch_bytes : kZeroChunk;
+                            const std::string zeros(zlen, '\0');
+                            const size_t fill_extent = batch_bytes;   // FULL attempted extent
+                            size_t fill_done = 0;
+                            while (fill_done < fill_extent) {
+                                const size_t n = (fill_extent - fill_done) < kZeroChunk
+                                                      ? (fill_extent - fill_done) : kZeroChunk;
+                                size_t w = 0;
+                                while (w < n) {
+#ifdef CHRONOKV_TEST_HOOKS
+                                    chronokv_iouring::wal_zerofill_pwrite_attempts_for_test()
+                                        .fetch_add(1, std::memory_order_relaxed);
+                                    if (chronokv_iouring::wal_zerofill_fail_write_for_test().exchange(false)) {
+                                        errno = EIO; fill_ok = false; break;
+                                    }
+                                    {   // SRC-E4: fail the N-th fill pwrite ATTEMPT
+                                        auto& nth = chronokv_iouring::wal_zerofill_fail_pwrite_nth_for_test();
+                                        if (nth.load(std::memory_order_relaxed) > 0 &&
+                                            nth.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                                            chronokv_iouring::wal_zerofill_nth_fired_for_test()
+                                                .store(true, std::memory_order_relaxed);
+                                            errno = EIO; fill_ok = false; break;
+                                        }
+                                    }
+                                    if (chronokv_iouring::wal_zerofill_short_write_for_test().exchange(false)) {
+                                        // SRC-E4: GENUINE short write — half the remaining
+                                        // chunk bytes (min 1) actually land on disk; the
+                                        // loop must CONTINUE, not fail.
+                                        chronokv_iouring::wal_zerofill_short_fired_for_test()
+                                            .store(true, std::memory_order_relaxed);
+                                        const size_t half = (n - w) / 2;
+                                        const size_t wn = half ? half : 1u;
+                                        const ssize_t ks = ::pwrite(active_fd_, zeros.data() + w, wn,
+                                                                    static_cast<off_t>(batch_start + fill_done + w));
+                                        if (ks < 0) {
+                                            if (errno == EINTR) continue;
+                                            fill_ok = false; break;
+                                        }
+                                        if (ks == 0) { errno = EIO; fill_ok = false; break; }
+                                        w += static_cast<size_t>(ks);
+                                        zeroed_bytes += static_cast<size_t>(ks);
+                                        continue;
+                                    }
+#endif
+                                    const ssize_t k = ::pwrite(active_fd_, zeros.data() + w, n - w,
+                                                               static_cast<off_t>(batch_start + fill_done + w));
+                                    if (k < 0) {
+                                        if (errno == EINTR) continue;    // interrupted: retry
+                                        fill_ok = false; break;          // device/fs refused
+                                    }
+                                    if (k == 0) { errno = EIO; fill_ok = false; break; }
+                                    w += static_cast<size_t>(k);         // short write: continue
+                                    zeroed_bytes += static_cast<size_t>(k);
+                                }
+                                if (!fill_ok) break;
+                                fill_done += n;
+                            }
+                        } catch (...) { fill_ok = false; }   // allocation failure: harmless, flag stays
+                        bool sync_ok = false;
+                        if (fill_ok) {
+#ifdef CHRONOKV_TEST_HOOKS
+                            if (chronokv_iouring::wal_zerofill_fail_sync_for_test().exchange(false)) {
+                                errno = EIO;
+                            } else
+#endif
+                            sync_ok = (::fdatasync(active_fd_) == 0);
+                        }
+#ifdef CHRONOKV_TEST_HOOKS
+                        {   // SRC-E4: finalize the run record.
+                            auto& zf = chronokv_iouring::wal_zerofill_last_run_for_test();
+                            zf.zeroed = static_cast<int64_t>(zeroed_bytes);
+                            zf.fill_ok = fill_ok;
+                            zf.sync_ok = sync_ok;
+                        }
+#endif
+                        if (fill_ok && sync_ok) {
+                            rollback_indeterminate_.store(false, std::memory_order_release);
+                            std::cerr << "NOTE: rollback zero-fill neutralized the rejected batch ("
+                                      << batch_bytes << " bytes at offset " << batch_start
+                                      << "); recovery will repair it as a torn tail\n";
+                        } else {
+                            std::cerr << "WARNING: rollback zero-fill INCOMPLETE (fill=" << fill_ok
+                                      << " fdatasync=" << sync_ok << " errno=" << errno << "; "
+                                      << zeroed_bytes << " of " << batch_bytes << " bytes zeroed"
+                                      << " at offset " << batch_start << " of " << seg_path(active_id_)
+                                      << ") — rollback-indeterminate stays set; the rejected "
+                                         "batch's surviving frames may persist, and the WAL may "
+                                         "refuse to open (interior-CORRUPT) until the segment is "
+                                         "manually truncated to offset "
+                                      << batch_start << " (README D2 repair procedure)\n";
+                        }
+                    } else {
+                        // v26 M0, invariant D2: make the ROLLBACK durable —
+                        // ftruncate alone lives in the page cache and a
+                        // power loss could resurrect the failed batch.
+                        if (!checked_fsync(active_fd_)) {
+                            diag::wal_truncate_fails.fetch_add(1, std::memory_order_relaxed);
+                            i_wal_truncate_fails.fetch_add(1, std::memory_order_relaxed);
+                            rollback_indeterminate_.store(true, std::memory_order_release);   // SRC-B opt.4
+                            std::cerr << "FATAL: could not make the WAL rollback "
+                                         "truncation durable (errno=" << errno
+                                      << ") — the failed batch may resurrect "
+                                         "after a crash; instance is failing "
+                                         "stop\n";
+                        }
+                        // v26 M0 drift correction (v25.7 review note 2):
+                        // applied under queue_mu_ in the state-flip section.
+                        if (batch_start >= 0)
+                            seg_bytes_rollback = true;
+                    }
+                }
+            }
+        } catch (...) {
+            try { throw; } catch (const std::exception& e) {
+                std::cerr << "WAL writer exception: " << e.what() << "\n";
+            } catch (...) {
+                std::cerr << "WAL writer exception: unknown\n";
+            }
+            writer_threw = true;
+            // W-STRAND: the writer NEVER rethrows (an exception escaping a
+            // thread is std::terminate — a silent process death with
+            // waiters parked). The flip below latches failed_ and
+            // terminal-fails this drain; the loop's death drain covers the
+            // rest of the queue. This is the C1-class contract's
+            // successor: failure is always terminal-for-waiters.
+        }
+
+        CKV_CRASH_POINT("wal_before_state_flip");
+        {
+            std::lock_guard<std::mutex> qlk(queue_mu_);
+            if (writer_threw || !io_ok) {
+                failed_ = true;
+                for (auto& b : drain) b->failed = true;
+                if (seg_bytes_rollback && batch_start >= 0)
+                    active_segment_bytes_ = (size_t)batch_start;
+            } else {
+                for (auto& b : drain) b->done = true;
+                active_segment_bytes_ += batch_bytes;
+            }
+            done_cv_.notify_all();
+            if (writer_threw) {
+                i_writer_deaths.fetch_add(1, std::memory_order_relaxed);
+                death_drain_locked();
+            }
+        }
+        // The state-flip seam (successor of wal_leader_done): cleanup just
+        // ran; the schedule decides who observes the flip first.
+        stress_point("wal_writer_batch_done");
+    }
+
+#endif  // CKV_WAL_LEGACY_LEADER (group_append legs)
+
+
+#ifdef CKV_WAL_LEGACY_LEADER
 bool rotate_after_checkpoint(uint64_t ckpt_ts) {
         std::unique_lock<std::mutex> lk(batch_mu_);
         if (failed_) return false;
@@ -5088,7 +5805,42 @@ bool rotate_after_checkpoint(uint64_t ckpt_ts) {
      // can acquire the exclusive lock while a leader is still in flight.
      batch_cv_.wait(lk, [this] { return !leader_active_ || failed_; });
      if (failed_) return false;
+     return rotate_after_checkpoint_impl(ckpt_ts);
+}
+#else
+// v29 M5 (§1.7): ROTATE rides the queue — FIFO ordering against batches
+// is STRUCTURAL (R-REBASE strengthens from lock-serialized to ordered: a
+// rotation can no longer merely avoid INTERLEAVING with in-flight leader
+// I/O, it can never overtake any batch enqueued before it). The writer
+// executes the shared body under queue_mu_ — the legacy leg's batch_mu_
+// substitution — and terminal-states the command for the waiting
+// checkpoint flow. Caller-side locks (checkpoint_mu_ exclusive, per-key
+// mutexes) are never held BY THE WRITER, so the wait cannot cycle (WW4).
+bool rotate_after_checkpoint(uint64_t ckpt_ts) {
+        auto cmd = std::make_shared<QueueCommand>();
+        cmd->kind = QueueCommand::ROTATE;
+        cmd->ckpt_ts = ckpt_ts;
+        {
+            std::lock_guard<std::mutex> glk(queue_mu_);
+            if (failed_) return false;
+            QueueItem it;
+            it.command = cmd;
+            queue_.push_back(std::move(it));
+        }
+        queue_cv_.notify_one();
+        std::unique_lock<std::mutex> lk(queue_mu_);
+        done_cv_.wait(lk, [&] { return cmd->terminal || failed_ || stop_requested_; });
+        return cmd->ok && !failed_;
+}
+#endif
 
+// The rotation body, shared by BOTH legs (decision §1.7: bodies move
+// without edits). The caller owns serialization and has checked failed_:
+// legacy = batch_mu_ + the v17 quiescence wait above; writer thread =
+// queue_mu_ + FIFO position. Every durability result is checked and
+// fail-stops (v26 M1 / invariant D3); the WAL-3 anchor comment and the
+// SRC-C counted-not-fail-stop final dir-fsync live below, untouched.
+bool rotate_after_checkpoint_impl(uint64_t ckpt_ts) {
         if (active_fd_ >= 0) {
             if (!checked_fsync(active_fd_)) { failed_ = true; return false; }
             if (!checked_close(active_fd_)) { failed_ = true; return false; }
@@ -6446,7 +7198,11 @@ public:
 public:
     explicit ChronoKV(const std::string& wal_dir = "",
                       size_t page_pool_bytes = 256ULL * 1024 * 1024,
-                      bool wal_read_only = false) {
+                      bool wal_read_only = false,
+                      // v29 M5 slice 1: writer-thread queue bounds (0 =
+                      // WalSegments defaults; ignored on the legacy leg).
+                      size_t wal_queue_max_items = 0,
+                      size_t wal_queue_max_bytes = 0) {
          wal_dir_ = wal_dir;
         // v25.1 M1.6: initialize the B+ tree index. Pool size is configurable
         // (default 256 MiB for production; tests pass a smaller size via
@@ -6466,7 +7222,8 @@ public:
         // of wal_ already null-checks (commit_txn, wal_stats, health,
         // checkpoint rotate) or is test-hook-guarded below.
         if (!wal_dir.empty() && !wal_read_only) {
-            wal_ = std::make_unique<WalSegments>(wal_dir);
+            wal_ = std::make_unique<WalSegments>(wal_dir, wal_queue_max_items,
+                                                 wal_queue_max_bytes);
             // v24 FIX (Group 2, Fix 5): seed clock_ from existing WAL
             // contents so the first commit doesn't reserve cts=1 and
             // collide with existing records. This is unconditional
@@ -6510,7 +7267,9 @@ public:
         return WalInstanceStats{w.batches, w.records, w.bytes, w.fsyncs,
                                 w.write_fails, w.fsync_fails, w.truncations,
                                 w.truncate_fails, w.async_lost,
-                                w.pub_allocated_max};
+                                w.pub_allocated_max,
+                                w.queue_high_water, w.backpressure_waits,
+                                w.class_switches, w.drains, w.writer_deaths};
     }
     EpochInstanceStats epoch_stats() const {
         auto e = phantom_tracker_.epoch_stats();
@@ -6973,6 +7732,23 @@ public:
          std::lock_guard<std::mutex> lk(gc_active_mu_);
          gc_once();
      }
+
+#ifdef CHRONOKV_TEST_HOOKS
+     // v29 M5 slice-1 controls (W3): arm the WAL executor's pre-drain park
+     // seam from the ENGINE level — the raw-ChronoKV scenarios (S1's
+     // vehicle shape) have no Database forwarder. Dispatches to the live
+     // leg's hook (writer_pre_drain_hook_ / leader_pre_drain_hook_): same
+     // seam, same collection window, rule-14 note at the Database
+     // forwarders.
+     void set_wal_pre_drain_hook_for_test(std::function<void()> fn) {
+         if (!wal_) return;
+#ifdef CKV_WAL_LEGACY_LEADER
+         wal_->leader_pre_drain_hook_ = std::move(fn);
+#else
+         wal_->writer_pre_drain_hook_ = std::move(fn);
+#endif
+     }
+#endif
 
      void start_gc() {
         // v20.1 BLOCKER #12: idempotent — assigning a new std::thread over a
@@ -9891,6 +10667,20 @@ struct Options {
     // still holds future records would collide on cts at the next
     // recovery). Requires recover_on_open = true.
     uint64_t pitr_as_of_cts = 0;
+    // v29 M5 slice 1 (WAL writer thread; decision doc
+    // docs/audits/2026-10-20-m5-wal-writer-thread-decision.md §1.3): bounds
+    // of the writer thread's MPSC work queue. Producers assure space
+    // BEFORE reserving their cts (backpressure can never orphan a
+    // reservation), so these are admission knobs, not failure knobs: a
+    // full queue blocks committers exactly where a busy leader blocks
+    // them today. 0 selects the built-in defaults (4096 items / 32 MiB of
+    // serialized record bytes, admitted with a conservative pre-
+    // serialization estimate — a bounded overshoot of one max-size record
+    // is possible and documented). Ignored by the CKV_WAL_LEGACY_LEADER
+    // build (the legacy leader path's pending_ is unbounded, as it has
+    // always been).
+    size_t wal_queue_max_items = 0;
+    size_t wal_queue_max_bytes = 0;
 };
 
 // ---- Forward declarations ---------------------------------------------
@@ -9902,6 +10692,12 @@ struct WalStats {
     uint64_t batches = 0, records = 0, bytes = 0, fsyncs = 0,
              write_fails = 0, fsync_fails = 0, truncations = 0,
              truncate_fails = 0, async_lost = 0, pub_allocated_max = 0;
+    // v29 M5 slice 1 (decision §10.3): writer-thread diagnostics. Zero on
+    // the CKV_WAL_LEGACY_LEADER build. `batches` counts I/O drains on the
+    // writer-thread path (the legacy leader's flush count — same meaning:
+    // one durability I/O unit), so arena comparisons stay apples-to-apples.
+    uint64_t queue_high_water = 0, backpressure_waits = 0,
+             class_switches = 0, drains = 0, writer_deaths = 0;
 };
 struct GcStats {
     uint64_t created = 0, retired = 0, reclaimed = 0, retired_pending = 0,
@@ -10009,7 +10805,9 @@ public:
             // no lock file, no writer flock, no torn-tail repair. Replay is
             // read-only (recover_all); writes/checkpoints are refused.
             engine = std::make_shared<ChronoKV>(opts.wal_dir, opts.page_pool_bytes,
-                                                /*wal_read_only=*/opts.pitr_as_of_cts != 0);
+                                                /*wal_read_only=*/opts.pitr_as_of_cts != 0,
+                                                opts.wal_queue_max_items,
+                                                opts.wal_queue_max_bytes);
         } catch (const std::exception& e) {
             throw LifecycleError(std::string("cannot open database: ") + e.what());
         }
@@ -10395,7 +11193,9 @@ public:
         auto w = eng->wal_stats();
         return WalStats{w.batches, w.records, w.bytes, w.fsyncs,
                         w.write_fails, w.fsync_fails, w.truncations,
-                        w.truncate_fails, w.async_lost, w.pub_allocated_max};
+                        w.truncate_fails, w.async_lost, w.pub_allocated_max,
+                        w.queue_high_water, w.backpressure_waits,
+                        w.class_switches, w.drains, w.writer_deaths};
     }
     GcStats gc_stats() const {
         auto eng = api_engine();
@@ -10473,20 +11273,42 @@ public:
         auto eng = api_engine();
         return eng->wal_ && eng->wal_->rollback_indeterminate();
     }
+#ifdef CKV_WAL_LEGACY_LEADER
     bool wal_leader_active_for_test() {
         auto eng = api_engine();
         return eng->wal_ ? eng->wal_->leader_active_for_test() : false;
     }
+#endif
+    // v29 M5 (rule-14 re-anchor, decision doc §11): the Database-level
+    // NAMES are the stable test surface; the seam they arm moved. On the
+    // writer-thread path "post-unlock" is structurally every I/O moment
+    // (the writer holds no lock across I/O), so the injection point is
+    // writer_io_throw_hook_; on the legacy leg it stays the leader's
+    // post-unlock window. Same injection class, same controls, cited at
+    // each battery.
     void set_leader_post_unlock_hook_for_test(std::function<void()> fn) {
         auto eng = api_engine();
-        if (eng->wal_) eng->wal_->leader_post_unlock_hook_ = std::move(fn);
+        if (!eng->wal_) return;
+#ifdef CKV_WAL_LEGACY_LEADER
+        eng->wal_->leader_post_unlock_hook_ = std::move(fn);
+#else
+        eng->wal_->writer_io_throw_hook_ = std::move(fn);
+#endif
     }
-    // SRC-E1: pause the elected leader before it drains pending_, so N
-    // concurrent committers deterministically collect into ONE batch
-    // (mirrors leader_post_unlock_hook_; see WalSegments::leader_pre_drain_hook_).
+    // SRC-E1: pause the WAL's I/O executor before it drains the queue, so
+    // N concurrent committers deterministically collect into ONE drain
+    // (legacy: the elected leader before pending_; v29 M5: the writer
+    // thread after wake, before the drain-prefix cut — the collection
+    // window is the same shape, which is why the SRC-E battery needs no
+    // edits beyond this forwarder).
     void set_leader_pre_drain_hook_for_test(std::function<void()> fn) {
         auto eng = api_engine();
-        if (eng->wal_) eng->wal_->leader_pre_drain_hook_ = std::move(fn);
+        if (!eng->wal_) return;
+#ifdef CKV_WAL_LEGACY_LEADER
+        eng->wal_->leader_pre_drain_hook_ = std::move(fn);
+#else
+        eng->wal_->writer_pre_drain_hook_ = std::move(fn);
+#endif
     }
 #ifdef CHRONOKV_TEST_HOOKS
     // v28 (CKV-003c): see ChronoKV::ckpt_dirty_capture_hook_.

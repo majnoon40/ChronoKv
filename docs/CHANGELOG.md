@@ -7,6 +7,78 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **feat (v29 M5 slice 1, 2026-10-22): the WAL writer thread is LIVE —
+  the leader/follower handshake is deleted on the default path, and the
+  C1/H3 defect class is structurally unreachable.** One dedicated thread
+  per `WalSegments` now owns EVERY WAL file mutation; committers are
+  producers on a BOUNDED MPSC queue (`Options::wal_queue_max_items` /
+  `wal_queue_max_bytes`, defaults 4096 / 32 MiB). `leader_active_`, the
+  shared `cur_batch_` mutation, the election loop and the `pending_` FIFO
+  exist only under `CKV_WAL_LEGACY_LEADER` — the compile-flag lifeboat the
+  roadmap prescribes for exactly one release (deletion is a later
+  dedicated commit gated on the full-matrix re-run). The reservation
+  window moved WHOLESALE to the producer under `queue_mu_` (failed_-gate
+  → cts reserve → `on_reserve` v17-closure → `wal_ser` → enqueue in ONE
+  critical section): EXTRA-1's latch fires at the same point in the same
+  order (latch under the mutex, burn via `on_abandon`, rethrow for
+  commit_txn's WalFailure + idempotent CKV-012R), and CKV-012's
+  window-end is now the enqueue — from there the writer OR its
+  death-drain owes every item a terminal state (**new invariant
+  W-STRAND**: writer failure is terminal-for-waiters, never silent; the
+  loop is total-catch, no rethrow — an escaping thread exception would be
+  `std::terminate` with waiters parked). Space is admitted BEFORE the
+  reservation, so backpressure can never orphan a cts, and cts-order ==
+  enqueue-order == drain-order == WAL-offset-order is STRUCTURAL — the
+  leader's defensive sort is subsumed and the triple identity
+  (cts == WAL == phantom order) holds by construction, re-proven by the
+  full matrix per the acceptance leg. v24-Fix-4's async-XOR-durable
+  invariant became the writer's maximal-same-class-prefix DRAIN POLICY,
+  so CKV-004's stage-gated rollback and the SRC-B zero-fill carry with
+  ZERO policy edits; `written` still publishes before the fsync (the
+  async silent-loss contract and D2's truncation gate keep their exact
+  stage semantics). `rotate_after_checkpoint` rides the queue as a FIFO
+  ROTATE command — R-REBASE strengthens from lock-serialized to
+  ORDER-structural (a rotation can never overake a batch enqueued before
+  it); the rotation bodies moved without edits, and
+  `maybe_rotate_segment`/H1/`last_ckpt_ts_` are untouched. Close is
+  drain-then-stop-then-JOIN before any fd closes (clean close finishes
+  durable I/O for everything queued; thread-outlives-fds is
+  unrepresentable). Diagnostics: `wal_stats()` gains queue_high_water /
+  backpressure_waits / class_switches / drains / writer_deaths (0 by
+  contract outside controls); seams `wal_writer_wake`,
+  `wal_drain_class_switch`, `wal_writer_batch_done`, `wal_enqueue_full`
+  succeed `wal_leader_elected` / `wal_mixed_handoff` / `wal_leader_done`
+  for the dst scheduler (S1/S2 re-anchored by comment per rule 14 —
+  their oracles are seam-agnostic and bind BOTH legs); the five `wal_*`
+  crash points keep their names and stage order (WW9), so crash-fuzz
+  plans replay unchanged. Test surface: the Database hook NAMES are
+  stable (`set_leader_pre_drain_hook_for_test` now arms the writer's
+  pre-drain park — SRC-E1's collection window is the same shape, which
+  is why the SRC-E battery needed zero edits; rule-14 notes at the
+  forwarders), C1a re-anchored per leg (legacy: `leader_active_` reset;
+  new: W-STRAND no-strand put), and `CKV_ONLY_M5=1` replays the new
+  battery. MEASURED (single-build directive; the recorded 1 GiB vehicle,
+  `-O0 --param ggc-min-expand=5`, g++ 12.2.0; io_uring BLOCKED in this
+  sandbox so every I/O leg ran the offset-pinned pwrite fallback — CI
+  exercises the ring paths): **new leg 620/0, legacy leg 612/0** (620 −
+  13 m5 controls + 5 legacy skip-lines; base 607 at f797b97d), both ALL
+  TESTS PASSED rc 0; -Wconversion ratchet 33 → 33 on BOTH legs; the m5
+  battery (W1–W5) caught one real defect on its first run — `drains` was
+  never incremented (W3 reddened alone, `switches=1 drains=0`, commits
+  unaffected) — fixed before the suite run, recorded per rule 9. NOT in
+  this slice (decision doc §8): the io_uring SINGLE_ISSUER/DEFER_TASKRUN
+  rungs + SQPOLL flag + adaptive linger (slice 2), the arena after-tables
+  and the 8/16/32-committer sweep (slice 3 — the before-column is the
+  banked 2026-10-17 calibration: fillseq ~0.20×, fillrandom ~0.27×,
+  ycsb_a ~0.38×, overwrite ~0.41×), and the legacy deletion (matrix-cited,
+  next release boundary). RECORDED FINDING (decision §1.11, no change):
+  Sync and Group durability are mechanical ALIASES at this commit — both
+  `need_fsync` per drained batch; M5 preserves the alias exactly and §12.4
+  owns whether to ever split them. Mutants recorded-not-executed per the
+  directive (NO-DEATH-DRAIN→W2 strands, NO-WRITER-CATCH→terminate,
+  RESERVE-BEFORE-SPACE→W4's pub_allocated_max oracle, NO-CLASS-PREFIX→W3,
+  SKIP-ROTATE-CMD→R-REBASE probes; each named against its block in the
+  battery header). Version stays 0.28.1 (arc-boundary pattern).
 - **ci (v29 M1 step 4, arena split):** the nightly ledger vehicle is now
   TWO parallel jobs — `arena-chronokv` (group + async legs; 90-min timeout
   sized from run #65's measured 44m01s, ~2x headroom) and `arena-baselines`

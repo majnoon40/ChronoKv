@@ -1,8 +1,10 @@
 # M5 WAL writer thread: the rewrite decision
 
 **Date:** 2026-10-20
-**Status:** DRAFT — DECIDED pending the maintainer's answers to §12 (open
-questions). This is the decide-before-build document the v29 M5 milestone
+**Status:** DECIDED — **slice 1 LANDED 2026-10-22** (the writer-thread
+rewrite behind `CKV_WAL_LEGACY_LEADER`, both legs green: new 620/0,
+legacy 612/0; §14 records the landing, the one battery-caught defect, and
+the §12 dispositions). Slices 2–3 and the deletion commit remain ahead. This is the decide-before-build document the v29 M5 milestone
 gets by the arc's standing process (M3's HP4/ABA doc and M4's merge-
 protocol doc are the precedents; M5 is the arc's largest DELETION and the
 house rule for those is the plan's own sentence: "the code stops existing;
@@ -412,7 +414,9 @@ THREAD.
 
 ## 8. Slice plan
 
-* **Slice 1 [L] — the rewrite, behind the flag.** Queue + writer thread
+* **Slice 1 [L] — the rewrite, behind the flag. LANDED 2026-10-22 —
+  measured in §14; every listed control shipped (W1–W5 + the re-anchored
+  C1a/SRC-E/S1/S2), both legs green.** Queue + writer thread
   + producer path + W-STRAND + ROTATE command + seam/hook/crash-point
   mapping (§11) + `CKV_WAL_LEGACY_LEADER` + controls: writer-death
   battery (kill/throw/park seams; bounded WalFailure; no-hang),
@@ -551,3 +555,70 @@ the chain loudly (never silently skips — the chain's continuity IS the
 number published. The self-hosted runner (true continuous 7 days) and
 the offline rig (which v30 M3's dm-flakey power-loss work needs anyway)
 are recorded as the upgrades, not the blockers.
+
+---
+
+## 14. Slice-1 landing postscript (2026-10-22; measured, per rule 9)
+
+**Landed shape.** All thirteen decisions shipped as written. Both legs
+green on the recorded 1 GiB vehicle (`-O0 --param ggc-min-expand=5`,
+g++ 12.2.0): **new path (default) 620/0**, **legacy leg
+(`CKV_WAL_LEGACY_LEADER`) 612/0** — the exact predicted relation (620 −
+13 m5 controls + 5 legacy skip-lines; base 607 at `f797b97d`). The
+legacy leg is the lifeboat proof: the UNMOVED leader-era suites —
+including C1a's original `leader_active_` assertion and the SRC-E
+zero-fill battery running through the re-anchored pre-drain forwarder —
+pass without edits. -Wconversion ratchet: 33 → 33 on BOTH legs.
+Sandbox note, recorded honestly: io_uring I/O ops are BLOCKED in this
+sandbox (the banner says so), so every local I/O leg ran the
+offset-pinned pwrite fallback; the ring paths (chain, CQE, LINK_TIMEOUT,
+registered buffers) are exercised by CI's modern-kernel runners exactly
+as before — the wrapper itself is untouched by this slice.
+
+**The battery caught one real defect on its first run** (rule 9,
+recorded not hidden): `drains` was never incremented — W3 reddened ALONE
+(`switches=1 drains=0`, both commits still Committed, records intact —
+a diagnostics-wiring bug, not a durability bug, and the isolation is
+exactly what the control was shaped for). Fixed before the suite run.
+
+**What the controls proved locally** (W1–W5, all deterministic via the
+parked-writer seams): writer death surfaces as WalFailure with the D3
+fail-stop latched, `writer_deaths == 1`, later writes failing FAST at
+the gate, reads of durable data working, health level 2, and recovery
+exact (rejected batch absent, acked baseline present); three parked
+waiters all RETURN WalFailure/Failed under a killed writer (the
+no-strand contract, bounded — the leak-and-detach path exists but did
+not fire); mixed async/group queues drain by class prefix
+(`class_switches ≥ 1`, `drains ≥ 2`, both classes read back); a
+queue-full producer holds NO cts while blocked (`pub_allocated_max == 1`
+— the RESERVE-BEFORE-SPACE mutant's exact oracle) and both commits then
+complete in cts order; close racing an in-flight put lands in exactly
+one documented outcome with the on-disk state matching the ack.
+
+**§12 dispositions at slice 1.** (1) Arena/soak vehicle: still OPEN —
+§13's recommendation stands, slice 3 needs it. (2) SQPOLL: slice 2 per
+plan. (3) Queue bounds: SHIPPED at 4096 / 32 MiB as `Options` fields
+(0 = default). (4) Sync≡Group alias: PRESERVED exactly; the finding is
+recorded in §1.11, the CHANGELOG, and the README durability text is
+left for the §12.4 decision (do not edit the table without commissioning
+the semantic split). (5) Flag name `CKV_WAL_LEGACY_LEADER` CONFIRMED in
+code + the CI matrix leg; the sunset is the deletion commit at the next
+release boundary, gated on the full-matrix re-run (DST + crash-fuzz +
+fault matrix on the new path — CI's stress/tsan/asan/crashfuzz/dst jobs
+are the vehicles; the local runs above are release-only).
+
+**Fork discipline, recorded at the code** (a design point the draft
+left implicit): the writer thread joins the GC thread's documented
+contract — forked children construct their OWN engine ("only the
+forking thread survives fork()"); every fork site in the suite already
+does this (crash-fuzz `child_body` included), so no `pthread_atfork`
+machinery exists or is needed, and the WalSegments comment says so.
+
+**Mutants remain recorded-not-executed** under the standing single-build
+directive (the battery header names each one's exact co-flip block:
+NO-DEATH-DRAIN→W2, NO-WRITER-CATCH→W1/W2 terminate, RESERVE-BEFORE-
+SPACE→W4, NO-CLASS-PREFIX→W3, SKIP-ROTATE-CMD→R-REBASE probes). The
+fail-first REDs against a pre-M5 scratch tree are owed the same way M4's
+were, with the same structural caveat: W4's `pub_allocated_max == 1`
+oracle and W2's bounded-return oracle cannot pass against code that
+lacks the mechanism they measure.
