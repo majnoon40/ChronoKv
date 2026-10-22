@@ -531,6 +531,15 @@ jobs:
           # it with the same margin as 3,125 did).
           CKV_DST_SEED: ${{ fromJSON('[911, 1000914, 2001817, 3002720, 4003623, 5004526, 6005429, 7006332]')[matrix.shard] }}
           CKV_DST_SEEDS: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '100' || '2083' }}
+          # v29 M5-era (2026-10-22, measured — see the DEADLINE_MS comment
+          # in tests_dst.cpp): the 10-22 nightly hung 4/2083 S5 seeds at
+          # the 20s wall on a degraded node (same sha+seeds green on
+          # 10-21; two hangs were pre-rendezvous ops=0 starvation shapes;
+          # local replay of all three reported seeds passes on both legs
+          # with 5-20x margin). The nightly gets a 3x margin; PR/push stay
+          # at the calibrated 20s. A true strand hangs at any deadline —
+          # this widens the noise gap, not the bar.
+          CKV_DST_DEADLINE_MS: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '20000' || '60000' }}
         run: |
           set -o pipefail
           ./build/stress/test 2>&1 | tee dst-seeds-shard${{ matrix.shard }}.log

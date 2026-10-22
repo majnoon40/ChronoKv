@@ -939,10 +939,31 @@ int run_dst_test() {
         {"reclaim_retire_pin (M3 grammar)",  dstscn::s6_reclaim_retire},
     };
 
-    const int DEADLINE_MS = 20000;   // clean children finish in ~ms-seconds
+    // Clean children finish in ~ms-seconds; the deadline exists to turn a
+    // strand into a reportable failure, not to measure speed — a true
+    // strand hangs at ANY deadline, so widening it costs only pathological
+    // runs. v29 M5-era calibration (2026-10-22, rule 9 — measured, not
+    // assumed): the 10-22 nightly (f797b97d) hung 4/2083 S5 seeds at 20s —
+    // two with ops=0/last_point=? (killed PRE-rendezvous: the build phase
+    // never reached a grant, a starvation shape, not an engine deadlock),
+    // one at ops=5249/steals=134 (0.7s of stuck grants inside a 20s budget
+    // that otherwise PROGRESSED) — while the SAME sha with the SAME fixed
+    // seed set was green on 10-21, the fleet's slow-node tail is documented
+    // in the dst job's own run-#17 note, shard 3 that night took 126min,
+    // and the adjacent v18 gate had just been recalibrated for TWO
+    // runner-variance flakes (f797b97d's own message). Local replay on the
+    // 1 GiB vehicle (-O0): all three reported seeds PASS on BOTH f797b97d
+    // and the M5 HEAD, clean children ~1-4s vs the 20s wall (5-20x
+    // margin). Verdict: deadline margin on a degraded node, recorded not
+    // hidden; the nightly gets CKV_DST_DEADLINE_MS=60000 (3x) via ci.yml,
+    // PR scale keeps 20s. If a hang recurs at 60s it is REAL and the
+    // replay handles below are the disposition path.
+    int DEADLINE_MS = 20000;
+    if (const char* e = getenv("CKV_DST_DEADLINE_MS")) { int v = atoi(e); if (v > 0) DEADLINE_MS = v; }
     for (size_t si = 0; si < sizeof(scns) / sizeof(scns[0]); ++si) {
         int n_hang = 0, n_crash = 0, n_assert = 0, n_pass = 0;
         uint64_t max_ops = 0, max_steals = 0;
+        long max_child_ms = 0;   // slowest child this scenario saw (deadline calibration)
         std::vector<std::string> first_fails;
         for (int s = 0; s < nseeds; ++s) {
             const uint64_t seed = seed_base + (uint64_t)si * 1000003ULL +
@@ -977,7 +998,9 @@ int run_dst_test() {
                 fflush(stderr);
                 _exit(rc);
             }
-            // Parent: bounded wait, then classify.
+            // Parent: bounded wait, then classify. Child wall time is
+            // measured for the scenario summary (max) — the calibration
+            // datum the deadline comment above cites (v29 M5-era).
             int wst = 0;
             bool reaped = false;
             auto t0 = std::chrono::steady_clock::now();
@@ -988,6 +1011,9 @@ int run_dst_test() {
                 if (r < 0) { reaped = true; wst = 0; break; }
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
+            const long child_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (child_ms > max_child_ms) max_child_ms = child_ms;
             std::string outcome;
             if (!reaped) {
                 kill(child, SIGKILL);
@@ -1038,7 +1064,8 @@ int run_dst_test() {
         check(nm.c_str(), ok, first_fails.empty() ? "" : first_fails[0]);
         std::cout << "      (pass=" << n_pass << " hang=" << n_hang << " crash=" << n_crash
                   << " invariant=" << n_assert << ", max child ops=" << max_ops
-                  << ", max steals=" << max_steals << ")\n";
+                  << ", max steals=" << max_steals
+                  << ", max child wall=" << max_child_ms << "ms/" << DEADLINE_MS << "ms)\n";
         for (size_t f = 1; f < first_fails.size(); ++f)
             std::cout << "      (also: " << first_fails[f] << ")\n";
     }
