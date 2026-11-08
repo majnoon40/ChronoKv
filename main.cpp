@@ -11044,6 +11044,26 @@ static int run_m5_slice3_test() {
         o.wal_dir = wd;
         o.durability = DurabilityMode::Group;
         o.auto_start_gc = false;
+// The header ALWAYS defines CKV_UNDER_SANITIZER (0 on release builds —
+// its auto-detect is #ifndef-wrapped), so the branch tests the VALUE.
+#if CKV_UNDER_SANITIZER
+        // v29 M5 slice-3 follow-up 2 (ci run #145 vs a local TSan build):
+        // at the DEFAULT 50us budget, instrumentation stretches the
+        // sequential committer's serialized ack->next-enqueue prep past
+        // the window (run #145, both tsan legs: spins=399 hits=0 at 1
+        // committer, while the same runs' H5 @4/@16 cells hit 514/710 —
+        // the arrival counter works, the GAP is what instrumentation
+        // stretches ~10x). The witness is budget-RELATIVE — a spin that
+        // sees the arrival inside whatever budget is set — so the budget
+        // scales 10x under instrumentation and the STRICT oracle survives
+        // (measured under a real TSan build, 3 runs: spins=399
+        // hits=396/396/396 at 500us — the same 399 idle transitions that
+        // hit 0 at the default). The mutant control keeps its teeth at
+        // ANY budget (hot-idle-ignores-arrivals hits 0 forever), and the
+        // DEFAULT-knob shape stays owned by H3 (knob 0 = off) and H4
+        // (read-only untaxed).
+        o.wal_writer_hot_idle_us = 500;
+#endif
         auto db = std::make_unique<Database>(Database::open(o));
         constexpr int OPS = 400;
         for (int i = 0; i < OPS; ++i)
@@ -11051,32 +11071,20 @@ static int run_m5_slice3_test() {
         const auto st = db->wal_stats();
         const uint64_t spins = st.hot_spins_taken, hits = st.hot_spin_hits;
         // A sequential committer's inter-enqueue gap after an ack is
-        // CPU-prep-sized (~10-25us on the dev box, comparable on CI), so
-        // MOST idle transitions after the first few should hit. The bound
-        // is deliberately loose on the hits side (runner scheduling can
-        // stretch the gap past the 50us budget on a loaded machine) but
-        // strict on "the mechanism fired at all": spins > 0 always, and
-        // hits > 0 except under sanitizer instrumentation — TSan stretches
-        // the committer's serialized CPU prep past any sane budget by
-        // 5-10x (CI run #145's tsan legs, both compilers: spins=399
-        // hits=0 at 1 committer, while @4/@16 hit 514/710 — the arrival
-        // counter works, the GAP is what instrumentation stretches; the
-        // recorded not-a-defect, per the bounded-budget design). Release
-        // builds keep the strict oracle (252/256 = 98% locally).
-// The header ALWAYS defines CKV_UNDER_SANITIZER (0 on release builds —
-// its auto-detect is #ifndef-wrapped), so the branch tests the VALUE.
-#if CKV_UNDER_SANITIZER
-        check("m5s3 H1: default on — sequential committer spins (hits recorded; sanitizer build)",
-              spins > 0,
-              "spins=" + std::to_string(spins) + " hits=" + std::to_string(hits) +
-                  " (sanitizer build: the prep gap outruns the budget BY DESIGN — "
-                  "the counter is witnessed by H5's multi-committer cells)");
-#else
+        // CPU-prep-sized (~10-25us on the dev box, comparable on CI; ~10x
+        // that under sanitizer instrumentation — hence the scaled budget
+        // above, which keeps the witness strict on EVERY leg), so MOST
+        // idle transitions after the first few should hit (release
+        // builds: 252/256 = 98% locally; TSan at the scaled budget:
+        // 396/399). The bound is deliberately loose on the hits side
+        // (runner scheduling can stretch the gap past the budget on a
+        // loaded machine) but strict on "the mechanism fired at all":
+        // spins > 0 AND hits > 0.
         check("m5s3 H1: default on — sequential committer takes spins and hits",
               spins > 0 && hits > 0,
               "spins=" + std::to_string(spins) + " hits=" + std::to_string(hits) +
+                  " budget=" + std::to_string(o.wal_writer_hot_idle_us) + "us" +
                   " (a hot-idle-ignores-arrivals mutant hits 0 forever)");
-#endif
         db.reset();
         std::filesystem::remove_all(wd);
     }
