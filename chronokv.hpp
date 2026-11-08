@@ -3980,8 +3980,25 @@ class WalSegments {
     // Used by the io_uring state-machine tests to exercise the submit →
     // wait → success/failure/timeout → fallback/skip paths without real
     // kernel io_uring (which is blocked by seccomp on this VM).
+    // v29 M5 slice 2 (run #141 fix): on the new path the swap takes
+    // queue_mu_ — the writer's lazy ring init (writer_loop, under the
+    // same lock) and this inject are now mutually exclusive, so the
+    // mock can never be overwritten by a late-scheduled writer building
+    // the real ring (measured on CI: thread START lags open() by
+    // milliseconds on loaded runners; the unlock-both-sides race was
+    // run #141's iouring-fail/timeout red). The drain-time READ of
+    // iouring_ stays outside the lock by design (the unlocked I/O
+    // section) — injects remain bound by the pre-existing
+    // quiescent-moments discipline for that window, exactly as on the
+    // legacy leg.
     void inject_iouring_for_test(std::unique_ptr<chronokv_iouring::IoUring> mock) {
+#ifndef CKV_WAL_LEGACY_LEADER
+        std::lock_guard<std::mutex> lk(queue_mu_);
         iouring_ = std::move(mock);
+        queue_cv_.notify_all();   // idle writer: re-check on next wake
+#else
+        iouring_ = std::move(mock);
+#endif
     }
     // Test-only: check if the last batch used io_uring (skipped sync fsync).
     std::atomic<bool> last_batch_used_iouring_{false};
@@ -5670,24 +5687,26 @@ public:
     // queue (death drain), and parks. The loop exits only on stop with an
     // empty queue (clean close drains everything first).
     void writer_loop() {
+        std::unique_lock<std::mutex> lk(queue_mu_);
 #ifndef CKV_WAL_LEGACY_LEADER
-        // v29 M5 slice 2 (CI run #140 fix): the writer-owned ring is
-        // created HERE — on the writer thread — so creator == submitter ==
-        // enterer (DEFER_TASKRUN's GETEVENTS constraint names the CREATOR;
-        // SINGLE_ISSUER latches the first submitter; the open thread
-        // satisfying neither was the run-#140 defect). The mock-injection
-        // contract is preserved in both orderings: a test that injects
-        // before the writer gets here finds its mock in place (the check
-        // is !iouring_) and no ring is built; the common case (inject
-        // after open) replaces the ring this built, exactly as it did
-        // when construction was ctor-time — the unsynchronized-inject
-        // quiescence discipline is the pre-existing one.
+        // v29 M5 slice 2 (CI runs #140/#141 fix): the writer-owned ring is
+        // created HERE — on the writer thread, UNDER queue_mu_ — so (a)
+        // creator == submitter == enterer: DEFER_TASKRUN's GETEVENTS
+        // constraint names the CREATOR and SINGLE_ISSUER latches the first
+        // submitter (a ring built on the open thread failed every writer
+        // enter on 6.8 kernels — run #140), and (b) the creation is
+        // mutually exclusive with inject_iouring_for_test (same lock), so
+        // a mock injected right after open can never be overwritten by a
+        // late-scheduled writer (thread START lags open() by milliseconds
+        // on loaded runners — run #141). Both orderings are correct:
+        // inject-first leaves the mock in place (the check is !iouring_);
+        // init-first gets replaced by the inject exactly as ctor-time
+        // construction always was.
         if (!iouring_) {
             iouring_ = std::make_unique<chronokv_iouring::IoUring>(
                 chronokv_iouring::IssuerMode::WriterThread);
         }
 #endif
-        std::unique_lock<std::mutex> lk(queue_mu_);
         while (true) {
 #ifdef CHRONOKV_STRESS
             // v29 M5 slice-1 DST fix: going idle WITH THE BATON is the
