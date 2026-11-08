@@ -2822,6 +2822,43 @@ constexpr unsigned CKV_SQE_HARDLINK    = 1u << 3;  // IOSQE_IO_HARDLINK (5.5+)
 #ifndef IORING_SETUP_COOP_TASKRUN
 #define IORING_SETUP_COOP_TASKRUN (1U << 8)    // 5.19+
 #endif
+// v29 M5 slice 2 (decision §8): the writer-thread rungs. Values are
+// frozen uapi (io_uring.h); #ifndef fallbacks keep the header compiling
+// against pre-5.19/pre-6.1 distro headers exactly like COOP_TASKRUN
+// above. Legality (the decision's own argument, restated where it binds):
+// SINGLE_ISSUER (5.19+) is a HINT that one task submits — true by
+// construction post-M5 (the writer thread is the ring's only submitter
+// AND only io_uring_enter caller; construction-time buffer registration
+// and close-time teardown are register/close syscalls, not submissions).
+// DEFER_TASKRUN (6.1+) REQUIRES SINGLE_ISSUER and enforces that
+// io_uring_enter is called from the submitting thread — the writer is
+// the sole enter caller, so the constraint is structural. Both rungs
+// are armed ONLY for the writer-owned ring (IssuerMode::WriterThread):
+// the legacy leader/follower leg submits and enters from ARBITRARY
+// committer threads, where SINGLE_ISSUER would be a lie and the second
+// committer's DEFER_TASKRUN enter would fail (the always-correct pwrite
+// fallback would silently eat the ring — a behavior change on the
+// lifeboat leg, not acceptable silently). SQPOLL (5.1+) spawns a kernel
+// polling thread; unprivileged since 5.12 with reduced capabilities —
+// it is env-probed (CKV_WAL_SQPOLL=1) and DEFAULT-OFF pending the
+// slice-3 arena measurement (the roadmap gates it there). Under SQPOLL
+// the kernel clears SINGLE_ISSUER (a kernel thread submits), so the
+// SQPOLL rung is exclusive with the issuer rungs by construction.
+#ifndef IORING_SETUP_SINGLE_ISSUER
+#define IORING_SETUP_SINGLE_ISSUER (1U << 12)   // 5.19+
+#endif
+#ifndef IORING_SETUP_DEFER_TASKRUN
+#define IORING_SETUP_DEFER_TASKRUN (1U << 13)   // 6.1+; requires SINGLE_ISSUER
+#endif
+#ifndef IORING_SETUP_SQPOLL
+#define IORING_SETUP_SQPOLL (1U << 2)           // 5.1+
+#endif
+#ifndef IORING_SQ_NEED_WAKEUP
+#define IORING_SQ_NEED_WAKEUP (1U << 0)         // sq-ring flags, 5.1+
+#endif
+#ifndef IORING_ENTER_SQ_WAKEUP
+#define IORING_ENTER_SQ_WAKEUP (1U << 1)        // 5.1+
+#endif
 #ifndef IORING_FSYNC_DATASYNC
 #define IORING_FSYNC_DATASYNC (1U << 0)        // 5.1+
 #endif
@@ -2833,13 +2870,27 @@ struct CkvTimespec { long long tv_sec; long long tv_nsec; };
 // Documented CQE-wait deadline for one WAL durability batch (ms).
 constexpr unsigned kDefaultDeadlineMs = 500;
 
+// v29 M5 slice 2: who is allowed to submit SQEs / call io_uring_enter on
+// this ring. Shared = the pre-M5 shape (any committer thread may lead a
+// batch — the legacy lifeboat leg and the default for mock/test rings):
+// the SINGLE_ISSUER/DEFER_TASKRUN rungs stay OFF. WriterThread = the
+// post-M5 shape: one dedicated thread owns every submission and every
+// enter (see the flag-block legality argument above) — the new rungs are
+// armed, each degrading independently at setup time.
+enum class IssuerMode { Shared, WriterThread };
+
 class IoUring {
 public:
-    IoUring() : ring_fd_(-1), available_(false) {
+    explicit IoUring(IssuerMode mode = IssuerMode::Shared)
+        : ring_fd_(-1), available_(false), issuer_mode_(mode) {
         // v25.2: see the section header for the full feature ladder.
         // Every step degrades independently at runtime; if the ring
         // cannot be created at all, available_ stays false and
         // WalSegments uses the sync pwrite+fsync fallback.
+        //
+        // v29 M5 slice 2: the ladder's TOP grew the issuer rungs for
+        // WriterThread rings (and an SQPOLL probe rung behind the env
+        // knob) — see the flag-block comment for the legality argument.
         //
         // To re-enable the container workaround (seccomp blocks io_uring
         // I/O ops with EPERM), define CKV_IOURING_DISABLED.
@@ -3061,6 +3112,12 @@ protected:
 
     // v25.2 runtime feature flags (see the section header comment).
     bool coop_taskrun_ = false;   // IORING_SETUP_COOP_TASKRUN active
+    // v29 M5 slice 2: the issuer rungs (WriterThread rings only — see the
+    // flag-block legality argument) and the SQPOLL probe result.
+    bool single_issuer_ = false;  // IORING_SETUP_SINGLE_ISSUER active (5.19+)
+    bool defer_taskrun_ = false;  // IORING_SETUP_DEFER_TASKRUN active (6.1+)
+    bool sqpoll_ = false;         // IORING_SETUP_SQPOLL active (env-probed)
+    IssuerMode issuer_mode_ = IssuerMode::Shared;
     bool fixed_buf_ = false;      // registered bounce buffer active
     bool fixed_files_ = false;    // registered file slot 0 active
     // v28 CKV-013: identity of the file currently occupying slot 0. The fd
@@ -3098,6 +3155,7 @@ protected:
     unsigned *sq_tail_ = nullptr;
     unsigned *sq_mask_ = nullptr;
     unsigned *sq_array_ = nullptr;
+    unsigned *sq_flags_ = nullptr;   // v29 M5 slice 2: SQPOLL NEED_WAKEUP check
 
     unsigned *cq_head_ = nullptr;
     unsigned *cq_tail_ = nullptr;
@@ -3124,20 +3182,56 @@ private:
     static constexpr unsigned kRingEntries = 64;
     static constexpr unsigned kCqEntries   = 128;
 
-    // Setup ladder: COOP_TASKRUN|CQSIZE -> CQSIZE -> plain -> unavailable.
+    // v29 M5 slice 2: SQPOLL is requested via CKV_WAL_SQPOLL=1 (probe +
+    // enable, DEFAULT OFF — slice 3's arena measurement owns the default
+    // decision; the roadmap gates SQPOLL on "worth its kernel thread").
+    // WriterThread rings only: the legacy leg's multi-task enter pattern
+    // would need the NEED_WAKEUP dance from arbitrary threads, which is
+    // complexity without a measurement to justify it.
+    static bool sqpoll_requested() {
+        const char* e = getenv("CKV_WAL_SQPOLL");
+        return e && e[0] == '1';
+    }
+
+    // Setup ladder (v29 M5 slice 2, decision §8):
+    //   WriterThread rings, SQPOLL env-probed:
+    //     CQSIZE|SQPOLL -> (falls through on EPERM/EINVAL/pre-5.12-priv)
+    //   WriterThread rings (unconditional):
+    //     CQSIZE|SINGLE_ISSUER|DEFER_TASKRUN (6.1+)
+    //      -> CQSIZE|SINGLE_ISSUER|COOP_TASKRUN (5.19+)
+    //   both legs (today's ladder, unchanged):
+    //     CQSIZE|COOP_TASKRUN -> CQSIZE -> plain -> unavailable.
     // Returns 0 on success (available_ = true), -1 otherwise.
     int setup_ring() {
-        struct { unsigned flags; bool coop; } attempts[] = {
-            { IORING_SETUP_CQSIZE | IORING_SETUP_COOP_TASKRUN, true  },
-            { IORING_SETUP_CQSIZE,                             false },
-            { 0,                                               false },
-        };
-        for (const auto& a : attempts) {
+        struct Rung { unsigned flags; bool coop, si, dtr, sqp; };
+        Rung attempts[6];
+        int n = 0;
+        const bool writer_owned = (issuer_mode_ == IssuerMode::WriterThread);
+        if (writer_owned && sqpoll_requested())
+            attempts[n++] = { IORING_SETUP_CQSIZE | IORING_SETUP_SQPOLL,
+                              false, false, false, true };
+        if (writer_owned) {
+            attempts[n++] = { IORING_SETUP_CQSIZE | IORING_SETUP_SINGLE_ISSUER
+                              | IORING_SETUP_DEFER_TASKRUN, false, true, true, false };
+            attempts[n++] = { IORING_SETUP_CQSIZE | IORING_SETUP_SINGLE_ISSUER
+                              | IORING_SETUP_COOP_TASKRUN, true, true, false, false };
+        }
+        attempts[n++] = { IORING_SETUP_CQSIZE | IORING_SETUP_COOP_TASKRUN, true, false, false, false };
+        attempts[n++] = { IORING_SETUP_CQSIZE, false, false, false, false };
+        attempts[n++] = { 0, false, false, false, false };
+        for (int i = 0; i < n; ++i) {
             memset(&params_, 0, sizeof(params_));
-            params_.flags = a.flags;
-            if (a.flags & IORING_SETUP_CQSIZE) params_.cq_entries = kCqEntries;
+            params_.flags = attempts[i].flags;
+            if (attempts[i].flags & IORING_SETUP_CQSIZE) params_.cq_entries = kCqEntries;
+            if (attempts[i].sqp) params_.sq_thread_idle = 2000;  // ms; slice 3 owns the tuning
             ring_fd_ = syscall(__NR_io_uring_setup, kRingEntries, &params_);
-            if (ring_fd_ >= 0) { coop_taskrun_ = a.coop; break; }
+            if (ring_fd_ >= 0) {
+                coop_taskrun_  = attempts[i].coop;
+                single_issuer_ = attempts[i].si;
+                defer_taskrun_ = attempts[i].dtr;
+                sqpoll_        = attempts[i].sqp;
+                break;
+            }
         }
         if (ring_fd_ < 0) return -1;
 
@@ -3160,6 +3254,7 @@ private:
         sq_tail_ = (unsigned*)((char*)sq_mmap_ + params_.sq_off.tail);
         sq_mask_ = (unsigned*)((char*)sq_mmap_ + params_.sq_off.ring_mask);
         sq_array_ = (unsigned*)((char*)sq_mmap_ + params_.sq_off.array);
+        sq_flags_ = (unsigned*)((char*)sq_mmap_ + params_.sq_off.flags);   // v29 M5 slice 2: SQPOLL
 
         cq_head_ = (unsigned*)((char*)cq_mmap_ + params_.cq_off.head);
         cq_tail_ = (unsigned*)((char*)cq_mmap_ + params_.cq_off.tail);
@@ -3324,6 +3419,29 @@ private:
         (void)to_submit;      // the kernel consumes every appended SQE
         (void)min_complete;   // see above — pending_sqes_ is authoritative
         int phys = (int)pending_sqes_;
+        // v29 M5 slice 2: under SQPOLL the kernel polling thread consumes
+        // the SQ ring — this task never passes to_submit. It only (a) wakes
+        // the poller when it slept (sq flags NEED_WAKEUP; the documented
+        // SQPOLL contract) and (b) waits for the batch's CQEs, which is
+        // still an io_uring_enter from the writer thread (the sole enter
+        // caller, unchanged).
+        if (sqpoll_) {
+            unsigned wake = 0;
+            if (phys > 0 &&
+                (__atomic_load_n(sq_flags_, __ATOMIC_ACQUIRE) & IORING_SQ_NEED_WAKEUP))
+                wake = IORING_ENTER_SQ_WAKEUP;
+            int ret = 0;
+            do {
+                // lint: explicit narrow (the ratchet counts the two
+                // pre-existing long->int syscall assignments; this one
+                // must not add a 34th).
+                ret = (int)syscall(__NR_io_uring_enter, ring_fd_, 0, phys,
+                                   flags | IORING_ENTER_GETEVENTS | wake, NULL, 0);
+            } while (ret < 0 && errno == EINTR);
+            pending_sqes_ = 0;
+            pending_sentinels_ = 0;
+            return ret;
+        }
         int ret = 0;
         do {
             ret = syscall(__NR_io_uring_enter, ring_fd_, phys, phys,
@@ -3340,6 +3458,12 @@ private:
         d += " cq=";
         d += std::to_string((int)params_.cq_entries);
         d += coop_taskrun_ ? " coop_taskrun=1" : " coop_taskrun=0";
+        // v29 M5 slice 2: the ladder's new rungs in the banner (checklist
+        // item 5 — a silent ladder regression is a visible diff, and the
+        // slice-2 suite check parses these fields so it is a RED diff too).
+        d += single_issuer_ ? " single_issuer=1" : " single_issuer=0";
+        d += defer_taskrun_ ? " defer_taskrun=1" : " defer_taskrun=0";
+        d += sqpoll_ ? " sqpoll=1" : " sqpoll=0";
         if (fixed_buf_) {
             d += " fixed_buf=";
             d += std::to_string((unsigned)(bounce_sz_ / 1024));
@@ -3647,6 +3771,8 @@ struct WalInstanceStats {
     // v29 M5 slice 1: writer-thread diagnostics (zero on the legacy leg).
     uint64_t queue_high_water = 0, backpressure_waits = 0,
              class_switches = 0, drains = 0, writer_deaths = 0;
+    // v29 M5 slice 2 (decision §1.10): adaptive-linger diagnostics.
+    uint64_t lingers_taken = 0, linger_us_total = 0;
 };
 struct EpochInstanceStats { uint64_t entries, oldest, newest; };
 struct GcInstanceStats {
@@ -3784,6 +3910,19 @@ class WalSegments {
     // M5 diagnostics (wal_stats face; single-writer = the producer/writer
     // under queue_mu_, atomics for lock-free reads like the v20 M1 set).
     std::atomic<uint64_t> i_queue_high_water{0};
+    // v29 M5 slice 2 (decision §1.10): adaptive-linger state — writer-
+    // exclusive plain state (like lsn_/active_segment_bytes_): only the
+    // writer thread touches it. lingers_taken/linger_us_total are the
+    // diagnostics face (wal_stats + the arena's latency attribution);
+    // drain_ema_ is the evidence gate's "previous drains averaged >= 2
+    // records" — an EWMA (weight 1/4) so a burst of fat drains opens the
+    // gate within a few batches and a sustained single-record workload
+    // closes it again. Seeded 0: a cold start never lingers (the gate
+    // opens only on evidence, never on hope).
+    uint32_t linger_cap_us_ = 0;      // 0 = OFF (default; R-2)
+    float    drain_ema_ = 0.0f;
+    std::atomic<uint64_t> i_lingers_taken{0};
+    std::atomic<uint64_t> i_linger_us_total{0};
     std::atomic<uint64_t> i_backpressure_waits{0};
     std::atomic<uint64_t> i_class_switches{0};
     std::atomic<uint64_t> i_drains{0};
@@ -3951,6 +4090,11 @@ public:
         // writer_deaths reads 0 outside the W-STRAND controls BY CONTRACT.
         uint64_t queue_high_water = 0, backpressure_waits = 0,
                  class_switches = 0, drains = 0, writer_deaths = 0;
+        // v29 M5 slice 2 (decision §1.10): linger diagnostics — the arena
+        // reads these to attribute latency (a batch-fill win must show up
+        // as lingers_taken>0 with drains growing fatter, never as a p99
+        // tax on the gap case).
+        uint64_t lingers_taken = 0, linger_us_total = 0;
     };
     WalStats wal_stats() const {
         WalStats s{
@@ -3970,6 +4114,8 @@ public:
         s.class_switches     = i_class_switches.load(std::memory_order_relaxed);
         s.drains             = i_drains.load(std::memory_order_relaxed);
         s.writer_deaths      = i_writer_deaths.load(std::memory_order_relaxed);
+        s.lingers_taken      = i_lingers_taken.load(std::memory_order_relaxed);
+        s.linger_us_total    = i_linger_us_total.load(std::memory_order_relaxed);
 #endif
         return s;
     }
@@ -4434,12 +4580,20 @@ public:
     // has always been and ignores them).
     explicit WalSegments(const std::string& dir,
                          size_t queue_max_items = 0,
-                         size_t queue_max_bytes = 0) : dir_(dir) {
+                         size_t queue_max_bytes = 0,
+                         // v29 M5 slice 2 (decision §1.10): adaptive-linger
+                         // cap in MICROSECONDS; 0 = the feature is OFF
+                         // (the default — R-2: a badly-tuned linger taxes
+                         // single-committer p99, so the cap starts at zero
+                         // and slice 3's arena owns the enable decision).
+                         uint32_t linger_cap_us = 0) : dir_(dir) {
 #ifndef CKV_WAL_LEGACY_LEADER
         if (queue_max_items) queue_max_items_ = queue_max_items;
         if (queue_max_bytes) queue_max_bytes_ = queue_max_bytes;
+        linger_cap_us_ = linger_cap_us;
 #else
         (void)queue_max_items; (void)queue_max_bytes;
+        (void)linger_cap_us;   // the legacy leader has no linger by design
 #endif
         // v28 review-F2: create wal_dir RECURSIVELY, and fail with the real
         // cause. The old single-level ::mkdir (return ignored) could not
@@ -4517,7 +4671,19 @@ public:
         // Item 6 fix: resume lsn_ from the existing segment so we don't reset to 0
         if (!failed_) {
             // v25.1 M2 Phase 2: initialize io_uring for WAL writes.
+            // v29 M5 slice 2: the ring is WRITER-OWNED on the new path —
+            // the only shape in which the SINGLE_ISSUER/DEFER_TASKRUN
+            // rungs are legal (the writer is the sole submitter AND the
+            // sole io_uring_enter caller; see the chronokv_iouring flag
+            // block for the full argument). The legacy leg keeps the
+            // Shared ladder verbatim — committers submit and enter from
+            // arbitrary threads there.
+#ifndef CKV_WAL_LEGACY_LEADER
+            iouring_ = std::make_unique<chronokv_iouring::IoUring>(
+                chronokv_iouring::IssuerMode::WriterThread);
+#else
             iouring_ = std::make_unique<chronokv_iouring::IoUring>();
+#endif
             // If io_uring is unavailable, the leader path falls back to
             // sync pwrite+fsync (transparent to callers).
             uint64_t max_lsn = [&]() -> uint64_t {
@@ -5447,6 +5613,48 @@ public:
         queue_cv_.notify_all();   // space-waiters wake and see failed_/stop
     }
 
+    // v29 M5 slice 2 (decision §1.10): the adaptive linger — a bounded
+    // wait for MORE same-class arrivals at the wake seam, taken only when
+    // recent history pays for it. Reading of the decision's clauses,
+    // stated because "never delays a drain that would empty the queue"
+    // admits interpretations: (a) OFF while failed_/stop_requested_ — the
+    // wait's predicate re-checks BOTH, so a stop arriving mid-linger ends
+    // it immediately (the linger-ignores-stop mutant's close-latency
+    // control exists to keep that true); (b) never before a ROTATE
+    // command — rotation is checkpoint-ordered work, not batching
+    // material; (c) the evidence gate — cap>0 AND (queue already >= 2 OR
+    // drain_ema_ >= 2.0): a cold or single-committer workload (drains of
+    // 1, EMA < 2) NEVER lingers, so the gap case's p99 is untaxed (R-2);
+    // (d) bounded by the cap and ended by the FIRST new arrival — the
+    // drain itself always runs, so nothing that would drain is withheld;
+    // the linger only decides whether items arriving within the cap join
+    // THIS drain or the next one. Suppressed while the dst controller is
+    // armed: a timed real-cv wait is a baton-held block (the exact shape
+    // the steal-storm fix removed from this loop), and linger is a
+    // latency/batching KNOB, not a correctness seam — scenarios gain
+    // nothing from exercising it and would pay steals for it.
+    void maybe_linger(std::unique_lock<std::mutex>& lk) {
+        if (linger_cap_us_ == 0 || failed_ || stop_requested_ || queue_.empty())
+            return;
+        if (queue_.front().command) return;               // ROTATE drains now
+        if (queue_.size() < 2 && drain_ema_ < 2.0f) return; // evidence gate (R-2)
+#ifdef CHRONOKV_STRESS
+        if (dst::is_armed()) return;   // baton discipline: no timed waits armed
+#endif
+        const size_t depth_at_wake = queue_.size();
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto deadline = t0 + std::chrono::microseconds(linger_cap_us_);
+        queue_cv_.wait_until(lk, deadline, [&] {
+            return stop_requested_ || failed_ || queue_.size() > depth_at_wake;
+        });
+        const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        i_lingers_taken.fetch_add(1, std::memory_order_relaxed);
+        if (waited > 0)
+            i_linger_us_total.fetch_add((uint64_t)waited, std::memory_order_relaxed);
+    }
+
+
     // v29 M5: the writer thread — the WAL's single I/O owner. The loop is
     // total-catch: NOTHING escapes to std::terminate silently; a failure
     // latches failed_, terminal-fails the current drain AND the rest of the
@@ -5517,6 +5725,11 @@ public:
             if (queue_.empty()) continue;            // hook-side effects
             if (failed_) { death_drain_locked(); continue; }
 #endif
+            // v29 M5 slice 2 (decision §1.10): the adaptive linger sits at
+            // the wake seam — after the hook's collection window, before
+            // the prefix cut — so what it waits for is exactly "more
+            // producers joining this batch".
+            maybe_linger(lk);
             if (queue_.front().command) {
                 std::shared_ptr<QueueCommand> cmd = queue_.front().command;
                 queue_.pop_front();
@@ -5604,6 +5817,11 @@ public:
             diag::wal_batches.fetch_add(1, std::memory_order_relaxed);
             i_wal_batches.fetch_add(1, std::memory_order_relaxed);
             i_drains.fetch_add(1, std::memory_order_relaxed);   // M5 diag: one drain == one durability I/O unit
+            // v29 M5 slice 2: the evidence gate's input — records per
+            // drain, EWMA-weighted (see the member's header). Writer-
+            // exclusive state, updated at the only site that knows the
+            // drain's size.
+            drain_ema_ = 0.75f * drain_ema_ + 0.25f * (float)total_records;
 
             batch_start = lseek(active_fd_, 0, SEEK_END);
             base_lsn = lsn_.fetch_add(total_records, std::memory_order_relaxed) + 1;
@@ -7336,7 +7554,10 @@ public:
                       // v29 M5 slice 1: writer-thread queue bounds (0 =
                       // WalSegments defaults; ignored on the legacy leg).
                       size_t wal_queue_max_items = 0,
-                      size_t wal_queue_max_bytes = 0) {
+                      size_t wal_queue_max_bytes = 0,
+                      // v29 M5 slice 2: adaptive-linger cap, microseconds
+                      // (0 = OFF, the default; ignored on the legacy leg).
+                      uint32_t wal_linger_cap_us = 0) {
          wal_dir_ = wal_dir;
         // v25.1 M1.6: initialize the B+ tree index. Pool size is configurable
         // (default 256 MiB for production; tests pass a smaller size via
@@ -7357,7 +7578,8 @@ public:
         // checkpoint rotate) or is test-hook-guarded below.
         if (!wal_dir.empty() && !wal_read_only) {
             wal_ = std::make_unique<WalSegments>(wal_dir, wal_queue_max_items,
-                                                 wal_queue_max_bytes);
+                                                 wal_queue_max_bytes,
+                                                 wal_linger_cap_us);
             // v24 FIX (Group 2, Fix 5): seed clock_ from existing WAL
             // contents so the first commit doesn't reserve cts=1 and
             // collide with existing records. This is unconditional
@@ -7403,7 +7625,8 @@ public:
                                 w.truncate_fails, w.async_lost,
                                 w.pub_allocated_max,
                                 w.queue_high_water, w.backpressure_waits,
-                                w.class_switches, w.drains, w.writer_deaths};
+                                w.class_switches, w.drains, w.writer_deaths,
+                                w.lingers_taken, w.linger_us_total};
     }
     EpochInstanceStats epoch_stats() const {
         auto e = phantom_tracker_.epoch_stats();
@@ -10815,6 +11038,16 @@ struct Options {
     // always been).
     size_t wal_queue_max_items = 0;
     size_t wal_queue_max_bytes = 0;
+    // v29 M5 slice 2 (decision §1.10): adaptive group-commit linger cap in
+    // MICROSECONDS. 0 (the default) disables the linger entirely — R-2's
+    // "default 0, adaptive gate requires evidence of arrivals": a
+    // badly-tuned linger taxes single-committer p99, so the cap ships off
+    // and slice 3's arena measurement owns the enable decision. When > 0,
+    // the writer may wait up to this long at the wake seam for more
+    // same-class arrivals, and only when the evidence gate (recent drains
+    // averaging >= 2 records, or >= 2 items already queued) pays for it.
+    // Diagnostics: wal_stats().lingers_taken / linger_us_total.
+    uint32_t wal_linger_cap_us = 0;
 };
 
 // ---- Forward declarations ---------------------------------------------
@@ -10832,6 +11065,10 @@ struct WalStats {
     // one durability I/O unit), so arena comparisons stay apples-to-apples.
     uint64_t queue_high_water = 0, backpressure_waits = 0,
              class_switches = 0, drains = 0, writer_deaths = 0;
+    // v29 M5 slice 2 (decision §1.10): adaptive-linger diagnostics (zero
+    // while the cap is 0 — the default — and on the legacy leg). The
+    // arena reads them to attribute batch-fill wins vs gap-case p99.
+    uint64_t lingers_taken = 0, linger_us_total = 0;
 };
 struct GcStats {
     uint64_t created = 0, retired = 0, reclaimed = 0, retired_pending = 0,
@@ -10941,7 +11178,8 @@ public:
             engine = std::make_shared<ChronoKV>(opts.wal_dir, opts.page_pool_bytes,
                                                 /*wal_read_only=*/opts.pitr_as_of_cts != 0,
                                                 opts.wal_queue_max_items,
-                                                opts.wal_queue_max_bytes);
+                                                opts.wal_queue_max_bytes,
+                                                opts.wal_linger_cap_us);
         } catch (const std::exception& e) {
             throw LifecycleError(std::string("cannot open database: ") + e.what());
         }
@@ -11329,7 +11567,8 @@ public:
                         w.write_fails, w.fsync_fails, w.truncations,
                         w.truncate_fails, w.async_lost, w.pub_allocated_max,
                         w.queue_high_water, w.backpressure_waits,
-                        w.class_switches, w.drains, w.writer_deaths};
+                        w.class_switches, w.drains, w.writer_deaths,
+                        w.lingers_taken, w.linger_us_total};
     }
     GcStats gc_stats() const {
         auto eng = api_engine();

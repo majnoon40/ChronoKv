@@ -7,6 +7,73 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **feat (v29 M5 slice 2, 2026-11-08): the ring rungs + the adaptive
+  linger — the writer thread's io_uring grows SINGLE_ISSUER/DEFER_TASKRUN,
+  SQPOLL is probed and stays OFF, and group-commit batching gains an
+  evidence-gated linger that ships disabled.** Three pieces, per the
+  decision doc §8's slice-2 list. (1) **The issuer rungs**: the ring is
+  constructed `IssuerMode::WriterThread` on the new path, which arms two
+  new setup-ladder rungs — `CQSIZE|SINGLE_ISSUER|DEFER_TASKRUN` (6.1+;
+  DEFER_TASKRUN requires SINGLE_ISSUER and enforces same-thread
+  `io_uring_enter`, both true by construction: the writer is the ring's
+  only submitter AND only enter caller; construction-time registration and
+  close-time teardown are register/close syscalls, not submissions) over
+  `CQSIZE|SINGLE_ISSUER|COOP_TASKRUN` (5.19+) over the unchanged
+  three-rung ladder. The LEGACY leg keeps the Shared ladder verbatim —
+  its committers submit and enter from arbitrary threads, where
+  SINGLE_ISSUER would be a lie and the second committer's DEFER_TASKRUN
+  enter would fail, silently eating the ring to the pwrite fallback: a
+  behavior change on the lifeboat leg that nobody asked for. (2)
+  **SQPOLL**: env-probed (`CKV_WAL_SQPOLL=1`), default OFF exactly per
+  the roadmap's "worth its kernel thread" gate — slice 3's arena owns
+  that decision. When probed, the enter path grows the documented
+  NEED_WAKEUP discipline (the kernel polling thread consumes the SQ ring;
+  this task only wakes it when the sq flags say so and waits for the
+  batch's CQEs). `sq_thread_idle=2000` is a placeholder the slice-3
+  measurement may retune. (3) **The adaptive linger** (decision §1.10):
+  `Options::wal_linger_cap_us` (default 0 = OFF — R-2's "default 0,
+  adaptive gate requires evidence of arrivals"; a badly-tuned linger
+  taxes single-committer p99). When on, the writer may wait up to the cap
+  at the wake seam for more same-class arrivals, but only when the
+  evidence gate passes (queue already ≥ 2 items, or a records-per-drain
+  EWMA ≥ 2 — seeded 0, so a cold start never lingers); never while
+  `failed_`/`stop_requested_` (the wait predicate re-checks both), never
+  before a ROTATE command, bounded by the cap, ended by the first new
+  arrival. Suppressed while the dst controller is armed (a timed real-cv
+  wait is a baton-held block — the exact shape the steal-storm fix
+  removed from this loop; the linger is a latency knob, not a
+  correctness seam). Diagnostics: `lingers_taken`/`linger_us_total`
+  through all three stats faces (WalSegments, WalInstanceStats, the
+  public `WalStats`). The feature-summary banner gains
+  `single_issuer=/defer_taskrun=/sqpoll=` (checklist item 5) and the
+  banner probe now constructs the ring in the ENGINE's issuer mode — a
+  Shared probe would print `single_issuer=0` forever and hide the very
+  regression the banner exists to surface. **Controls (L1–L5, in-suite,
+  bounded; `CKV_ONLY_M5=1` now runs W1–W5 + L1–L5)**: L1 ladder fields
+  present (values are platform facts — this 5.10 sandbox reads 0/0/0,
+  CI's ubuntu-24.04 runners read 1/1/0); L2 close-latency honors stop —
+  the linger-ignores-stop mutant control (16 hot committers, 500 ms cap,
+  mid-flight close must finish under 250 ms; the mutant parks the writer
+  a full cap during drain-down); L3 the gap case is untaxed,
+  DETERMINISTICALLY — one sequential committer with the cap ON takes
+  zero lingers (every drain 1 record, gate closed); L4 the default
+  configuration never lingers; L5 the sensitivity record, measured on
+  this sandbox (-O2, 2 cores): @1 committer 256/256 commits, 256
+  single-record drains, 0 lingers; @4 1024/1024 commits, 347 drains
+  (2.9 records/drain), 336 lingers totaling 12.8 ms; @16 4096/4096
+  commits, 678 drains (6.0 records/drain), 640 lingers totaling 43.2 ms,
+  queue high-water 16 — the gate opens exactly where the decision said
+  history pays. Validation: full release, stress (CHRONOKV_STRESS) and
+  legacy (CKV_WAL_LEGACY_LEADER) suites ALL TESTS PASSED locally (the
+  async-benchmark skip via CKV_UNDER_SANITIZER stays a sandbox-only
+  workaround for the 925-thread cap, as recorded in the steal-storm
+  entry); -Wconversion ratchet 33 → 33 (the SQPOLL enter's long→int
+  syscall return is explicitly narrowed — the ratchet counts exactly the
+  two pre-existing occurrences of that pattern); header hygiene
+  (reinclude + 2-TU stress link) green. NOT in this slice (decision §8):
+  the arena after-tables + 8/16/32-committer sweep, the depth-2
+  pipelining and SQPOLL measured decisions, band updates — all slice 3.
+
 - **fix (v29 M5 slice-1 CI acceptance, 2026-11-08): the nightly DST crawl —
   every nightly red or cancelled since run #121, the FIRST post-slice-1 —
   is diagnosed and fixed; the steal storm is gone and the pre-M5 wall-time

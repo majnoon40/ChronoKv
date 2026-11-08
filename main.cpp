@@ -584,6 +584,7 @@ static int run_bt3_visibility_test();        // BT-3 (2026-10-18): split rebuild
 static int run_m3_purge_test();              // v29 M3 slice 3: physical purge controls
 static int run_m4_merge_test();              // v29 M4: leaf merge & rebalance controls (decision doc 2026-10-18)
 static int run_m5_writer_test();             // v29 M5 slice 1: WAL writer-thread / W-STRAND controls (decision doc 2026-10-20)
+static int run_m5_slice2_test();             // v29 M5 slice 2: io_uring issuer rungs + adaptive linger (decision doc 2026-10-20 §8)
 static int run_m2_phase1_test();
 static int run_m2_phase2_test();
 static int run_m2_phase3_test();
@@ -2497,6 +2498,7 @@ return 0;
     if (getenv("CKV_ONLY_M5")) {
         crc_init();
         int f = run_m5_writer_test();
+        f += run_m5_slice2_test();   // v29 M5 slice 2: the ring rungs + linger
         std::cout.flush();
         return f == 0 ? 0 : 1;
     }
@@ -2548,7 +2550,14 @@ return 0;
                   << "  Sync pwrite fallback will be used. Mock tests still run.\n";
 #else
         {
-            chronokv_iouring::IoUring feature_probe;
+            // v29 M5 slice 2: the banner probe uses the ENGINE's issuer
+            // mode (WriterThread) so the rungs it reports are the rungs
+            // the WAL's ring actually got — a Shared probe would print
+            // single_issuer=0 forever, even on 6.1+ kernels, and hide a
+            // ladder regression the checklist item-5 banner exists to
+            // surface.
+            chronokv_iouring::IoUring feature_probe(
+                chronokv_iouring::IssuerMode::WriterThread);
             if (feature_probe.available())
                 std::cout << "  " << feature_probe.describe() << "\n";
             else
@@ -8068,6 +8077,7 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     fails += run_m3_purge_test();
     fails += run_m4_merge_test();
     fails += run_m5_writer_test();
+    fails += run_m5_slice2_test();   // v29 M5 slice 2: ring rungs + adaptive linger
     fails += run_bt3_visibility_test();
     fails += run_m2_phase1_test();
     fails += run_m2_phase2_test();
@@ -10412,6 +10422,9 @@ static int run_m4_merge_test() {
 //   SKIP-ROTATE-CMD (rotate_after_checkpoint bypasses the queue)
 //       -> the checkpoint batteries' R-REBASE ordering probes (H1
 //          regression, m2_phase1) under adversarial scheduling.
+
+// =====================================================================
+// v29 M5 slice 1 — the WAL writer thread / W-STRAND controls.
 // =====================================================================
 static int run_m5_writer_test() {
     using namespace chronokv;
@@ -10743,6 +10756,206 @@ static int run_m5_writer_test() {
 #endif  // CKV_WAL_LEGACY_LEADER
 
     if (fails == 0) std::cout << "   M5 WRITER BATTERY PASSED\n";
+    return fails;
+}
+
+// =====================================================================
+// v29 M5 slice 2 — the ring rungs + the adaptive linger (decision doc
+// 2026-10-20, §8 slice 2; §1.10 linger design). Controls, bounded and
+// in-suite (the arena owns the real measurement, slice 3):
+//   L1  feature-summary ladder fields present — the WriterThread-mode
+//       ring's describe() must carry single_issuer=/defer_taskrun=/
+//       sqpoll= (checklist item 5: a silent ladder regression is a
+//       visible-and-RED diff). Values are platform facts, not verdicts
+//       (pre-5.19 kernels read 0 by design; CI's ubuntu-24.04 runners
+//       read 1/1).
+//   L2  close-latency: the linger honors stop — 16 hot committers, a
+//       500 ms cap, and a mid-flight close must finish far under the
+//       cap. THE MUTANT CONTROL: linger-ignores-stop (maybe_linger's
+//       predicate loses stop_requested_) parks the writer a full cap
+//       during drain-down -> close >= cap -> RED. Healthy close pays
+//       only the remaining drains' fsyncs (ms).
+//   L3  gap-case untaxed (R-2, deterministic): a single sequential
+//       committer with the cap ON takes ZERO lingers — every drain is
+//       one record, the EWMA stays under the gate, the queue never
+//       holds 2. The evidence gate is what keeps single-committer p99
+//       un-taxed, and this is the control that keeps the gate honest.
+//   L4  default off: default Options (cap 0) -> zero lingers.
+//   L5  sensitivity record at 1/4/16 committers with the cap on:
+//       commits OK, wall bounded, batching witnessed (drains < commits
+//       at 16 — 4096 commits through one writer cannot serialize to
+//       1-record drains on any real core count; if this ever flakes,
+//       the message names the diagnostics to read), linger diagnostics
+//       printed for the record.
+// =====================================================================
+static int run_m5_slice2_test() {
+    using namespace chronokv;
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) {
+            ++fails;
+            if (!detail.empty()) std::cout << "      (" << detail << ")\n";
+        }
+    };
+#ifdef CKV_WAL_LEGACY_LEADER
+    check("m5s2 L1: ladder fields in feature summary (skipped — legacy leader leg)", true);
+    check("m5s2 L2: close-latency honors stop (skipped — legacy leader leg)", true);
+    check("m5s2 L3: gap-case untaxed, zero lingers (skipped — legacy leader leg)", true);
+    check("m5s2 L4: default off, zero lingers (skipped — legacy leader leg)", true);
+    check("m5s2 L5: sensitivity record (skipped — legacy leader leg)", true);
+#else
+    // ---- L1: the ladder fields in the WriterThread ring's summary. ----
+    {
+        chronokv_iouring::IoUring probe(chronokv_iouring::IssuerMode::WriterThread);
+        const std::string& d = probe.describe();
+        const bool has_fields = d.find("single_issuer=") != std::string::npos &&
+                                d.find("defer_taskrun=") != std::string::npos &&
+                                d.find("sqpoll=") != std::string::npos;
+        check("m5s2 L1: ladder fields in feature summary (single_issuer/defer_taskrun/sqpoll)",
+              has_fields, d);
+    }
+
+    // ---- L2: close-latency — the linger-ignores-stop mutant control. ----
+    {
+        const std::string wd = "/tmp/m5s2_l2";
+        std::filesystem::remove_all(wd);
+        std::filesystem::create_directories(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.durability = DurabilityMode::Group;
+        o.auto_start_gc = false;
+        o.wal_linger_cap_us = 500000;   // 500 ms: mutant pays a full cap, healthy close pays ms
+        // The house idiom: a unique_ptr over the value-returning open()
+        // gives the mid-flight close a precise, measured destruction point.
+        auto db = std::make_unique<Database>(Database::open(o));
+        constexpr int NC = 16, OPS = 256;
+        std::atomic<int> ok_commits{0};
+        std::atomic<bool> stop{false};
+        std::vector<std::thread> ths;
+        for (int t = 0; t < NC; ++t)
+            ths.emplace_back([&, t] {
+                for (int i = 0; i < OPS && !stop.load(std::memory_order_relaxed); ++i)
+                    if (db->put("l2_" + std::to_string(t) + "_" + std::to_string(i), "v")
+                            == Status::OK)
+                        ok_commits.fetch_add(1, std::memory_order_relaxed);
+            });
+        // Let the batch machinery warm (gate opens on fat drains), then
+        // close MID-FLIGHT: in-flight committers race the destructor's
+        // drain-then-stop exactly like the W5 control's shape.
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const auto t0 = std::chrono::steady_clock::now();
+        stop.store(true, std::memory_order_relaxed);
+        db.reset();   // ~Database: drain-to-terminal, stop, join
+        const long close_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        for (auto& th : ths) th.join();
+        check("m5s2 L2: close-latency honors stop (16 hot committers, 500ms cap)",
+              close_ms < 250,
+              "close took " + std::to_string(close_ms) + "ms (bound 250ms; a "
+              "linger-ignores-stop mutant parks the writer a full 500ms cap "
+              "during drain-down)");
+        std::filesystem::remove_all(wd);
+    }
+
+    // ---- L3: gap-case untaxed — deterministic zero-linger control. ----
+    {
+        const std::string wd = "/tmp/m5s2_l3";
+        std::filesystem::remove_all(wd);
+        std::filesystem::create_directories(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.durability = DurabilityMode::Group;
+        o.auto_start_gc = false;
+        o.wal_linger_cap_us = 1000;     // 1 ms cap ON — the gate must keep it silent
+        auto db = std::make_unique<Database>(Database::open(o));
+        for (int i = 0; i < 50; ++i)
+            (void)db->put("l3_" + std::to_string(i), "v");
+        const uint64_t taken = db->wal_stats().lingers_taken;
+        check("m5s2 L3: gap-case untaxed — single committer, cap on, zero lingers",
+              taken == 0,
+              "lingers_taken=" + std::to_string(taken) +
+                  " (every drain was 1 record; the evidence gate must stay closed)");
+        db.reset();
+        std::filesystem::remove_all(wd);
+    }
+
+    // ---- L4: default off — the shipped configuration never lingers. ----
+    {
+        const std::string wd = "/tmp/m5s2_l4";
+        std::filesystem::remove_all(wd);
+        std::filesystem::create_directories(wd);
+        Options o;   // default: wal_linger_cap_us == 0
+        o.wal_dir = wd;
+        o.durability = DurabilityMode::Group;
+        o.auto_start_gc = false;
+        auto db = std::make_unique<Database>(Database::open(o));
+        for (int i = 0; i < 50; ++i)
+            (void)db->put("l4_" + std::to_string(i), "v");
+        const uint64_t taken = db->wal_stats().lingers_taken;
+        check("m5s2 L4: default off — cap 0, zero lingers", taken == 0,
+              "lingers_taken=" + std::to_string(taken));
+        db.reset();
+        std::filesystem::remove_all(wd);
+    }
+
+    // ---- L5: sensitivity record at 1/4/16 committers (cap on). ----
+    {
+        const int counts[] = {1, 4, 16};
+        for (int nc : counts) {
+            const std::string wd = "/tmp/m5s2_l5_" + std::to_string(nc);
+            std::filesystem::remove_all(wd);
+            std::filesystem::create_directories(wd);
+            Options o;
+            o.wal_dir = wd;
+            o.durability = DurabilityMode::Group;
+            o.auto_start_gc = false;
+            o.wal_linger_cap_us = 200;   // 200 us: the decision's default-cap neighborhood
+            auto db = std::make_unique<Database>(Database::open(o));
+            constexpr int OPS = 256;
+            std::atomic<int> ok_commits{0};
+            std::vector<std::thread> ths;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int t = 0; t < nc; ++t)
+                ths.emplace_back([&, t] {
+                    for (int i = 0; i < OPS; ++i)
+                        if (db->put("l5_" + std::to_string(t) + "_" + std::to_string(i), "v")
+                                == Status::OK)
+                            ok_commits.fetch_add(1, std::memory_order_relaxed);
+                });
+            for (auto& th : ths) th.join();
+            const long wall_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            const auto st = db->wal_stats();
+            // Batching witness at 16: 4096 commits through ONE writer
+            // cannot serialize into 4096 single-record drains — the queue
+            // builds behind the drain I/O and the drains fatten. At nc=1
+            // the no-batching shape (drains == commits) is EXPECTED and
+            // printed for the record.
+            const bool batching_ok = (nc < 16) || (st.drains < (uint64_t)nc * OPS);
+            // The sensitivity RECORD (printed unconditionally — the arena
+            // owns the measurement, this is the in-suite evidence trail):
+            std::cout << "      [m5s2 L5 @" << nc << "] commits=" << ok_commits.load()
+                      << "/" << nc * OPS << " drains=" << st.drains
+                      << " lingers=" << st.lingers_taken
+                      << " linger_us=" << st.linger_us_total
+                      << " qhw=" << st.queue_high_water
+                      << " wall=" << wall_ms << "ms\n";
+            check(("m5s2 L5: sensitivity @" + std::to_string(nc) + " committers — commits ok, batching witnessed").c_str(),
+                  ok_commits.load() == nc * OPS && batching_ok,
+                  "commits=" + std::to_string(ok_commits.load()) + "/" +
+                      std::to_string(nc * OPS) + " drains=" + std::to_string(st.drains) +
+                      " lingers=" + std::to_string(st.lingers_taken) +
+                      " linger_us=" + std::to_string(st.linger_us_total) +
+                      " qhw=" + std::to_string(st.queue_high_water) +
+                      " wall=" + std::to_string(wall_ms) + "ms");
+            db.reset();
+            std::filesystem::remove_all(wd);
+        }
+    }
+#endif
+    if (fails == 0) std::cout << "   M5 SLICE-2 BATTERY PASSED\n";
+    else std::cout << "   M5 SLICE-2 FAILURES: " << fails << "\n";
     return fails;
 }
 
