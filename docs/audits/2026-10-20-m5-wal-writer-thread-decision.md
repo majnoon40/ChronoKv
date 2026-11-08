@@ -835,5 +835,54 @@ remain the post-fix NIGHTLIES (the A/B is the diagnostic, not the
 ledger), and the band recompute stays the dedicated commit from ≥7
 post-change nights — the committed bands are untouched.
 
-*(Reserved: the post-rework sweep numbers from the re-dispatch on the
-follow-up commit, and the nightly verdicts as they accumulate.)*
+**The post-rework sweep (dispatch run #148, 6b99eab — the linger-gate
+rework; artifact writer-sweep-42487488178).** A DIFFERENT host (EPYC
+7763, fdatasync p50 308 µs vs the 9V74's 195 µs — the arena's own
+calibration documented four CPU models across the green week; the 7763
+appears twice in it). Within-run numbers (the only fair comparison):
+
+* The rework's mechanism effect is proven by the fsync counts: C=2 now
+  runs **10,582 fsyncs for 16,000 records (rec_per_drain 1.512, 4,979
+  lingers)** against the same host's legacy leg at 10,869 (1.47
+  rec/fsync) — the writer thread does FEWER fsyncs than the leader
+  path it replaced; C=4 reads 13,653 for 32,000 (2.34 rec/drain)
+  against legacy's 14,495. C=1 stays exactly 8,000/8,000 with ZERO
+  lingers (R-2 by construction, on the runner).
+* New/legacy throughput on THIS host: 0.95× (C=1), 0.95× (C=2, was
+  0.73× pre-rework on the 9V74), 0.98× (C=4, was 0.85×), 0.88× (C=8),
+  0.93× (C=16), 0.96× (C=32); async tracks group. The C=2–4 deficit
+  the first artifact exposed is CLOSED to parity on the runner that
+  could show it.
+* **The C≥8 "win" is host-dependent and single-run sweeps cannot
+  settle it**: +23%/+13% on the 9V74 (#146), −12%/−7% on the 7763
+  (#148). The ratio itself moves across hosts (the legs' sensitivities
+  differ by CPU class), which is exactly why the arena's acceptance
+  vehicle is the ≥7-NIGHT LEDGER with ratio bands, not a one-off
+  sweep. The "measurable win at 8+" claim stands as MEASURED-ON-ONE-
+  HOST, NOT-REPRODUCED-ON-ANOTHER — the post-change nights are the
+  arbiter, and the band recompute will carry the answer.
+
+**The arena gate verdicts across the two dispatches — the honest
+intermediate state.** Run #146 (4aa83e0, hot idle only, 9V74 host):
+**GREEN — 0 REGRESSION, 16 WARN** (every series inside floor;
+fillrandom recovered above median-tolerance on that host). Run #148
+(6b99eab, + linger rework, 7763 host): **RED — 6 REGRESSIONs** (async
+fillrandom 0.223 vs floor 0.231; ycsb_c.read 0.616 vs 0.621; the
+ycsb_d/ycsb_e pairs) — the same residual (~5–13% below the legacy-
+calibrated bands on write mixes, per the A/B), dipping below floor
+exactly where the host itself is slow. The reading is consistent
+across all the evidence: the composed fixes recovered the
+fillrandom-class regression ON THE HOST CLASS THAT SHOWED IT GREEN,
+closed the C=2–4 batching deficit by fsync count, and left a genuine
+~0.87–0.98× residual against the legacy-calibrated bands that is
+visible as WARN on fast hosts and REGRESSION on slow ones. The
+disposition, per the gate's own policies: ONE re-run dispatched on the
+landed commit (the re-run rule); TWO consecutive REGRESSION verdicts
+would make it a standing regression — and the standing candidates for
+closing it are ALREADY recorded (the committer-side adaptive timed
+park — the publish-wake half of the handoff — is the named follow-up
+decision; the band recompute from ≥7 post-change nights is the
+calibrated re-anchor that M1's policy planned for exactly this
+engine change). The nightly ledger, not any single dispatch, is the
+acceptance vehicle — and the nightlies from here on run the composed
+shape.

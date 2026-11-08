@@ -7,6 +7,31 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **docs (v29 M5 slice 3, dispatch verdicts recorded, 2026-11-08): the
+  two writer-sweep artifacts and both arena gate verdicts land in the
+  decision doc §15.1 — the honest intermediate state.** Run #146
+  (4aa83e0, hot idle, 9V74 host): the FULL 33-job matrix green
+  INCLUDING the arena gate — 0 REGRESSION, 16 WARN, fillrandom
+  recovered inside floor on the host class that had shown it red.
+  Run #148 (6b99eab, + linger-gate rework, 7763 host): the sweep
+  proves the rework's mechanism by fsync count (C=2: 10,582 fsyncs per
+  16,000 records vs the legacy leg's 10,869 — the writer thread now
+  does fewer fsyncs than the leader path it replaced; C=1 exactly
+  8,000/8,000 with zero lingers), the C=2-4 deficit the first artifact
+  exposed is closed to parity (0.95x/0.98x, from 0.73x/0.85x), and the
+  arena gate reddened on the slower host (6 REGRESSIONs, async series)
+  — the same ~5-13% residual against the legacy-calibrated bands,
+  visible as WARN on fast hosts and below-floor on slow ones. The
+  C>=8 "win" measured +23%/+13% on one host and -12%/-7% on the other:
+  single-run sweeps cannot settle a ratio that itself moves across CPU
+  classes — the >=7-night ledger is the acceptance vehicle, exactly as
+  M1's design intended. Disposition per the gate's own policies: one
+  re-run dispatched on the landed commit; the committer-side adaptive
+  timed park is the named follow-up decision if the residual matters
+  after the post-change nights accumulate; the band recompute from
+  >=7 post-change nights remains the planned re-anchor citing M5.
+  Nothing in the engine changes in this commit — it is the record.
+
 - **fix+test+docs (v29 M5 slice 3 follow-up, 2026-11-08): the runner
   sweep's first artifact rewrites the linger's evidence gate — the hot
   idle's eager pickup was DEFEATING group-commit batching at 2-4
