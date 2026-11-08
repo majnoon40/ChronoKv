@@ -695,6 +695,123 @@ jobs:
             cov/*/run.log
           if-no-files-found: ignore
 
+  # ---- v29 M5 slice 3: the WAL committer-count sweep (dispatch-only) -------
+  # The roadmap's own acceptance instrument ("a measurable win at 8+
+  # committers" needs the sweep; the nightly ledger's geometry is pinned
+  # at 4 threads and must NOT gain a concurrency axis). Runs BOTH WAL
+  # legs (writer thread vs CKV_WAL_LEGACY_LEADER) on ONE runner so the
+  # per-committer-count delta is same-hardware measured: the regression
+  # diagnosis for the red arena gate since nightly #121 AND the acceptance
+  # leg in one artifact. Plus: the raw pwrite/fdatasync probe (the depth-2
+  # pipelining decision's measured basis), the SQPOLL cells (the default
+  # decision), and a hot-idle OFF cell (the fix's own contribution on the
+  # arena hardware). NOT in ci-passed needs — a measurement vehicle, not a
+  # gate; dispatch it on a commit to judge that commit's write path.
+  # Rule 13: the 60-min cap is deliberately generous (measured need ~20-30
+  # min on the sweep cells + the arena A/B subset); tighten after the
+  # first completed run publishes real per-cell durations.
+  writer-sweep:
+    name: writer-sweep (M5 slice-3 measurement — committer sweep + io probe + sqpoll)
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Same fixed geometry discipline as the arena job; the sweep's own
+      # axis is COMMITTERS, so keys/ops are sized for the cell count, not
+      # the ledger's 200k.
+      SWEEP_KEYS: "50000"
+      SWEEP_OPS: "8000"
+      ARENA_KEYS: "200000"
+      ARENA_OPS: "200000"
+      ARENA_THREADS: "4"
+      ARENA_SEED: "42"
+      ARENA_VALSIZE: "100"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build both legs (arena + arena-legacy + sweep + sweep-legacy)
+        run: make arena arena-legacy sweep sweep-legacy
+
+      - name: Raw I/O probe (pwrite vs fdatasync on the runner fs)
+        run: |
+          mkdir -p sweep-results
+          ./build/sweep/sweep --probe io --dir /tmp/ckv_probe \
+            --valsize "$ARENA_VALSIZE" > sweep-results/io_probe.tsv 2>&1
+          cat sweep-results/io_probe.tsv
+
+      - name: Sweep — both legs x {group,async} x {1,2,4,8,16,32} committers
+        run: |
+          for leg in sweep sweep-legacy; do
+            for dur in group async; do
+              for c in 1 2 4 8 16 32; do
+                echo "== leg=$leg dur=$dur committers=$c"
+                ./build/sweep/$leg \
+                  --committers $c --ops "$SWEEP_OPS" --keys "$SWEEP_KEYS" \
+                  --durability $dur --valsize "$ARENA_VALSIZE" --seed "$ARENA_SEED" \
+                  --dir /tmp/ckv_sw_${leg}_${dur}_${c} \
+                  --label ${leg}_${dur}_c${c} \
+                  >> sweep-results/sweep.tsv 2>&1
+              done
+            done
+          done
+
+      - name: Sweep — hot-idle OFF cell (the fix's contribution, same runner)
+        run: |
+          for dur in group async; do
+            ./build/sweep/sweep \
+              --committers 1 --ops "$SWEEP_OPS" --keys "$SWEEP_KEYS" \
+              --durability $dur --valsize "$ARENA_VALSIZE" --seed "$ARENA_SEED" \
+              --hot-idle-us 0 \
+              --dir /tmp/ckv_sw_nohot_${dur} \
+              --label nohotidle_${dur}_c1 \
+              >> sweep-results/sweep.tsv 2>&1
+          done
+
+      - name: Sweep — SQPOLL cells (the default decision's measurement)
+        run: |
+          for c in 4 16; do
+            echo "== sqpoll c=$c"
+            CKV_WAL_SQPOLL=1 ./build/sweep/sweep \
+              --committers $c --ops "$SWEEP_OPS" --keys "$SWEEP_KEYS" \
+              --durability group --valsize "$ARENA_VALSIZE" --seed "$ARENA_SEED" \
+              --dir /tmp/ckv_sw_sqpoll_${c} \
+              --label sqpoll_group_c${c} \
+              >> sweep-results/sweep.tsv 2>&1
+          done
+
+      - name: Arena after-table A/B — both legs, the regressed write mixes, pinned geometry
+        run: |
+          for leg in arena arena-legacy; do
+            for dur in group async; do
+              echo "== arena leg=$leg dur=$dur"
+              ./build/arena/$leg \
+                --keys "$ARENA_KEYS" --ops "$ARENA_OPS" --threads "$ARENA_THREADS" \
+                --seed "$ARENA_SEED" --valsize "$ARENA_VALSIZE" --durability $dur \
+                --dir /tmp/ckv_ab_${leg}_${dur} \
+                --workloads fillrandom,overwrite,ycsb_a \
+                > sweep-results/arena-${leg}-${dur}.tsv 2>&1
+            done
+          done
+
+      - name: Digest
+        if: always()
+        run: |
+          echo "== sweep.tsv"
+          grep -vE '^#' sweep-results/sweep.tsv | awk -F'\t' '{printf "  %-24s %10s ops/s  p50=%-7s p99=%s\n", $1, $4, $5, $6}' || true
+          echo "== arena A/B"
+          for f in sweep-results/arena-*.tsv; do
+            echo "-- $f"
+            grep -vE '^#' "$f" | awk -F'\t' '{printf "  %-16s %10s ops/s\n", $1, $4}' || true
+          done
+
+      - name: Upload sweep artifact
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: writer-sweep-${{ github.run_id }}
+          path: sweep-results/
+          if-no-files-found: warn
+
   # ---- v29 M1 gate hardening (2026-10-17): self-tests for the arena gate ----
   # The gate that judges the ledger must itself be judged. Runs
   # scripts/test_arena_gate.py: the positive/negative controls for the five

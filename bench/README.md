@@ -236,3 +236,44 @@ make arena                       # -O2 default; small boxes: make arena ARENA_FL
 Numbers are **budgets, not trophies** (rule 9): a result without its
 methodology header does not get quoted, and published tables ride the
 regression ledger, not commit messages.
+
+## The WAL committer-count sweep (v29 M5 slice 3, 2026-11-08)
+
+`bench/writer_sweep.cpp` is the roadmap's own acceptance instrument for
+M5's concurrency leg — "a measurable win at 8+ committers" needs the
+8/16/32 sweep, and the nightly ledger cannot carry it: the ledger's
+geometry is PINNED at 4 threads (a concurrency axis would be a
+ledger-format change). So the sweep is an ARENA-ADJACENT ONE-OFF, per
+the M5 decision doc §8's own wording, with the same rule-9 methodology
+header as the arena workloads and a per-cell `wal_stats` diagnostics
+line (drains, records-per-drain, hot-idle spins/hits, lingers, queue
+high-water) so every latency number is attributable.
+
+The workload isolates the WAL commit path: an untimed pre-fill, then N
+committers × K timed puts over the shared zipfian key space — no reads.
+The A/B it exists for is BOTH WAL legs on one machine:
+
+```sh
+make sweep sweep-legacy            # writer-thread leg + CKV_WAL_LEGACY_LEADER leg
+./build/sweep/sweep       --committers 8 --ops 8000 --keys 50000 --label new_c8 ...
+./build/sweep/sweep-legacy --committers 8 --ops 8000 --keys 50000 --label leg_c8 ...
+```
+
+`--probe io` (no committers) times raw pwrite vs fdatasync on the
+wal_dir's filesystem and prints the depth-2 pipelining upper bound
+(`depth2_upper_bound_pct` = the write share of the per-drain critical
+path — the most depth-2 could ever remove). Knob overrides
+(`--hot-idle-us`, `--linger-us`) exist for sensitivity cells; the
+Options defaults are never changed by the harness.
+
+`make arena-legacy` builds the arena's own legacy-leg twin (separate
+output path — the two legs can never alias each other's objects) for
+after-table A/B runs at the pinned geometry.
+
+The `writer-sweep` CI job (workflow_dispatch only, NOT in ci-passed
+needs — a measurement vehicle, not a gate) runs the full matrix on one
+runner: both legs × {group, async} × {1,2,4,8,16,32} committers, a
+hot-idle-OFF cell, SQPOLL cells, the io probe, and the arena A/B over
+the regressed write mixes; the artifact is the record the M5 decision
+doc §15.1 cites. Rule 13 applies: the 60-min cap ships generous, to be
+tightened after the first completed run publishes per-cell durations.

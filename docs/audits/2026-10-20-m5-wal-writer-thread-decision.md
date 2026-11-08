@@ -622,3 +622,120 @@ fail-first REDs against a pre-M5 scratch tree are owed the same way M4's
 were, with the same structural caveat: W4's `pub_allocated_max == 1`
 oracle and W2's bounded-return oracle cannot pass against code that
 lacks the mechanism they measure.
+
+---
+
+## 15. Slice-3 postscript (2026-11-08; measured, per rule 9)
+
+**The slice the roadmap named "the measurement" opened with a defect the
+measurement itself surfaced.** The steal-storm fix (same day) made the
+nightlies runnable again and exposed what the storm had been masking
+since run #121: the arena regression gate was RED on every post-slice-1
+nightly — #144 (first post-slice-2): chronokv-async/fillrandom 0.215 vs
+band-median 0.275, below floor 0.231; #137: async/ycsb_a 0.223 vs floor
+0.289 (×2); #121: ycsb_d/ycsb_e ×4 — all with the five baselines FLAT
+across the same nights (N7 same-CPU raws vs #144: sqlite-full fillrandom
+8816→8169, lmdb 3922→3904, rocksdb-tuned 232481→204752, a ±7% lottery,
+while chronokv-async fillrandom moved 4262→3093, −27%). The gate was
+working exactly as designed; the regression was ours, engine-side, and
+dated precisely at the writer-thread landing.
+
+**Mechanism, isolated before any fix was written.** On the dev sandbox
+(2-core, fast overlay fs — io_uring LIVE, which the slice-1 sandbox
+could not do): a single-committer async put is p50 20.6 µs on the
+legacy leader leg vs 28.0 µs on the writer-thread leg — +7.4 µs, almost
+exactly the measured cv ping-pong round trip (7.0 µs) — while a pure
+I/O-shape A/B at 4 committers showed no engine-side delta. The reading:
+EVERY low-concurrency commit pays two scheduler round trips the legacy
+leader never paid (the elected leader ran its own I/O inline) — the
+producer→writer wake at enqueue, the writer→committer wake at publish.
+On azure runners, where fdatasync is an order of magnitude slower, that
+handoff is the fill path's critical-path addition. §2's performance
+case predicted the writer thread would MOVE the durable-write ratios;
+it moved them DOWN at the arena's low effective committer counts
+(fills are single-writer; the YCSB mixes run 4 threads) because the
+predicted 8+ win and the predicted low-C loss are the same mechanism
+seen from opposite sides, and the arena's geometry sits on the losing
+side. The acceptance leg ("no regression at any concurrency") was
+therefore NOT met by slice 1 as landed.
+
+**The fix — the writer's HOT IDLE (§1.10's complement).** After a
+batch drain, instead of parking on `queue_cv_` (a park whose wake IS
+the round trip), the writer stays hot for a bounded budget
+(`Options::wal_writer_hot_idle_us`, default 50 µs — the measured knee:
+any budget ≥ 25 µs recovers the same latency, because a sequential
+committer's inter-enqueue gap after an ack is CPU-prep-sized, not
+I/O-sized), polling a monotonic arrival counter bumped by both
+producers under `queue_mu_` at the same instant as the enqueue. An
+arrival inside the budget is observed in ~100 ns; the writer then flows
+through the SAME wake seam (`wal_writer_wake`; the dst re-registration
+contract untouched). Correctness never depends on the hint — the spin
+re-acquires the lock before touching the queue, and a parked writer's
+cv predicate re-checks under the lock; W-STRAND, CKV-012, and every
+drain invariant are untouched by construction (the queue's contents
+and order are exactly what they were). Discipline mirrors the linger:
+one-shot per idle transition, batch drains only; stop is polled
+unlocked via a hint (bounded close under ANY budget — the H2 control);
+suppressed while the dst controller is armed. Cost: zero on read-only
+workloads (H4: no drains, no spins) and zero at high concurrency (the
+queue never empties). Diagnostics ride `wal_stats()` — the in-suite
+health ratio at 1 committer measured 252/256 = 98% hits. Measured
+recovery on the dev box: single-committer async put p50 31.5 µs
+(OFF) → 27.5 µs (ON) vs legacy 21.5 µs — the producer→writer half is
+gone; the writer→committer wake plus the writer's per-drain overhead
+are the recorded residual, and the runner sweep owns their measurement
+(§15.1). The residual's candidate successor — a committer-side
+adaptive timed park — is RECORDED as the follow-up decision if the
+runner sweep shows it matters; it is deliberately not in this slice
+(bounded-blast-radius discipline: one seam per landing, the writer's
+seam this time).
+
+**§8's slice-3 items, status:**
+* *Arena after-tables on the nightly vehicle + the 8/16/32 sweep:* the
+  instruments shipped — `bench/writer_sweep.cpp` (both legs, per-cell
+  wal_stats diagnostics, rule-9 headers) + `make arena-legacy` + the
+  dispatch-only `writer-sweep` CI job (both legs × {group, async} ×
+  {1,2,4,8,16,32}, a hot-idle-OFF cell, SQPOLL cells, and the pinned-
+  geometry arena A/B over the three regressed write mixes). The
+  runner-scale numbers land in this section as the dispatch runs
+  complete (§15.1 below); the official after-tables are the post-fix
+  NIGHTLIES themselves, and the band recompute is the dedicated commit
+  from ≥7 post-change nights per the M1 policy — the committed bands
+  are untouched in-flight.
+* *Depth-2 pipelining measured and decided:* the decision FRAMEWORK
+  ships with the sweep (`--probe io` prints the mechanism's upper
+  bound: write_p50 / (write_p50 + fdatasync_p50) on the arena
+  filesystem). The decision itself — ship or record-refuse — is taken
+  on the runner probe's number, recorded in §15.1 when the dispatch
+  lands; the failure-path hazard (a drain-N rollback truncating a
+  pipelined drain-N+1's acked-durable bytes — CKV-004's gate read at
+  the wrong granularity) is the recorded reason the bar for shipping
+  is HIGH, and the I/O-shape identity principle (§1.9: slice 1's shape
+  is deliberately one chain in flight) is the default.
+* *SQPOLL measured and default-decided:* the sweep job carries the
+  CKV_WAL_SQPOLL=1 cells at 4 and 16 committers; the default decision
+  rides §15.1 with those numbers. The prior on the record: §2's own
+  v25.2 argument (per-batch durability waits nullify the poller's
+  benefit) plus one kernel thread of cost.
+* *Band updates per policy:* unchanged — recomputed only in a
+  dedicated commit citing M5, from ≥7 post-change nights, never
+  widened in-flight to silence a red night.
+
+**Validation of the fix, locally (the dev sandbox; CI is the matrix
+judge):** full M5 battery (W1–W5, L1–L5, H1–H5) green on BOTH legs
+(legacy leg skip-PASSes H); CKV_ONLY_REMEDIATION 93/0;
+CKV_ONLY_DST green under the stress build with steal counts at the
+post-steal-storm level (max 71 on tree_merge_cascade vs the recorded
+62 — the spin's dst suppression holds); CKV_ONLY_CRASHFUZZ green
+(every crash point reachable, no loss); CKV_ONLY_LINCHECK green;
+-Wconversion ratchet 33→33; lint -Werror + header hygiene green;
+hooks-off smoke green. Mutants recorded-not-executed per the standing
+single-build directive: hot-idle-ignores-arrivals (H1 RED), 
+spin-ignores-stop (H2 RED).
+
+### 15.1 Runner-scale records (to be filled from the writer-sweep dispatch artifacts)
+
+*(Reserved: the sweep.tsv per-committer deltas both legs, the io_probe
+line, the SQPOLL cells, the arena A/B tables, and the two decisions
+they settle — depth-2 ship-or-refuse and the SQPOLL default. Each
+recorded with its run id, in the house format.)*

@@ -585,6 +585,7 @@ static int run_m3_purge_test();              // v29 M3 slice 3: physical purge c
 static int run_m4_merge_test();              // v29 M4: leaf merge & rebalance controls (decision doc 2026-10-18)
 static int run_m5_writer_test();             // v29 M5 slice 1: WAL writer-thread / W-STRAND controls (decision doc 2026-10-20)
 static int run_m5_slice2_test();             // v29 M5 slice 2: io_uring issuer rungs + adaptive linger (decision doc 2026-10-20 §8)
+static int run_m5_slice3_test();             // v29 M5 slice 3: writer hot-idle controls (the arena-regression fix)
 static int run_m2_phase1_test();
 static int run_m2_phase2_test();
 static int run_m2_phase3_test();
@@ -2499,6 +2500,7 @@ return 0;
         crc_init();
         int f = run_m5_writer_test();
         f += run_m5_slice2_test();   // v29 M5 slice 2: the ring rungs + linger
+        f += run_m5_slice3_test();   // v29 M5 slice 3: the writer hot idle
         std::cout.flush();
         return f == 0 ? 0 : 1;
     }
@@ -8078,6 +8080,7 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     fails += run_m4_merge_test();
     fails += run_m5_writer_test();
     fails += run_m5_slice2_test();   // v29 M5 slice 2: ring rungs + adaptive linger
+    fails += run_m5_slice3_test();   // v29 M5 slice 3: the writer hot idle
     fails += run_bt3_visibility_test();
     fails += run_m2_phase1_test();
     fails += run_m2_phase2_test();
@@ -10971,6 +10974,217 @@ static int run_m5_slice2_test() {
 #endif
     if (fails == 0) std::cout << "   M5 SLICE-2 BATTERY PASSED\n";
     else std::cout << "   M5 SLICE-2 FAILURES: " << fails << "\n";
+    return fails;
+}
+
+// =====================================================================
+// v29 M5 slice 3 — the writer's HOT IDLE (the arena-regression fix;
+// nightly runs #121..#144 carried a red arena gate since the slice-1
+// writer-thread landing, masked until the steal-storm fix by the DST
+// timeouts). Controls in the L-battery's shape, bounded and in-suite
+// (the runner sweep owns the arena-scale measurement):
+//   H1  default ON, mechanism witnessed: a single sequential committer
+//       with default Options takes spins and HITS — the arrival counter
+//       observes the next enqueue inside the budget. The hits ratio is
+//       the mechanism's health signal (near 1.0 on a back-to-back
+//       stream). THE MUTANT CONTROL: hot-idle-ignores-arrivals (the
+//       spin's poll loses the queue_arrivals_ check) spins always, hits
+//       never -> RED here.
+//   H2  close-latency: the spin honors stop — one hot committer, a
+//       500 ms BUDGET (the mutant-class number), and a mid-flight close
+//       must finish far under the budget. THE MUTANT CONTROL:
+//       spin-ignores-stop (the unlocked poll loses stop_hint_) pays a
+//       full 500 ms spin during close -> RED. Mirrors L2's shape with
+//       the budget playing the cap's role.
+//   H3  knob 0 = OFF: with wal_writer_hot_idle_us == 0, zero spins —
+//       the opt-out is real, not advisory.
+//   H4  read-only untaxed: a pure-get workload over a filled store
+//       takes ZERO spins (no drains, no heat — the regression fix may
+//       not tax the read path that never regressed).
+//   H5  the sensitivity record at 1/4/16 committers: commits OK, wall
+//       bounded, spin diagnostics printed for the record (the arena
+//       sweep on the runner owns the latency numbers).
+// =====================================================================
+static int run_m5_slice3_test() {
+    using namespace chronokv;
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) {
+            ++fails;
+            if (!detail.empty()) std::cout << "      (" << detail << ")\n";
+        }
+    };
+#ifdef CKV_WAL_LEGACY_LEADER
+    check("m5s3 H1: default on, hits witnessed (skipped — legacy leader leg)", true);
+    check("m5s3 H2: close-latency honors stop (skipped — legacy leader leg)", true);
+    check("m5s3 H3: knob 0 = off, zero spins (skipped — legacy leader leg)", true);
+    check("m5s3 H4: read-only untaxed, zero spins (skipped — legacy leader leg)", true);
+    check("m5s3 H5: sensitivity record (skipped — legacy leader leg)", true);
+#else
+    // ---- H1: default ON — a sequential committer's stream hits the spin. ----
+    {
+        const std::string wd = "/tmp/m5s3_h1";
+        std::filesystem::remove_all(wd);
+        std::filesystem::create_directories(wd);
+        Options o;   // default: wal_writer_hot_idle_us == 50
+        o.wal_dir = wd;
+        o.durability = DurabilityMode::Group;
+        o.auto_start_gc = false;
+        auto db = std::make_unique<Database>(Database::open(o));
+        constexpr int OPS = 400;
+        for (int i = 0; i < OPS; ++i)
+            (void)db->put("h1_" + std::to_string(i), "v");
+        const auto st = db->wal_stats();
+        const uint64_t spins = st.hot_spins_taken, hits = st.hot_spin_hits;
+        // A sequential committer's inter-enqueue gap after an ack is
+        // CPU-prep-sized (~10-25us on the dev box, comparable on CI), so
+        // MOST idle transitions after the first few should hit. The bound
+        // is deliberately loose on the hits side (runner scheduling can
+        // stretch the gap past the 50us budget on a loaded machine) but
+        // strict on "the mechanism fired at all": spins > 0 AND hits > 0.
+        check("m5s3 H1: default on — sequential committer takes spins and hits",
+              spins > 0 && hits > 0,
+              "spins=" + std::to_string(spins) + " hits=" + std::to_string(hits) +
+                  " (a hot-idle-ignores-arrivals mutant hits 0 forever)");
+        db.reset();
+        std::filesystem::remove_all(wd);
+    }
+
+    // ---- H2: close-latency — the spin-ignores-stop mutant control. ----
+    {
+        const std::string wd = "/tmp/m5s3_h2";
+        std::filesystem::remove_all(wd);
+        std::filesystem::create_directories(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.durability = DurabilityMode::Group;
+        o.auto_start_gc = false;
+        o.wal_writer_hot_idle_us = 500000;   // 500 ms: mutant pays a full budget, healthy close pays ms
+        auto db = std::make_unique<Database>(Database::open(o));
+        std::atomic<int> ok_commits{0};
+        std::atomic<bool> stop{false};
+        std::vector<std::thread> ths;
+        for (int t = 0; t < 4; ++t)
+            ths.emplace_back([&, t] {
+                for (int i = 0; i < 64 && !stop.load(std::memory_order_relaxed); ++i)
+                    if (db->put("h2_" + std::to_string(t) + "_" + std::to_string(i), "v")
+                            == Status::OK)
+                        ok_commits.fetch_add(1, std::memory_order_relaxed);
+            });
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const auto t0 = std::chrono::steady_clock::now();
+        stop.store(true, std::memory_order_relaxed);
+        try { db->close(); } catch (...) {}
+        const long close_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        for (auto& th : ths) th.join();
+        db.reset();
+        check("m5s3 H2: close-latency honors stop (hot committers, 500ms budget)",
+              close_ms < 250,
+              "close took " + std::to_string(close_ms) + "ms (bound 250ms; a "
+              "spin-ignores-stop mutant spins a full 500ms budget during "
+              "close)");
+        std::filesystem::remove_all(wd);
+    }
+
+    // ---- H3: knob 0 = OFF — the opt-out is real. ----
+    {
+        const std::string wd = "/tmp/m5s3_h3";
+        std::filesystem::remove_all(wd);
+        std::filesystem::create_directories(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.durability = DurabilityMode::Group;
+        o.auto_start_gc = false;
+        o.wal_writer_hot_idle_us = 0;   // explicit OFF
+        auto db = std::make_unique<Database>(Database::open(o));
+        for (int i = 0; i < 100; ++i)
+            (void)db->put("h3_" + std::to_string(i), "v");
+        const uint64_t spins = db->wal_stats().hot_spins_taken;
+        check("m5s3 H3: knob 0 = off — zero spins", spins == 0,
+              "hot_spins_taken=" + std::to_string(spins));
+        db.reset();
+        std::filesystem::remove_all(wd);
+    }
+
+    // ---- H4: read-only untaxed — no drains, no spins, no heat. ----
+    {
+        const std::string wd = "/tmp/m5s3_h4";
+        std::filesystem::remove_all(wd);
+        std::filesystem::create_directories(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.checkpoint_path = wd + "/ckpt";   // H4 checkpoints before reading
+        o.durability = DurabilityMode::Group;
+        o.auto_start_gc = false;
+        auto db = std::make_unique<Database>(Database::open(o));
+        for (int i = 0; i < 200; ++i)
+            (void)db->put("h4_" + std::to_string(i), "v");
+        (void)db->checkpoint();   // read phase serves from a stable state
+        const uint64_t spins_before = db->wal_stats().hot_spins_taken;
+        uint64_t found = 0;
+        constexpr int READS = 2000, KEYS = 200;
+        for (int i = 0; i < READS; ++i)
+            if (db->get("h4_" + std::to_string(i % KEYS))) ++found;
+        const uint64_t spins_after = db->wal_stats().hot_spins_taken;
+        check("m5s3 H4: read-only untaxed — pure gets take zero spins",
+              found == (uint64_t)READS && spins_after == spins_before,
+              "found=" + std::to_string(found) + "/" + std::to_string(READS) +
+                  " spins_before=" + std::to_string(spins_before) +
+                  " spins_after=" + std::to_string(spins_after));
+        db.reset();
+        std::filesystem::remove_all(wd);
+    }
+
+    // ---- H5: sensitivity record at 1/4/16 committers (default budget). ----
+    {
+        const int counts[] = {1, 4, 16};
+        for (int nc : counts) {
+            const std::string wd = "/tmp/m5s3_h5_" + std::to_string(nc);
+            std::filesystem::remove_all(wd);
+            std::filesystem::create_directories(wd);
+            Options o;   // default: wal_writer_hot_idle_us == 50
+            o.wal_dir = wd;
+            o.durability = DurabilityMode::Group;
+            o.auto_start_gc = false;
+            auto db = std::make_unique<Database>(Database::open(o));
+            constexpr int OPS = 256;
+            std::atomic<int> ok_commits{0};
+            std::vector<std::thread> ths;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int t = 0; t < nc; ++t)
+                ths.emplace_back([&, t] {
+                    for (int i = 0; i < OPS; ++i)
+                        if (db->put("h5_" + std::to_string(t) + "_" + std::to_string(i), "v")
+                                == Status::OK)
+                            ok_commits.fetch_add(1, std::memory_order_relaxed);
+                });
+            for (auto& th : ths) th.join();
+            const long wall_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            const auto st = db->wal_stats();
+            // The sensitivity RECORD (printed unconditionally — the runner
+            // sweep owns the arena-scale measurement, this is the in-suite
+            // evidence trail):
+            std::cout << "      [m5s3 H5 @" << nc << "] commits=" << ok_commits.load()
+                      << "/" << nc * OPS << " drains=" << st.drains
+                      << " spins=" << st.hot_spins_taken
+                      << " hits=" << st.hot_spin_hits
+                      << " spin_us=" << st.hot_spin_us_total
+                      << " qhw=" << st.queue_high_water
+                      << " wall=" << wall_ms << "ms\n";
+            check(("m5s3 H5: sensitivity @" + std::to_string(nc) + " committers — commits ok, wall bounded").c_str(),
+                  ok_commits.load() == nc * OPS && wall_ms < 30000,
+                  "commits=" + std::to_string(ok_commits.load()) + "/" +
+                      std::to_string(nc * OPS) + " wall=" + std::to_string(wall_ms) + "ms");
+            db.reset();
+            std::filesystem::remove_all(wd);
+        }
+    }
+#endif
+    if (fails == 0) std::cout << "   M5 SLICE-3 BATTERY PASSED\n";
+    else std::cout << "   M5 SLICE-3 FAILURES: " << fails << "\n";
     return fails;
 }
 

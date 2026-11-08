@@ -109,6 +109,39 @@ space := $(empty) $(empty)
 ARENA_FLAGS ?= -O2 -g
 ARENA_INFO  := $(subst $(space),_,$(CXX) $(CXXSTD) $(ARENA_FLAGS))
 
+# ---- v29 M5 slice 3: the WAL committer-count sweep (bench/writer_sweep.cpp
+# — arena-ADJACENT one-off per the roadmap's own wording: the nightly ledger
+# geometry stays pinned at 4 threads; this is the concurrency instrument for
+# the "no regression at any concurrency, a measurable win at 8+" acceptance
+# leg. TWO binaries by design — the A/B against the legacy leader leg is the
+# measurement (make sweep; make sweep-legacy; same box, same geometry), and
+# the separate output paths mean the two legs can never alias each other's
+# objects.
+sweep: $(BIN_DIR)/sweep/sweep
+sweep-legacy: $(BIN_DIR)/sweep/sweep-legacy
+
+$(BIN_DIR)/sweep/sweep: bench/writer_sweep.cpp chronokv.hpp | $(BIN_DIR)/sweep
+	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(CKV_EXTRA_DEFS) \
+	    -DARENA_BUILD_INFO=\"$(ARENA_INFO)\" $(ARENA_FLAGS) \
+	    bench/writer_sweep.cpp -o $@ -lpthread
+
+$(BIN_DIR)/sweep/sweep-legacy: bench/writer_sweep.cpp chronokv.hpp | $(BIN_DIR)/sweep
+	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(CKV_EXTRA_DEFS) \
+	    -DCKV_WAL_LEGACY_LEADER \
+	    -DARENA_BUILD_INFO=\"$(ARENA_INFO)_legacy\" $(ARENA_FLAGS) \
+	    bench/writer_sweep.cpp -o $@ -lpthread
+
+# v29 M5 slice 3: the arena's OWN legacy-leg twin (the after-table A/B on
+# the same runner — the nightly arena only builds the default path; the
+# dispatch-only writer-sweep job builds both and compares).
+arena-legacy: $(BIN_DIR)/arena/arena-legacy
+
+$(BIN_DIR)/arena/arena-legacy: bench/arena.cpp chronokv.hpp | $(BIN_DIR)/arena
+	$(CXX) $(CXXSTD) $(WARN) $(INCLUDE) $(CKV_EXTRA_DEFS) \
+	    -DCKV_WAL_LEGACY_LEADER \
+	    -DARENA_BUILD_INFO=\"$(ARENA_INFO)_legacy\" $(ARENA_FLAGS) \
+	    bench/arena.cpp -o $@ -lpthread
+
 # ---- hooks-on targets ----
 release: $(BIN_DIR)/release/test
 asan:    $(BIN_DIR)/asan/test
@@ -253,7 +286,7 @@ lint-header-2tu:
 
 # ---- dirs ----
 $(BIN_DIR)/release $(BIN_DIR)/asan $(BIN_DIR)/tsan $(BIN_DIR)/stress $(BIN_DIR)/coverage \
-$(BIN_DIR)/arena \
+$(BIN_DIR)/arena $(BIN_DIR)/sweep \
 $(BIN_DIR)/smoke_off/release $(BIN_DIR)/smoke_off/asan \
 $(BIN_DIR)/smoke_off/tsan $(BIN_DIR)/smoke_off/stress:
 	mkdir -p $@
@@ -261,7 +294,7 @@ $(BIN_DIR)/smoke_off/tsan $(BIN_DIR)/smoke_off/stress:
 clean:
 	rm -rf $(BIN_DIR)
 
-.PHONY: release asan tsan stress coverage arena arena-baselines \
+.PHONY: release asan tsan stress coverage arena arena-baselines arena-legacy sweep sweep-legacy \
 	smoke_off_release smoke_off_asan smoke_off_tsan smoke_off_stress \
 	lint lint-werror lint-conversion lint-header lint-header-reinclude lint-header-2tu \
 	all clean

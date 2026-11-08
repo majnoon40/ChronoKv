@@ -3773,6 +3773,10 @@ struct WalInstanceStats {
              class_switches = 0, drains = 0, writer_deaths = 0;
     // v29 M5 slice 2 (decision §1.10): adaptive-linger diagnostics.
     uint64_t lingers_taken = 0, linger_us_total = 0;
+    // v29 M5 slice 3: hot-idle diagnostics — spins taken, arrival hits, and
+    // the microseconds spent hot (the arena's latency attribution reads
+    // these exactly where it reads the linger's).
+    uint64_t hot_spins_taken = 0, hot_spin_hits = 0, hot_spin_us_total = 0;
 };
 struct EpochInstanceStats { uint64_t entries, oldest, newest; };
 struct GcInstanceStats {
@@ -3823,6 +3827,21 @@ struct FdGuard {
 // defined after this class; the W3 control arms the writer seam at the
 // engine level, where no Database forwarder exists).
 class ChronoKV;
+
+// v29 M5 slice 3: the pause instruction for the writer's hot-idle spin —
+// on x86 it is a hint that saves power + SMT sibling pressure inside a
+// tight poll loop; everywhere else a plain no-op keeps the loop portable
+// (std::this_thread::yield would be a syscall per iteration: the exact
+// latency the spin exists to remove). Kept out of any namespace: it is a
+// compiler-level primitive, not an engine abstraction.
+inline void ckv_cpu_pause() {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
+    __builtin_ia32_pause();
+#else
+    // ARMv8 could use __builtin_arm_yield; leaving it empty is correct
+    // (the loop's exit conditions are the budget and the arrival counter).
+#endif
+}
 
 class WalSegments {
     friend class ::chronokv::Database;  // v25.1 M2: test injection access
@@ -3923,6 +3942,29 @@ class WalSegments {
     float    drain_ema_ = 0.0f;
     std::atomic<uint64_t> i_lingers_taken{0};
     std::atomic<uint64_t> i_linger_us_total{0};
+    // v29 M5 slice 3 (the arena-regression fix; full story in the hot-idle
+    // block of writer_loop): the writer's HOT IDLE state. hot_idle_us_ is
+    // the spin budget at the idle seam (0 = OFF); hot_after_drain_ is the
+    // one-shot "the last loop iteration drained a batch" expectation flag
+    // (writer-exclusive plain state like drain_ema_); queue_arrivals_ is a
+    // MONOTONIC enqueue counter bumped by both producers under queue_mu_
+    // (relaxed is sufficient: the spin that polls it re-acquires queue_mu_
+    // before touching the queue, and the cv wait's under-lock predicate
+    // re-check is the missed-hint safety net — the hint is a latency
+    // optimization, never a correctness input); arrivals_seen_ is the
+    // writer's plain mirror of the same counter (updated under queue_mu_
+    // wherever items leave the queue, so the delta is exactly "new work").
+    // stop_hint_ mirrors stop_requested_ for the unlocked spin poll —
+    // bounded close latency under a large budget is the linger L2
+    // discipline carried to the spin (the H2 control proves it).
+    uint32_t hot_idle_us_ = 0;        // 0 = OFF
+    bool     hot_after_drain_ = false;
+    uint64_t arrivals_seen_ = 0;      // writer-exclusive plain mirror
+    std::atomic<uint64_t> queue_arrivals_{0};
+    std::atomic<bool>     stop_hint_{false};
+    std::atomic<uint64_t> i_hot_spins_taken{0};
+    std::atomic<uint64_t> i_hot_spin_us_total{0};
+    std::atomic<uint64_t> i_hot_spin_hits{0};
     std::atomic<uint64_t> i_backpressure_waits{0};
     std::atomic<uint64_t> i_class_switches{0};
     std::atomic<uint64_t> i_drains{0};
@@ -4112,6 +4154,13 @@ public:
         // as lingers_taken>0 with drains growing fatter, never as a p99
         // tax on the gap case).
         uint64_t lingers_taken = 0, linger_us_total = 0;
+        // v29 M5 slice 3: hot-idle diagnostics (zero on the legacy leg and
+        // while the budget is 0). hot_spin_hits/spins is the mechanism's
+        // health ratio — a sustained single-committer stream should sit
+        // near 1.0 (every spin finds its arrival); a hits ratio near 0 on
+        // a write-heavy workload means the budget is set too long for the
+        // arrival cadence (pure heat, latency-neutral).
+        uint64_t hot_spins_taken = 0, hot_spin_hits = 0, hot_spin_us_total = 0;
     };
     WalStats wal_stats() const {
         WalStats s{
@@ -4133,6 +4182,9 @@ public:
         s.writer_deaths      = i_writer_deaths.load(std::memory_order_relaxed);
         s.lingers_taken      = i_lingers_taken.load(std::memory_order_relaxed);
         s.linger_us_total    = i_linger_us_total.load(std::memory_order_relaxed);
+        s.hot_spins_taken    = i_hot_spins_taken.load(std::memory_order_relaxed);
+        s.hot_spin_hits      = i_hot_spin_hits.load(std::memory_order_relaxed);
+        s.hot_spin_us_total  = i_hot_spin_us_total.load(std::memory_order_relaxed);
 #endif
         return s;
     }
@@ -4603,14 +4655,22 @@ public:
                          // (the default — R-2: a badly-tuned linger taxes
                          // single-committer p99, so the cap starts at zero
                          // and slice 3's arena owns the enable decision).
-                         uint32_t linger_cap_us = 0) : dir_(dir) {
+                         uint32_t linger_cap_us = 0,
+                         // v29 M5 slice 3: the writer's hot-idle spin budget
+                         // in MICROSECONDS (0 = OFF). The default is decided
+                         // by measurement (the nightly-#121..#144 arena
+                         // regression is the handoff latency this removes;
+                         // see the hot-idle block in writer_loop).
+                         uint32_t hot_idle_us = 0) : dir_(dir) {
 #ifndef CKV_WAL_LEGACY_LEADER
         if (queue_max_items) queue_max_items_ = queue_max_items;
         if (queue_max_bytes) queue_max_bytes_ = queue_max_bytes;
         linger_cap_us_ = linger_cap_us;
+        hot_idle_us_ = hot_idle_us;
 #else
         (void)queue_max_items; (void)queue_max_bytes;
         (void)linger_cap_us;   // the legacy leader has no linger by design
+        (void)hot_idle_us;     // ...and no writer thread to keep hot
 #endif
         // v28 review-F2: create wal_dir RECURSIVELY, and fail with the real
         // cause. The old single-level ::mkdir (return ignored) could not
@@ -5570,6 +5630,12 @@ public:
             it.batch = my_batch;
             queue_bytes_ += rec.size();
             queue_.push_back(std::move(it));
+            // v29 M5 slice 3: the hot-idle hint — monotonic, under the same
+            // lock as the push_back it describes. Relaxed: the spinning
+            // writer re-acquires queue_mu_ before touching the queue, and a
+            // parked writer's cv predicate re-checks under the lock, so a
+            // stale poll can cost latency but never correctness.
+            queue_arrivals_.fetch_add(1, std::memory_order_relaxed);
             if (queue_.size() > i_queue_high_water.load(std::memory_order_relaxed))
                 i_queue_high_water.store(queue_.size(), std::memory_order_relaxed);
             // CKV-012 window END (the legacy has_async store's successor):
@@ -5617,6 +5683,10 @@ public:
         {
             std::lock_guard<std::mutex> lk(queue_mu_);
             stop_requested_ = true;
+            // v29 M5 slice 3: the unlocked hot-idle spin polls this hint so
+            // a close arriving mid-spin ends it immediately (bounded close
+            // latency under any budget; the H2 control's contract).
+            stop_hint_.store(true, std::memory_order_relaxed);
         }
         queue_cv_.notify_all();
         done_cv_.notify_all();
@@ -5635,6 +5705,7 @@ public:
             if (it.command) { it.command->ok = false; it.command->terminal = true; }
         }
         queue_bytes_ = 0;
+        arrivals_seen_ = queue_arrivals_.load(std::memory_order_relaxed);
         done_cv_.notify_all();
         queue_cv_.notify_all();   // space-waiters wake and see failed_/stop
     }
@@ -5729,7 +5800,84 @@ public:
             if (dst::is_armed() && queue_.empty() && !stop_requested_)
                 dst::thread_done();
 #endif
-            queue_cv_.wait(lk, [this] { return !queue_.empty() || stop_requested_; });
+            // v29 M5 slice 3 — the HOT IDLE (the arena-regression fix).
+            // The nightly arena has been red since run #121 (the first
+            // post-slice-1 nightly): the write-mixed ratios sit ~15-25%
+            // below the 0.28.1 green-week bands with the baselines flat —
+            // the writer-thread handoff itself is the cost. Isolated on the
+            // dev sandbox (2-core, fast overlay fs, io_uring live): a
+            // single-committer async put is p50 20.6us on the legacy leader
+            // vs 28.0us on the writer thread — +7.4us, almost exactly the
+            // measured cv ping-pong round trip (7.0us) — while a pure
+            // I/O-shape A/B at 4 committers shows no engine-side delta.
+            // The mechanism: EVERY low-concurrency commit pays two
+            // scheduler round trips the legacy leader never paid (the
+            // elected leader ran its own I/O inline); on the azure arena
+            // runners, where fdatasync is ~10x slower than the dev box,
+            // the handoff is the fill-path's critical-path addition.
+            // The fix removes the FIRST round trip — producer-enqueue ->
+            // writer-wake — for back-to-back commit streams: after a
+            // drain, instead of parking on the cv (a park whose wake is
+            // the round trip), the writer stays HOT for a bounded budget,
+            // polling a monotonic arrival counter that both producers
+            // bump under queue_mu_ at the same instant as the enqueue. An
+            // arrival inside the budget is observed in ~100ns instead of
+            // a futex wake; the writer then flows through the SAME wake
+            // seam (wal_writer_wake re-registers the dst scheduler; the
+            // seam's documented window only widens). Correctness never
+            // depends on the hint: the spin re-acquires queue_mu_ before
+            // touching the queue, and a parked writer's cv predicate
+            // re-checks under the lock — a stale/missed poll can cost
+            // latency, never work (the classic hint-and-safety-net pair;
+            // W-STRAND, CKV-012 and every drain invariant are untouched —
+            // the queue's contents and order are exactly what they were).
+            // Bound and discipline, mirroring the linger's clauses: (a)
+            // one-shot per idle transition, only after a BATCH drain (the
+            // expectation "the next arrival is soon" is earned by the
+            // drain that just happened; ROTATEs and cold starts do not
+            // earn it); (b) never while failed_/stop_requested_, and the
+            // unlocked spin ALSO polls stop_hint_ so a close arriving
+            // mid-spin ends it immediately — bounded close latency under
+            // ANY budget is the linger L2 discipline carried to the spin
+            // (the H2 control proves it); (c) the budget bounds the worst
+            // case — one spin of idle heat per drain, ~0 CPU for read-only
+            // workloads (no drains, no spins) and none at high concurrency
+            // (the queue never empties, the writer never reaches the idle
+            // seam); (d) suppressed while the dst controller is armed — a
+            // poll is not a park, but scenarios gain nothing from it and
+            // the scheduler's registration lifecycle stays exactly as the
+            // steal-storm fix shaped it.
+            bool hot_arrival = false;
+            if (hot_idle_us_ > 0 && hot_after_drain_ && !failed_ && !stop_requested_) {
+                hot_after_drain_ = false;   // one-shot, consumed whether or not the spin runs
+#ifdef CHRONOKV_STRESS
+                if (!dst::is_armed())   // baton discipline: no spins while armed
+#endif
+                {
+                    lk.unlock();
+                    const auto t0 = std::chrono::steady_clock::now();
+                    const auto deadline = t0 + std::chrono::microseconds(hot_idle_us_);
+                    while (std::chrono::steady_clock::now() < deadline) {
+                        if (queue_arrivals_.load(std::memory_order_relaxed) != arrivals_seen_) {
+                            hot_arrival = true;
+                            break;
+                        }
+                        if (stop_hint_.load(std::memory_order_relaxed)) break;
+                        ckv_cpu_pause();
+                    }
+                    const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    i_hot_spins_taken.fetch_add(1, std::memory_order_relaxed);
+                    if (hot_arrival)
+                        i_hot_spin_hits.fetch_add(1, std::memory_order_relaxed);
+                    if (waited > 0)
+                        i_hot_spin_us_total.fetch_add((uint64_t)waited,
+                                                      std::memory_order_relaxed);
+                    lk.lock();
+                }
+            }
+            if (!hot_arrival)
+                queue_cv_.wait(lk, [this] { return !queue_.empty() || stop_requested_; });
             if (queue_.empty()) {
                 if (stop_requested_) break;
                 continue;
@@ -5778,6 +5926,7 @@ public:
             if (queue_.front().command) {
                 std::shared_ptr<QueueCommand> cmd = queue_.front().command;
                 queue_.pop_front();
+                arrivals_seen_ += 1;   // hot-idle hint accounting (writer-exclusive)
                 // Command bodies run UNDER queue_mu_ — the rotation bodies
                 // mutate the same accounting the test accessors read, and
                 // the legacy leg ran them under batch_mu_ with the same
@@ -5813,10 +5962,14 @@ public:
             size_t drained_est = 0, total_records = 0;
             for (const auto& b : drain)
                 for (const auto& r : b->records) { drained_est += r.second.size(); ++total_records; }
+            arrivals_seen_ += drain.size();   // hot-idle hint accounting
             queue_bytes_ = (queue_bytes_ > drained_est) ? queue_bytes_ - drained_est : 0;
             queue_cv_.notify_all();   // space freed: wake blocked producers
             lk.unlock();
             run_batch_io(drain, cls_async, total_records);
+            // v29 M5 slice 3: the drain that just completed is the hot
+            // idle's evidence — the next idle transition may spin once.
+            hot_after_drain_ = true;
             lk.lock();
             if (failed_) death_drain_locked();   // W-STRAND for the remainder
         }
@@ -6214,6 +6367,8 @@ bool rotate_after_checkpoint(uint64_t ckpt_ts) {
             QueueItem it;
             it.command = cmd;
             queue_.push_back(std::move(it));
+            // v29 M5 slice 3: the hot-idle hint (see group_append's twin).
+            queue_arrivals_.fetch_add(1, std::memory_order_relaxed);
         }
         queue_cv_.notify_one();
         std::unique_lock<std::mutex> lk(queue_mu_);
@@ -7602,7 +7757,10 @@ public:
                       size_t wal_queue_max_bytes = 0,
                       // v29 M5 slice 2: adaptive-linger cap, microseconds
                       // (0 = OFF, the default; ignored on the legacy leg).
-                      uint32_t wal_linger_cap_us = 0) {
+                      uint32_t wal_linger_cap_us = 0,
+                      // v29 M5 slice 3: the writer's hot-idle spin budget,
+                      // microseconds (0 = OFF; ignored on the legacy leg).
+                      uint32_t wal_writer_hot_idle_us = 0) {
          wal_dir_ = wal_dir;
         // v25.1 M1.6: initialize the B+ tree index. Pool size is configurable
         // (default 256 MiB for production; tests pass a smaller size via
@@ -7624,7 +7782,8 @@ public:
         if (!wal_dir.empty() && !wal_read_only) {
             wal_ = std::make_unique<WalSegments>(wal_dir, wal_queue_max_items,
                                                  wal_queue_max_bytes,
-                                                 wal_linger_cap_us);
+                                                 wal_linger_cap_us,
+                                                 wal_writer_hot_idle_us);
             // v24 FIX (Group 2, Fix 5): seed clock_ from existing WAL
             // contents so the first commit doesn't reserve cts=1 and
             // collide with existing records. This is unconditional
@@ -7671,7 +7830,9 @@ public:
                                 w.pub_allocated_max,
                                 w.queue_high_water, w.backpressure_waits,
                                 w.class_switches, w.drains, w.writer_deaths,
-                                w.lingers_taken, w.linger_us_total};
+                                w.lingers_taken, w.linger_us_total,
+                                w.hot_spins_taken, w.hot_spin_hits,
+                                w.hot_spin_us_total};
     }
     EpochInstanceStats epoch_stats() const {
         auto e = phantom_tracker_.epoch_stats();
@@ -11093,6 +11254,24 @@ struct Options {
     // averaging >= 2 records, or >= 2 items already queued) pays for it.
     // Diagnostics: wal_stats().lingers_taken / linger_us_total.
     uint32_t wal_linger_cap_us = 0;
+    // v29 M5 slice 3: the writer's HOT-IDLE budget in MICROSECONDS — after
+    // draining a batch, the writer thread briefly polls a monotonic arrival
+    // counter instead of parking on the condition variable, so a
+    // back-to-back commit stream's next enqueue is observed in ~100ns
+    // rather than a futex-wake round trip. This is the first half of the
+    // handoff-latency fix for the arena regression the nightlies have
+    // carried since run #121 (the writer-thread landing): every
+    // low-concurrency commit paid two scheduler round trips the legacy
+    // leader never paid. 0 disables it. The cost is bounded idle heat —
+    // one budget-sized spin per idle transition after a drain, never on
+    // read-only workloads (no drains) and never at high concurrency (the
+    // queue never empties). The 50us default is the measured knee on the
+    // dev sandbox (single-committer async put: 31.5us p50 OFF vs 27.5us
+    // ON at every budget >= 25us — the inter-enqueue gap after an ack is
+    // CPU-prep-sized, ~10-25us, not I/O-sized) with 2x headroom for
+    // slower arena runners. Diagnostics: wal_stats().hot_spins_taken /
+    // hot_spin_hits / hot_spin_us_total.
+    uint32_t wal_writer_hot_idle_us = 50;
 };
 
 // ---- Forward declarations ---------------------------------------------
@@ -11114,6 +11293,12 @@ struct WalStats {
     // while the cap is 0 — the default — and on the legacy leg). The
     // arena reads them to attribute batch-fill wins vs gap-case p99.
     uint64_t lingers_taken = 0, linger_us_total = 0;
+    // v29 M5 slice 3: hot-idle diagnostics (zero while the budget is 0
+    // and on the legacy leg). hot_spin_hits / hot_spins_taken is the
+    // mechanism's health ratio — near 1.0 on sustained
+    // single-committer streams, near 0.0 when the budget outruns the
+    // arrival cadence (pure heat, latency-neutral).
+    uint64_t hot_spins_taken = 0, hot_spin_hits = 0, hot_spin_us_total = 0;
 };
 struct GcStats {
     uint64_t created = 0, retired = 0, reclaimed = 0, retired_pending = 0,
@@ -11224,7 +11409,8 @@ public:
                                                 /*wal_read_only=*/opts.pitr_as_of_cts != 0,
                                                 opts.wal_queue_max_items,
                                                 opts.wal_queue_max_bytes,
-                                                opts.wal_linger_cap_us);
+                                                opts.wal_linger_cap_us,
+                                                opts.wal_writer_hot_idle_us);
         } catch (const std::exception& e) {
             throw LifecycleError(std::string("cannot open database: ") + e.what());
         }
@@ -11613,7 +11799,9 @@ public:
                         w.truncate_fails, w.async_lost, w.pub_allocated_max,
                         w.queue_high_water, w.backpressure_waits,
                         w.class_switches, w.drains, w.writer_deaths,
-                        w.lingers_taken, w.linger_us_total};
+                        w.lingers_taken, w.linger_us_total,
+                        w.hot_spins_taken, w.hot_spin_hits,
+                        w.hot_spin_us_total};
     }
     GcStats gc_stats() const {
         auto eng = api_engine();
