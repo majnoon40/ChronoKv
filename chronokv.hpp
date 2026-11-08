@@ -1805,6 +1805,21 @@ namespace dst {
                 if (waiting[i].tid == my_tid) { me = waiting[i].granted; break; }
             if (me) break;
             cv.wait_for(lk, std::chrono::milliseconds(1));
+            // v29 M5 slice-1 fix (2026-11-08): disarm RELEASES parked
+            // threads. M5 made the WAL writer an engine-internal thread
+            // that reaches dst points, so a park can now be outstanding
+            // when a scenario disarms (the writer parks between drains
+            // whenever work arrives); before this, disarm's
+            // waiting.clear() left any such parker scanning a set
+            // that no longer contains it, forever — a join hang at
+            // shutdown, the exact "child HANG" class the deadline
+            // exists to surface. Scenarios still disarm only after
+            // joining their workload threads, so for them this return
+            // stays unreachable; the engine-internal parker returns
+            // WITHOUT taking the baton (holder is UINT64_MAX after
+            // disarm by construction, and the post-loop `holder =
+            // my_tid` is skipped by the early return).
+            if (!armed) return;
             // Deadlock breaker: baton granted but the runner is stuck on a
             // real lock held by a parked thread (or died). Steal it.
             if (holder != UINT64_MAX &&
@@ -1876,8 +1891,63 @@ inline void stress_point(const char* name) {
             stress::gap_callback_root_install();
     }
 }
+
+// v29 M5 slice-1 DST fix (2026-11-08, rule 9 — measured on the crawl this
+// exists for): the baton discipline for REAL-condvar waits on the commit
+// path. Blocking on a real cv while HOLDING the baton is the steal-storm
+// shape: the controller cannot grant (the baton is out) and the blocked
+// thread cannot run, so after steal_wait_ms (5ms) a parked thread steals
+// — and M5's writer thread made that block per-COMMIT (every committer
+// waits on done_cv_ for the writer's publication; the writer itself
+// idles in queue_cv_ after each drain; await_published stretches under
+// the longer in-memory tails). Measured, local -O2 stress build,
+// CKV_DST_SEEDS=12, BEFORE the fix: every scenario's child wall ==
+// steals x ~5.4ms to within noise (tree_cursor_split 797/4278ms,
+// tree_merge_cascade 1345/7285ms, gc_epoch_scan 107/581ms,
+// wal_mixed_handoff 44/242ms) — the steal windows ARE the wall time.
+// The CI consequence: nightly DST shards went 63-75min (pre-M5, run
+// #116, f797b97d) to 240-min timeout-cancellations on EVERY nightly
+// since #121 (the first post-slice-1, 85a2bd1); push legs stayed green
+// only because 100-seed scale still fit the 60-min budget (run #122:
+// 23m50s) — the crawl was invisible at PR scale and fatal at nightly
+// scale. The fix: while the controller is armed, a waiter on one of
+// these seams PARKS at a named point (releasing the baton properly)
+// and re-checks the predicate after each grant — the writer gets its
+// grants, publishes, and the waiter proceeds with NO steal window at
+// all. Unarmed (production, and stress before arm): the plain
+// predicated wait, byte-for-byte today's code. Determinism accounting,
+// stated honestly: the re-park count per wait is wall-clock-dependent
+// (the writer's real I/O overlaps the grant churn), so a run replays
+// from (seed, op-count) up to the park sequence exactly as it already
+// replayed up to the logged steal points — the trade is many
+// microsecond-scale re-parks for the 5ms windows that were 100% of the
+// crawl. The steal counter remains the honest health signal: clean
+// scenarios on clean code target ~0 steals (the baton design's own
+// bar), restored by this fix.
+template <class Pred>
+inline void dst_aware_wait(std::condition_variable& cv,
+                           std::unique_lock<std::mutex>& lk,
+                           Pred pred, const char* name) {
+    if (dst::is_armed()) {
+        while (!pred()) {
+            lk.unlock();
+            dst::point(name);   // park: release the baton properly
+            lk.lock();
+        }
+        return;
+    }
+    cv.wait(lk, pred);
+}
 #else
 inline void stress_point(const char*) {}
+// Unarmed twin of the stress-mode dst_aware_wait: the plain predicated
+// wait, so call sites compile identically in production TUs.
+template <class Pred>
+inline void dst_aware_wait(std::condition_variable& cv,
+                           std::unique_lock<std::mutex>& lk,
+                           Pred pred, const char*) {
+    cv.wait(lk, pred);
+}
 #endif
 
 // ======================== Linearizability history recorder ========================
@@ -5329,11 +5399,17 @@ public:
 
         const bool need_fsync = !i_am_async;
         lk.lock();
-        done_cv_.wait(lk, [&] {
+        // v29 M5 slice-1 DST fix: this wait was the steal-storm's biggest
+        // single source — every committer blocked here HOLDING the baton
+        // (its last park was after_cts_reserve, inside the reservation
+        // window), waiting for the writer — a thread that is itself either
+        // blocked in queue_cv_ or mid-drain. Park, don't block-with-baton;
+        // see dst_aware_wait's header for the measured story.
+        dst_aware_wait(done_cv_, lk, [&] {
             return my_batch->failed ||
                    (need_fsync ? my_batch->done
                                : my_batch->written.load(std::memory_order_acquire));
-        });
+        }, "wal_await_publication");
         bool ok = need_fsync ? (my_batch->done && !my_batch->failed)
                              : my_batch->written.load(std::memory_order_acquire);
         if (!ok) return {1, ts};
@@ -5379,6 +5455,27 @@ public:
     void writer_loop() {
         std::unique_lock<std::mutex> lk(queue_mu_);
         while (true) {
+#ifdef CHRONOKV_STRESS
+            // v29 M5 slice-1 DST fix: going idle WITH THE BATON is the
+            // writer-side steal source — after each drain the loop returns
+            // here holding the grant from wal_writer_batch_done and blocks
+            // in the real wait below, so the controller is frozen out for
+            // steal_wait_ms before a parked committer rescues it. Idle
+            // transitions are per-drain, i.e. per commit batch on
+            // single-committer scenarios (S4's measured shape). Fix: leave
+            // the scheduler before idling — thread_done() releases the
+            // baton and the registration (a no-op when never registered:
+            // pre-rendezvous idles, exactly the states where the plain cv
+            // wait cannot hold a baton anyway); the wake path
+            // re-registers at wal_writer_wake exactly as it already does,
+            // causally post-rendezvous (work must have arrived). The idle
+            // state sits OUTSIDE the scheduler, as it is in production —
+            // no grant-lottery churn, no timing-dependent park counts,
+            // strictly fewer steals than both the unfixed loop and any
+            // park-while-idle variant.
+            if (dst::is_armed() && queue_.empty() && !stop_requested_)
+                dst::thread_done();
+#endif
             queue_cv_.wait(lk, [this] { return !queue_.empty() || stop_requested_; });
             if (queue_.empty()) {
                 if (stop_requested_) break;
@@ -5388,7 +5485,25 @@ public:
             // The wake seam (successor of wal_leader_elected): between this
             // point and the prefix cut, producers can still enqueue — the
             // dst-schedulable window where batch composition is decided.
+            //
+            // v29 M5 slice-1 DST fix (2026-11-08, measured with a
+            // steal-attribution build): this park MOVED OUT of the
+            // queue_mu_ critical section. Parked-under-the-lock, it was
+            // 91% of the post-slice-1 steal storm's remaining volume
+            // (tree scenarios, 12 seeds: 10105 of 11074 steals): a
+            // committer granted at wal_await_publication re-locks
+            // queue_mu_ to re-check its predicate and BLOCKS on the real
+            // mutex held by the writer parked HERE — baton held, 5ms
+            // steal window, once per commit. Unlocked, the seam's own
+            // documented window WIDENS (producers can enqueue DURING the
+            // park, not only after the grant — strictly more drain-
+            // composition interleavings for the S1 class-switch oracle);
+            // the re-checks below mirror the hook block's discipline.
+            lk.unlock();
             stress_point("wal_writer_wake");
+            lk.lock();
+            if (queue_.empty()) continue;            // park-side effects / stop
+            if (failed_) { death_drain_locked(); continue; }
 #ifdef CHRONOKV_TEST_HOOKS
             // The pre-drain hook runs UNLOCKED — exactly like the legacy
             // leader's election-window hook: its whole purpose (SRC-E1) is
@@ -5447,6 +5562,16 @@ public:
             lk.lock();
             if (failed_) death_drain_locked();   // W-STRAND for the remainder
         }
+#ifdef CHRONOKV_STRESS
+        // The replay contract, closed for the writer: "every thread that
+        // can reach a dst point must call thread_done() before it exits" —
+        // M5 slice 1 added the engine's first such thread and missed this
+        // half (harmless while exit only happened post-disarm; the idle
+        // fix above makes the writer's registration lifecycle explicit,
+        // so the exit path states it too). No-op when disarmed or never
+        // registered.
+        dst::thread_done();
+#endif
     }
 
     // v29 M5: one drain's I/O — the stage-for-stage mirror of the legacy
@@ -6233,7 +6358,16 @@ public:
     // can block on the waiter's locks. Full argument in the header block.
     void await_published(uint64_t ts) {
         std::unique_lock<std::mutex> lk(mu_);
-        cv_.wait(lk, [&] { return published_.load(std::memory_order_relaxed) >= ts; });
+        // v29 M5 slice-1 DST fix: same baton discipline as the WAL
+        // publication wait — the caller's last park (before_publish) is
+        // immediately above, so blocking here held the baton against the
+        // lower-cts committers the barrier exists to sequence. This site
+        // predates M5 (it is where the pre-M5 steal baseline came from:
+        // ~0.03-0.2 steals/commit); the writer thread stretched the
+        // in-memory tails it waits on, so it parks now too.
+        dst_aware_wait(cv_, lk,
+                       [&] { return published_.load(std::memory_order_relaxed) >= ts; },
+                       "pub_barrier_wait");
     }
 };
 

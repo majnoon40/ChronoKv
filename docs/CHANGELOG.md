@@ -7,6 +7,81 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **fix (v29 M5 slice-1 CI acceptance, 2026-11-08): the nightly DST crawl —
+  every nightly red or cancelled since run #121, the FIRST post-slice-1 —
+  is diagnosed and fixed; the steal storm is gone and the pre-M5 wall-time
+  band is restored.** The landing's "both legs green" was true at PR scale
+  and false at nightly scale: DST shards went 63–75 min (run #116,
+  f797b97d, pre-slice-1) to 240-min timeout-cancellations on EVERY nightly
+  from #121 on (8 shards × 4h each, `ci-passed` red as collateral), while
+  push legs stayed green only because 100-seed scale still fit the 60-min
+  budget (run #122: 23m50s) — the crawl was invisible where the gate
+  looked and fatal where it didn't. Root cause (measured, not assumed):
+  M5's writer thread made the baton scheduler's escape hatch — the 5 ms
+  steal window, designed as a deadlock-breaker that "clean scenarios
+  never" need — a per-COMMIT tax. Three real-cv waits moved onto the baton
+  path (every committer's `done_cv_` publication wait, now waiting for a
+  different thread by construction; `await_published`'s longer in-memory
+  tails; the writer's own `queue_cv_` idle block after every drain), and
+  each block held the baton against the controller for one full window.
+  Measured locally, `-O2` stress build, 12 seeds/scenario, BEFORE the fix:
+  every scenario's child wall == steals × ~5.4 ms to within noise
+  (tree_cursor_split 797 steals/4278 ms, tree_merge_cascade 1345/7285 ms,
+  gc_epoch_scan 107/581 ms — matching CI's 800/4622 ms on the 11-07
+  nightly), i.e. the steal windows ARE the wall time; the shard math
+  (2083 seeds × the two tree scenarios) rebuilds the observed >320-min
+  need against the 240-min cap. The fix, in three moves: (1)
+  `dst_aware_wait` — while the controller is armed, a waiter on these
+  seams PARKS at a named point (`wal_await_publication`,
+  `pub_barrier_wait`) and re-checks its predicate after each grant, so the
+  writer gets its grants and the waiter proceeds with no steal window at
+  all; unarmed it is byte-for-byte the plain predicated wait (production
+  TUs unchanged); (2) the writer LEAVES the scheduler before idling —
+  `dst::thread_done()` on the idle transition (baton + registration
+  released; the wake path re-registers at `wal_writer_wake` exactly as it
+  already does, causally post-rendezvous), so the idle state sits outside
+  the scheduler as it is in production, with no grant-lottery churn; (3)
+  the `wal_writer_wake` park moved OUT of the `queue_mu_` critical
+  section — a steal-attribution build measured parked-under-the-lock as
+  91% of the remaining storm (10105 of 11074 steals across the tree
+  scenarios: a committer granted at `wal_await_publication` re-locks
+  `queue_mu_` and blocks on the writer parked THERE, baton held, once per
+  commit); unlocked, the seam's own documented window widens (producers
+  can enqueue DURING the park — strictly more drain-composition
+  interleavings for the S1 class-switch oracle), with the hook block's
+  re-check discipline mirrored after the park. Two scheduler-contract
+  closures ride along: `dst::point`'s poll loop now returns on disarm (an
+  engine-internal thread may be parked when a scenario disarms — before
+  this, `disarm`'s `waiting.clear()` left such a parker scanning a set
+  that no longer contains it, forever), and the writer's exit path calls
+  `dst::thread_done()` (M5 slice 1 added the engine's first
+  dst-reaching internal thread and missed the replay contract's exit
+  half). MEASURED AFTER (same vehicle, same 12 seeds): tree_cursor_split
+  4278 → 70 ms (797 → 4 steals), tree_merge_cascade 7285 → 440 ms
+  (1345 → 62), gc_epoch_scan 581 → 187 ms, wal_mixed_handoff 242 → 91 ms,
+  reclaim_retire_pin 339 → 71 ms — all six scenarios PASS with hang=0
+  crash=0 invariant=0; shard extrapolation ~25–30 min, inside the 240-min
+  budget with the pre-M5 band restored. Determinism accounting, stated
+  honestly: the re-park count per wait is wall-clock-dependent (the
+  writer's real I/O overlaps the grant churn), so a run replays from
+  (seed, op-count) up to the park sequence exactly as it already replayed
+  up to the logged steal points — many microsecond re-parks replace the
+  5 ms windows that were 100% of the crawl, and the steal counter remains
+  the honest health signal (clean code targets ~0 steals: the design's
+  own bar, restored). Validation: full release, stress (CHRONOKV_STRESS)
+  and legacy (CKV_WAL_LEGACY_LEADER) suites ALL TESTS PASSED locally —
+  with `CKV_UNDER_SANITIZER=1` on the two local runs ONLY to skip the
+  async benchmark, because this sandbox's `kernel.threads-max=925` sits
+  under the benchmark's ~1000-thread `std::async` stampede: pristine HEAD
+  at `ulimit -u 600` aborts there identically, so that failure mode is the
+  box, not the change (CI's normal limits run it green every push);
+  -Wconversion ratchet 33 → 33; header hygiene (reinclude + 2-TU stress
+  link) green. The arena gate's Nov-04..07 reds are NOT addressed here —
+  per the workflow's own RE-RUN POLICY the disposition path is a
+  workflow_dispatch re-run on the same commit, two consecutive verdicts
+  being the real-regression bar; this fix unblocks that re-run (every
+  nightly since 10-25 was red-or-cancelled on DST regardless of arena).
+
 - **ci (v29 M1 step 4, arena split):** the nightly ledger vehicle is now
   TWO parallel jobs — `arena-chronokv` (group + async legs; 90-min timeout
   sized from run #65's measured 44m01s, ~2x headroom) and `arena-baselines`
