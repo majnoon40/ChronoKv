@@ -10850,15 +10850,21 @@ static int run_m5_slice2_test() {
                         ok_commits.fetch_add(1, std::memory_order_relaxed);
             });
         // Let the batch machinery warm (gate opens on fat drains), then
-        // close MID-FLIGHT: in-flight committers race the destructor's
-        // drain-then-stop exactly like the W5 control's shape.
+        // close MID-FLIGHT. W5's shape, NOT a destructor race: close() is
+        // the concurrency-safe teardown (in-flight puts complete-or-fail-
+        // cleanly; drain-then-stop-then-join happens inside it), while
+        // reset() with committers still inside db->put is a UAF on the
+        // Database object itself — the asan legs of CI run #142 caught
+        // exactly that. The object stays alive until every committer has
+        // joined; the CLOSE is what the clock measures.
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
         const auto t0 = std::chrono::steady_clock::now();
         stop.store(true, std::memory_order_relaxed);
-        db.reset();   // ~Database: drain-to-terminal, stop, join
+        try { db->close(); } catch (...) {}
         const long close_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
         for (auto& th : ths) th.join();
+        db.reset();
         check("m5s2 L2: close-latency honors stop (16 hot committers, 500ms cap)",
               close_ms < 250,
               "close took " + std::to_string(close_ms) + "ms (bound 250ms; a "
