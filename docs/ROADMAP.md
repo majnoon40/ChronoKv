@@ -1216,7 +1216,7 @@ gone; the triple identity **cts-order == WAL-order == phantom-order**
 re-proven by the full matrix — and since TXN-1, phantom-order carries
 *every* write, so the identity has strictly more content to preserve.
 
-## M6 — Space and steady state  **[M]**
+## M6 — Space and steady state  **[M]**  *(STARTED 2026-11-09 — ITEM 5 LANDED, the streaming recovery parse; see the CHANGELOG. The 64 MiB segment slurp is deleted: every WAL segment parses through a rolling buffer bounded by one maximum frame + one chunk — measured at the production cap, a 262 KB high-water parsing a 64 MiB segment (256× below the slurp) and 1.6× faster than the slurp's parse-only pass; recover_all is a sink-templated pipeline with a new status-only verify_all leg so the verify paths (verify_wal_dir, backup verification) stop materializing record vectors; WAL-1 interior-damage semantics preserved EXACTLY — the m6 r1 battery holds streaming == the in-memory oracle across clean/torn-tail/interior-damage shapes, including the corrupted-length-on-a-700-KiB-frame scan whose valid continuation sits past two chunk boundaries. The record-vector accumulation in recover_all's public leg (the API contract) and the caller-side sorts are unchanged — streaming the REPLAY is a possible later slice, deliberately not smuggled in. Items 1–4 and 6–8 not started.)*
 
 Carried unchanged (appendix §M6): persistent incremental GC cursor
 (O(N/256) sweeps); slab-compaction reuse against a published

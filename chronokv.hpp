@@ -2483,89 +2483,97 @@ inline std::vector<uint8_t> wal_prepend_lsn(uint64_t lsn, const std::vector<uint
 
 enum class WalStatus { OK, TORN_TAIL, CORRUPT };
 
+// v29 M6 item 5: the single-frame parser, extracted VERBATIM from
+// wal_recover_buf's local lambda so the streaming reader (below) and the
+// in-memory oracle share ONE parse implementation — the m6 r1 equivalence
+// controls hold them to identical behavior. Frame layout:
+// [len:4][crc:4][lsn:8][cts:8][n:4]{[kl:2][key][vl:4][val][del:1]}*.
+// Advances p ONLY on success; every failure path returns false with p
+// unmoved (the streaming reader depends on that to retry after a refill).
+inline bool wal_parse_frame(const std::vector<uint8_t>& buf, size_t& p,
+                            uint64_t& lsn, uint64_t& ts, WriteSet& ws) {
+    if (p + 8 > buf.size()) return false;
+
+    uint32_t len = 0, crc = 0;
+    for (int i = 0; i < 4; ++i) len |= static_cast<uint32_t>(buf[p+i]) << (8*i);
+    for (int i = 0; i < 4; ++i) crc |= static_cast<uint32_t>(buf[p+4+i]) << (8*i);
+
+    if (len < 20 || len > (1u << 20) || p + 8 + len > buf.size()) return false;
+
+    {
+        std::vector<uint8_t> crc_input;
+        crc_input.reserve(4 + len);
+        for (int i = 0; i < 4; ++i) crc_input.push_back(buf[p+i]);
+        crc_input.insert(crc_input.end(), buf.begin() + p + 8, buf.begin() + p + 8 + len);
+        if (crc32(crc_input.data(), crc_input.size()) != crc) return false;
+    }
+
+    size_t q = p + 8;
+    const size_t end = p + 8 + len;
+
+    auto need = [&](size_t n) {
+        return q <= end && n <= end - q;
+    };
+
+    auto pu64 = [&]() {
+        uint64_t v = 0;
+        for (int i = 0; i < 8; ++i) v |= (uint64_t(buf[q++]) << (8*i));
+        return v;
+    };
+    auto pu32 = [&]() {
+        uint32_t v = 0;
+        for (int i = 0; i < 4; ++i) v |= (uint32_t(buf[q++]) << (8*i));
+        return v;
+    };
+    auto pu16 = [&]() {
+        uint16_t v = 0;
+        for (int i = 0; i < 2; ++i) v |= (uint16_t(buf[q++]) << (8*i));
+        return v;
+    };
+
+    if (!need(8)) return false;
+    lsn = pu64();
+
+    if (!need(8)) return false;
+    ts = pu64();
+
+    if (!need(4)) return false;
+    uint32_t n = pu32();
+
+    ws.clear();
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!need(2)) return false;
+        uint16_t kl = pu16();
+
+        if (!need(kl)) return false;
+        std::string k;
+        if (kl > 0) k.assign(reinterpret_cast<const char*>(&buf[q]), kl);
+        q += kl;
+
+        if (!need(4)) return false;
+        uint32_t vl = pu32();
+
+        if (!need(vl)) return false;
+        std::string v;
+        if (vl > 0) v.assign(reinterpret_cast<const char*>(&buf[q]), vl);
+        q += vl;
+
+        if (!need(1)) return false;
+        bool dl = buf[q++] != 0;
+
+        ws.push_back({k, v, dl});
+    }
+
+    if (q != end) return false;
+
+    p += 8 + len;
+    return true;
+}
+
 inline std::pair<WalStatus, std::vector<std::pair<uint64_t, WriteSet>>>
 wal_recover_buf(const std::vector<uint8_t>& buf) {
     std::vector<std::pair<uint64_t, WriteSet>> out;
     size_t pos = 0;
-
-    auto parse = [&](size_t& p, uint64_t& lsn, uint64_t& ts, WriteSet& ws) -> bool {
-        if (p + 8 > buf.size()) return false;
-
-        uint32_t len = 0, crc = 0;
-        for (int i = 0; i < 4; ++i) len |= static_cast<uint32_t>(buf[p+i]) << (8*i);
-        for (int i = 0; i < 4; ++i) crc |= static_cast<uint32_t>(buf[p+4+i]) << (8*i);
-
-        if (len < 20 || len > (1u << 20) || p + 8 + len > buf.size()) return false;
-
-        {
-            std::vector<uint8_t> crc_input;
-            crc_input.reserve(4 + len);
-            for (int i = 0; i < 4; ++i) crc_input.push_back(buf[p+i]);
-            crc_input.insert(crc_input.end(), buf.begin() + p + 8, buf.begin() + p + 8 + len);
-            if (crc32(crc_input.data(), crc_input.size()) != crc) return false;
-        }
-
-        size_t q = p + 8;
-        const size_t end = p + 8 + len;
-
-        auto need = [&](size_t n) {
-            return q <= end && n <= end - q;
-        };
-
-        auto pu64 = [&]() {
-            uint64_t v = 0;
-            for (int i = 0; i < 8; ++i) v |= (uint64_t(buf[q++]) << (8*i));
-            return v;
-        };
-        auto pu32 = [&]() {
-            uint32_t v = 0;
-            for (int i = 0; i < 4; ++i) v |= (uint32_t(buf[q++]) << (8*i));
-            return v;
-        };
-        auto pu16 = [&]() {
-            uint16_t v = 0;
-            for (int i = 0; i < 2; ++i) v |= (uint16_t(buf[q++]) << (8*i));
-            return v;
-        };
-
-        if (!need(8)) return false;
-        lsn = pu64();
-
-        if (!need(8)) return false;
-        ts = pu64();
-
-        if (!need(4)) return false;
-        uint32_t n = pu32();
-
-        ws.clear();
-        for (uint32_t i = 0; i < n; ++i) {
-            if (!need(2)) return false;
-            uint16_t kl = pu16();
-
-            if (!need(kl)) return false;
-            std::string k;
-            if (kl > 0) k.assign(reinterpret_cast<const char*>(&buf[q]), kl);
-            q += kl;
-
-            if (!need(4)) return false;
-            uint32_t vl = pu32();
-
-            if (!need(vl)) return false;
-            std::string v;
-            if (vl > 0) v.assign(reinterpret_cast<const char*>(&buf[q]), vl);
-            q += vl;
-
-            if (!need(1)) return false;
-            bool dl = buf[q++] != 0;
-
-            ws.push_back({k, v, dl});
-        }
-
-        if (q != end) return false;
-
-        p += 8 + len;
-        return true;
-    };
 
     uint64_t expected_lsn = 0;
     bool have_lsn = false;
@@ -2575,7 +2583,7 @@ wal_recover_buf(const std::vector<uint8_t>& buf) {
         WriteSet ws;
         size_t save = pos;
 
-        if (parse(pos, lsn, ts, ws)) {
+        if (wal_parse_frame(buf, pos, lsn, ts, ws)) {
             if (have_lsn && lsn != expected_lsn) return {WalStatus::CORRUPT, out};
             expected_lsn = lsn + 1;
             have_lsn = true;
@@ -2607,7 +2615,7 @@ wal_recover_buf(const std::vector<uint8_t>& buf) {
                 size_t nxt = off;
                 uint64_t l2, t2;
                 WriteSet w2;
-                if (parse(nxt, l2, t2, w2) && (!have_lsn || l2 >= expected_lsn)) valid_after = true;
+                if (wal_parse_frame(buf, nxt, l2, t2, w2) && (!have_lsn || l2 >= expected_lsn)) valid_after = true;
             }
 
             return {valid_after ? WalStatus::CORRUPT : WalStatus::TORN_TAIL, out};
@@ -2617,13 +2625,163 @@ wal_recover_buf(const std::vector<uint8_t>& buf) {
     return {WalStatus::OK, out};
 }
 
+// v29 M6 item 5 — the STREAMING segment reader. wal_recover_file
+// previously slurped the whole segment into memory (64 MiB at the
+// production cap) before parsing; the soak's open-after-kill with a large
+// WAL window multiplies that spike per segment. The streaming core reads
+// in CHUNK-byte pieces through a rolling buffer bounded by ONE maximum
+// frame (8 + 1 MiB by the parse's own length cap) + one chunk, and
+// preserves BOTH recovery semantics exactly:
+//   * LSN contiguity: a parsed frame whose lsn != expected is CORRUPT.
+//   * WAL-1 interior-damage classification: on a frame that fails at
+//     true EOF, the reader scans EVERY later byte offset IN THE FILE
+//     (streaming, across chunk boundaries) for a CRC-valid frame whose
+//     LSN continues the sequence; found => CORRUPT, none => TORN_TAIL.
+//     A scan that stopped at the chunk boundary would misclassify
+//     interior damage as a torn tail — the m6 r1 C/D controls redden
+//     that mutant class.
+// buf_hwm (optional): the rolling buffer's high-water mark — the
+// structural memory bound, independent of segment size (m6 r1 E asserts
+// it while parsing a multi-MiB segment).
+template <class Sink>
+inline WalStatus wal_recover_stream_file(const std::string& path, Sink&& sink,
+                                         size_t* buf_hwm = nullptr) {
+    std::ifstream ff(path, std::ios::binary);
+    if (!ff) return WalStatus::OK;   // absent file: the old slurp leg returned {OK, {}}
+    constexpr size_t CHUNK = 256 * 1024;
+    std::vector<uint8_t> buf;   // buf[0] is absolute file offset `base`
+    uint64_t base = 0;
+    size_t pos = 0;
+    bool eof = false;
+    size_t hwm = 0;
+
+    auto refill = [&]() -> bool {   // compact consumed prefix + read one chunk
+        if (pos > 0) { buf.erase(buf.begin(), buf.begin() + pos); base += pos; pos = 0; }
+        if (eof) return false;
+        const size_t old = buf.size();
+        buf.resize(old + CHUNK);   // the honest allocation high-water
+        if (buf.size() > hwm) hwm = buf.size();
+        ff.read(reinterpret_cast<char*>(buf.data() + old),
+                static_cast<std::streamsize>(CHUNK));
+        const size_t got = static_cast<size_t>(ff.gcount());
+        buf.resize(old + got);
+        if (got < CHUNK) eof = true;
+        return got > 0;
+    };
+    // "the failure is only a shortage of buffered bytes so far": an
+    // incomplete header, or an in-range length whose body is not fully
+    // buffered yet. Structural failures (length out of range) and
+    // validation failures (CRC, trailing bytes) are damage — no amount
+    // of additional data repairs them.
+    auto needs_more = [&]() -> bool {
+        if (eof) return false;
+        if (pos + 8 > buf.size()) return true;
+        uint32_t ln = 0;
+        for (int i = 0; i < 4; ++i) ln |= uint32_t(buf[pos+i]) << (8*i);
+        if (ln < 20 || ln > (1u << 20)) return false;
+        return pos + 8 + ln > buf.size();
+    };
+
+    uint64_t expected_lsn = 0;
+    bool have_lsn = false;
+
+    while (true) {
+        if (pos >= buf.size()) { if (!refill()) break; continue; }
+        uint64_t lsn, ts;
+        WriteSet ws;
+        const size_t save = pos;
+        if (wal_parse_frame(buf, pos, lsn, ts, ws)) {
+            if (have_lsn && lsn != expected_lsn) {
+                if (buf_hwm) *buf_hwm = hwm;
+                return WalStatus::CORRUPT;
+            }
+            expected_lsn = lsn + 1;
+            have_lsn = true;
+            sink(lsn, ts, ws);
+            continue;
+        }
+        pos = save;   // wal_parse_frame leaves p unmoved on failure; belt and suspenders
+        if (needs_more()) { refill(); continue; }
+
+        // Damage at absolute offset (base + save). WAL-1: scan every
+        // LATER byte offset in the FILE — a fresh sequential reader from
+        // dmg+1, so the scan crosses chunk boundaries exactly like the
+        // slurp leg scanned the fully-buffered tail.
+        bool valid_after = false;
+        {
+            const uint64_t dmg_off = base + save;
+            std::ifstream sf(path, std::ios::binary);
+            sf.seekg(static_cast<std::streamoff>(dmg_off + 1));
+            std::vector<uint8_t> sbuf;   // sbuf[0] is absolute file offset sbase
+            uint64_t sbase = dmg_off + 1;
+            size_t soff = 0;
+            bool seof = false;
+            auto srefill = [&]() -> bool {
+                if (soff > 0) { sbuf.erase(sbuf.begin(), sbuf.begin() + soff); sbase += soff; soff = 0; }
+                if (seof) return false;
+                const size_t old = sbuf.size();
+                sbuf.resize(old + CHUNK);
+                if (sbuf.size() > hwm) hwm = sbuf.size();
+                sf.read(reinterpret_cast<char*>(sbuf.data() + old),
+                        static_cast<std::streamsize>(CHUNK));
+                const size_t got = static_cast<size_t>(sf.gcount());
+                sbuf.resize(old + got);
+                if (got < CHUNK) seof = true;
+                return got > 0;
+            };
+            while (!valid_after) {
+                if (soff + 8 + 20 > sbuf.size()) { if (!srefill()) break; continue; }
+                if (have_lsn) {   // cheap LSN prefilter (same as the slurp leg)
+                    uint64_t cl = 0;
+                    for (int i = 0; i < 8; ++i) cl |= uint64_t(sbuf[soff+8+i]) << (8*i);
+                    if (cl < expected_lsn || cl - expected_lsn > (uint64_t(1) << 32)) { ++soff; continue; }
+                }
+                {   // cheap structural prefilter (no allocation, no CRC): plausible
+                    // length, and a write-count that fits it (each entry costs
+                    // >= 7 bytes after the 20-byte header) — verbatim from the
+                    // slurp leg, with one streaming addition: a plausible
+                    // candidate whose body crosses the read frontier gets a
+                    // refill before it is skipped.
+                    uint32_t c_len = 0, c_n = 0;
+                    for (int i = 0; i < 4; ++i) c_len |= uint32_t(sbuf[soff+i]) << (8*i);
+                    if (c_len >= 20 && c_len <= (1u << 20) && soff + 8 + c_len > sbuf.size()) {
+                        if (!seof) { srefill(); continue; }
+                        ++soff; continue;
+                    }
+                    if (c_len < 20 || c_len > (1u << 20) || soff + 8 + c_len > sbuf.size()) { ++soff; continue; }
+                    for (int i = 0; i < 4; ++i) c_n |= uint32_t(sbuf[soff+8+16+i]) << (8*i);
+                    if (c_n > (c_len - 20) / 7) { ++soff; continue; }
+                }
+                size_t nxt = soff;
+                uint64_t l2, t2;
+                WriteSet w2;
+                if (wal_parse_frame(sbuf, nxt, l2, t2, w2) && (!have_lsn || l2 >= expected_lsn)) {
+                    valid_after = true;
+                    break;
+                }
+                ++soff;
+            }
+        }
+        if (buf_hwm) *buf_hwm = hwm;
+        return valid_after ? WalStatus::CORRUPT : WalStatus::TORN_TAIL;
+    }
+    if (buf_hwm) *buf_hwm = hwm;
+    return WalStatus::OK;
+}
+
 inline std::pair<WalStatus, std::vector<std::pair<uint64_t, WriteSet>>>
 wal_recover_file(const std::string& path) {
-    std::ifstream ff(path, std::ios::binary);
-    if (!ff) return {WalStatus::OK, {}};
-    std::vector<uint8_t> buf(
-        (std::istreambuf_iterator<char>(ff)), std::istreambuf_iterator<char>());
-    return wal_recover_buf(buf);
+    std::vector<std::pair<uint64_t, WriteSet>> out;
+    const WalStatus s = wal_recover_stream_file(
+        path, [&](uint64_t, uint64_t ts, WriteSet& ws) { out.push_back({ts, std::move(ws)}); });
+    return {s, out};
+}
+
+// v29 M6 item 5: the status-only leg — identical parse and classification,
+// records parsed-and-discarded. The WAL-scrubbing callers (verify_wal_dir,
+// backup verification) stop materializing O(window) record vectors.
+inline WalStatus wal_verify_file(const std::string& path) {
+    return wal_recover_stream_file(path, [](uint64_t, uint64_t, WriteSet&) {});
 }
 
 
@@ -6462,9 +6620,17 @@ bool rotate_after_checkpoint_impl(uint64_t ckpt_ts) {
     //   - Detects orphan segments (id > manifest active_id).
     //   - Detects missing sealed segments.
     //   - Tolerates torn tails only in the final (active) segment.
-    static std::pair<WalStatus, std::vector<std::pair<uint64_t, WriteSet>>>
-    recover_all(const std::string& dir, uint64_t& ckpt_ts) {
-        std::vector<std::pair<uint64_t, WriteSet>> all;
+    // v29 M6 item 5: recover_all is now a thin wrapper over a sink-templated
+    // core (recover_all_impl) so the verify paths can run the IDENTICAL
+    // manifest / orphan / missing-segment / per-segment validation without
+    // materializing the O(window) record vector. The two public legs:
+    //   recover_all — the full record vector (replay, PITR, replication);
+    //   verify_all  — status only (verify_wal_dir, backup verification).
+    // Both stream each segment through wal_recover_stream_file (bounded
+    // memory per segment — the 64 MiB slurp is gone).
+    template <class Sink>
+    static WalStatus recover_all_impl(const std::string& dir, uint64_t& ckpt_ts,
+                                      Sink&& sink) {
 
         // 1. Read manifest READ-ONLY (no file creation).
         std::string mp = dir + "/MANIFEST";
@@ -6537,7 +6703,7 @@ bool rotate_after_checkpoint_impl(uint64_t ckpt_ts) {
             }
             if (max_seg_id == 0) {
                 // Fresh database: no MANIFEST, no segments.
-                return {WalStatus::OK, all};
+                return WalStatus::OK;
             }
             // Non-checkpointed database: infer active_id from highest segment.
             active_id = max_seg_id;
@@ -6641,7 +6807,7 @@ bool rotate_after_checkpoint_impl(uint64_t ckpt_ts) {
                 }
             }
 
-            auto [status, records] = wal_recover_file(seg_path);
+            const WalStatus status = wal_recover_stream_file(seg_path, sink);
 
             if (status == WalStatus::CORRUPT) {
                 diag::rec_crc_fails.fetch_add(1, std::memory_order_relaxed);
@@ -6657,11 +6823,24 @@ bool rotate_after_checkpoint_impl(uint64_t ckpt_ts) {
                 diag::rec_torn.fetch_add(1, std::memory_order_relaxed);
                 worst = WalStatus::TORN_TAIL;
             }
-
-            all.insert(all.end(), records.begin(), records.end());
         }
 
-        return {worst, all};
+        return worst;
+    }
+
+    static std::pair<WalStatus, std::vector<std::pair<uint64_t, WriteSet>>>
+    recover_all(const std::string& dir, uint64_t& ckpt_ts) {
+        std::vector<std::pair<uint64_t, WriteSet>> all;
+        const WalStatus s = recover_all_impl(
+            dir, ckpt_ts,
+            [&](uint64_t, uint64_t ts, WriteSet& ws) { all.push_back({ts, std::move(ws)}); });
+        return {s, all};
+    }
+
+    // v29 M6 item 5: the status-only leg — identical validation pipeline,
+    // identical streaming parse, no record materialization.
+    static WalStatus verify_all(const std::string& dir, uint64_t& ckpt_ts) {
+        return recover_all_impl(dir, ckpt_ts, [](uint64_t, uint64_t, WriteSet&) {});
     }
 
     // v24 FIX (Group 2, Fix 5): seed clock_ from existing WAL contents.
@@ -8169,7 +8348,7 @@ public:
         }
         uint64_t ckpt_ts = 0;
         try {
-            auto [status, records] = WalSegments::recover_all(wal_dir, ckpt_ts);
+            const WalStatus status = WalSegments::verify_all(wal_dir, ckpt_ts);
             if (status == WalStatus::CORRUPT) {
                 if (reason) *reason = "WAL corruption detected";
                 return false;
@@ -9502,8 +9681,8 @@ public:
         if (m.active_id > 0) {
             uint64_t ckpt_ts = 0;
             try {
-                auto [status, records] =
-                    WalSegments::recover_all(dest_dir + "/wal", ckpt_ts);
+                const WalStatus status =
+                    WalSegments::verify_all(dest_dir + "/wal", ckpt_ts);
                 if (status == WalStatus::CORRUPT)
                     return fail("backup WAL corruption detected");
             } catch (const std::exception& e) {

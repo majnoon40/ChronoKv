@@ -7,6 +7,55 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **feat+test (v29 M6 item 5, 2026-11-09): STREAMING RECOVERY PARSE — the
+  64 MiB segment slurp is deleted; recovery reads every WAL segment
+  through a rolling buffer bounded by one maximum frame + one chunk
+  (measured at the production cap: a 262 KB high-water parsing a
+  64 MiB segment, a 256× peak reduction, and 1.6× FASTER than the
+  slurp's parse-only pass — the working set now fits in cache).**
+  `wal_recover_file` previously read each segment WHOLE into memory
+  before parsing (64 MiB at the production cap), and the verify paths
+  (verify_wal_dir, backup verification) additionally materialized the
+  full record vector only to read one status off it — the soak's
+  open-after-kill with a large WAL window multiplies that spike per
+  segment. The slice, per the roadmap's own note ("a small item with a
+  large worst-case payoff"): the single-frame parser is extracted
+  VERBATIM from wal_recover_buf's local lambda into `wal_parse_frame`
+  (one parse implementation shared by the in-memory oracle and the
+  streaming reader), and a new sink-templated streaming core
+  `wal_recover_stream_file` reads each segment in 256 KiB chunks. BOTH
+  recovery semantics are preserved exactly: LSN contiguity, and the
+  WAL-1 interior-damage classification — on a frame that fails at true
+  EOF the reader scans every LATER byte offset IN THE FILE (streaming,
+  across chunk boundaries) for a CRC-valid frame whose LSN continues
+  the sequence; found is CORRUPT, none is TORN_TAIL. recover_all
+  becomes a thin wrapper over a sink-templated `recover_all_impl` with
+  two public legs: `recover_all` (the full record vector — replay,
+  PITR, replication extract) and the new `verify_all` (status only) —
+  verify_wal_dir and backup verification stop materializing
+  O(window) record vectors on top of the bounded parse. The m6 r1
+  battery (CKV_ONLY_M6) holds the equivalence: A/B/C/D compare the
+  streaming reader against the slurp oracle on clean, torn-tail,
+  interior-damage, and corrupted-length-on-a-700-KiB-frame segments (D
+  is the WAL-1 hazard named at its own fix — the valid continuation
+  frame sits past TWO chunk boundaries, so the chunk-bounded-scan
+  mutant calls interior damage a torn tail and reddens); E asserts the
+  structural memory bound (hwm ≤ 8 + 1 MiB + 256 KiB while parsing a
+  >2.5 MiB segment, every record delivered exactly once); F runs both
+  legs against a real Database WAL dir (statuses agree, verify_wal
+  green, and real-segment interior damage fails BOTH legs); G (stress
+  leg) parses a full 64 MiB segment — 1,359,434 frames, hwm 262,194 B,
+  wall 268 ms vs the slurp leg's 442 ms parse-only on top of its
+  64 MiB raw hold. Validation: full release suite green (ALL TESTS
+  PASSED), M5 writer battery + CKV-001..021 remediation battery green,
+  crash-fuzz 8 seeds / 2688 iterations / 0 violations, stress-leg m6
+  battery green, three-config syntax (release/tsan/legacy leader).
+  Scope honestly recorded: the record-VECTOR accumulation in
+  recover_all's public leg is unchanged (it is the API contract), as
+  are the caller-side sorts — a future slice may stream the replay
+  itself, but that changes failure semantics around duplicate/gap
+  detection and is not smuggled into this one.
+
 - **docs (v29 M5 slice 3, dispatch verdicts recorded, 2026-11-08): the
   two writer-sweep artifacts and both arena gate verdicts land in the
   decision doc §15.1 — the honest intermediate state.** Run #146

@@ -586,6 +586,7 @@ static int run_m4_merge_test();              // v29 M4: leaf merge & rebalance c
 static int run_m5_writer_test();             // v29 M5 slice 1: WAL writer-thread / W-STRAND controls (decision doc 2026-10-20)
 static int run_m5_slice2_test();             // v29 M5 slice 2: io_uring issuer rungs + adaptive linger (decision doc 2026-10-20 §8)
 static int run_m5_slice3_test();             // v29 M5 slice 3: writer hot-idle controls (the arena-regression fix)
+static int run_m6_slice1_test();             // v29 M6 item 5: streaming recovery parse (the 64 MiB slurp deleted)
 static int run_m2_phase1_test();
 static int run_m2_phase2_test();
 static int run_m2_phase3_test();
@@ -2501,6 +2502,17 @@ return 0;
         int f = run_m5_writer_test();
         f += run_m5_slice2_test();   // v29 M5 slice 2: the ring rungs + linger
         f += run_m5_slice3_test();   // v29 M5 slice 3: the writer hot idle
+        std::cout.flush();
+        return f == 0 ? 0 : 1;
+    }
+
+    // v29 M6 item 5 (2026-11-09): CKV_ONLY_M6=1 runs just the streaming
+    // recovery battery — the slurp-vs-streaming equivalence controls
+    // (the in-memory wal_recover_buf is the oracle, so every mutant
+    // class in the battery's header comment reddens a REAL leg).
+    if (getenv("CKV_ONLY_M6")) {
+        crc_init();
+        int f = run_m6_slice1_test();
         std::cout.flush();
         return f == 0 ? 0 : 1;
     }
@@ -8081,6 +8093,7 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     fails += run_m5_writer_test();
     fails += run_m5_slice2_test();   // v29 M5 slice 2: ring rungs + adaptive linger
     fails += run_m5_slice3_test();   // v29 M5 slice 3: the writer hot idle
+    fails += run_m6_slice1_test();   // v29 M6 item 5: the streaming recovery parse
     fails += run_bt3_visibility_test();
     fails += run_m2_phase1_test();
     fails += run_m2_phase2_test();
@@ -11305,6 +11318,273 @@ static int run_m5_slice3_test() {
 #endif
     if (fails == 0) std::cout << "   M5 SLICE-3 BATTERY PASSED\n";
     else std::cout << "   M5 SLICE-3 FAILURES: " << fails << "\n";
+    return fails;
+}
+
+// =====================================================================
+// v29 M6 item 5 — STREAMING RECOVERY PARSE (the 64 MiB segment slurp
+// deleted; the roadmap's own words: "a small item with a large
+// worst-case payoff — measured at the soak's WAL-window sizes").
+// recover_all previously read each segment WHOLE into memory before
+// parsing, and the verify paths (verify_wal_dir, backup verification)
+// additionally materialized the full record vector only to read a
+// status off it. Now one streaming core (wal_recover_stream_file)
+// parses every segment through a rolling buffer bounded by ONE maximum
+// frame + ONE chunk, and recover_all is a sink-templated pipeline with
+// two public legs (recover_all / verify_all). The controls, each naming
+// the mutant class it reddens:
+//   r1 A  streaming == slurp ORACLE on a clean multi-frame segment: the
+//         in-memory wal_recover_buf fed the same bytes is the oracle —
+//         any divergence in status or records reddens here.
+//   r1 B  torn-tail equivalence: a truncated final frame (the crash
+//         shape) — both legs TORN_TAIL, identical records. A streaming
+//         reader that misreads a partial tail as corruption reddens.
+//   r1 C  interior-damage equivalence (THE WAL-1 control): a flipped
+//         byte inside a MIDDLE frame, valid frames after it — both legs
+//         CORRUPT. The mutant class: a damage scan that stops at the
+//         chunk boundary calls interior damage a torn tail -> RED.
+//   r1 D  the scan crosses CHUNK boundaries: damage EARLY in a
+//         multi-chunk segment, the valid continuation frame far past
+//         the 256 KiB chunk boundary — CORRUPT. The mutant: any
+//         buffer-bounded scan (the scan must walk the FILE, not the
+//         current buffer) -> RED.
+//   r1 E  the structural memory bound: a >2 MiB segment parses with the
+//         rolling buffer's high-water under the max-frame+chunk bound,
+//         every record delivered exactly once. The mutant: the slurp
+//         behavior (hwm == file size) -> RED.
+//   r1 F  verify_all == recover_all on a real Database WAL directory
+//         (statuses agree; verify_wal green), and the status-only leg
+//         runs the same per-segment validation — interior damage in a
+//         real segment fails BOTH legs.
+//   r1 G  (stress leg only) the production-cap record: a 64 MiB
+//         segment, streaming vs the slurp oracle, wall + hwm on the
+//         record; the BOUND is asserted, the timing printed (the arena
+//         owns the numbers).
+// =====================================================================
+static int run_m6_slice1_test() {
+    using namespace chronokv;
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) {
+            ++fails;
+            if (!detail.empty()) std::cout << "      (" << detail << ")\n";
+        }
+    };
+    using Rec = std::pair<uint64_t, WriteSet>;
+    auto slurp_bytes = [](const std::string& p) {
+        std::ifstream f(p, std::ios::binary);
+        return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)),
+                                    std::istreambuf_iterator<char>());
+    };
+    auto same_records = [](const std::pair<WalStatus, std::vector<Rec>>& a,
+                            const std::pair<WalStatus, std::vector<Rec>>& b) {
+        if (a.first != b.first || a.second.size() != b.second.size()) return false;
+        for (size_t i = 0; i < a.second.size(); ++i) {
+            if (a.second[i].first != b.second[i].first) return false;
+            if (a.second[i].second != b.second[i].second) return false;
+        }
+        return true;
+    };
+    auto describe = [](const std::pair<WalStatus, std::vector<Rec>>& r) {
+        return "status=" + std::to_string((int)r.first) +
+               " records=" + std::to_string(r.second.size());
+    };
+    auto one_ws = [](const std::string& k, const std::string& v) {
+        return WriteSet{{k, v, false}};
+    };
+    // build frames into `bytes`, recording each frame's start offset.
+    auto build_frames = [](std::vector<uint8_t>& bytes, std::vector<size_t>& offs,
+                           uint64_t first_lsn, uint64_t first_cts, int count) {
+        for (int i = 0; i < count; ++i) {
+            offs.push_back(bytes.size());
+            const auto rec = wal_make_record(first_lsn + (uint64_t)i,
+                                             first_cts + (uint64_t)i,
+                                             WriteSet{{"k" + std::to_string(first_cts + (uint64_t)i),
+                                                       "v" + std::to_string(first_cts + (uint64_t)i), false}});
+            bytes.insert(bytes.end(), rec.begin(), rec.end());
+        }
+    };
+    auto write_file = [](const std::string& p, const std::vector<uint8_t>& bytes) {
+        std::ofstream f(p, std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)bytes.size());
+    };
+
+    const std::string dir = "/tmp/m6r1";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const std::string seg = dir + "/wal_000001.log";
+    const size_t CHUNK_BOUND = 8 + (1u << 20) + 256 * 1024;   // max frame + one chunk
+
+    std::vector<uint8_t> bytes;
+    std::vector<size_t> offs;
+    build_frames(bytes, offs, 1, 1, 300);
+    write_file(seg, bytes);
+
+    // ---- r1 A: clean-segment equivalence vs the in-memory oracle. ----
+    {
+        const auto stream = wal_recover_file(seg);
+        const auto oracle = wal_recover_buf(slurp_bytes(seg));
+        check("m6 r1 A: streaming == slurp oracle (clean segment)",
+              same_records(stream, oracle) && stream.first == WalStatus::OK &&
+                  stream.second.size() == 300,
+              "stream " + describe(stream) + " vs oracle " + describe(oracle));
+    }
+
+    // ---- r1 B: torn tail — a truncated final frame. ----
+    {
+        std::vector<uint8_t> torn(bytes);
+        const auto partial = wal_make_record(301, 301, one_ws("k301", "v301"));
+        torn.insert(torn.end(), partial.begin(), partial.begin() + 10);   // half a header+2
+        write_file(seg, torn);
+        const auto stream = wal_recover_file(seg);
+        const auto oracle = wal_recover_buf(slurp_bytes(seg));
+        check("m6 r1 B: torn tail — both legs TORN_TAIL, records identical",
+              stream.first == WalStatus::TORN_TAIL &&
+                  same_records(stream, oracle) && stream.second.size() == 300,
+              "stream " + describe(stream) + " vs oracle " + describe(oracle));
+    }
+
+    // ---- r1 C: interior damage (WAL-1) — flip a byte inside a middle ----
+    // frame; valid frames follow. Both legs must say CORRUPT.
+    {
+        std::vector<uint8_t> damaged(bytes);
+        damaged[offs[149] + 12] ^= 0xFF;   // inside frame 150's CRC-covered body
+        write_file(seg, damaged);
+        const auto stream = wal_recover_file(seg);
+        const auto oracle = wal_recover_buf(slurp_bytes(seg));
+        check("m6 r1 C: interior damage — both legs CORRUPT (the chunk-bounded-scan mutant calls it TORN_TAIL)",
+              stream.first == WalStatus::CORRUPT && same_records(stream, oracle),
+              "stream " + describe(stream) + " vs oracle " + describe(oracle));
+    }
+
+    // ---- r1 D: the damage scan crosses chunk boundaries — a ~700 KiB
+    // frame whose LENGTH field is corrupted (the WAL-1 headline shape:
+    // “never trust the damaged frame's own length field”), so the next
+    // valid continuation frame sits past 512 KiB of scan distance and TWO
+    // chunk boundaries. The mutant: any buffer-bounded scan -> TORN_TAIL.
+    {
+        std::vector<uint8_t> big;
+        std::vector<size_t> big_offs;
+        build_frames(big, big_offs, 1, 1, 1);              // frame 1: small
+        {
+            // frame 2: one ~700 KiB value of 'x' bytes (no accidental
+            // CRC-valid frame inside: the structural prefilter rejects
+            // 0x78787878 lengths instantly, keeping the scan linear).
+            big_offs.push_back(big.size());
+            const std::string big_val(700 * 1024, 'x');
+            const auto rec = wal_make_record(2, 2, WriteSet{{"big", big_val, false}});
+            big.insert(big.end(), rec.begin(), rec.end());
+        }
+        build_frames(big, big_offs, 3, 3, 8);              // frames 3..10: small
+        big[big_offs[1]] ^= 0xFF;                           // corrupt frame 2's LENGTH field
+        write_file(seg, big);
+        const auto stream = wal_recover_file(seg);
+        const auto oracle = wal_recover_buf(slurp_bytes(seg));
+        check("m6 r1 D: corrupted length on a 700 KiB frame — continuation past TWO chunk boundaries, both legs CORRUPT",
+              big_offs[2] > 2 * 256 * 1024 && stream.first == WalStatus::CORRUPT &&
+                  same_records(stream, oracle) && stream.second.size() == 1,
+              "frame3 at " + std::to_string(big_offs[2]) + "B stream " + describe(stream) +
+                  " vs oracle " + describe(oracle));
+    }
+
+    // ---- r1 E: the structural memory bound on a >2 MiB segment. ----
+    {
+        std::vector<uint8_t> big;
+        std::vector<size_t> big_offs;
+        while (big.size() < (size_t)5 * 512 * 1024)   // >2.5 MiB of small frames
+            build_frames(big, big_offs, (uint64_t)big_offs.size() + 1,
+                         (uint64_t)big_offs.size() + 1, 1000);
+        write_file(seg, big);
+        uint64_t n_records = 0;
+        size_t hwm = 0;
+        const WalStatus st = wal_recover_stream_file(
+            seg, [&](uint64_t, uint64_t, WriteSet&) { ++n_records; }, &hwm);
+        check("m6 r1 E: >2.5 MiB segment parses with hwm under the max-frame+chunk bound",
+              st == WalStatus::OK && n_records == big_offs.size() && hwm <= CHUNK_BOUND,
+              "segment=" + std::to_string(big.size()) + "B records=" + std::to_string(n_records) +
+                  " hwm=" + std::to_string(hwm) +
+                  " (bound " + std::to_string(CHUNK_BOUND) + "; the slurp leg's hwm was the file size)");
+    }
+
+    // ---- r1 F: verify_all == recover_all on a real Database WAL dir. ----
+    {
+        const std::string wd = "/tmp/m6r1_db";
+        std::filesystem::remove_all(wd);
+        std::filesystem::create_directories(wd);
+        Options o;
+        o.wal_dir = wd;
+        o.durability = DurabilityMode::Group;
+        o.auto_start_gc = false;
+        {
+            auto db = std::make_unique<Database>(Database::open(o));
+            for (int i = 0; i < 50; ++i)
+                (void)db->put("f" + std::to_string(i), "v");
+        }
+        uint64_t ckpt_stream = 0, ckpt_vec = 0;
+        const auto recs = WalSegments::recover_all(wd, ckpt_vec);
+        const auto st_verify = WalSegments::verify_all(wd, ckpt_stream);
+        const bool ver = ChronoKV::verify_wal_dir(wd);
+        check("m6 r1 F1: verify_all == recover_all on a real WAL dir (verify_wal green)",
+              st_verify == recs.first && st_verify == WalStatus::OK &&
+                  ckpt_stream == ckpt_vec && recs.second.size() == 50 && ver,
+              "verify=" + std::to_string((int)st_verify) + " recover=" +
+                  std::to_string((int)recs.first) + " records=" + std::to_string(recs.second.size()));
+        // The status-only leg runs the same per-segment validation:
+        // interior damage in the REAL active segment fails BOTH legs.
+        const std::string active_seg = wd + "/wal_000001.log";
+        auto raw = slurp_bytes(active_seg);
+        if (raw.size() > 64) {
+            raw[40] ^= 0xFF;   // inside an early frame's CRC-covered body
+            write_file(active_seg, raw);
+        }
+        uint64_t ck2 = 0;
+        bool recs_threw = false, verify_threw = false;
+        try { (void)WalSegments::recover_all(wd, ck2); } catch (const std::exception&) { recs_threw = true; }
+        try { (void)WalSegments::verify_all(wd, ck2); } catch (const std::exception&) { verify_threw = true; }
+        check("m6 r1 F2: real-segment interior damage — BOTH legs throw (status-only still validates)",
+              raw.size() <= 64 || (recs_threw && verify_threw &&
+                                   !ChronoKV::verify_wal_dir(wd)),
+              "recover_all threw=" + std::to_string(recs_threw) +
+                  " verify_all threw=" + std::to_string(verify_threw));
+        std::filesystem::remove_all(wd);
+    }
+
+#ifdef CHRONOKV_STRESS
+    // ---- r1 G (stress leg): the production-cap record — 64 MiB. ----
+    {
+        std::vector<uint8_t> big;
+        std::vector<size_t> big_offs;
+        while (big.size() < (size_t)64 * 1024 * 1024)
+            build_frames(big, big_offs, (uint64_t)big_offs.size() + 1,
+                         (uint64_t)big_offs.size() + 1, 1000);
+        write_file(seg, big);
+        uint64_t n_records = 0;
+        size_t hwm = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        const WalStatus st = wal_recover_stream_file(
+            seg, [&](uint64_t, uint64_t, WriteSet&) { ++n_records; }, &hwm);
+        const long stream_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        const auto t1 = std::chrono::steady_clock::now();
+        const auto oracle = wal_recover_buf(slurp_bytes(seg));
+        const long oracle_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t1).count();
+        check("m6 r1 G: 64 MiB segment — streaming hwm at the structural bound, all records delivered",
+              st == WalStatus::OK && n_records == big_offs.size() &&
+                  oracle.second.size() == big_offs.size() && hwm <= CHUNK_BOUND,
+              "segment=" + std::to_string(big.size()) + "B stream wall=" +
+                  std::to_string(stream_ms) + "ms hwm=" + std::to_string(hwm) +
+                  "B; slurp-oracle wall=" + std::to_string(oracle_ms) + "ms" +
+                  " (the old leg ALSO held all " + std::to_string(big.size()) +
+                  "B raw + the parsed records; the streaming leg held " +
+                  std::to_string(hwm) + "B rolling)");
+    }
+#endif
+
+    std::filesystem::remove_all(dir);
+    if (fails == 0) std::cout << "   M6 SLICE-1 BATTERY PASSED\n";
+    else std::cout << "   M6 SLICE-1 FAILURES: " << fails << "\n";
     return fails;
 }
 
