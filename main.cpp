@@ -10806,14 +10806,23 @@ static int run_m5_slice2_test() {
     check("m5s2 L5: sensitivity record (skipped — legacy leader leg)", true);
 #else
     // ---- L1: the ladder fields in the WriterThread ring's summary. ----
+    // A ring that cannot be created at all (CKV_IOURING_DISABLED, or a
+    // host where setup fails) has an EMPTY description by design — there
+    // is no ladder to report, so the check skip-passes (the io_uring
+    // disabled CI leg caught the unconditional version; run #140).
     {
         chronokv_iouring::IoUring probe(chronokv_iouring::IssuerMode::WriterThread);
-        const std::string& d = probe.describe();
-        const bool has_fields = d.find("single_issuer=") != std::string::npos &&
-                                d.find("defer_taskrun=") != std::string::npos &&
-                                d.find("sqpoll=") != std::string::npos;
-        check("m5s2 L1: ladder fields in feature summary (single_issuer/defer_taskrun/sqpoll)",
-              has_fields, d);
+        if (!probe.available()) {
+            check("m5s2 L1: ladder fields in feature summary (skipped — ring unavailable)",
+                  true, probe.describe());
+        } else {
+            const std::string& d = probe.describe();
+            const bool has_fields = d.find("single_issuer=") != std::string::npos &&
+                                    d.find("defer_taskrun=") != std::string::npos &&
+                                    d.find("sqpoll=") != std::string::npos;
+            check("m5s2 L1: ladder fields in feature summary (single_issuer/defer_taskrun/sqpoll)",
+                  has_fields, d);
+        }
     }
 
     // ---- L2: close-latency — the linger-ignores-stop mutant control. ----

@@ -4671,16 +4671,25 @@ public:
         // Item 6 fix: resume lsn_ from the existing segment so we don't reset to 0
         if (!failed_) {
             // v25.1 M2 Phase 2: initialize io_uring for WAL writes.
-            // v29 M5 slice 2: the ring is WRITER-OWNED on the new path —
-            // the only shape in which the SINGLE_ISSUER/DEFER_TASKRUN
-            // rungs are legal (the writer is the sole submitter AND the
-            // sole io_uring_enter caller; see the chronokv_iouring flag
-            // block for the full argument). The legacy leg keeps the
-            // Shared ladder verbatim — committers submit and enter from
-            // arbitrary threads there.
+            // v29 M5 slice 2 (CI run #140 fix, 2026-11-08): on the new
+            // path the ring is NO LONGER constructed here — it is created
+            // BY THE WRITER THREAD at writer_loop start. Reason (measured
+            // on CI's 6.8 runners, where the new rungs actually engage —
+            // the 5.10 sandbox never could): DEFER_TASKRUN's contract is
+            // that the GETEVENTS caller "must be the thread that CREATED
+            // the io_uring" (io_uring_enter(2)), and SINGLE_ISSUER
+            // latches the submitting task at the FIRST submission — a
+            // ring built (and probed) on the open thread fails every
+            // writer submit/enter, the run_batch_io fallback silently
+            // eats every batch, and the iouring-real engine-path check
+            // goes RED while the direct-use check stays green. Creator ==
+            // submitter == enterer, all on the writer, closes both
+            // constraints by construction. The LEGACY leg keeps the
+            // ctor-time Shared ring verbatim — committers submit and
+            // enter from arbitrary threads there, and the Shared ladder
+            // arms neither rung.
 #ifndef CKV_WAL_LEGACY_LEADER
-            iouring_ = std::make_unique<chronokv_iouring::IoUring>(
-                chronokv_iouring::IssuerMode::WriterThread);
+            // (writer-owned ring: see writer_loop)
 #else
             iouring_ = std::make_unique<chronokv_iouring::IoUring>();
 #endif
@@ -5661,6 +5670,23 @@ public:
     // queue (death drain), and parks. The loop exits only on stop with an
     // empty queue (clean close drains everything first).
     void writer_loop() {
+#ifndef CKV_WAL_LEGACY_LEADER
+        // v29 M5 slice 2 (CI run #140 fix): the writer-owned ring is
+        // created HERE — on the writer thread — so creator == submitter ==
+        // enterer (DEFER_TASKRUN's GETEVENTS constraint names the CREATOR;
+        // SINGLE_ISSUER latches the first submitter; the open thread
+        // satisfying neither was the run-#140 defect). The mock-injection
+        // contract is preserved in both orderings: a test that injects
+        // before the writer gets here finds its mock in place (the check
+        // is !iouring_) and no ring is built; the common case (inject
+        // after open) replaces the ring this built, exactly as it did
+        // when construction was ctor-time — the unsynchronized-inject
+        // quiescence discipline is the pre-existing one.
+        if (!iouring_) {
+            iouring_ = std::make_unique<chronokv_iouring::IoUring>(
+                chronokv_iouring::IssuerMode::WriterThread);
+        }
+#endif
         std::unique_lock<std::mutex> lk(queue_mu_);
         while (true) {
 #ifdef CHRONOKV_STRESS
