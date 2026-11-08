@@ -10779,11 +10779,13 @@ static int run_m5_writer_test() {
 //       during drain-down -> close >= cap -> RED. Healthy close pays
 //       only the remaining drains' fsyncs (ms).
 //   L3  gap-case untaxed (R-2, deterministic): a single sequential
-//       committer with the cap ON takes ZERO lingers — every drain is
-//       one record, the EWMA stays under the gate, the queue never
-//       holds 2. The evidence gate is what keeps single-committer p99
-//       un-taxed, and this is the control that keeps the gate honest.
-//   L4  default off: default Options (cap 0) -> zero lingers.
+//       committer with the cap ON takes ZERO lingers — the queue is
+//       empty at every drain completion, so the concurrency flag never
+//       sets and the gate never opens (slice-3 rework: previously the
+//       records-per-drain EWMA held it closed; the runner sweep showed
+//       that gate was circular at exactly 2-4 committers, so the flag
+//       replaced it — the control that keeps the gate honest stays).
+//   L4  knob 0 = OFF: default Options (cap 0) -> zero lingers.
 //   L5  sensitivity record at 1/4/16 committers with the cap on:
 //       commits OK, wall bounded, batching witnessed (drains < commits
 //       at 16 — 4096 commits through one writer cannot serialize to
@@ -10898,12 +10900,16 @@ static int run_m5_slice2_test() {
         std::filesystem::remove_all(wd);
     }
 
-    // ---- L4: default off — the shipped configuration never lingers. ----
+    // ---- L4: knob 0 = OFF — the opt-out is real (slice-3 rework: the
+    // DEFAULT cap is now the measured 250us, so this control sets 0
+    // explicitly; the single-committer shape above already proves the
+    // DEFAULT never lingers the gap case). ----
     {
         const std::string wd = "/tmp/m5s2_l4";
         std::filesystem::remove_all(wd);
         std::filesystem::create_directories(wd);
-        Options o;   // default: wal_linger_cap_us == 0
+        Options o;
+        o.wal_linger_cap_us = 0;   // explicit OFF
         o.wal_dir = wd;
         o.durability = DurabilityMode::Group;
         o.auto_start_gc = false;
@@ -10911,7 +10917,7 @@ static int run_m5_slice2_test() {
         for (int i = 0; i < 50; ++i)
             (void)db->put("l4_" + std::to_string(i), "v");
         const uint64_t taken = db->wal_stats().lingers_taken;
-        check("m5s2 L4: default off — cap 0, zero lingers", taken == 0,
+        check("m5s2 L4: knob 0 = off — cap 0, zero lingers", taken == 0,
               "lingers_taken=" + std::to_string(taken));
         db.reset();
         std::filesystem::remove_all(wd);
@@ -11008,6 +11014,12 @@ static int run_m5_slice2_test() {
 static int run_m5_slice3_test() {
     using namespace chronokv;
     int fails = 0;
+    // H6's park latch (W2's ParkFlags shape, local to this battery).
+    struct ParkFlags {
+        std::atomic<bool> parked{false};
+        std::atomic<bool> release{false};
+        std::atomic<bool> timed_out{false};
+    };
     auto check = [&](const char* name, bool ok, const std::string& detail = "") {
         std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
         if (!ok) {
@@ -11021,6 +11033,7 @@ static int run_m5_slice3_test() {
     check("m5s3 H3: knob 0 = off, zero spins (skipped — legacy leader leg)", true);
     check("m5s3 H4: read-only untaxed, zero spins (skipped — legacy leader leg)", true);
     check("m5s3 H5: sensitivity record (skipped — legacy leader leg)", true);
+    check("m5s3 H6: concurrency-gated linger (skipped — legacy leader leg)", true);
 #else
     // ---- H1: default ON — a sequential committer's stream hits the spin. ----
     {
@@ -11042,11 +11055,28 @@ static int run_m5_slice3_test() {
         // MOST idle transitions after the first few should hit. The bound
         // is deliberately loose on the hits side (runner scheduling can
         // stretch the gap past the 50us budget on a loaded machine) but
-        // strict on "the mechanism fired at all": spins > 0 AND hits > 0.
+        // strict on "the mechanism fired at all": spins > 0 always, and
+        // hits > 0 except under sanitizer instrumentation — TSan stretches
+        // the committer's serialized CPU prep past any sane budget by
+        // 5-10x (CI run #145's tsan legs, both compilers: spins=399
+        // hits=0 at 1 committer, while @4/@16 hit 514/710 — the arrival
+        // counter works, the GAP is what instrumentation stretches; the
+        // recorded not-a-defect, per the bounded-budget design). Release
+        // builds keep the strict oracle (252/256 = 98% locally).
+// The header ALWAYS defines CKV_UNDER_SANITIZER (0 on release builds —
+// its auto-detect is #ifndef-wrapped), so the branch tests the VALUE.
+#if CKV_UNDER_SANITIZER
+        check("m5s3 H1: default on — sequential committer spins (hits recorded; sanitizer build)",
+              spins > 0,
+              "spins=" + std::to_string(spins) + " hits=" + std::to_string(hits) +
+                  " (sanitizer build: the prep gap outruns the budget BY DESIGN — "
+                  "the counter is witnessed by H5's multi-committer cells)");
+#else
         check("m5s3 H1: default on — sequential committer takes spins and hits",
               spins > 0 && hits > 0,
               "spins=" + std::to_string(spins) + " hits=" + std::to_string(hits) +
                   " (a hot-idle-ignores-arrivals mutant hits 0 forever)");
+#endif
         db.reset();
         std::filesystem::remove_all(wd);
     }
@@ -11178,6 +11208,88 @@ static int run_m5_slice3_test() {
                   ok_commits.load() == nc * OPS && wall_ms < 30000,
                   "commits=" + std::to_string(ok_commits.load()) + "/" +
                       std::to_string(nc * OPS) + " wall=" + std::to_string(wall_ms) + "ms");
+            db.reset();
+            std::filesystem::remove_all(wd);
+        }
+    }
+    // ---- H6: the concurrency-aware linger gate (slice-3 rework). ----
+    // Deterministic via the cqe_wait hook: hold the writer INSIDE drain
+    // N's io_uring enter while committer B enqueues (the hook fires only
+    // on the io_uring path — skip-pass when the ring is unavailable, the
+    // io_uring-disabled CI leg). Release: drain N completes with B's
+    // record already queued -> concurrent_arrivals_ sets -> drain N+1's
+    // wake seam LINGERS (bounded by the cap — no third committer exists,
+    // so the wait runs to the cap and still drains). THE MUTANT CONTROL:
+    // gate-ignores-concurrency (maybe_linger loses the
+    // concurrent_arrivals_ clause and the fat-queue early-return) -> the
+    // single-committer L3 shape would linger too (and the C=2 batching
+    // the rework exists for never happens — the runner-sweep oracle).
+    {
+        const std::string wd = "/tmp/m5s3_h6";
+        std::filesystem::remove_all(wd);
+        std::filesystem::create_directories(wd);
+        // Ring availability first: the hook only fires on the io_uring
+        // path (mirrors L1's skip discipline).
+        bool ring_ok = false;
+        {
+            chronokv_iouring::IoUring probe(chronokv_iouring::IssuerMode::WriterThread);
+            ring_ok = probe.available();
+        }
+        if (!ring_ok) {
+            check("m5s3 H6: concurrency-gated linger (skipped — io_uring unavailable)", true,
+                  "the cqe_wait seam exists only on the ring path");
+        } else {
+            Options o;
+            o.wal_dir = wd;
+            o.durability = DurabilityMode::Group;
+            o.auto_start_gc = false;
+            o.wal_linger_cap_us = 5000;   // 5 ms: the linger must be VISIBLE, not raced
+            auto db = std::make_unique<Database>(Database::open(o));
+            auto pf = std::make_shared<ParkFlags>();
+            db->set_cqe_wait_hook_for_test([pf] {
+                if (pf->parked.exchange(true)) return;   // hold drain N once
+                const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (!pf->release.load(std::memory_order_acquire)) {
+                    if (std::chrono::steady_clock::now() > dl) {
+                        pf->timed_out.store(true);
+                        return;
+                    }
+                    std::this_thread::yield();
+                }
+            });
+            // A: the first committer — its drain parks inside the enter.
+            auto stA = std::make_shared<Status>();
+            std::thread thA([&] { *stA = db->put("h6_a", "v"); });
+            const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!pf->parked.load() && std::chrono::steady_clock::now() < dl)
+                std::this_thread::yield();
+            // B: enqueues DURING drain N's held I/O (the gate's evidence).
+            auto stB = std::make_shared<Status>();
+            std::thread thB([&] { *stB = db->put("h6_b", "v"); });
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            pf->release.store(true, std::memory_order_release);
+            thA.join();
+            thB.join();
+            db->set_cqe_wait_hook_for_test(nullptr);
+            const auto st = db->wal_stats();
+            // B's drain must have LINGERED: queue==1 at its wake seam and
+            // concurrent_arrivals_ set by B's own arrival during A's I/O.
+            const bool lingered = st.lingers_taken >= 1;
+            check("m5s3 H6: concurrency-gated linger — arrival during I/O opens the gate",
+                  *stA == Status::OK && *stB == Status::OK && lingered && !pf->timed_out.load(),
+                  "A=" + std::to_string((int)*stA) + " B=" + std::to_string((int)*stB) +
+                      " lingers=" + std::to_string(st.lingers_taken) +
+                      " (a gate-ignores-concurrency mutant never batches at C=2)");
+            // And the single-committer shape after: the flag was NOT re-set
+            // by B's drain (queue empty at its completion), so a further
+            // sequential burst takes ZERO lingers — R-2 by construction.
+            const uint64_t before = db->wal_stats().lingers_taken;
+            for (int i = 0; i < 50; ++i)
+                (void)db->put("h6_s" + std::to_string(i), "v");
+            const uint64_t after = db->wal_stats().lingers_taken;
+            check("m5s3 H6: the gate re-closes without concurrency — zero lingers after",
+                  after == before,
+                  "before=" + std::to_string(before) + " after=" + std::to_string(after));
             db.reset();
             std::filesystem::remove_all(wd);
         }

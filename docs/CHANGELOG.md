@@ -7,6 +7,85 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **fix+test+docs (v29 M5 slice 3 follow-up, 2026-11-08): the runner
+  sweep's first artifact rewrites the linger's evidence gate — the hot
+  idle's eager pickup was DEFEATING group-commit batching at 2-4
+  committers — and the two deferred decisions land measured: depth-2
+  pipelining REFUSED at a 2% ceiling, SQPOLL stays OFF at a measured
+  −8%.** The dispatchable writer-sweep job ran on 4aa83e0
+  (writer-sweep-42483188123, run #146, EPYC 9V74 / 4 vCPU / kernel
+  7.0): the I/O probe reads pwrite p50 3 µs vs fdatasync p50 195 µs —
+  the write stage is 2% of the per-drain critical path on arena
+  hardware, so DEPTH-2 PIPELINING IS REFUSED on the measurement (the
+  §1.9 candidate's upper bound cannot pay for its failure-path surface:
+  a drain-N rollback's ftruncate would erase a pipelined drain-N+1's
+  acked-durable bytes — CKV-004's gate at the wrong granularity — plus
+  the chain split's mock/state-machine rework; the probe ships in the
+  sweep job so the decision is re-takable on hardware where the split
+  exceeds ~10%). SQPOLL's cells measured −8.1% at C=4 and −7.2% at C=16
+  against the non-SQPOLL cells on the same runner: the default stays
+  OFF with numbers behind it, not the v25.2 prior alone. THE SWEEP'S
+  MAIN FINDING: the writer thread WINS the acceptance leg — group
+  durability +23% at 8 committers, +13% at 16 ("measurable win at 8+"
+  is MET) — but C=2-4 sat at 0.73-0.85× legacy because the hot idle's
+  ~0.2 µs pickup snapped EVERY arrival into a single-record drain:
+  15,984 fsyncs for 16,000 records at C=2 (rec_per_drain 1.001)
+  against the legacy leader's 10,869 (its election-window pile-up
+  batched 1.47 rec/fsync) — on a filesystem where one fdatasync is
+  195 µs, the eager writer DOUBLED the dominant cost. **The fix: the
+  linger's evidence gate becomes CONCURRENCY OBSERVED** —
+  `concurrent_arrivals_`, a writer-exclusive flag set at each drain's
+  completion from the queue's state (an arrival DURING the drain's I/O
+  is the only honest predictor that another committer exists to batch
+  with), REPLACING the records-per-drain EWMA (`drain_ema_` deleted)
+  the same data showed to be circular in exactly this case: the queue
+  never piled up (the eager writer drained it instantly), so the ema
+  stayed 1.0 and the gate could never open. New gate reading: a THIN
+  queue (exactly one item) AND the flag → wait up to the cap for a
+  second arrival; a DEEP queue (≥2) drains NOW (waiting would tax an
+  already-fat drain — the C≥8 cells never idle, never linger, and win
+  on natural batching); a single committer NEVER sets the flag (the
+  queue is empty at every drain completion) — R-2's gap case untaxed
+  by construction, verified on every single-committer cell of the
+  sweep (0 lingers, 8000/8000 single-record drains). The cap's default
+  moves 0 → 250 µs (the decision deferred the enable to "slice 3's
+  arena measurement owns it" — this is that measurement: 250 µs covers
+  the observed ~125-250 µs inter-arrival phase offset at C=2-4 while
+  the wait still ENDS on the first new arrival; the cap only bounds a
+  mis-gated wait). Controls: L3's premise updated (single committer +
+  cap ON still takes ZERO lingers — the flag, not the threshold, holds
+  the gate); L4 now sets cap 0 explicitly (the opt-out control, since
+  the default is no longer 0); H6 added to the slice-3 battery —
+  DETERMINISTIC via the new `set_cqe_wait_hook_for_test` forwarder
+  (hold drain N's io_uring enter while committer B enqueues: B's
+  arrival during A's I/O sets the flag, drain N+1 lingers; and zero
+  lingers on the sequential burst after — the gate re-closes), with
+  the gate-ignores-concurrency mutant recorded (never batches at C=2).
+  Also in this commit: H1's oracle fixed from the CI evidence (run
+  #145's tsan legs, both compilers: spins=399 hits=0 at 1 committer —
+  TSan stretches the committer's serialized CPU prep past any sane
+  budget, so the hits>0-at-one-committer property is a LATENCY
+  property instrumentation legitimately stretches; the control now
+  asserts spins>0 under sanitizers with the hits recorded, keeps the
+  strict spins>0 AND hits>0 oracle on release — and tests the macro's
+  VALUE, not its definition: the header's auto-detect #ifndef-wraps
+  CKV_UNDER_SANITIZER, so it is defined-as-0 on release builds). Local
+  sweep at C=2 with the rework: **1.42 rec/fsync vs the legacy leg's
+  1.06** — the writer thread now does FEWER fsyncs than the leader
+  path it replaced. Validation: full M5 battery (W/L/H incl. H6) green
+  on release AND ASan AND the legacy leg; CKV_ONLY_REMEDIATION 93/0;
+  CKV_ONLY_DST green under the stress build (steals ≤ 5); crashfuzz
+  and lincheck green; lint -Werror + header hygiene + the
+  -Wconversion ratchet 33 → 33 green. The runner re-dispatch on this
+  commit re-measures the C=2-4 cells; the numbers land in the decision
+  doc §15.1 as they complete. The C=1 residual (0.95×/0.90×) is
+  recorded with its ambiguity: the hot-idle ON-vs-OFF cells on the
+  quota-limited runner pool measured inside single-cell noise, the
+  spin's engagement is proven by its diagnostics (7999/8001 hits,
+  10.9 µs average), and a committer-side adaptive timed park remains
+  the recorded follow-up decision if the post-rework sweep shows a
+  C≤2 gap that still matters.
+
 - **fix+feat+bench (v29 M5 slice 3, 2026-11-08): the arena regression the
   red nightlies were carrying since #121 is diagnosed and fixed — the
   writer's HOT IDLE — plus the slice-3 measurement instruments (the

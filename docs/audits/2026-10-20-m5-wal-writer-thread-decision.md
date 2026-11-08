@@ -733,9 +733,107 @@ hooks-off smoke green. Mutants recorded-not-executed per the standing
 single-build directive: hot-idle-ignores-arrivals (H1 RED), 
 spin-ignores-stop (H2 RED).
 
-### 15.1 Runner-scale records (to be filled from the writer-sweep dispatch artifacts)
+### 15.1 Runner-scale records (workflow_dispatch run #146, 2026-11-08, commit 4aa83e0 — the hot-idle landing; artifact writer-sweep-42483188123)
 
-*(Reserved: the sweep.tsv per-committer deltas both legs, the io_probe
-line, the SQPOLL cells, the arena A/B tables, and the two decisions
-they settle — depth-2 ship-or-refuse and the SQPOLL default. Each
-recorded with its run id, in the house format.)*
+**The I/O probe (the depth-2 decision's basis).** On the arena runner's
+filesystem (EPYC 9V74, 4 vCPU, kernel 7.0.0-1017-azure): pwrite p50
+**3 µs** (p99 11) vs fdatasync p50 **195 µs** (p99 1108) for a
+164-byte WAL-frame-class record, 2000 samples. The write stage is ~2%
+of the per-drain critical path. **DECISION, depth-2 pipelining:
+REFUSED, on the measurement.** The mechanism's upper bound on arena
+hardware is 2% — against the failure-path hazard recorded at §1.9's
+candidate line (a drain-N rollback's ftruncate would erase a pipelined
+drain-N+1's acked-durable bytes: CKV-004's gate read at the wrong
+granularity; closing it needs the write/fsync chain split and a
+rollback interlock), the I/O-shape identity principle this whole arc
+relied on ("slice 1's I/O shape is deliberately identical — one chain
+in flight"), and the mock/state-machine rework the chain split owes
+the four mock-mode tests. A 2% ceiling cannot pay for that surface.
+The probe ships in the sweep job (`--probe io`), so the decision is
+re-takable on any future hardware where the split might exceed ~10%.
+
+**SQPOLL: stays OFF — now measured, no longer a prior.** The job's
+CKV_WAL_SQPOLL=1 cells on the same runner: group C=4 **6631** ops/s vs
+the non-SQPOLL cell's 7218 (**−8.1%**); group C=16 **15541** vs 16748
+(**−7.2%**). Consistent with §2's v25.2 argument (per-batch durability
+waits nullify the poller's benefit) and the kernel-thread cost. The
+env knob stays for the record; the default stays OFF with numbers
+behind it. `sq_thread_idle` retuning is moot at a measured loss.
+
+**The committer sweep (both legs, one runner; the per-cell diag lines
+carry drains/fsyncs/spins).** Group durability, ops/s:
+
+| C | writer thread | legacy leader | ratio |
+| --- | --- | --- | --- |
+| 1 | 3767 | 3953 | 0.95× |
+| 2 | 4085 | 5588 | 0.73× |
+| 4 | 7218 | 8445 | 0.85× |
+| 8 | 12582 | 10206 | **1.23×** |
+| 16 | 16748 | 14844 | **1.13×** |
+| 32 | 17019 | 16461 | 1.03× |
+
+Async tracks group within noise (0.90–0.99× below C=8, parity above).
+**The "measurable win at 8+ committers" acceptance leg is MET for
+group durability** (+23% at C=8, +13% at C=16) — the architecture's
+own win: no election, the single-issuer ring, and natural batching
+(the C=8 diag: 3.75 records per drain without ever idling). The
+C=2–4 deficit and the C=1 residual are the recorded story below.
+
+**The C=2–4 deficit was SELF-INFLICTED by the hot idle — measured.**
+The hot idle's ~0.2 µs pickup made the writer snap up EACH arrival
+into a single-record drain: at C=2 the new leg ran **15,984 fsyncs for
+16,000 records** (rec_per_drain 1.001) against the legacy leader's
+**10,869** (its election-window pile-up batched 1.47 records/fsync) —
+on a filesystem where one fdatasync is 195 µs. The eager writer
+doubled the dominant cost. **The fix's follow-up (same day): the
+linger's evidence gate reworked to CONCURRENCY OBSERVED** —
+`concurrent_arrivals_`, a writer-exclusive flag set at each drain's
+completion from the queue's state (an arrival DURING the drain's I/O is
+the only honest predictor that another committer exists), replacing
+the records-per-drain EWMA the runner data showed to be circular in
+exactly this case (the ema stayed 1.0 forever because the queue never
+piled up — the gate could never open). Gate: a THIN queue (one item)
+AND the flag; a deep queue (≥2) drains NOW; a single committer never
+sets the flag (the queue is empty at every drain completion — R-2
+preserved by construction, verified: every single-committer cell of
+the sweep took 0 lingers). Cap default 250 µs (the measured
+inter-arrival phase offset at C=2–4 is ~125–250 µs; the wait ends on
+the first new arrival, so the cap only bounds a mis-gated wait). The
+H6 control proves the gate deterministically (the cqe_wait hook holds
+drain N's enter while committer B enqueues → drain N+1 lingers; and
+zero lingers on the sequential burst after). Local sweep at C=2:
+**1.42 rec/fsync vs the legacy leg's 1.06** — the new leg now does
+FEWER fsyncs than the leader path it replaced. The runner re-dispatch
+on the follow-up commit re-measures C=2–4; the numbers land here when
+it completes.
+
+**The C=1 residual, recorded honestly.** With the hot idle ON, the
+runner's C=1 cells sit at 0.95× (group) / 0.90× (async) vs legacy:
+the writer→committer publish wake plus the writer's per-drain
+overhead — the second half of the handoff the hot idle does not
+touch. The mechanism data says the spin itself engages exactly as
+designed (C=1 cell: 7999 hits of 8001 spins, 10.9 µs average — the
+arrival is observed well inside the 50 µs budget). The hot-idle-OFF
+sensitivity cells on the same runner measured 3961/4212 (group/async)
+against the hot cells' 3767/4021 — single cells, ±5%, and the runner
+pool is cgroup-quota-limited (a spinning thread eats quota the
+committer needs), so the C=1 ON-vs-OFF call on THAT hardware is
+inside noise; the knob exists, the composed design keeps the spin ON
+(it is what makes the C=2–4 linger's first pickup fast), and the
+record states the ambiguity rather than picking a side the data does
+not support. A committer-side adaptive timed park remains the recorded
+follow-up decision if the post-rework sweep still shows a C≤2 gap
+that matters.
+
+**The arena after-table A/B (same runner, the three regressed write
+mixes at the pinned geometry, PRE-linger-rework):** new 0.71–0.95×
+legacy (fillrandom 3623/4207 group, overwrite 7420/8018, ycsb_a.update
+6222/8708 — ycsb_a.read rides the update stalls: p50 2 µs in both
+legs). The C=2–4 eager-drain fsync doubling above IS this gap's
+mechanism; the linger rework targets it. The official after-tables
+remain the post-fix NIGHTLIES (the A/B is the diagnostic, not the
+ledger), and the band recompute stays the dedicated commit from ≥7
+post-change nights — the committed bands are untouched.
+
+*(Reserved: the post-rework sweep numbers from the re-dispatch on the
+follow-up commit, and the nightly verdicts as they accumulate.)*

@@ -3929,17 +3929,33 @@ class WalSegments {
     // M5 diagnostics (wal_stats face; single-writer = the producer/writer
     // under queue_mu_, atomics for lock-free reads like the v20 M1 set).
     std::atomic<uint64_t> i_queue_high_water{0};
-    // v29 M5 slice 2 (decision §1.10): adaptive-linger state — writer-
-    // exclusive plain state (like lsn_/active_segment_bytes_): only the
-    // writer thread touches it. lingers_taken/linger_us_total are the
-    // diagnostics face (wal_stats + the arena's latency attribution);
-    // drain_ema_ is the evidence gate's "previous drains averaged >= 2
-    // records" — an EWMA (weight 1/4) so a burst of fat drains opens the
-    // gate within a few batches and a sustained single-record workload
-    // closes it again. Seeded 0: a cold start never lingers (the gate
-    // opens only on evidence, never on hope).
-    uint32_t linger_cap_us_ = 0;      // 0 = OFF (default; R-2)
-    float    drain_ema_ = 0.0f;
+    // v29 M5 slice 2 (decision §1.10), GATE REWORKED in slice 3: adaptive-
+    // linger state — writer-exclusive plain state (like lsn_/
+    // active_segment_bytes_): only the writer thread touches it.
+    // lingers_taken/linger_us_total are the diagnostics face (wal_stats +
+    // the arena's latency attribution); linger_cap_us_ is the budget
+    // (0 = OFF — the raw ctor default; the PRODUCT default comes from
+    // Options, which owns the measured 250us); concurrent_arrivals_ is
+    // the evidence (see its own header below).
+    uint32_t linger_cap_us_ = 0;      // 0 = OFF (raw ctor default)
+    // v29 M5 slice 3 follow-up (runner-sweep evidence, dispatch run #146):
+    // the linger's evidence gate reworked — CONCURRENCY OBSERVED, not
+    // fat-drain history. concurrent_arrivals_ is a writer-exclusive flag
+    // set at each drain's completion from the queue's state: an arrival
+    // DURING the drain's I/O is the only honest predictor that another
+    // committer exists to batch with. It replaces drain_ema_ (an EWMA of
+    // records-per-drain), which the runner data showed to be circular in
+    // exactly the case the linger must serve: with the hot idle's
+    // ~0.2us pickup, the queue NEVER piles up at C=2-4 — the writer snaps
+    // each arrival into a single-record drain (measured: rec_per_drain
+    // 1.001 at C=2, 15,984 fsyncs for 16,000 records vs the legacy
+    // leader's 10,869 — the eager writer DOUBLED the fsync count and ate
+    // the architecture's own win), so the ema stayed at 1.0 forever and
+    // the gate could never open. Single committers never set the flag
+    // (the queue is empty at every drain completion), so the gap case's
+    // p99 stays untaxed — R-2 preserved EXACTLY, now by construction
+    // instead of by threshold.
+    bool concurrent_arrivals_ = false;
     std::atomic<uint64_t> i_lingers_taken{0};
     std::atomic<uint64_t> i_linger_us_total{0};
     // v29 M5 slice 3 (the arena-regression fix; full story in the hot-idle
@@ -5710,31 +5726,39 @@ public:
         queue_cv_.notify_all();   // space-waiters wake and see failed_/stop
     }
 
-    // v29 M5 slice 2 (decision §1.10): the adaptive linger — a bounded
-    // wait for MORE same-class arrivals at the wake seam, taken only when
-    // recent history pays for it. Reading of the decision's clauses,
-    // stated because "never delays a drain that would empty the queue"
-    // admits interpretations: (a) OFF while failed_/stop_requested_ — the
-    // wait's predicate re-checks BOTH, so a stop arriving mid-linger ends
-    // it immediately (the linger-ignores-stop mutant's close-latency
-    // control exists to keep that true); (b) never before a ROTATE
-    // command — rotation is checkpoint-ordered work, not batching
-    // material; (c) the evidence gate — cap>0 AND (queue already >= 2 OR
-    // drain_ema_ >= 2.0): a cold or single-committer workload (drains of
-    // 1, EMA < 2) NEVER lingers, so the gap case's p99 is untaxed (R-2);
-    // (d) bounded by the cap and ended by the FIRST new arrival — the
-    // drain itself always runs, so nothing that would drain is withheld;
-    // the linger only decides whether items arriving within the cap join
-    // THIS drain or the next one. Suppressed while the dst controller is
-    // armed: a timed real-cv wait is a baton-held block (the exact shape
-    // the steal-storm fix removed from this loop), and linger is a
-    // latency/batching KNOB, not a correctness seam — scenarios gain
-    // nothing from exercising it and would pay steals for it.
+    // v29 M5 slice 2 (decision §1.10) — GATE REWORKED in slice 3 (runner
+    // evidence, dispatch run #146; see concurrent_arrivals_' header): the
+    // adaptive linger is a bounded wait for a SECOND same-class arrival at
+    // the wake seam, taken only when CONCURRENCY was observed — an arrival
+    // during the previous drain's I/O — or the queue already holds ≥ 2.
+    // Reading of the decision's clauses, stated because "never delays a
+    // drain that would empty the queue" admits interpretations:
+    // (a) OFF while failed_/stop_requested_ — the wait's predicate
+    // re-checks BOTH, so a stop arriving mid-linger ends it immediately
+    // (the linger-ignores-stop mutant's close-latency control exists to
+    // keep that true); (b) never before a ROTATE command — rotation is
+    // checkpoint-ordered work, not batching material; (c) the evidence
+    // gate — a THIN queue (exactly one item) AND concurrency observed:
+    // a deep queue (≥ 2) drains NOW (waiting would add latency to an
+    // already-fat drain — the runner sweep's C≥8 cells never idle, never
+    // linger, and win on batching alone); a single committer never sets
+    // the flag, so the gap case's p99 is untaxed (R-2) — 0 lingers on
+    // every single-committer cell of the runner sweep, 15,984/15,984
+    // single-record drains at C=2 included; (d) bounded by the cap and
+    // ended by the FIRST new arrival — the drain itself always runs, so
+    // nothing that would drain is withheld; the linger only decides
+    // whether items arriving within the cap join THIS drain or the next
+    // one. Suppressed while the dst controller is armed: a timed real-cv
+    // wait is a baton-held block (the exact shape the steal-storm fix
+    // removed from this loop), and linger is a latency knob, not a
+    // correctness seam — scenarios gain nothing from exercising it and
+    // would pay steals for it.
     void maybe_linger(std::unique_lock<std::mutex>& lk) {
         if (linger_cap_us_ == 0 || failed_ || stop_requested_ || queue_.empty())
             return;
         if (queue_.front().command) return;               // ROTATE drains now
-        if (queue_.size() < 2 && drain_ema_ < 2.0f) return; // evidence gate (R-2)
+        if (queue_.size() >= 2) return;                   // fat queue: drain now
+        if (!concurrent_arrivals_) return;                // no observed concurrency (R-2)
 #ifdef CHRONOKV_STRESS
         if (dst::is_armed()) return;   // baton discipline: no timed waits armed
 #endif
@@ -5972,6 +5996,11 @@ public:
             hot_after_drain_ = true;
             lk.lock();
             if (failed_) death_drain_locked();   // W-STRAND for the remainder
+            // v29 M5 slice 3 follow-up: the linger's evidence — an arrival
+            // during THIS drain's I/O is the predictor that another
+            // committer exists (see concurrent_arrivals_' header for why
+            // this replaced the records-per-drain EWMA).
+            concurrent_arrivals_ = !queue_.empty();
         }
 #ifdef CHRONOKV_STRESS
         // The replay contract, closed for the writer: "every thread that
@@ -6015,11 +6044,6 @@ public:
             diag::wal_batches.fetch_add(1, std::memory_order_relaxed);
             i_wal_batches.fetch_add(1, std::memory_order_relaxed);
             i_drains.fetch_add(1, std::memory_order_relaxed);   // M5 diag: one drain == one durability I/O unit
-            // v29 M5 slice 2: the evidence gate's input — records per
-            // drain, EWMA-weighted (see the member's header). Writer-
-            // exclusive state, updated at the only site that knows the
-            // drain's size.
-            drain_ema_ = 0.75f * drain_ema_ + 0.25f * (float)total_records;
 
             batch_start = lseek(active_fd_, 0, SEEK_END);
             base_lsn = lsn_.fetch_add(total_records, std::memory_order_relaxed) + 1;
@@ -11244,16 +11268,25 @@ struct Options {
     // always been).
     size_t wal_queue_max_items = 0;
     size_t wal_queue_max_bytes = 0;
-    // v29 M5 slice 2 (decision §1.10): adaptive group-commit linger cap in
-    // MICROSECONDS. 0 (the default) disables the linger entirely — R-2's
-    // "default 0, adaptive gate requires evidence of arrivals": a
-    // badly-tuned linger taxes single-committer p99, so the cap ships off
-    // and slice 3's arena measurement owns the enable decision. When > 0,
-    // the writer may wait up to this long at the wake seam for more
-    // same-class arrivals, and only when the evidence gate (recent drains
-    // averaging >= 2 records, or >= 2 items already queued) pays for it.
+    // v29 M5 slice 2 (decision §1.10) + slice-3 rework: adaptive
+    // group-commit linger cap in MICROSECONDS — a bounded wait at the
+    // writer's wake seam for a SECOND same-class arrival to join THIS
+    // drain, taken only when CONCURRENCY was observed (an arrival during
+    // the previous drain's I/O) or the queue already holds >= 2 items; a
+    // single committer NEVER lingers (the queue is empty at every drain
+    // completion — R-2's gap case untaxed by construction). 0 disables
+    // it. The 250us default is slice-3's measured enable (the decision
+    // deferred it to "the arena measurement owns the enable decision"):
+    // the runner sweep (dispatch run #146) showed the writer thread's
+    // eager single-record drains at 2-4 committers DOUBLING the fsync
+    // count against the legacy leader (15,984 fsyncs per 16,000 records
+    // vs 10,869) on a filesystem where fdatasync p50 is 195us — the
+    // linger is the batching mechanism that coalesces those arrivals,
+    // and 250us covers the measured inter-arrival phase offset at 2-4
+    // committers (~125-250us) while the wait still ENDS on the first
+    // new arrival (the cap only bounds a mis-gated wait).
     // Diagnostics: wal_stats().lingers_taken / linger_us_total.
-    uint32_t wal_linger_cap_us = 0;
+    uint32_t wal_linger_cap_us = 250;
     // v29 M5 slice 3: the writer's HOT-IDLE budget in MICROSECONDS — after
     // draining a batch, the writer thread briefly polls a monotonic arrival
     // counter instead of parking on the condition variable, so a
@@ -11900,6 +11933,17 @@ public:
 #else
         eng->wal_->writer_io_throw_hook_ = std::move(fn);
 #endif
+    }
+    // v29 M5 slice 3 (H6 control): hold the writer INSIDE the io_uring
+    // enter seam (before the CQE wait), simulating long drain I/O so a
+    // second committer's enqueue lands DURING the I/O — the exact event
+    // the concurrency-aware linger gate reads at drain completion. Fires
+    // only on the io_uring path; controls arming it skip-pass when the
+    // ring is unavailable (the io_uring-disabled CI leg).
+    void set_cqe_wait_hook_for_test(std::function<void()> fn) {
+        auto eng = api_engine();
+        if (!eng->wal_) return;
+        eng->wal_->cqe_wait_hook_ = std::move(fn);
     }
     // SRC-E1: pause the WAL's I/O executor before it drains the queue, so
     // N concurrent committers deterministically collect into ONE drain
