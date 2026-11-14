@@ -60,6 +60,12 @@ Subcommands:
                      the most recent committed promoted week; a half-dead
                      baseline leg — one dropped row — passes any row count
                      while silently shifting every ratio it feeds).
+                     Defect 6 adds baseline VERSION identity: each of the five
+                     baseline TSVs must record the same library version as the
+                     calibrated reference (a distro/vendored version change
+                     moves the geomean denominator and can fake or mask a
+                     REGRESSION); ChronoKV's own version is NOT gated (it
+                     legitimately changes between recalibrations).
                      Replaces the ci.yml shell count, which passed green on
                      empty/comment-only files (grep -c prints 0 AND exits 1, so
                      `|| echo 0` produced "0\n0" and `[ -lt ]` errored to rc=2
@@ -503,6 +509,60 @@ def reference_workload_sets(ref):
     return first
 
 
+def recorded_baseline_version(path):
+    """The library version recorded in a baseline TSV's methodology header.
+
+    bench/baselines.cpp writes one '# engine=...' line whose tail carries
+    '; version=<library version>' — sqlite '3.45.1', lmdb the full
+    mdb_version string ('LMDB 0.9.31: (July 10, 2023) 0.9.31'), rocksdb
+    '8.9.1'. The version is everything after the LAST 'version=' on that
+    line (lmdb's own string contains spaces/parens, so no token split).
+    Returns None when no '# engine=' line carries a version field.
+    """
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line.startswith("#"):
+                continue
+            body = line.lstrip("# ").strip()
+            if not body.startswith("engine="):
+                continue
+            _, sep, tail = body.rpartition("version=")
+            if sep and tail.strip():
+                return tail.strip()
+    return None
+
+def reference_baseline_versions(ref):
+    """Per-baseline-engine recorded version from the reference. Same
+    reference rules as reference_workload_sets: a promoted WEEK must agree
+    across all its nights (inconsistency is a tool error, never a silent
+    pick); a single NIGHT via --expect-from is its own reference. A
+    reference TSV lacking the version header is a tool error too — the
+    calibration ground truth must itself be rule-9 complete."""
+    nights = []
+    if os.path.isdir(ref):
+        subs = sorted(d for d in os.listdir(ref)
+                      if os.path.isdir(os.path.join(ref, d)))
+        nights = [os.path.join(ref, d) for d in subs] if subs else [ref]
+    per_night = []
+    for nd in nights:
+        vers = {}
+        for eng in BASELINE_ENGINES:
+            path = os.path.join(nd, eng + ".tsv")
+            if not os.path.isfile(path):
+                sys.exit(f"error: reference night {nd} lacks {eng}.tsv — cannot derive expected baseline versions")
+            v = recorded_baseline_version(path)
+            if v is None:
+                sys.exit(f"error: reference night {nd}: {eng}.tsv carries no '# engine=...; version=...' header — cannot derive expected baseline versions")
+            vers[eng] = v
+        per_night.append((nd, vers))
+    first = per_night[0][1]
+    for nd, vs in per_night[1:]:
+        if vs != first:
+            diff = {e: (first[e], vs[e]) for e in BASELINE_ENGINES if first[e] != vs[e]}
+            sys.exit(f"error: reference {ref} is internally inconsistent ({per_night[0][0]} vs {nd}: {diff}) — fix the promoted reference before gating against it")
+    return first
+
 def cmd_verify_ledger(args):
     print(f"# verify-ledger night={args.night}")
     ref = args.expect_from or default_reference_week()
@@ -510,7 +570,10 @@ def cmd_verify_ledger(args):
         print("# error: no workload-set reference found (no committed promoted week; pass --expect-from DIR)")
         return 1
     expected = reference_workload_sets(ref)
+    expected_versions = reference_baseline_versions(ref)
     print(f"# workload-set reference: {ref}")
+    print(f"# baseline-version reference: {ref} "
+          + ", ".join(f"{e}={expected_versions[e]}" for e in BASELINE_ENGINES))
     bad = []
     for eng in ENGINE_FILES:
         path = os.path.join(args.night, eng + ".tsv")
@@ -536,18 +599,47 @@ def cmd_verify_ledger(args):
         actual = valid_workload_set(path)
         missing = expected[eng] - actual
         extra = actual - expected[eng]
+        failed = False
         if missing or extra:
             print(f"  WORKLOAD-SET     {eng}.tsv  {n} valid rows but workload set != calibrated "
                   f"(expected {len(expected[eng])}): "
                   + (f"missing={sorted(missing)} " if missing else "")
                   + (f"unexpected={sorted(extra)}" if extra else ""))
+            failed = True
+        # Gate hardening (defect 6): baseline VERSION identity. The nightly
+        # arena installs distro baseline packages while bench/third_party/
+        # versions.txt pins source recipes; a library version change moves the
+        # same-night geomean DENOMINATOR every ratio is normalized by, so it
+        # can fake a REGRESSION (denominator falls) or mask one (denominator
+        # rises) — the same failure class as the half-dead baseline legs of
+        # defect 5, but invisible to row/workload-set counting. The recorded
+        # version must EQUAL the calibrated reference's; a change is a
+        # ledger-format change that owes a recalibration commit (which
+        # re-promotes), never a silent mix. ChronoKV's own version is NOT
+        # gated here: it legitimately changes between recalibrations.
+        if eng in BASELINE_ENGINES:
+            want = expected_versions[eng]
+            got = recorded_baseline_version(path)
+            if got is None:
+                print(f"  VERSION-MISSING  {eng}.tsv  no '# engine=...; version=...' methodology "
+                      f"header (calibrated: {want})")
+                failed = True
+            elif got != want:
+                print(f"  VERSION-DRIFT    {eng}.tsv  version={got} != calibrated {want} "
+                      "(baseline version change = ledger-format change: the geomean denominator "
+                      "moved; owes a recalibration commit that re-promotes, never a silent mix)")
+                failed = True
+        if failed:
             bad.append(eng)
+        elif eng in BASELINE_ENGINES:
+            print(f"  ok               {eng}.tsv  {n} valid rows, workload set == calibrated ({len(actual)}), "
+                  f"version == calibrated ({expected_versions[eng]})")
         else:
             print(f"  ok               {eng}.tsv  {n} valid rows, workload set == calibrated ({len(actual)})")
     if bad:
         print(f"# VERIFY-LEDGER FAILED: {len(bad)} engine(s) incomplete: {', '.join(bad)}")
         return 1
-    print(f"# verify-ledger: all {len(ENGINE_FILES)} engines complete (>=1 valid row AND workload set == calibrated)")
+    print(f"# verify-ledger: all {len(ENGINE_FILES)} engines complete (>=1 valid row, workload set == calibrated, baseline versions == calibrated)")
     return 0
 
 
@@ -621,7 +713,7 @@ def main():
     vl = sub.add_parser("verify-ledger")
     vl.add_argument("--night", required=True)
     vl.add_argument("--expect-from", default=None,
-                    help="reference night/week dir for the expected workload sets "
+                    help="reference night/week dir for the expected workload sets AND baseline versions "
                          "(default: the most recent committed bench/results/promoted/ week)")
     lo = sub.add_parser("loo")
     lo.add_argument("--nights", nargs="+", required=True)

@@ -836,7 +836,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - name: Gate self-tests (four hardened defects, controls both directions)
+      - name: Gate self-tests (six hardened defects, controls both directions)
         run: python3 scripts/test_arena_gate.py
 
   # ---- v29 M1 step 4: nightly arena ledger vehicle + regression gate ------

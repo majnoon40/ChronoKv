@@ -119,7 +119,8 @@ mixed geometries refuse to band). `arena` sits in `ci-passed`'s needs,
 skip-tolerated on push/PR where it does not run: a flaky shared runner
 never blocks a PR, and the gate has teeth on the nightly.
 
-**Gate hardening (2026-10-17, same day as enablement — four defects,
+**Gate hardening (2026-10-17, same day as enablement — four defects;
+defect 5 added same-day by the M1 owner, defect 6 added 2026-11-14 —
 each fixed behind fail-first controls; the full before/after evidence is
 in the CHANGELOG entry and the commit message):**
 * **Defect 1 — the completeness step passed green on dead legs.** The
@@ -193,8 +194,30 @@ in the CHANGELOG entry and the commit message):**
   unaffected; the committed bands are untouched (recomputation over
   the seven nights is identical to 1.1e-14 relative — geomean
   summation-order float noise, zero verdict drift on all seven).
-* **All of the above are wired into `scripts/test_arena_gate.py`** (19
-  controls + 2 meta-controls — 21 checks; the meta pair proves the suite
+* **Defect 6 (2026-11-14): baseline VERSION identity was ungated.** The
+  nightly arena installs **distro** baseline packages (`apt-get
+  libsqlite3-dev liblmdb-dev librocksdb-dev`) while
+  `bench/third_party/versions.txt` pins source recipes, and nothing
+  verified that the recorded baseline *versions* match the calibration:
+  a library version change moves the same-night geomean **denominator**
+  every ratio is normalized by — faking a REGRESSION when it falls,
+  masking one when it rises (the same failure class as defect 5's
+  half-dead baseline legs, but invisible to row/workload-set counting;
+  the nightlies of 2026-11-10..13 failing only the `check` step on an
+  unchanged commit are consistent with exactly this drift). Fixed in
+  `verify-ledger` (the completeness gate CI runs before `check`):
+  each of the five baseline TSVs must record the same library version
+  as the calibrated reference — same promoted-week reference, same
+  agreement rule (a week must agree across its nights; inconsistency is
+  a hard tool error, never a silent pick). Version extraction is driven
+  by the real header format (`# engine=…; version=…`, everything after
+  the last `version=`, so LMDB's full `mdb_version` string parses
+  whole). A baseline version change is a ledger-format change that
+  owes a recalibration commit (which re-promotes), never a silent
+  mix; ChronoKV's own version is NOT gated — it legitimately changes
+  between recalibrations.
+* **All of the above are wired into `scripts/test_arena_gate.py`** (24
+  controls + 2 meta-controls — 26 checks; the meta pair proves the suite
   never mutates the bands or
   the promoted TSVs it judges), running as the `arena-gate-selftest`
   job on EVERY push/PR (committed fixtures, no runner hardware needed)

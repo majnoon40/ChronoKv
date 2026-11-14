@@ -34,6 +34,14 @@ four is in the gate-hardening commit's message and the CHANGELOG entry):
             fillrandom REGRESSIONs. Includes the masking direction (dropping
             a FAST baseline row) and the extras direction (an unexpected new
             workload is a ledger-format change and must fail too).
+  defect 6  baseline VERSION identity: the nightly arena installs distro
+            baseline packages while bench/third_party/versions.txt pins source
+            recipes; a library version change moves the same-night geomean
+            denominator and can fake or mask a REGRESSION. verify-ledger must
+            fail on a drifted or missing baseline version header (naming the
+            engine), must NOT gate ChronoKV's own version, and must hard-error
+            on an internally inconsistent reference. The pristine night must
+            report all five baselines version == calibrated (anti-vacuity).
 
 Meta-controls: the committed inputs (bench/arena_bands.json and the promoted
 week) are hashed before and after — the tests must never mutate what they
@@ -126,6 +134,28 @@ def scale_ckv(dst, factor):
         open(p, "w").writelines(out)
 
 
+def set_baseline_version(dst, engine, new_version):
+    """Rewrite the '; version=...' tail of a baseline TSV's '# engine=' header."""
+    p = os.path.join(dst, engine + ".tsv")
+    out = []
+    for line in open(p):
+        if line.startswith("# engine=") and "version=" in line:
+            head, _, _tail = line.rstrip("\n").rpartition("version=")
+            line = head + "version=" + new_version + "\n"
+        out.append(line)
+    open(p, "w").writelines(out)
+
+def strip_baseline_version(dst, engine):
+    """Remove the version field from a baseline TSV's '# engine=' header."""
+    p = os.path.join(dst, engine + ".tsv")
+    out = []
+    for line in open(p):
+        if line.startswith("# engine=") and "version=" in line:
+            head, _, _tail = line.rstrip("\n").rpartition("version=")
+            line = head.rstrip("; ").rstrip() + "\n"
+        out.append(line)
+    open(p, "w").writelines(out)
+
 def main():
     for need in (TOOL, BANDS, WEEK, N7):
         if not os.path.exists(need):
@@ -134,7 +164,7 @@ def main():
     bands_hash_before = hashlib.sha256(open(BANDS, "rb").read()).hexdigest()
     week_hash_before = tree_hash(WEEK)
 
-    print("# arena gate self-tests (controls for the five hardened defects)")
+    print("# arena gate self-tests (controls for the six hardened defects)")
 
     # ---------------- defect 1: verify-ledger ----------------
     print("## defect 1 — verify-ledger (positive controls must exit nonzero)")
@@ -273,6 +303,58 @@ def main():
     rc, out = run("check", "--bands", BANDS, "--night", N7)
     expect("pristine night under the strict geomean: exit 0, 0 BASELINE-GAP (no false refusals)",
            rc == 0 and summary_field(out, "BASELINE-GAP") == 0, f"exit={rc}")
+
+    # ---------------- defect 6: baseline version identity ----------------
+    print("## defect 6 — baseline VERSION identity (drift / missing / reference consistency)")
+
+    # drift: a baseline library version change must fail verify-ledger, naming
+    # the engine and both versions (the geomean denominator moved)
+    night = tmp_night(); set_baseline_version(night, "sqlite-full", "3.46.0")
+    rc_v, out_v = run("verify-ledger", "--night", night)
+    drift_lines = [l for l in out_v.splitlines() if l.startswith("  VERSION-DRIFT")]
+    expect("version drift (sqlite-full 3.45.1 -> 3.46.0): verify-ledger exit 1, exactly one VERSION-DRIFT naming the engine",
+           rc_v == 1 and len(drift_lines) == 1 and "sqlite-full" in out_v
+           and "3.46.0" in out_v and "3.45.1" in out_v,
+           f"exit={rc_v} drift_lines={len(drift_lines)}")
+    shutil.rmtree(os.path.dirname(night))
+
+    # missing: a baseline TSV with no version header cannot be verified
+    night = tmp_night(); strip_baseline_version(night, "lmdb")
+    rc_v, out_v = run("verify-ledger", "--night", night)
+    expect("missing version header (lmdb): verify-ledger exit 1 with VERSION-MISSING",
+           rc_v == 1 and "VERSION-MISSING" in out_v and "lmdb" in out_v, f"exit={rc_v}")
+    shutil.rmtree(os.path.dirname(night))
+
+    # ChronoKV's own version is NOT gated (it legitimately changes between
+    # recalibrations) — rewriting it must NOT fail verify-ledger
+    night = tmp_night()
+    for eng in ("chronokv-group", "chronokv-async"):
+        p = os.path.join(night, eng + ".tsv")
+        txt = open(p).read().replace("# chronokv_version=0.28.1", "# chronokv_version=0.29.0-dev")
+        open(p, "w").write(txt)
+    rc_v, out_v = run("verify-ledger", "--night", night)
+    expect("chronokv version drift is NOT gated (engine versions change between recalibrations)",
+           rc_v == 0, f"exit={rc_v} out={out_v.strip().splitlines()[-1:]}")
+    shutil.rmtree(os.path.dirname(night))
+
+    # internally inconsistent reference: two reference nights disagreeing on a
+    # baseline version is a hard tool error, never a silent pick
+    refdir = tempfile.mkdtemp(prefix="arena_gate_ref_")
+    shutil.copytree(N7, os.path.join(refdir, "nightA"))
+    shutil.copytree(N7, os.path.join(refdir, "nightB"))
+    set_baseline_version(os.path.join(refdir, "nightB"), "rocksdb-sync", "8.10.0")
+    night = tmp_night()
+    rc_v, out_v = run("verify-ledger", "--night", night, "--expect-from", refdir)
+    expect("inconsistent reference (two nights disagree on rocksdb-sync version): hard tool error",
+           rc_v != 0 and "internally inconsistent" in out_v, f"exit={rc_v}")
+    shutil.rmtree(os.path.dirname(night)); shutil.rmtree(refdir)
+
+    # anti-vacuity: the pristine night must actually exercise the version check
+    # (five baseline 'version == calibrated' ok lines), not pass by skipping it
+    rc_v, out_v = run("verify-ledger", "--night", N7)
+    nok = sum(1 for l in out_v.splitlines() if l.startswith("  ok") and "version == calibrated" in l)
+    expect("pristine night: exit 0 AND all five baselines report version == calibrated (check ran)",
+           rc_v == 0 and nok == 5, f"exit={rc_v} version_ok_lines={nok}")
 
     # ---------------- meta controls ----------------
     print("## meta — the tests never mutate what they judge")
