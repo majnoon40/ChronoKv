@@ -318,6 +318,85 @@ jobs:
           path: test.log
           if-no-files-found: ignore
 
+  # ---- finding #5 (TSan suppression blind spot, 2026-11-14): the
+  # UNSUPPRESSED TSan leg — a report-class ratchet, nightly/dispatch
+  # only, OUTSIDE ci-passed until promoted. WHY: docs/tsan.supp's one
+  # deadlock:chronokv_btree::LatchTable line is typed per report class
+  # (races stay at full strength) but its recorded blind spot is that a
+  # REAL page-latch x engine-mutex inversion also carries a LatchTable
+  # frame and is suppressed with the artifact; today's only backstop is
+  # behavioral (a real latch-order deadlock hangs the suite — deadlines
+  # fail loudly). This leg runs the same full suite WITHOUT any
+  # suppressions and ratchets the REPORT CLASSES, not the suite verdict:
+  # the known artifact's signatures are committed as a baseline
+  # (ci/tsan-unsuppressed.baseline — the -Wconversion ratchet's shape),
+  # signatures may shrink, never grow, and data-race/other non-deadlock
+  # classes ALWAYS fail even if someone baselines them. NOT GATING YET:
+  # until the maintainer calibration commit lands (one dispatch, READ
+  # every signature, confirm each is the documented role-flip artifact,
+  # commit the baseline in a dedicated commit citing docs/tsan.supp —
+  # exactly like the arena bands), the ratchet step runs in PREVIEW
+  # (census only, exit 0) so this job cannot false-red before its
+  # evidence exists; the suite's own exit code is deliberately NOT the
+  # gate either way (forked children exit 66 on the known artifact —
+  # see docs/tsan.supp). Promotion into ci-passed follows the
+  # experimental->gating convention the sanitizer legs used: green
+  # three runs straight.
+  tsan-unsuppressed:
+    name: tsan (unsuppressed — report-class ratchet, nightly/dispatch)
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build TSan
+        run: make -j4 tsan
+
+      - name: Run full suite WITHOUT suppressions
+        # Suite verdicts are deliberately NOT the gate: the known LatchTable
+        # role-flip artifact makes forked children exit 66 (see docs/tsan.supp).
+        # The gate is the report-class ratchet below.
+        env:
+          TSAN_OPTIONS: halt_on_error=0 detect_deadlocks=1
+        run: |
+          set -o pipefail
+          ./build/tsan/test > tsan-unsuppressed.log 2>&1 || true
+          tail -40 tsan-unsuppressed.log
+
+      - name: Report-class ratchet (guarded — preview until the baseline commit)
+        run: |
+          if [ ! -f ci/tsan-unsuppressed.baseline ]; then
+            {
+              echo "# PREVIEW — ci/tsan-unsuppressed.baseline is not committed yet."
+              echo "# This job CANNOT red until the maintainer calibration commit lands"
+              echo "# (one dispatch, read every signature, confirm the LatchTable artifact;"
+              echo "#  see scripts/tsan_reports.py's header). The census below is"
+              echo "# informational: what the unsuppressed run reports today."
+            } > tsan-ratchet.md
+            # Census only. `baseline` refuses non-deadlock classes (exit 1)
+            # — surfaced here as text, swallowed on purpose: preview mode
+            # must not gate. The temp file is never uploaded or committed.
+            python3 scripts/tsan_reports.py baseline \
+              --log tsan-unsuppressed.log --out tsan-preview.baseline >> tsan-ratchet.md 2>&1 || true
+            cat tsan-preview.baseline >> tsan-ratchet.md 2>/dev/null || true
+          else
+            python3 scripts/tsan_reports.py check \
+              --log tsan-unsuppressed.log \
+              --baseline ci/tsan-unsuppressed.baseline | tee tsan-ratchet.md
+          fi
+          cat tsan-ratchet.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: tsan-unsuppressed-${{ github.run_id }}
+          path: |
+            tsan-unsuppressed.log
+            tsan-ratchet.md
+          if-no-files-found: warn
+
   # ---- hooks-off: public-API smoke, no test hooks -------------------------
   public-api-smoke:
     name: smoke (${{ matrix.name }})
@@ -909,14 +988,24 @@ jobs:
   # it judges. Uses only committed fixtures: no runner hardware, no arena run,
   # so it gates EVERY push/PR (unlike the nightly-only arena job). Red here
   # means the arena gate's verdicts are untrustworthy until green again.
+  # 2026-11-14 (finding #5): the same job now also self-tests the TSan
+  # report-class ratchet (scripts/test_tsan_reports.py — controls both
+  # directions for scripts/tsan_reports.py, the unsuppressed leg's judge:
+  # known-artifact green, data-race/engine-mutex/mixed-inversion red,
+  # normalization across recompilation, shrink-only, zero-reports note,
+  # baseline-refuses-races) — committed fixtures in the real gcc libtsan
+  # format, captured from an actual unsuppressed run of the 711cd00
+  # role-flip driver. The gate that judges the ratchet is itself judged.
   arena-gate-selftest:
-    name: arena-gate selftest (controls for the ledger gate)
+    name: gate selftests (arena ledger gate + tsan report-class ratchet)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - name: Gate self-tests (six hardened defects, controls both directions)
         run: python3 scripts/test_arena_gate.py
+      - name: TSan report-class ratchet self-tests (finding #5 leg, controls both directions)
+        run: python3 scripts/test_tsan_reports.py
 
   # ---- v29 M1 step 4: nightly arena ledger vehicle + regression gate ------
   # Runs the arena (ChronoKV, both durability classes) and the five baseline
