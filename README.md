@@ -292,10 +292,10 @@ g++ -std=c++20 -O2 -I. my_app.cpp -o my_app -lpthread
 | Surface | Entry points | Notes |
 | --- | --- | --- |
 | Database | `open/get/put/erase/range_scan/begin/checkpoint/close` | move-only; ops on a closed DB throw `LifecycleError` |
-| Transactions | `get/put/erase/range_scan/commit/abort` | SSI; read-your-writes over the snapshot; must commit or abort before destruction |
+| Transactions | `get/put/erase/range_scan/commit/abort` | SSI; read-your-writes over the snapshot; must commit or abort before destruction — `Options::on_transaction_leak` picks the destructor's failure mode: `Abort` (default, since v21: `std::abort()`) or `Report` (quiet rollback, leak counted, `health()` level 1) |
 | Batch | `create_batch()` → `put/erase/commit` | atomic write-set commit, cheaper than a transaction |
 | Async | `put_async/get_async/erase_async` | `std::future`-based; errors via `Result<T>` / `Status` |
-| Streams | `RangeScanStream::has_next/next` | incremental B+ tree cursor; per-page snapshot consistency |
+| Streams | `RangeScanStream::has_next/next` | incremental B+ tree cursor; snapshot consistency: writes committed after construction stay invisible for the whole stream (an `effective_ts` MVCC cut pinned by the #7c battery) |
 | Observers | `observe(prefix, callback)` | inline callbacks on the committing thread; fired by `put/erase/Batch::commit` **and `Transaction::commit`** (v25.7); `old_val` is always `nullopt`; a throwing callback is **contained** (counted in diagnostics) and never inverts the commit result (v28 CKV-007) |
 | Backup | `backup(dest_dir)` / `verify_backup(dest_dir, reason*)` / `backup_cts(dest_dir)` | v26 M3; requires `checkpoint_path`; restore by opening `Options` against the copy |
 | PITR | `Options::pitr_as_of_cts` / `restore_pitr(src_wal, src_ckpt, dest, as_of)` | v26 M4; PITR opens are read-only; `restore_pitr` materializes a writable as-of DB in a fresh directory |
@@ -700,12 +700,20 @@ E1–E16 safety argument and the v24 fix log at the top of the file).
   and the `Database` is alive. This is deliberate (see Safety properties), but
   it means an exception propagating out of a scope that holds a `Transaction`
   will `SIGABRT` during unwinding. Always commit or abort explicitly, and
-  prefer an explicit `try`/`catch` around transactional scopes.
+  prefer an explicit `try`/`catch` around transactional scopes. Embedders
+  that cannot tolerate `std::abort()` (fail-soft servers) may opt into
+  `Options::on_transaction_leak = Report` (2026-11-14, finding #7a): the
+  destructor rolls back quietly, releases the reader slot, counts the leak,
+  and degrades `health()` to level 1 with a `transaction leaks: N` reason —
+  the engine stays usable; monitor `txn_leaks()`.
 - **Observer reentrancy**: callbacks run inline under the observer lock;
   re-entering the observer machinery from a callback deadlocks
   (tracked for a future dedicated notification thread).
-- **Stream consistency**: `RangeScanStream` guarantees per-page snapshots,
-  not cross-page consistency during concurrent writes.
+- **Stream consistency**: `RangeScanStream` is snapshot-consistent for the
+  whole stream, not per-page-only — writes committed after construction are
+  invisible for the entire iteration (the `effective_ts` MVCC cut; pinned
+  by the #7c battery, `CKV_ONLY_API7=1`). The v25.1-era "per-page only"
+  wording understated the measured guarantee and was corrected 2026-11-14.
 - **Single process**: the `flock` guard fails fast on accidental second
   openers; there is no multi-process mode.
 - **Linux only**: no macOS/Windows support.

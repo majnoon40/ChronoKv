@@ -587,6 +587,7 @@ static int run_m5_writer_test();             // v29 M5 slice 1: WAL writer-threa
 static int run_m5_slice2_test();             // v29 M5 slice 2: io_uring issuer rungs + adaptive linger (decision doc 2026-10-20 §8)
 static int run_m5_slice3_test();             // v29 M5 slice 3: writer hot-idle controls (the arena-regression fix)
 static int run_m6_slice1_test();             // v29 M6 item 5: streaming recovery parse (the 64 MiB slurp deleted)
+static int run_api7_contract_test();        // 2026-11-14 (#7a/#7c): txn-leak Report policy + stream-consistency pin
 static int run_m2_phase1_test();
 static int run_m2_phase2_test();
 static int run_m2_phase3_test();
@@ -2513,6 +2514,24 @@ return 0;
     if (getenv("CKV_ONLY_M6")) {
         crc_init();
         int f = run_m6_slice1_test();
+        std::cout.flush();
+        return f == 0 ? 0 : 1;
+    }
+
+    // 2026-11-14 (#7a/#7c): CKV_ONLY_API7=1 runs just the API-contract
+    // battery — the transaction-leak Report policy (forked children prove
+    // both directions of the destructor contract) and the stream
+    // consistency pin (what a RangeScanStream actually guarantees,
+    // MEASURED, so the docs' claim is the tested one). Fail-first: the
+    // Report legs were written against a tree without the Report branch
+    // (they die with SIGABRT in the forked child, exactly like the Abort
+    // default); the stream pin's controls were written against the
+    // header's OLD "cross-page consistency is NOT guaranteed" claim — the
+    // measurement settled which way the docs went (the corrected claim
+    // is the one in the class comment now).
+    if (getenv("CKV_ONLY_API7")) {
+        crc_init();
+        int f = run_api7_contract_test();
         std::cout.flush();
         return f == 0 ? 0 : 1;
     }
@@ -8106,6 +8125,7 @@ std::cout << "   v22.1 M4: cross-process fork test SKIPPED (sanitizer build)\n";
     // v25.7 review detectors: GC busy-spin (H2), API lifecycle (M2).
     fails += run_gc_idle_test();
     fails += run_lifecycle_test();
+    fails += run_api7_contract_test();   // 2026-11-14 (#7a/#7c): leak Report policy + stream pin
     // v26 M3: online backup + verify_backup (invariant B1).
     fails += run_backup_test();
     // v26 M4: point-in-time restore.
@@ -12700,6 +12720,319 @@ static int run_gc_idle_test() {
         db.close();
     }
     if (fails == 0) std::cout << "   GC IDLE TEST PASSED\n";
+    return fails;
+}
+
+// =====================================================================
+// 2026-11-14, finding #7a — TransactionLeakPolicy (Options::
+// on_transaction_leak = Abort | Report). The Abort default is the
+// unchanged v21 contract (asserted by the lifecycle battery's forked
+// child). Report is the new opt-in soft path: ~Transaction on a still-
+// active txn rolls back via the abort() cleanup (reader-slot release +
+// phantom deregister), never throws (the destructor may run during
+// unwinding — a second throw would std::terminate), increments the leak
+// diagnostic, and degrades health() to level 1 "transaction leaks: N";
+// the engine stays usable. INVARIANTS: TXN-3 (cleanup runs while the
+// engine is pinned) and T1 (no half-commit — the write set is discarded).
+//
+// FAIL-FIRST (the REVERSION CONTROLS these batteries pin):
+//   * Mutant R7a-1 "Report branch deleted" (policy falls back to Abort):
+//     child 1 dies SIGABRT -> legs L1..L4 all RED.
+//   * Mutant R7a-2 "leak counter not incremented": L2, L4 RED (health
+//     stays level 0; txn_leaks() stays 0).
+//   * Mutant R7a-3 "Report throws instead of rolling back": an
+//     exception unwinding through the active txn would std::terminate ->
+//     child 2 dies on signal -> L3 RED.
+//   * Mutant R7a-4 "Abort default changed to Report": child 5 does NOT
+//     die -> L5 RED (the loud default is the product contract).
+// Child 6 is the negative control's own vacuity check: without the
+// leak, health() must stay level 0 (a counter that fires unbidden is
+// as broken as one that never fires).
+// =====================================================================
+static int run_api7_contract_test() {
+    using namespace chronokv;
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& fr = {}) {
+        std::cout << "   " << name << ":  " << (ok ? "PASS" : "FAIL") << "\n";
+        if (!ok) { ++fails; if (!fr.empty()) std::cout << "      (" << fr << ")\n"; }
+    };
+    std::cout << "\n#7a — TransactionLeakPolicy (on_transaction_leak)\n";
+
+    // ---- L1: Report — no SIGABRT, engine reusable, writes rolled back ----
+    // Forked: even a soft-path BUG that falls through to std::abort() must
+    // be caught as a child signal, not kill this suite.
+    {
+        std::cout.flush();
+        pid_t child = fork();
+        if (child < 0) {
+            check("L1 Report: fork", false, "fork() failed");
+        } else if (child == 0) {
+            int rc = 0;
+            try {
+                Options o;
+                o.auto_start_gc = false;
+                o.on_transaction_leak = TransactionLeakPolicy::Report;
+                auto db = Database::open(o);
+                db.put("a", "1");
+                {
+                    auto txn = db.begin();
+                    txn.put("a", "2");       // staged, never committed
+                    txn.put("b", "9");
+                    // txn destructor: Report -> quiet rollback + diagnostic
+                }
+                // Engine usable: every op below must just work.
+                if (db.get("a") != std::optional<std::string>{"1"}) rc |= 1;   // staged write DISCARDED
+                if (db.get("b").has_value())                   rc |= 2;   // never committed -> absent
+                if (db.put("c", "3") != Status::OK)           rc |= 4;   // engine reusable
+                if (db.get("c") != std::optional<std::string>{"3"}) rc |= 8;
+                auto h = db.health();
+                if (h.level != 1)                             rc |= 16;  // degraded
+                if (db.txn_leaks() != 1)                      rc |= 32;  // counted
+                _exit(rc);
+            } catch (...) { _exit(64); }
+        } else {
+            int wst = 0;
+            if (waitpid(child, &wst, 0) != child) {
+                check("L1 Report: leak rolls back, engine reusable", false, "waitpid failed");
+            } else if (WIFSIGNALED(wst)) {
+                check("L1 Report: leak rolls back, engine usable", false,
+                      std::string("child DIED on signal ") + std::to_string(WTERMSIG(wst)) +
+                      " (Report fell back to abort)");
+            } else if (WEXITSTATUS(wst) != 0) {
+                int r = WEXITSTATUS(wst);
+                check("L1 Report: leak rolls back, engine usable", false,
+                      "rc=" + std::to_string(r) + " bits:" +
+                      std::string(r & 1 ? " discard-a" : "") + (r & 2 ? " absent-b" : "") +
+                      (r & 4 ? " put-c" : "") + (r & 8 ? " get-c" : "") +
+                      (r & 16 ? " health!=1" : "") + (r & 32 ? " leaks!=1" : "") +
+                      (r & 64 ? " threw" : ""));
+            } else {
+                check("L1 Report: leak rolls back, engine reusable, health=1, leaks=1", true);
+            }
+        }
+    }
+
+    // ---- L2: Report — health() level 1 with the named reason, counter ----
+    {
+        Options o;
+        o.auto_start_gc = false;
+        o.on_transaction_leak = TransactionLeakPolicy::Report;
+        auto db = Database::open(o);
+        {
+            auto txn = db.begin();
+            txn.put("x", "1");
+        }
+        auto h = db.health();
+        bool reason = false;
+        for (auto& r : h.reasons) if (r.find("transaction leaks") == 0) reason = true;
+        check("L2 Report: health() level 1, reason 'transaction leaks: 1'",
+              h.level == 1 && reason && db.txn_leaks() == 1,
+              "level=" + std::to_string(h.level) + " leaks=" + std::to_string(db.txn_leaks()));
+
+        // ---- L4 (same instance): a SECOND leak increments, engine still usable ----
+        {
+            auto txn2 = db.begin();
+            txn2.put("y", "2");
+        }
+        h = db.health();
+        check("L4 Report: second leak increments (leaks=2), engine still usable",
+              db.txn_leaks() == 2 && h.level == 1 && db.put("z", "3") == Status::OK,
+              "leaks=" + std::to_string(db.txn_leaks()));
+    }
+
+    // ---- L3: Report — exception unwinding through the active txn lives ----
+    // THE reason Report exists: the Abort default SIGABRTs here (README
+    // Known limitations). Forked so both policies can be exercised.
+    {
+        std::cout.flush();
+        pid_t child = fork();
+        if (child < 0) {
+            check("L3 Report: unwind through active txn", false, "fork() failed");
+        } else if (child == 0) {
+            int rc = 0;
+            try {
+                Options o;
+                o.auto_start_gc = false;
+                o.on_transaction_leak = TransactionLeakPolicy::Report;
+                auto db = Database::open(o);
+                try {
+                    auto txn = db.begin();
+                    txn.put("a", "1");
+                    throw std::runtime_error("boom");   // unwinds through txn
+                } catch (const std::runtime_error&) {
+                    // SURVIVED (no SIGABRT, no terminate): the leak was
+                    // reported, not fatal.
+                }
+                if (db.txn_leaks() != 1) rc |= 1;
+                if (db.put("after", "ok") != Status::OK) rc |= 2;
+                _exit(rc);
+            } catch (...) { _exit(4); }
+        } else {
+            int wst = 0;
+            if (waitpid(child, &wst, 0) != child) {
+                check("L3 Report: unwind through active txn", false, "waitpid failed");
+            } else if (WIFSIGNALED(wst)) {
+                check("L3 Report: unwind through active txn", false,
+                      std::string("child DIED on signal ") + std::to_string(WTERMSIG(wst)));
+            } else if (WEXITSTATUS(wst) != 0) {
+                check("L3 Report: unwind through active txn", false,
+                      "rc=" + std::to_string(WEXITSTATUS(wst)));
+            } else {
+                check("L3 Report: unwind through active txn survives (no SIGABRT), leak=1", true);
+            }
+        }
+    }
+
+    // ---- L5: Abort default — the v21 contract is UNCHANGED ----
+    {
+        std::cout.flush();
+        pid_t child = fork();
+        if (child < 0) {
+            check("L5 Abort default unchanged", false, "fork() failed");
+        } else if (child == 0) {
+            Options o;
+            o.auto_start_gc = false;
+            // on_transaction_leak left at default (Abort)
+            auto db = Database::open(o);
+            db.put("a", "1");
+            {
+                auto txn = db.begin();
+                txn.put("a", "2");
+                // destructor: Abort -> std::abort()
+            }
+            _exit(0);   // unreachable
+        } else {
+            int wst = 0;
+            if (waitpid(child, &wst, 0) != child) {
+                check("L5 Abort default unchanged", false, "waitpid failed");
+            } else if (!WIFSIGNALED(wst) || WTERMSIG(wst) != SIGABRT) {
+                check("L5 Abort default unchanged (SIGABRT on leaked txn)", false,
+                      "child did not die with SIGABRT");
+            } else {
+                check("L5 Abort default unchanged (SIGABRT on leaked txn)", true);
+            }
+        }
+    }
+
+    // ---- L6: negative control — no leak, no diagnostic, level 0 ----
+    {
+        Options o;
+        o.auto_start_gc = false;
+        o.on_transaction_leak = TransactionLeakPolicy::Report;
+        auto db = Database::open(o);
+        {
+            auto txn = db.begin();
+            txn.put("a", "1");
+            if (txn.commit() != Status::OK) { /* counted below */ }
+        }
+        {
+            auto txn = db.begin();
+            txn.put("b", "2");
+            txn.abort();               // explicit — not a leak
+        }
+        auto h = db.health();
+        check("L6 negative: committed + explicitly-aborted txns leave leaks=0, level 0",
+              db.txn_leaks() == 0 && h.level == 0,
+              "leaks=" + std::to_string(db.txn_leaks()) + " level=" + std::to_string(h.level));
+    }
+
+    // =================================================================
+    // 2026-11-14, finding #7c — RangeScanStream consistency, pinned.
+    // The v25.1-era class comment said "Cross-page consistency is NOT
+    // guaranteed" (per-page snapshots only). The pImpl MEASURES stronger
+    // than that claim: ChronoKVRangeScanCursorState stamps
+    // effective_ts = min(guard.read_ts(), published()) at construction and
+    // every row is read via read_at_idx(effective_ts, ...) — MVCC version
+    // visibility filters mid-stream commits for the WHOLE stream, which
+    // IS cross-page snapshot consistency (the parked-page rule explains
+    // the page-level mechanism, not the visibility contract). The docs
+    // now state the measured contract; these controls keep them honest.
+    //
+    // REVERSION CONTROLS pinned here:
+    //   * R7c-1 "effective_ts dropped, raw tree reads": a mid-stream
+    //     commit's overwrite of an UNCONSUMED key would APPEAR in the
+    //     stream -> S2 RED.
+    //   * R7c-2 "guard not held / read_ts ignored": S1 (prefix stability)
+    //     and S3 (already-yielded rows stable) go RED under the various
+    //     raw-read mutants.
+    //   * R7c-3 "docs claim per-page only": not a runtime mutant — the
+    //     docs WERE the defect; the corrected claim is now testable.
+    // =================================================================
+    std::cout << "\n#7c — RangeScanStream consistency pin\n";
+    {
+        // S1/S2/S3 on one instance: build 400 keys, park mid-stream,
+        // commit an overwrite of a NOT-yet-yielded key, drain.
+        Options o;
+        o.auto_start_gc = false;
+        auto db = Database::open(o);
+        for (int i = 0; i < 400; ++i) {
+            char k[8];
+            std::snprintf(k, sizeof k, "k%03d", i);
+            db.put(k, "v0");
+        }
+        Database::RangeScanStream s(db, "k000", "k399");
+        int seen_before = 0;
+        std::string last_before;
+        while (s.has_next()) {
+            auto [k, v] = s.next();
+            if (v != "v0") { /* caught by S3 below if it regresses */ }
+            last_before = k;
+            ++seen_before;
+            if (seen_before >= 100) break;   // parked ~25% in
+        }
+        check("S1 park: 100 rows of v0 consumed before the commit",
+              seen_before == 100 && last_before == "k099",
+              "seen=" + std::to_string(seen_before) + " last=" + last_before);
+
+        // The mid-stream write: an overwrite of a NOT-yet-yielded key.
+        db.put("k200", "v1");
+
+        // S2: the mid-stream commit must NOT appear in THIS stream (MVCC
+        // visibility at the construction-stamped effective_ts).
+        int leaks = 0;
+        int rows = 0;
+        std::string first_after;
+        while (s.has_next()) {
+            auto [k, v] = s.next();
+            ++rows;
+            if (first_after.empty()) first_after = k;
+            if (v != "v0") ++leaks;   // a post-construction value: the mutant
+        }
+        check("S2 mid-stream commit invisible for the WHOLE stream (k200 stays v0)",
+              leaks == 0 && rows == 300 && first_after == "k100",
+              "leaked=" + std::to_string(leaks) + " rows=" + std::to_string(rows) +
+              " first=" + first_after);
+
+        // S3: a NEW stream after the commit sees it (the visibility cut is
+        // the OLD stream's, not the database's) — proves S2 is MVCC
+        // filtering, not a broken scan.
+        {
+            Database::RangeScanStream s2(db, "k195", "k205");
+            std::string v200;
+            while (s2.has_next()) {
+                auto [k, v] = s2.next();
+                if (k == "k200") v200 = v;
+            }
+            check("S3 fresh stream sees the commit (k200=v1)", v200 == "v1",
+                  "v=" + v200);
+        }
+
+        // S4: already-yielded rows stay stable — replay the same prefix
+        // through a fresh stream built BEFORE another commit and compare.
+        {
+            db.put("k010", "LATE");
+            Database::RangeScanStream s3(db, "k000", "k020");
+            std::string v010;
+            while (s3.has_next()) {
+                auto [k, v] = s3.next();
+                if (k == "k010") v010 = v;
+            }
+            check("S4 fresh stream after LATE commit sees it (cut is per-stream)",
+                  v010 == "LATE", "v=" + v010);
+        }
+    }
+
+    if (fails == 0) std::cout << "\n#7a/#7c API-CONTRACT TEST PASSED\n";
     return fails;
 }
 

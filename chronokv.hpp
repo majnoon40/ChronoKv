@@ -2169,6 +2169,7 @@ namespace diag {
     inline std::atomic<uint64_t> rec_pitr_wal_skipped{0}; // v26.1: WAL records superseded/duplicated by filtered delta entries
     inline std::atomic<uint64_t> epoch_entries{0}, epoch_oldest{0}, epoch_newest{0};
     inline std::atomic<uint64_t> observer_exceptions{0}; // v28 CKV-007: contained observer-callback throws
+    inline std::atomic<uint64_t> txn_leaks{0};   // 2026-11-14 (#7a): Report-mode leaked transactions (process-wide)
 
     inline void dump() {
         uint64_t created = gc_created.load(), retired = gc_retired.load(),
@@ -2201,7 +2202,8 @@ namespace diag {
             << " pitr_wal_skipped=" << rec_pitr_wal_skipped.load() << "\n"
             << "epoch:    entries=" << epoch_entries.load()
             << " oldest=" << epoch_oldest.load() << " newest=" << epoch_newest.load() << "\n"
-            << "observer: contained_exceptions=" << observer_exceptions.load() << "\n";
+            << "observer: contained_exceptions=" << observer_exceptions.load() << "\n"
+            << "txn:      leaked_reported=" << txn_leaks.load() << "\n";
     }
 }
 
@@ -2833,6 +2835,22 @@ enum class TxnState : uint8_t { Active, Committed, Aborted };
 //                    if you can tolerate silent loss on fsync failure (e.g., ephemeral
 //                    data, or you have an external recovery mechanism).
 enum class DurabilityMode : uint8_t { Sync, Group, Async };
+
+// 2026-11-14 (finding #7a): what ~Transaction() does when a transaction is
+// destroyed while still ACTIVE and the Database is alive.
+//   Abort (the DEFAULT, unchanged since v21): std::abort() — a leaked
+//     transaction is a programming error and the process dies loudly; the
+//     exception-unwinding SIGABRT consequence is documented in README's
+//     Known limitations and asserted by the v21 lifecycle battery.
+//   Report (opt-in): roll back quietly — the destructor runs the SAME
+//     cleanup as an explicit abort() (release the reader slot, deregister
+//     the phantom reader), increments a leak diagnostic, and degrades
+//     health() to level 1 with a "transaction leaks: N" reason; the engine
+//     stays usable. Report trades the crash for an observable degraded
+//     state — choose it only where the embedder cannot tolerate
+//     std::abort() (servers that must fail soft), and read health().
+enum class TransactionLeakPolicy : uint8_t { Abort, Report };
+
 
 // [[maybe_unused]]: only called under CHRONOKV_RECORD_HISTORY.
 [[maybe_unused]] static const char* to_string(TxnResult r) {
@@ -7460,6 +7478,9 @@ class ChronoKV {
     std::atomic<uint64_t> i_fence_retries{0};
     std::atomic<uint64_t> i_gc_passes{0}, i_gc_last_keys{0}, i_gc_last_steps{0};
     std::atomic<uint64_t> i_gc_last_pass_ns{0}, i_gc_max_pass_ns{0};
+    // 2026-11-14 (#7a): Report-mode leaked transactions on this instance
+    // (surfaced as the health() level-1 reason "transaction leaks: N").
+    std::atomic<uint64_t> i_txn_leaks{0};
     std::atomic<uint64_t> i_rec_records{0};
     std::atomic<uint64_t> i_pub_allocated_no_wal{0};
     // v23 Phase C: epoch-pinned reclamation.
@@ -8210,6 +8231,14 @@ public:
             h.level = std::max(h.level, 1);
             h.reasons.push_back("wal truncate failures: " + std::to_string(w.truncate_fails));
         }
+        // 2026-11-14 (#7a): transactions rolled back by ~Transaction's
+        // Report branch — degraded, never failing (the data is correct; the
+        // caller's control flow is what leaked).
+        if (i_txn_leaks.load(std::memory_order_relaxed) > 0) {
+            h.level = std::max(h.level, 1);
+            h.reasons.push_back("transaction leaks: " +
+                std::to_string(i_txn_leaks.load(std::memory_order_relaxed)));
+        }
         if (pitr_as_of_) {
             // v26 M4: deliberate restricted mode, not a fault — degraded,
             // never failing.
@@ -8515,6 +8544,13 @@ public:
 #endif
      }
 #endif
+
+     // 2026-11-14 (#7a): the leak diagnostic's instance half; called by
+     // Database::note_transaction_leak() from ~Transaction's Report branch
+     // (the diag:: global is incremented by the Database side).
+     void note_txn_leak() {
+        i_txn_leaks.fetch_add(1, std::memory_order_relaxed);
+     }
 
      void start_gc() {
         // v20.1 BLOCKER #12: idempotent — assigning a new std::thread over a
@@ -11416,6 +11452,11 @@ struct Options {
     bool auto_start_gc = true;
     bool recover_on_open = true;
     DurabilityMode durability = DurabilityMode::Group;
+    // 2026-11-14 (#7a): destructor policy for a still-active Transaction —
+    // Abort (default, the v21 contract: std::abort()) | Report (quiet
+    // rollback + leak diagnostic + health() level 1). See
+    // TransactionLeakPolicy above for the full contract.
+    TransactionLeakPolicy on_transaction_leak = TransactionLeakPolicy::Abort;
     // v25.1 M1.6: page pool capacity for the B+ tree index. Default 256 MiB
     // (production-sized). Tests can set this lower (e.g., 16 MiB) to avoid
     // virtual memory pressure on memory-constrained VMs — the 2-CPU test
@@ -11574,6 +11615,29 @@ class Database {
     // are close()-safe by construction (engine keepalive + this flag).
     std::shared_ptr<std::atomic<bool>> alive_ = std::make_shared<std::atomic<bool>>(true);
 
+    // 2026-11-14 (#7a): destructor policy for still-active transactions,
+    // copied from Options at open(); read by ~Transaction's Report branch.
+    // (See TransactionLeakPolicy for the contract.)
+    TransactionLeakPolicy txn_leak_policy_ = TransactionLeakPolicy::Abort;
+
+    // 2026-11-14 (#7a): called by ~Transaction's Report branch — increments
+    // both the engine instance counter (health()/txn_leaks()) and the
+    // process-wide diag global. FRIEND-ONLY path: Transaction calls this via
+    // its Database* (db_), which is valid under the same liveness check the
+    // abort branch uses.
+    void note_transaction_leak() {
+        diag::txn_leaks.fetch_add(1, std::memory_order_relaxed);
+        try {
+            auto eng = api_engine();
+            eng->note_txn_leak();
+        } catch (...) {
+            // Engine already closed/unreachable: the diag global above still
+            // counted the leak; health() reads the instance counter only
+            // while the engine lives, so the degraded state cannot be
+            // missed on a live instance.
+        }
+    }
+
     // Private constructor (used by open factory)
     Database(std::shared_ptr<ChronoKV> eng, std::string cp)
         : engine_(std::move(eng)), checkpoint_path_(std::move(cp)) {}
@@ -11617,7 +11681,7 @@ public:
             // v28 CKV-011: a PITR open must not touch the source directory —
             // no lock file, no writer flock, no torn-tail repair. Replay is
             // read-only (recover_all); writes/checkpoints are refused.
-            engine = std::make_shared<ChronoKV>(opts.wal_dir, opts.page_pool_bytes,
+        engine = std::make_shared<ChronoKV>(opts.wal_dir, opts.page_pool_bytes,
                                                 /*wal_read_only=*/opts.pitr_as_of_cts != 0,
                                                 opts.wal_queue_max_items,
                                                 opts.wal_queue_max_bytes,
@@ -11638,10 +11702,14 @@ public:
         if (opts.auto_start_gc) {
             engine->start_gc();
         }
-        
+
         engine->set_durability(opts.durability);
-        
-        return Database(std::move(engine), opts.checkpoint_path);
+
+        // 2026-11-14 (#7a): record the leak policy on the Database wrapper
+        // (the engine never needs it — only ~Transaction consults it).
+        Database db(std::move(engine), opts.checkpoint_path);
+        db.txn_leak_policy_ = opts.on_transaction_leak;
+        return db;
     }
 
     ~Database() {
@@ -12023,6 +12091,9 @@ public:
                        g.last_keys, g.last_steps, g.last_pass_ns,
                        g.max_pass_ns, g.entries_retired, g.entries_reclaimed};
     }
+    // 2026-11-14 (#7a): Report-mode transaction leaks on this instance —
+    // the same counter health() surfaces as its level-1 reason.
+    uint64_t txn_leaks() const { return api_engine()->i_txn_leaks.load(std::memory_order_relaxed); }
     // v29 M3 slice 3 (roadmap: pool utilization + high-water in stats).
     PoolStats pool_stats() const {
         return api_engine()->pool_stats();
@@ -12529,10 +12600,21 @@ public:
     // re-scan per chunk. The stream holds a pImpl (ChronoKVRangeScanCursorState)
     // that contains the Cursor + SnapshotGuard, defined after BTree.
     //
-    // Consistency guarantee: per-page snapshot via Cursor's shared latch
-    // (M1.4). A cursor observes the state of each leaf at the moment it
-    // enters it; concurrent mutations to that page are invisible until the
-    // cursor moves on. Cross-page consistency is NOT guaranteed.
+    // Consistency guarantee (CORRECTED 2026-11-14, finding #7c — the
+    // v25.1-era comment here claimed "per-page snapshot only; cross-page
+    // consistency is NOT guaranteed", which UNDERSTATES the measured
+    // contract): the pImpl stamps effective_ts =
+    // min(guard.read_ts(), pub_.published()) at CONSTRUCTION and reads
+    // every row through MVCC version visibility at that timestamp — so
+    // writes committed after the stream was constructed are invisible for
+    // the WHOLE stream, across pages, not merely until the cursor leaves
+    // a page. Reads you have already consumed are trivially stable. The
+    // per-page shared-latch crabbing is the MECHANISM (a page's contents
+    // cannot shift under the cursor mid-read), not the contract. This is
+    // the same class of snapshot cut range_scan() has. Pinned by the
+    // #7c battery (CKV_ONLY_API7=1): a mid-stream commit of a
+    // not-yet-yielded key must NOT appear in the open stream, and a fresh
+    // stream MUST see it — the docs' claim is the tested one now.
 
     class RangeScanStream {
     public:
@@ -12710,8 +12792,32 @@ public:
         // under this transaction, the ReadWriteTransaction destructor
         // (guarded by its own weak_ptr check) will safely skip cleanup,
         // so we just destroy txn_ and return.
+        //
+        // 2026-11-14 (#7a): the Abort default above is the unchanged v21
+        // contract; under Report the same liveness case takes the new
+        // soft path instead — rollback (the abort() cleanup: reader-slot
+        // release + phantom deregister), a leak diagnostic, health() level
+        // 1. The Database-gone case is untouched: it was never a leak.
         if (active_) {
             if (auto sp = db_alive_.lock(); sp && *sp) {
+                if (db_ && db_->txn_leak_policy_ == TransactionLeakPolicy::Report) {
+                    // Same cleanup as an explicit abort(), never a throw:
+                    // the destructor may run during exception unwinding and
+                    // a second throw here would std::terminate (exactly the
+                    // SIGABRT consequence Abort exists to make loud; Report
+                    // must fail soft instead).
+                    try {
+                        abort();
+                    } catch (...) {
+                        // Keep unwinding quiet: the slot/phantom cleanup may
+                        // be incomplete, but ~ReadWriteTransaction's own
+                        // guards still run below via txn_'s reset inside
+                        // abort() — and leaking the diagnostic is worse
+                        // than a possibly-stale slot here.
+                    }
+                    db_->note_transaction_leak();
+                    return;
+                }
                 // Engine is still live — this is a real leak, abort.
                 std::abort();
             }
