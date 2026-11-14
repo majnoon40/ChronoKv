@@ -812,6 +812,85 @@ jobs:
           path: sweep-results/
           if-no-files-found: warn
 
+  # ---- readrandom short-window noise probe (2026-11-14, red-night
+  # investigation): a dispatch-only MEASUREMENT vehicle, writer-sweep
+  # precedent — outside ci-passed, never a gate, exit 0 always. WHY: the
+  # nightlies of 2026-11-10..13 failed the regression gate on an UNCHANGED
+  # commit with rotating series — 9V74 CPU-class nights as denominator
+  # shifts, and #157 (same 7763 class as the green #153) as a series-specific
+  # numerator collapse: readrandom -44.7% while all 20 other group series
+  # held within ±10%. readrandom is the ledger's shortest timed window
+  # (~tens of ms), and ratio-normalization cancels the CPU-model lottery but
+  # NOT bursty shared-runner contention landing inside that window. This
+  # probe loops the SAME arena binary back-to-back on ONE runner — 30
+  # fresh-prep iterations plus 10 ledger-order (fillrandom,readrandom)
+  # iterations — snapshots /proc/stat steal around each, and reports the
+  # ops/s distribution (max/min, CV, bimodal hint), the p50-flat/p99-swing
+  # stall signature, and steal anti-correlation. Its verdict (TIGHT / WIDE /
+  # INCONCLUSIVE) decides whether the nightly remedy is environmental
+  # (recalibration / longer window / warmup, as a dedicated ledger-format
+  # commit) or engine-side (reopen the microarch question; do NOT
+  # recalibrate to absorb it). Two wiring notes: the two groups run in
+  # SEPARATE subdirectories with steal_<i>.txt snapshots named identically
+  # in each, because the aggregator pairs steal snapshots to TSVs by the
+  # numeric suffix alone — a shared directory would key order_<i> onto the
+  # rr group's steal_<i> and report a bogus correlation; and the aggregator
+  # is invoked once per directory, so each report's primary series carries
+  # its own steal pairing. NOT dispatched yet — needs one live dispatch to
+  # confirm wall-time and steal wiring.
+  readrandom-variance:
+    name: readrandom-variance (short-window noise probe — measurement, not a gate)
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      ARENA_KEYS: "200000"
+      ARENA_VALSIZE: "100"
+      ARENA_THREADS: "4"
+      ARENA_SEED: "42"
+      RR_ITERS: "30"        # readrandom-only iterations (~50s each)
+      RR_ORDER_ITERS: "10"  # fillrandom,readrandom iterations (ledger ordering)
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build arena (hooks-off consumer build, ledger flags)
+        run: make arena
+
+      - name: Probe — same binary, one runner, back-to-back
+        run: |
+          set -u
+          mkdir -p rr-probe/fresh rr-probe/order
+          for i in $(seq 1 "$RR_ITERS"); do
+            grep '^cpu ' /proc/stat > "rr-probe/fresh/steal_${i}.txt"
+            ./build/arena/arena --keys "$ARENA_KEYS" --threads "$ARENA_THREADS" \
+              --seed "$ARENA_SEED" --valsize "$ARENA_VALSIZE" --durability group \
+              --dir "/tmp/ckv_rr_${i}" --workloads readrandom \
+              > "rr-probe/fresh/rr_${i}.tsv" 2>&1 || echo "::warning::rr iter ${i} nonzero"
+            grep '^cpu ' /proc/stat > "rr-probe/fresh/steal_${i}_after.txt"
+          done
+          for i in $(seq 1 "$RR_ORDER_ITERS"); do
+            grep '^cpu ' /proc/stat > "rr-probe/order/steal_${i}.txt"
+            ./build/arena/arena --keys "$ARENA_KEYS" --threads "$ARENA_THREADS" \
+              --seed "$ARENA_SEED" --valsize "$ARENA_VALSIZE" --durability group \
+              --dir "/tmp/ckv_ro_${i}" --workloads fillrandom,readrandom \
+              > "rr-probe/order/order_${i}.tsv" 2>&1 || echo "::warning::order iter ${i} nonzero"
+            grep '^cpu ' /proc/stat > "rr-probe/order/steal_${i}_after.txt"
+          done
+
+      - name: Aggregate + verdict (informational; exit 0 always)
+        run: |
+          python3 scripts/readrandom_variance.py rr-probe/fresh | tee rr-probe/fresh/report.md
+          python3 scripts/readrandom_variance.py rr-probe/order | tee rr-probe/order/report.md
+          cat rr-probe/fresh/report.md rr-probe/order/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload probe artifact
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: readrandom-variance-${{ github.run_id }}
+          path: rr-probe/
+          if-no-files-found: warn
+
   # ---- v29 M1 gate hardening (2026-10-17): self-tests for the arena gate ----
   # The gate that judges the ledger must itself be judged. Runs
   # scripts/test_arena_gate.py: the positive/negative controls for the five
