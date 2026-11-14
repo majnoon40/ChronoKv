@@ -177,6 +177,11 @@ before the DST harness is green") is met.
 - Linux (uses `io_uring`, `flock`, `fork`-based tests)
 - C++20 compiler — tested with g++ 12/13/14, clang 18, g++ 15.2
 - pthreads
+- **Validated envelope:** Linux **x86-64** only. CI covers ubuntu-24.04
+  (g++ 13/14, clang 18) and ubuntu-22.04 (g++ 12, kernel 5.15 — the io_uring
+  fallback ladder). ARM, 32-bit, and big-endian are **untested**; the 4 KiB
+  page layout is an on-disk constant, not a host-page-size assumption, but no
+  non-x86-64 build is gated.
 
 ## Quick start
 
@@ -310,11 +315,17 @@ inactive transaction), `Error` (engine failures), `NotYetImplementedError`.
 
 **Durability modes** (`chronokv::Options::durability`):
 
-| Mode | fsync behavior | Survives |
-| --- | --- | --- |
-| `Sync` | every commit | power loss |
-| `Group` *(default)* | per batch of concurrent committers | power loss |
-| `Async` | none | process crash only |
+| Mode | fsync behavior | Design target | Validated today |
+| --- | --- | --- | --- |
+| `Sync` | every commit | power loss | process crash (crash-fuzz) |
+| `Group` _(default)_ | per batch of concurrent committers | power loss | process crash (crash-fuzz) |
+| `Async` | none | process crash only | process crash (crash-fuzz) |
+
+**Validation status:** "power loss" is a *design target*, not a measured
+property. The crash fuzzer kills the process with `_exit()`, which leaves the
+kernel page cache intact; it validates the recovery state machine, not
+durability across power loss. Block-layer fault injection (`dm-flakey` /
+`dm-dust`) is the missing vehicle — see Known limitations and ROADMAP v30 M3.
 
 ### Safety properties
 
@@ -480,6 +491,16 @@ inactive transaction), `Error` (engine failures), `NotYetImplementedError`.
   checkpoint chain is structurally valid, and the copied WAL fully
   parses (invariant B1); an interrupted copy has no complete
   `BACKUP_COMPLETE` marker and is therefore rejected.
+
+### Threat model
+
+CRC-32 on WAL frames, checkpoints, and backup markers is **non-cryptographic**:
+it detects accidental corruption (torn writes, bit rot), not adversarial
+tampering. There is no encryption at rest. On-disk parsers bound lengths and
+segment counts (WAL-1, WAL-4, the 1 MiB value / 4048-byte key caps), so a
+malformed file fails loud rather than allocating without bound — but database
+files are **trusted input**. The `flock` guard is advisory and single-process;
+it is not a security boundary. Do not open directories from untrusted sources.
 
 ## Build and test
 

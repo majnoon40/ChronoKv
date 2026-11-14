@@ -7,6 +7,75 @@ version history; 0.28.0 is recorded in full.
 
 ## Unreleased
 
+- **feat+test+docs (TSan suppression blind spot — finding #5, 2026-11-14):
+  the UNSUPPRESSED TSan leg, a report-class ratchet — not a suite-verdict
+  gate.** docs/tsan.supp's single `deadlock:chronokv_btree::LatchTable`
+  line is typed per report class (data races stay at full strength), but
+  its recorded blind spot is that a REAL page-latch x engine-mutex
+  inversion also carries a LatchTable frame and is suppressed with the
+  artifact; the only backstop today is behavioral (a real latch-order
+  deadlock hangs the suite — deadlines fail loudly, the C1 precedent).
+  The new `tsan-unsuppressed` CI job (nightly/dispatch, OUTSIDE ci-passed)
+  runs the full suite WITHOUT suppressions and ratchets REPORT CLASSES
+  against a committed baseline (`ci/tsan-unsuppressed.baseline`, the
+  -Wconversion ratchet's shape): signatures may shrink, never grow; data
+  races and other non-deadlock classes ALWAYS fail even if someone
+  baselines them. scripts/tsan_reports.py is proven against REAL gcc
+  libtsan output, not a guess: the 711cd00 role-flip scratch driver was
+  rebuilt under the Makefile's exact TSan flags on g++ 14.2 and
+  reproduced the artifact verbatim (exit 66, LatchTable frame blocks),
+  and the classifier was run both directions on the captured logs
+  (baseline/check-green on the artifact, FATAL on a real race log,
+  baseline REFUSES the race). Its self-test (scripts/
+  test_tsan_reports.py — 11 controls in the test_arena_gate.py house
+  style, fixtures in the real report-block grammar, including the
+  blind-spot control itself: a fabricated LatchTable x engine-mutex mixed
+  inversion must land NEW) now runs on EVERY push/PR in the renamed
+  gate-selftest job, so the ratchet's judge is itself judged. NOT GATING
+  YET, by design: until the maintainer calibration commit (one dispatch,
+  READ every signature, confirm each is the documented role-flip
+  artifact, commit the baseline in a dedicated commit citing
+  docs/tsan.supp — exactly the arena-bands discipline), the ratchet step
+  runs in PREVIEW (census only, exit 0) so the job cannot false-red
+  before its evidence exists; promotion into ci-passed then follows the
+  sanitizer legs' experimental->gating convention (green three runs
+  straight). The suite's own exit code is deliberately never the gate —
+  the known artifact makes forked children exit 66.
+
+- **docs (honesty pass — findings #9 and #1's work order, 2026-11-14): the
+  durability table stops asserting an unvalidated property; the validated
+  envelope, the threat model, and the contributing rules are stated; the
+  power-loss work order is in-tree.** README: the durability modes table
+  splits "Design target" from "Validated today" (power loss is a design
+  target — the crash fuzzer's `_exit()` leaves the kernel page cache
+  intact, so what is validated is the recovery state machine; dm-flakey/
+  dm-dust is the missing vehicle), Requirements states the validated
+  envelope (Linux x86-64 only; CI covers ubuntu-24.04 g++ 13/14 + clang
+  18 and ubuntu-22.04 g++ 12/kernel 5.15 — the io_uring fallback ladder;
+  ARM/32-bit/big-endian untested; the 4 KiB page layout is an on-disk
+  constant, not a host-page-size assumption), and a Threat model note
+  lands beside Safety properties (CRC-32 is non-cryptographic — it
+  detects accidental corruption, not adversarial tampering; on-disk
+  parsers bound lengths and segment counts so malformed files fail loud,
+  but database files are trusted input; the `flock` guard is advisory,
+  not a security boundary). CONTRIBUTING.md is the short form of
+  ROADMAP's canonical process rules (measure first, reproduce first,
+  docs in the same commit, name the invariant, mutation controls,
+  replay handles, never widen a band in flight, geometry changes are
+  ledger-format changes). The power-loss validation work order (finding
+  #1, highest severity) is committed at
+  docs/audits/2026-11-14-power-loss-work-order.md: dm-flakey/dm-dust
+  over a loop device on a privileged runner (the blocking decision —
+  hosted runners will not do it; ROADMAP risk C2's plan B stands), the
+  boundary matrix mapped to the existing kAll crash points, per-boundary
+  assertions (D1 per durability class / D2 no-resurrection / D3
+  fail-stop / never silently wrong), and the WAL-3 wrong-target
+  old-GREEN/new-RED break-proof that would move the target half from
+  STRUCTURAL to PROVEN; ROADMAP v30 M3 (both sections) and INVARIANTS
+  G-1 now point at it. In the same push, docs/workspace.tar.gz leaves
+  the source tree as its own commit (D5): a release asset, not source;
+  history retains it.
+
 - **feat+test (v29 M6 item 5, 2026-11-09): STREAMING RECOVERY PARSE — the
   64 MiB segment slurp is deleted; recovery reads every WAL segment
   through a rolling buffer bounded by one maximum frame + one chunk

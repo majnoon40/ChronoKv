@@ -195,7 +195,11 @@ docs, indexed here by milestone rather than sha):
   invisible to `_exit()` testing — the decision doc's boundary); the
   row now names the SRC-C fired-witness leg as the handling-contract
   checker, marks the target half STRUCTURAL with its anchor, and defers
-  the mechanical proof to v30 M3's dm-flakey leg.
+  the mechanical proof to v30 M3's dm-flakey leg. The executable work
+  order for that leg is in-tree since 2026-11-14:
+  `docs/audits/2026-11-14-power-loss-work-order.md` (vehicle, boundary
+  matrix, the WAL-3 wrong-target old-GREEN/new-RED break-proof,
+  acceptance rows below).
 - **G-2 (I3, R1):** assert-class invariants lack a modern indexed
   break-demo; v30 M0 owes one each (a corrupted-record scratch build for
   I3; a publication-order mutant for R1) or a reviewed structural argument.

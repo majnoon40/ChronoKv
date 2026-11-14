@@ -1332,7 +1332,10 @@ directory-entry durability and a wrong-directory fsync are invisible to
 metadata was never tested against a lying device) and were found by
 *reading*, not by running. A block layer that lies is the only harness
 that could have caught them mechanically. The D-invariant set finally gets
-tested against a layer that can violate it.
+tested against a layer that can violate it. The executable work order is
+in-tree since 2026-11-14: `docs/audits/2026-11-14-power-loss-work-order.md`
+(vehicle, runner decision, method, boundary matrix mapped to the existing
+kAll crash points, the WAL-3 wrong-target break-proof, acceptance).
 
 ## M4 — Documentation overhaul  **[M]**
 
@@ -2151,6 +2154,17 @@ claim's missing leg: SQLite has TH3 and the field; ChronoKV will have
 **Acceptance.** D2/D3/D4 detectors run against injected flush-loss; a
 deliberately weakened fsync fails the harness (fail-first, at the block
 layer); results published in the docs.
+
+**Work order (2026-11-14).** The executable spec is committed at
+`docs/audits/2026-11-14-power-loss-work-order.md`: dm-flakey/dm-dust over a
+loop device holding the WAL directory, per-boundary assertions (D1 per
+durability class / D2 no-resurrection / D3 fail-stop / never silently
+wrong), and the WAL-3-specific old-GREEN/new-RED pair — a build whose
+`rotate_after_checkpoint` passes the wrong path to `fsync_dir` stays green
+under `_exit()` testing (the recorded gap) and must FAIL under dm-flakey.
+The privileged-runner decision (self-hosted or privileged container —
+hosted runners will not do loop devices + dmsetup) is the blocking item,
+exactly as the M4 soak-vehicle decision is.
 
 ## M4 — Documentation overhaul  **[M]**
 
