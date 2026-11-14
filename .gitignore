@@ -29,3 +29,6 @@ chronokv_iouring_test.tmp
 
 # pinned baseline fetches (bench/third_party/fetch.sh)
 bench/third_party/src/
+
+# workspace snapshots are release artifacts, not source
+docs/workspace.tar.gz
