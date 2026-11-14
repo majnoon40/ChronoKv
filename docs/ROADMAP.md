@@ -1225,7 +1225,25 @@ space-amplification budget; WAL delta-encoding only if it pays;
 change, migration rule before implementation, GC-watermark coupling in
 scope from day one; streaming recovery parse (recover_all's 64 MiB slurp);
 checkpoint-stall measure-then-decide; observer notification thread; async
-API worker-pool-or-removal decided by an arena table. Two 0.28.1
+API worker-pool-or-removal decided by an arena table.
+
+> **Work orders in-tree (2026-11-14, findings #7b and #8).** The
+> executable specs for two of the items above are committed:
+> `docs/audits/2026-11-14-gc-cursor-coverage-work-order.md` (the
+> persistent incremental GC cursor — the `gc_once` `tree_scan_all()`
+> per-pass rescan the README's "GC sweep cost" limitation names; the
+> v25.7 H2 fix stopped the idle spin, not the rescan — plus the
+> coverage escape-point hardening: the nightly two-stage vehicle exists
+> because six of eight forced fault kinds die in ~1.5 s at full-suite
+> depth on `fut.get()` rethrows and `stoi` cascades; acceptance includes
+> the single-stage collapse) and
+> `docs/audits/2026-11-14-observer-dispatcher-work-order.md` (the
+> observer notification thread — CKV-007/API-3 preservation, the
+> explicit reentrancy decision with its fail-first battery, queue-depth
+> diagnostics; the arena txn series landed the same day are the
+> before/after latency instrument). The txn/GC ledger series (finding
+> #6) also landed 2026-11-14, opt-in pending recalibration:
+> `docs/audits/2026-11-14-txn-gc-series-sequencing.md`. Two 0.28.1
 interactions: the observer thread builds on API-3's `ObserverState`
 shared_ptr (its lifetime semantics are already move-safe and
 raw-pointer-free — the notification thread becomes the state's only

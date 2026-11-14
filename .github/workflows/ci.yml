@@ -970,6 +970,88 @@ jobs:
           path: rr-probe/
           if-no-files-found: warn
 
+  # ---- finding #6 (2026-11-14): txn/GC series calibration vehicle -------
+  # Dispatch-only MEASUREMENT job (the readrandom-probe precedent): runs
+  # the NEW opt-in series — ycsb_a.txn / rmw.txn (SSI transactions,
+  # conflicts counted) and overwrite_gc / deletechurn_gc (auto_start_gc
+  # = true) — at ledger geometry on the nightly runner class, for the
+  # wall-time census the recalibration commit needs. NEVER a gate and
+  # NOT in ci-passed: the series are opt-in by --workloads precisely so
+  # the committed bands and the workload-set gate (defect 5) see no
+  # change until a dedicated RECALIBRATION commit adds them to the
+  # default set, recomputes the bands from >= 7 post-change nights, and
+  # re-promotes the reference week — the ledger-format-change rule. The
+  # anti-vacuity markers (VACUOUS:no-conflicts /
+  # VACUOUS:gc-did-not-move) make the runs exit 1 if the series did not
+  # exercise what they measure, so a vacuous calibration night is loud,
+  # not green.
+  txn-gc-calibration:
+    name: txn-gc series calibration (measurement, not a gate)
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      ARENA_KEYS: "200000"
+      ARENA_OPS: "200000"
+      ARENA_THREADS: "4"
+      ARENA_SEED: "42"
+      ARENA_VALSIZE: "100"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install baseline libraries (SQLite always needed for the txn-parity leg)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev liblmdb-dev librocksdb-dev
+
+      - name: Build arena + baselines
+        run: make arena arena-baselines
+
+      - name: Run the txn/GC series (ChronoKV, both durability classes)
+        run: |
+          set -u
+          mkdir -p txn-gc-probe
+          for dur in group async; do
+            ./build/arena/arena \
+              --keys "$ARENA_KEYS" --ops "$ARENA_OPS" --threads "$ARENA_THREADS" \
+              --seed "$ARENA_SEED" --valsize "$ARENA_VALSIZE" --durability "$dur" \
+              --dir "/tmp/ckv_txngc_$dur" \
+              --workloads ycsb_a.txn,rmw.txn,overwrite_gc,deletechurn_gc \
+              > "txn-gc-probe/chronokv-$dur.tsv" 2>&1 || \
+              echo "::warning::txn/gc run chronokv-$dur exited nonzero (VACUOUS markers fail loud)"
+          done
+
+      - name: Run the baseline txn series (SQLite + LMDB + RocksDB parity legs)
+        run: |
+          set -u
+          for eng in sqlite-full lmdb rocksdb-sync; do
+            ./build/arena/baselines \
+              --engine "$eng" \
+              --keys "$ARENA_KEYS" --ops "$ARENA_OPS" --threads "$ARENA_THREADS" \
+              --seed "$ARENA_SEED" --valsize "$ARENA_VALSIZE" \
+              --dir /tmp/ckv_txngc_base \
+              --workloads ycsb_a.txn,rmw.txn \
+              > "txn-gc-probe/$eng.tsv" 2>&1 || \
+              echo "::warning::baseline txn run $eng exited nonzero"
+          done
+
+      - name: Digest (informational; the census the recalibration commit cites)
+        if: always()
+        run: |
+          for f in txn-gc-probe/*.tsv; do
+            echo "== $f"
+            grep -vE '^#' "$f" | awk -F'\t' '{printf "  %-22s %12s ops/s  p50=%-6s p99=%s  %s\n", $1, $4, $5, $6, $8}'
+          done | tee txn-gc-probe/digest.txt
+          cat txn-gc-probe/digest.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload calibration artifact
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: txn-gc-calibration-${{ github.run_id }}
+          path: txn-gc-probe/
+          if-no-files-found: warn
+
   # ---- v29 M1 gate hardening (2026-10-17): self-tests for the arena gate ----
   # The gate that judges the ledger must itself be judged. Runs
   # scripts/test_arena_gate.py: the positive/negative controls for the five

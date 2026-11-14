@@ -110,6 +110,25 @@ python3 scripts/arena_bands.py loo --nights <dir-per-night> [...] # honest cross
 python3 scripts/test_arena_gate.py                              # the gate's own controls
 ```
 
+**Txn/GC series (finding #6, 2026-11-14) — OPT-IN, not a typo.**
+`ycsb_a.txn`, `rmw.txn` (read+update inside ONE begin()/commit() SSI
+transaction, conflicts counted — the row fails VACUOUS if conflicts==0
+at threads>1), and `overwrite_gc`, `deletechurn_gc` (the existing
+workloads with `auto_start_gc=true` and gc_stats deltas in the note —
+VACUOUS if retired/reclaimed froze). They are NOT in the default
+`--workloads` string; the workload-set gate (defect 5) would refuse them
+as a ledger-format change, on purpose. The promotion sequence is
+docs/audits/2026-11-14-txn-gc-series-sequencing.md: >= 7 calibration
+nights (the dispatch-only `txn-gc-calibration` CI job exists for this),
+then ONE dedicated recalibration commit that adds them to the default
+set, recomputes the bands, and re-promotes the reference week — from
+which point defect-5/6 gate the new set automatically. Baseline parity:
+`Engine::txn()` in bench/baselines.cpp (SQLite BEGIN IMMEDIATE shape
+with SQLITE_BUSY-as-conflict; LMDB one write txn, no conflict signal
+exists — printed in the note; RocksDB atomic batch, no isolation —
+printed in the note). The isolation deviation is IN the row's note,
+never implied.
+
 **The gate** (ci.yml `arena` job, nightly/dispatch only): a ledger
 completeness step (all seven engines must produce data rows — a crashed
 leg writes stderr into its TSV, so "file exists" is not "rows exist"),

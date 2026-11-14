@@ -29,6 +29,10 @@
 //             --durability group --dir /tmp/ckv_arena
 //             --workloads fillseq,fillrandom,readrandom,overwrite,rangescan,
 //                         deletechurn,ckptload,coldrecovery,memory
+//       (finding #6, 2026-11-14 — OPT-IN, never in the default set above:
+//             --workloads ycsb_a.txn,rmw.txn,overwrite_gc,deletechurn_gc
+//        the SSI-transaction and GC-on series; promote only via the
+//        recalibration commit — see the #6 comment block above.)
 #include "chronokv.hpp"
 
 #include <algorithm>
@@ -240,6 +244,176 @@ static const YcsbSpec kYcsb[] = {
     {'e',  0,  0, 5,95, 0},
     {'f', 50,  0, 0, 0,50},
 };
+
+// ---------- finding #6 (2026-11-14): the txn / GC-on series ----------
+//
+// The ledger's flagship-gap series, OPT-IN (--workloads; NOT in the default
+// set, so no existing series or band sees them until the recalibration
+// commit): the engine's own SSI transaction path and steady-state GC cost.
+//
+//   ycsb_a.txn  — YCSB A's 50/50 read/update mix, but every read+update
+//                 pair runs INSIDE one Database::begin()/commit() SSI
+//                 transaction (zipfian keys, c.threads concurrent
+//                 committers). Conflicts are counted and the row is
+//                 VACUOUS if conflicts == 0 (no SSI contention means the
+//                 path was never really exercised — the anti-vacuity
+//                 control the arena's other series get from their
+//                 misses=/rows= notes).
+//   rmw.txn     — read-modify-write inside one transaction (YCSB F's
+//                 rmw op promoted to a full begin/commit txn), same
+//                 conflict discipline.
+//   overwrite_gc / deletechurn_gc — the EXISTING overwrite/deletechurn
+//                 with Options::auto_start_gc = true and gc_stats deltas
+//                 (created/retired/reclaimed/passes) in the note; VACUOUS
+//                 if retired/reclaimed did not move (GC never ran or
+//                 reclaimed nothing — exactly the auto_start_gc=false
+//                 state every other series runs at).
+//
+// Baseline parity: bench/baselines.cpp gains the matching ycsb_a.txn /
+// rmw.txn series (SQLite BEGIN IMMEDIATE..COMMIT around read+update;
+// BEGIN DEFERRED..COMMIT for the read leg — the documented isolation
+// deviations: SQLite's writer-serializable locking is not SSI; a Conflict
+// there surfaces as SQLITE_BUSY, counted the same way). The GC-on
+// series are ChronoKV-only by construction (no baseline has ChronoKV's GC
+// model) — ratio-less rows in the ledger, like the chronokv-exclusive
+// family. NEVER add these to the default --workloads string: the
+// workload-set gate (defect 5) treats any set change as a ledger-format
+// change; the promotion is a dedicated recalibration commit.
+
+Result w_ycsb_txn(const Config& c, const char* name, unsigned read_pct) {
+    Result r; r.workload = name;
+    reset_dir(c.dir + "/" + name);
+    auto db = Database::open(base_options(c, name));
+    std::mt19937_64 rng(c.seed);
+    if (!prep_fill(db, c, c.keys, rng, false)) { r.note = "prep failed"; return r; }
+    const size_t ops = c.ops ? c.ops : c.keys;
+    const size_t per_thread = std::max<size_t>(100, ops / c.threads);
+    const Zipfian zipf(c.keys);
+    std::vector<Recorder> reads(c.threads), updates(c.threads);
+    std::atomic<uint64_t> conflicts{0}, committed{0}, errors{0};
+    const auto t0 = Clock::now();
+    std::vector<std::thread> ts;
+    for (unsigned t = 0; t < c.threads; ++t) ts.emplace_back([&, t] {
+        std::mt19937_64 lrng(c.seed * 6007 + t);   // fresh family: never shares a stream with ycsb_a
+        reads[t].reserve(per_thread / 2);
+        updates[t].reserve(per_thread / 2);
+        for (size_t i = 0; i < per_thread; ++i) {
+            const unsigned roll = (unsigned)(lrng() % 100);
+            const auto s0 = Clock::now();
+            const auto us = [&] {
+                return std::chrono::duration<double, std::micro>(Clock::now() - s0).count();
+            };
+            if (roll < read_pct) {
+                // read-only leg: same begin/commit discipline so the
+                // snapshot machinery is priced in on every op.
+                auto txn = db.begin();
+                auto v = txn.get(key16(zipf.next(lrng)));
+                reads[t].record(us());
+                txn.abort();               // a read that never committed is not a leak
+            } else {
+                // read+update inside ONE SSI transaction: the flagship path.
+                const uint64_t k = zipf.next(lrng);
+                auto txn = db.begin();
+                auto v = txn.get(key16(k));
+                txn.put(key16(k), v ? *v : make_value(lrng, c.valsize));
+                const Status st = txn.commit();
+                updates[t].record(us());
+                if (st == Status::Conflict) conflicts.fetch_add(1, std::memory_order_relaxed);
+                else if (st == Status::OK) committed.fetch_add(1, std::memory_order_relaxed);
+                else errors.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    });
+    for (auto& th : ts) th.join();
+    r.seconds = elapsed_s(t0);
+    Recorder mr, mu;
+    for (auto& rc : reads) mr.merge(std::move(rc));
+    for (auto& rc : updates) mu.merge(std::move(rc));
+    r.ops = mr.size() + mu.size();
+    r.p50 = mu.pct(0.50);        // the committed-txn latency is the series' signal
+    r.p99 = mu.pct(0.99);
+    const uint64_t cf = conflicts.load();
+    r.note = "zipfian(0.99)-cdf threads=" + std::to_string(c.threads) +
+             " txn-committed=" + std::to_string(committed.load()) +
+             " conflicts=" + std::to_string(cf) +
+             (errors.load() ? " errors=" + std::to_string(errors.load()) : "");
+    if (cf == 0 && c.threads > 1)
+        r.note += " VACUOUS:no-conflicts(SSI-path-uncontended)";
+    db.close();
+    return r;
+}
+
+Result w_gc_on(const Config& c, bool overwrite_mode) {
+    const char* name = overwrite_mode ? "overwrite_gc" : "deletechurn_gc";
+    Result r; r.workload = name;
+    reset_dir(c.dir + "/" + name);
+    Options o = base_options(c, name);
+    o.auto_start_gc = true;          // THE difference: every other series runs GC-off
+    auto db = Database::open(o);
+    std::mt19937_64 rng(c.seed);
+    if (!prep_fill(db, c, c.keys, rng, false)) { r.note = "prep failed"; return r; }
+    // Let the GC thread settle the prep's retired versions first so the
+    // TIMED phase measures steady-state churn, not the initial backlog.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    auto g0 = db.gc_stats();
+    const auto t0 = Clock::now();
+    uint64_t ops = 0;
+    if (overwrite_mode) {
+        const size_t n = std::max<size_t>(1000, c.keys / 4);
+        std::atomic<bool> failed{false};
+        std::vector<std::thread> ts;
+        for (unsigned t = 0; t < c.threads; ++t) ts.emplace_back([&, t] {
+            std::mt19937_64 lrng(c.seed * 2001 + t);   // distinct from overwrite's family
+            const size_t per = n / c.threads;
+            for (size_t i = 0; i < per; ++i)
+                if (db.put(key16(lrng() % c.keys), make_value(lrng, c.valsize)) != Status::OK)
+                    failed.store(true);
+        });
+        for (auto& th : ts) th.join();
+        ops = n;
+        if (failed.load()) r.note = "FAILED-PUTS";
+    } else {
+        // deletechurn's 3x delete+reinsert cycles, GC on.
+        const size_t slice = c.keys / 10;
+        for (int cycle = 0; cycle < 3; ++cycle) {
+            const size_t base = (size_t)(rng() % std::max<size_t>(1, c.keys - slice));
+            for (size_t i = 0; i < slice; ++i) {
+                if (db.erase(key16(base + i)) != Status::OK) { r.note = "erase failed"; db.close(); return r; }
+                ++ops;
+            }
+            for (size_t i = 0; i < slice; ++i) {
+                if (db.put(key16(base + i), make_value(rng, c.valsize)) != Status::OK) {
+                    r.note = "reinsert failed"; db.close(); return r;
+                }
+                ++ops;
+            }
+        }
+        // churn creates the retired versions; give the sweeper a beat to
+        // run before sampling gc_stats (same settle discipline as above).
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    }
+    r.seconds = elapsed_s(t0);
+    r.ops = ops;
+    auto g1 = db.gc_stats();
+    const uint64_t ret = g1.retired - g0.retired, rec = g1.reclaimed - g0.reclaimed;
+    const long rss1 = proc_status_kb("VmRSS");
+    r.note = std::string(overwrite_mode ? "overwrite with auto_start_gc=true; " : "3x delete+reinsert of a 10% slice with auto_start_gc=true; ") +
+             "gc_retired_delta=" + std::to_string(ret) +
+             " gc_reclaimed_delta=" + std::to_string(rec) +
+             " gc_passes_delta=" + std::to_string(g1.passes - g0.passes) +
+             " rss_mb=" + std::to_string(rss1 / 1024);
+    if (ret == 0 || rec == 0)
+        r.note += " VACUOUS:gc-did-not-move(gc_stats-frozen)";
+    db.close();
+    return r;
+}
+
+Result w_rmw_txn(const Config& c) {
+    // rmw.txn — read-modify-write in ONE begin/commit txn, single row,
+    // full-concurrency conflict surface (zipfian hot keys make conflicts
+    // structural, not incidental).
+    return w_ycsb_txn(c, "rmw.txn", /*read_pct=*/0);
+}
 
 // ---------- workloads ----------
 
@@ -671,12 +845,25 @@ int main(int argc, char** argv) {
             w_ycsb(c, *spec);   // emits its own per-op-type rows
             continue;
         }
+        // finding #6 (2026-11-14): the txn / GC-on series — OPT-IN ONLY
+        // (never in the default workloads string above; the workload-set
+        // gate treats a set change as a ledger-format change). Promote via
+        // the dedicated recalibration commit that re-promotes the reference
+        // week, exactly like any other ledger-format change.
+        else if (w == "ycsb_a.txn")   r = w_ycsb_txn(c, "ycsb_a.txn", 50);
+        else if (w == "rmw.txn")      r = w_rmw_txn(c);
+        else if (w == "overwrite_gc") r = w_gc_on(c, true);
+        else if (w == "deletechurn_gc") r = w_gc_on(c, false);
         else { std::cerr << "unknown workload: " << w << "\n"; rc = 2; continue; }
         emit(r);
         if (r.note.find("ABORTED") != std::string::npos ||
             r.note.find("SANITY-FAIL") != std::string::npos ||
             r.note.find("FAILED") != std::string::npos ||
-            r.note.find("THREW") != std::string::npos)
+            r.note.find("THREW") != std::string::npos ||
+            // finding #6: a vacuity marker is a FAILED measurement, not a
+            // green row — the txn/GC series must prove they exercised
+            // what they exist to measure.
+            r.note.find("VACUOUS") != std::string::npos)
             rc = 1;
     }
 

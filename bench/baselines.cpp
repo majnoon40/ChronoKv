@@ -192,6 +192,16 @@ struct Engine {
     virtual bool scan(unsigned tid, const std::string& lo, const std::string& hi,
                       std::vector<std::pair<std::string, std::string>>* rows,
                       std::string* err) = 0;
+    // finding #6 (2026-11-14): the SSI-comparable transactional op —
+    // read key k then write k=v INSIDE ONE TRANSACTION, commit, and
+    // report the outcome. Returns 0 = committed, 1 = conflict (the
+    // engine's contention signal — SQLITE_BASE on SQLite, MDB_MAP_FULL
+    // lookalikes do NOT count; LMDB has none under single-writer), 2 =
+    // hard error (*err). Engines whose isolation model cannot express
+    // this shape return 3 ("not comparable" — the row is then skipped
+    // rather than silently mislabeled).
+    virtual int txn(unsigned tid, const std::string& k, const std::string& v,
+                    std::string* err) = 0;
     virtual void close() = 0;
 };
 
@@ -306,6 +316,46 @@ public:
         if (rc != SQLITE_DONE) { *err = sqlite3_errmsg(conns_[tid]); return false; }
         return true;
     }
+    // finding #6: the SSI-comparable transactional op — BEGIN IMMEDIATE
+    // (the write-txn upgrade at BEGIN, the shape SQLite's deadlock rule
+    // exists for), SELECT the current value INSIDE the txn, INSERT OR
+    // REPLACE, COMMIT. Contention surfaces as SQLITE_BUSY on BEGIN or
+    // COMMIT — reported as conflict=1 (the same contention signal
+    // ChronoKV's Status::Conflict reports). ISOLATION DEVIATION,
+    // documented here and in the row's note: SQLite is
+    // writer-serializable with busy_timeout waiting, NOT SSI — the
+    // series measures each engine's own transactional cost at its own
+    // isolation level, and the deviation is printed, never implied.
+    int txn(unsigned tid, const std::string& k, const std::string& v,
+            std::string* err) override {
+        sqlite3* db = conns_[tid];
+        if (exec_(db, "BEGIN IMMEDIATE") != SQLITE_OK) {
+            const std::string m = sqlite3_errmsg(db);
+            *err = "BEGIN: " + m;
+            return (m.find("locked") != std::string::npos ||
+                    m.find("busy") != std::string::npos) ? 1 : 2;
+        }
+        sqlite3_reset(gets_[tid]);
+        sqlite3_bind_blob(gets_[tid], 1, k.data(), (int)k.size(), SQLITE_STATIC);
+        const int grc = sqlite3_step(gets_[tid]);
+        sqlite3_reset(gets_[tid]);   // close the read snapshot before writing (the adapter's own anti-deadlock rule)
+        if (grc != SQLITE_ROW && grc != SQLITE_DONE) {
+            *err = sqlite3_errmsg(db); exec_(db, "ROLLBACK"); return 2;
+        }
+        sqlite3_reset(puts_[tid]);
+        sqlite3_bind_blob(puts_[tid], 1, k.data(), (int)k.size(), SQLITE_STATIC);
+        sqlite3_bind_blob(puts_[tid], 2, v.data(), (int)v.size(), SQLITE_STATIC);
+        if (sqlite3_step(puts_[tid]) != SQLITE_DONE) {
+            *err = sqlite3_errmsg(db); exec_(db, "ROLLBACK"); return 2;
+        }
+        if (exec_(db, "COMMIT") != SQLITE_OK) {
+            const std::string m = sqlite3_errmsg(db);
+            *err = "COMMIT: " + m;
+            return (m.find("locked") != std::string::npos ||
+                    m.find("busy") != std::string::npos) ? 1 : 2;
+        }
+        return 0;
+    }
     void close() override {
         for (size_t t = 0; t < conns_.size(); ++t) {
             if (puts_[t]) sqlite3_finalize(puts_[t]);
@@ -404,6 +454,31 @@ public:
         mdb_txn_abort(txn);
         return rc == MDB_NOTFOUND || rc == 0;
     }
+    // finding #6: LMDB's shape — read+write inside one write txn. LMDB
+    // serializes writers internally (a single writer lock), so under
+    // threads>1 a concurrent writer makes txn_begin BLOCK (LMDB's
+    // contention model) rather than return a conflict; a genuinely
+    // concurrent-conflict signal does not exist in this shape. Reported
+    // as committed=0/conflicts=0 — the row prints "lmdb: writers
+    // serialized, no-conflict-signal (documented isolation deviation)"
+    // instead of a fake conflict count.
+    int txn(unsigned, const std::string& k, const std::string& v,
+            std::string* err) override {
+        MDB_txn* txn = nullptr;
+        int rc = mdb_txn_begin(env_, nullptr, 0, &txn);
+        if (rc) { *err = mdb_strerror(rc); return 2; }
+        MDB_val mk{(size_t)k.size(), (void*)k.data()}, mv{};
+        rc = mdb_get(txn, dbi_, &mk, &mv);            // read INSIDE the write txn
+        if (rc != 0 && rc != MDB_NOTFOUND) {
+            *err = mdb_strerror(rc); mdb_txn_abort(txn); return 2;
+        }
+        MDB_val wv{(size_t)v.size(), (void*)v.data()};
+        rc = mdb_put(txn, dbi_, &mk, &wv, 0);
+        if (rc) { *err = mdb_strerror(rc); mdb_txn_abort(txn); return 2; }
+        rc = mdb_txn_commit(txn);
+        if (rc) { *err = mdb_strerror(rc); return 2; }
+        return 0;
+    }
     void close() override { if (env_) { mdb_env_close(env_); env_ = nullptr; } }
 };
 #endif
@@ -465,6 +540,25 @@ public:
             rows->emplace_back(it->key().ToString(), it->value().ToString());
         if (!it->status().ok()) { *err = it->status().ToString(); return false; }
         return true;
+    }
+    // finding #6: RocksDB's shape — a WriteBatch (Get + Put inside one
+    // atomic batch, one durability unit at WriteOptions). RocksDB
+    // transactions (TransactionDB) are a SEPARATE library component; at
+    // plain DB the batch is atomic but ISOLATION is none (concurrent
+    // writers interleave, no conflict signal exists). 0 = committed,
+    // 2-with-empty-err = "isolation not comparable" is NOT used — the
+    // batch IS the honest comparable shape, the isolation deviation is
+    // printed in the note ("no isolation / no conflict signal").
+    int txn(unsigned, const std::string& k, const std::string& v,
+            std::string* err) override {
+        std::string cur;
+        auto gs = db_->Get(rocksdb::ReadOptions(), k, &cur);
+        if (!gs.ok() && !gs.IsNotFound()) { *err = gs.ToString(); return 2; }
+        rocksdb::WriteBatch b;
+        b.Put(k, v);
+        auto ws = db_->Write(wo_, &b);
+        if (!ws.ok()) { *err = ws.ToString(); return 2; }
+        return 0;
     }
     void close() override { db_.reset(); }
 };
@@ -810,6 +904,91 @@ void w_ycsb_def(Engine& e, const Config& c, char mix) {
     row("rmw", m.rmw);
 }
 
+// ---- finding #6 (2026-11-14): the transactional series --------------
+// Mirrors bench/arena.cpp's w_ycsb_txn operation-for-operation (the same
+// per-thread rng family seed*6007+t, the same zipfian draws, the same
+// read_pct roll) so a ycsb_a.txn row is a same-methodology comparison
+// across engines. One ISOLATION DEVIATION, printed in every row's note
+// (never implied): the baselines' transactional semantics are each
+// engine's OWN (SQLite: writer-serialized BEGIN IMMEDIATE, conflicts =
+// SQLITE_BUSY; LMDB: internally serialized writers, NO conflict signal
+// — the note says so instead of printing a fabricated 0-conflict
+// comparison; RocksDB: atomic WriteBatch, no isolation, no conflict
+// signal). ChronoKV's row is SSI with real Status::Conflict counts. The
+// cross-engine txn row therefore measures each engine's own transaction
+// cost at its own isolation — the honest comparison, deviation printed.
+void w_ycsb_txn(Engine& e, const Config& c, const char* name, unsigned read_pct,
+                const char* isolation_note) {
+    const std::string wl = name;
+    std::mt19937_64 rng(c.seed);
+    std::string err;
+    if (!prep_fill(e, c, rng, false, &err)) {
+        Result r; r.workload = wl; r.note = "ABORTED prep: " + err; emit(r); return;
+    }
+    const size_t ops = c.ops ? c.ops : c.keys;
+    const size_t per = std::max<size_t>(100, ops / c.threads);
+    const Zipfian zipf(c.keys);
+    std::vector<Recorder> reads(c.threads), updates(c.threads);
+    std::atomic<uint64_t> conflicts{0}, committed{0}, errors{0}, misses{0};
+    std::mutex err_mu; std::string first_err;
+    auto capture = [&](const std::string& e2) {
+        if (!e2.empty()) { std::lock_guard<std::mutex> g(err_mu); if (first_err.empty()) first_err = e2; }
+    };
+    const auto t0 = Clock::now();
+    std::vector<std::thread> ts;
+    for (unsigned t = 0; t < c.threads; ++t) ts.emplace_back([&, t] {
+        std::mt19937_64 lrng(c.seed * 6007 + t);
+        reads[t].reserve(per / 2);
+        updates[t].reserve(per / 2);
+        std::string out, e2;
+        for (size_t i = 0; i < per; ++i) {
+            const unsigned roll = (unsigned)(lrng() % 100);
+            const auto s0 = Clock::now();
+            const auto us = [&] {
+                return std::chrono::duration<double, std::micro>(Clock::now() - s0).count();
+            };
+            if (roll < read_pct) {
+                // read-only leg through the engine's txn machinery where
+                // it has one; LMDB/RocksDB read txns are the get() path —
+                // a read-only BEGIN adds no isolation on any baseline, so
+                // the read leg uses plain get for parity of SHAPE (the
+                // arena's read leg pays begin/abort; the deviation is the
+                // note's, stated once).
+                out.clear();
+                if (!e.get(t, key16(zipf.next(lrng)), &out, &e2)) {
+                    errors.fetch_add(1, std::memory_order_relaxed); capture(e2);
+                } else if (out.empty()) misses.fetch_add(1, std::memory_order_relaxed);
+                reads[t].record(us());
+            } else {
+                const std::string k = key16(zipf.next(lrng));
+                int rc = e.txn(t, k, make_value(lrng, c.valsize), &e2);
+                updates[t].record(us());
+                if (rc == 0)      committed.fetch_add(1, std::memory_order_relaxed);
+                else if (rc == 1) conflicts.fetch_add(1, std::memory_order_relaxed);
+                else { errors.fetch_add(1, std::memory_order_relaxed); capture(e2); }
+            }
+        }
+    });
+    for (auto& th : ts) th.join();
+    const double wall = elapsed_s(t0);
+    Recorder mr, mu;
+    for (auto& rc2 : reads) mr.merge(std::move(rc2));
+    for (auto& rc2 : updates) mu.merge(std::move(rc2));
+    std::string note = "zipfian(0.99)-cdf threads=" + std::to_string(c.threads) +
+        " txn-committed=" + std::to_string(committed.load()) +
+        " conflicts=" + std::to_string(conflicts.load()) +
+        (errors.load() ? " errors=" + std::to_string(errors.load()) : "") +
+        " isolation=" + isolation_note;
+    { std::lock_guard<std::mutex> g(err_mu); if (!first_err.empty()) note += " first_err=" + first_err; }
+    if (mu.size()) {
+        Result r; r.workload = wl; r.ops = mu.size() + mr.size(); r.seconds = wall;
+        r.p50 = mu.pct(0.50); r.p99 = mu.pct(0.99); r.note = note;
+        emit(r);
+    } else {
+        Result r; r.workload = wl; r.ops = 0; r.seconds = wall; r.note = "ABORTED: no txn ops"; emit(r);
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -860,7 +1039,27 @@ int main(int argc, char** argv) {
         else if (w == "ycsb_d")      w_ycsb_def(*e, c, 'd');
         else if (w == "ycsb_e")      w_ycsb_def(*e, c, 'e');
         else if (w == "ycsb_f")      w_ycsb_def(*e, c, 'f');
-        else { std::cerr << "unknown workload: " << w << " (set: fillseq,fillrandom,readrandom,overwrite,ycsb_a..ycsb_f)\n"; rc = 2; }
+        // finding #6 (2026-11-14): OPT-IN transactional series (never
+        // in the default workloads string). Isolation notes per engine
+        // are printed in every row — the comparison is each engine's own
+        // transaction cost at its own isolation.
+        else if (w == "ycsb_a.txn") {
+            const char* iso = (c.engine.rfind("sqlite", 0) == 0)
+                ? "sqlite-writer-serialized-SQLITE_BUSY-as-conflict"
+                : (c.engine == "lmdb")
+                    ? "lmdb-internal-writer-serialization-no-conflict-signal"
+                    : "rocksdb-atomic-batch-no-isolation";
+            w_ycsb_txn(*e, c, "ycsb_a.txn", 50, iso);
+        }
+        else if (w == "rmw.txn") {
+            const char* iso = (c.engine.rfind("sqlite", 0) == 0)
+                ? "sqlite-writer-serialized-SQLITE_BUSY-as-conflict"
+                : (c.engine == "lmdb")
+                    ? "lmdb-internal-writer-serialization-no-conflict-signal"
+                    : "rocksdb-atomic-batch-no-isolation";
+            w_ycsb_txn(*e, c, "rmw.txn", 0, iso);
+        }
+        else { std::cerr << "unknown workload: " << w << " (set: fillseq,fillrandom,readrandom,overwrite,ycsb_a..ycsb_f,ycsb_a.txn,rmw.txn)\n"; rc = 2; }
     }
     e->close();
     if (!c.keep) { std::error_code ec; std::filesystem::remove_all(c.dir, ec); }
